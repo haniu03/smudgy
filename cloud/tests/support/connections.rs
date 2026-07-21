@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 
+use smudgy_cloud::{CORNER_INSET, DIAGONAL_BEARING_RATIO};
 use uuid::Uuid;
 
 use super::state::{AreaRecord, ConnectionRecord, EndpointRecord};
@@ -31,17 +32,43 @@ pub type Working = BTreeMap<Uuid, AreaRecord>;
 /// nearest the partner bearing, East at `0.5` when there is none.
 pub fn anchor_for(direction: Option<&str>, bearing_x: f32, bearing_y: f32) -> (&'static str, f32) {
     match direction {
-        Some("Northwest") => ("North", 0.0),
+        Some("Northwest") => ("North", CORNER_INSET),
         Some("North") => ("North", 0.5),
-        Some("Northeast") => ("North", 1.0),
+        Some("Northeast") => ("North", 1.0 - CORNER_INSET),
         Some("East") => ("East", 0.5),
-        Some("Southwest") => ("South", 0.0),
+        Some("Southwest") => ("South", CORNER_INSET),
         Some("South") => ("South", 0.5),
-        Some("Southeast") => ("South", 1.0),
+        Some("Southeast") => ("South", 1.0 - CORNER_INSET),
         Some("West") => ("West", 0.5),
         _ => {
-            if bearing_x.abs() >= bearing_y.abs() {
-                if bearing_x >= 0.0 { ("East", 0.5) } else { ("West", 0.5) }
+            let major = bearing_x.abs().max(bearing_y.abs());
+            let minor = bearing_x.abs().min(bearing_y.abs());
+            if major > 0.0 && minor / major >= DIAGONAL_BEARING_RATIO {
+                if bearing_y < 0.0 {
+                    (
+                        "North",
+                        if bearing_x < 0.0 {
+                            CORNER_INSET
+                        } else {
+                            1.0 - CORNER_INSET
+                        },
+                    )
+                } else {
+                    (
+                        "South",
+                        if bearing_x < 0.0 {
+                            CORNER_INSET
+                        } else {
+                            1.0 - CORNER_INSET
+                        },
+                    )
+                }
+            } else if bearing_x.abs() >= bearing_y.abs() {
+                if bearing_x >= 0.0 {
+                    ("East", 0.5)
+                } else {
+                    ("West", 0.5)
+                }
             } else if bearing_y >= 0.0 {
                 ("South", 0.5)
             } else {
@@ -171,7 +198,11 @@ pub fn insert_port_slot(
                 Some(p) if p.room_number != room_number => {
                     let own = room_xy(working, area_id, room_number).unwrap_or((0.0, 0.0));
                     let other = room_xy(working, area_id, p.room_number).unwrap_or(own);
-                    if axis_x { other.0 - own.0 } else { other.1 - own.1 }
+                    if axis_x {
+                        other.0 - own.0
+                    } else {
+                        other.1 - own.1
+                    }
                 }
                 Some(_) => 0.0, // self-loop partner: neutral bearing
                 None => any_outbound.map_or(0.0, |d| direction_component(d, axis_x)),
@@ -194,11 +225,15 @@ pub fn insert_port_slot(
         .filter(|(bearing, _)| *bearing > new_bearing)
         .map(|(_, port)| *port)
         .fold(f32::NAN, f32::min);
-    let low = if below.is_nan() { 0.0 } else { below };
-    let high = if above.is_nan() { 1.0 } else { above };
+    let low = if below.is_nan() { CORNER_INSET } else { below };
+    let high = if above.is_nan() {
+        1.0 - CORNER_INSET
+    } else {
+        above
+    };
     // A crowded or inverted gap stacks at the least-overlapping midpoint —
     // the editor surfaces the warning (§4.3); the slot stays in range.
-    f32::midpoint(low, high).clamp(0.0, 1.0)
+    f32::midpoint(low, high).clamp(CORNER_INSET, 1.0 - CORNER_INSET)
 }
 
 /// Facts needed to attach a new exit to a Connection.
@@ -310,8 +345,7 @@ pub fn attach_for_new_exit(
             secret_class,
             o_offset_default,
         );
-        let record =
-            ConnectionRecord::blank(cid, endpoint(link.from_room, o_side, o_port), None);
+        let record = ConnectionRecord::blank(cid, endpoint(link.from_room, o_side, o_port), None);
         working
             .get_mut(&area_id)
             .expect("scope area exists")
@@ -333,7 +367,9 @@ pub fn attach_for_new_exit(
             from_xy.1 - to_xy.unwrap_or(from_xy).1,
         )
     };
-    let to_room = link.to_room_number.expect("has_b requires a destination room");
+    let to_room = link
+        .to_room_number
+        .expect("has_b requires a destination room");
     let d_bearing = if wall_axis_is_x(d_side) {
         from_xy.0 - to_xy.unwrap_or(from_xy).0
     } else {
@@ -350,7 +386,13 @@ pub fn attach_for_new_exit(
         o_offset_default,
     );
     let d_port = insert_port_slot(
-        working, area_id, to_room, d_side, d_bearing, secret_class, d_offset_default,
+        working,
+        area_id,
+        to_room,
+        d_side,
+        d_bearing,
+        secret_class,
+        d_offset_default,
     );
 
     // Canonical orientation: lower room number is endpoint A; self-loop
@@ -400,7 +442,8 @@ pub fn cleanup_after_exit_delete(working: &mut Working, area_id: Uuid, connectio
 /// Connections touching the room are deleted.
 pub fn repair_after_room_delete(working: &mut Working, area_id: Uuid, room_number: i32) {
     if let Some(area) = working.get_mut(&area_id) {
-        area.exits.retain(|exit| exit.from_room_number != room_number);
+        area.exits
+            .retain(|exit| exit.from_room_number != room_number);
     }
     for host in working.values_mut() {
         for exit in &mut host.exits {
@@ -500,7 +543,9 @@ pub fn maintain_after_retarget(working: &mut Working, area_id: Uuid, connection_
         return;
     }
 
-    let to_room = exit.to_room_number.expect("same-area destination has a room");
+    let to_room = exit
+        .to_room_number
+        .expect("same-area destination has a room");
     let self_loop = to_room == exit.from_room_number;
     let stored = working
         .get(&area_id)
@@ -567,7 +612,11 @@ pub fn maintain_after_retarget(working: &mut Working, area_id: Uuid, connection_
     let mut origin = take_origin(connection);
     origin.room_number = exit.from_room_number;
     let old_a_room = connection.endpoint_a.room_number;
-    let (a, b) = if origin_first { (origin, far) } else { (far, origin) };
+    let (a, b) = if origin_first {
+        (origin, far)
+    } else {
+        (far, origin)
+    };
     if a.room_number != old_a_room {
         connection.route_points.reverse();
     }
