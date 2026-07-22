@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Package manifests and consent records now use only the canonical
+  `interop: ["read", "write"]` capabilities; the deprecated
+  `events: ["subscribe", "emit"]` alias has been removed for 0.5.
 - Creating rooms while auto-mapping no longer slows down as more maps
   are loaded: the cost of a map write now scales with the touched map,
   not with everything loaded. With 100,000 rooms loaded, an auto-mapped
