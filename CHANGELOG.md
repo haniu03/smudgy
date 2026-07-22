@@ -66,6 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Plain-string `line.replace(...)` now preserves the style of the matched text,
+  including when the match starts exactly at a color boundary; it previously
+  restyled the replacement with the line's first color.
 - Every map overlay (`MapView`) a script ever mounted quietly kept its
   pan/zoom state and player-location tracking for the rest of the
   session, even after the widget was removed. Unmounted maps are now
