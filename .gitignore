@@ -39,3 +39,11 @@ crash.log
 !/infra/github-runner/bootstrap/terraform.tfstate.backup
 # Downloaded Lambda release artifacts (re-fetch with runners/fetch-lambdas.sh).
 /infra/github-runner/runners/lambdas/
+
+# Local agent/editor tooling (workstation-specific, never tracked)
+.claude/
+.cursor/
+AGENTS.md
+CLAUDE.md
+.mcp.json
+.cargo/
