@@ -34,6 +34,7 @@ use trigger::Manager;
 #[cfg(feature = "bench-api")]
 pub use trigger::{Manager, MatchCapture, PushTriggerParams, SharedAutomationRegistry};
 pub mod catalogue;
+pub mod image_assets;
 pub mod input;
 pub mod line_operation;
 mod message_bus;

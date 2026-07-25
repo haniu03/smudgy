@@ -286,7 +286,7 @@ fn media_type_for(subpath: &str) -> &'static str {
         .unwrap_or_default()
         .to_ascii_lowercase();
     match ext.as_str() {
-        "ts" | "tsx" | "mts" => "application/typescript",
+        "ts" | "tsx" | "mts" | "cts" => "application/typescript",
         "js" | "jsx" | "mjs" | "cjs" => "application/javascript",
         "json" => "application/json",
         "wasm" => "application/wasm",
@@ -353,6 +353,20 @@ pub async fn publish_local_package(
             is_entry: m.subpath == entry,
         })
         .collect();
+    // Image assets are the first routinely-large modules a package ships. Warn (don't
+    // block — the server enforces its own caps) about anything past the loader's 32 MiB
+    // per-image cap: it would publish fine and then never display.
+    for module in &authored {
+        const IMAGE_LOAD_CAP: usize = 32 * 1024 * 1024;
+        if module.content.len() > IMAGE_LOAD_CAP {
+            warn!(
+                "publishing {}: {} is {} bytes — larger than the {IMAGE_LOAD_CAP}-byte cap image loading enforces, so <Image> will refuse it",
+                package.name,
+                module.subpath,
+                module.content.len()
+            );
+        }
+    }
     let authored_count = authored.len();
 
     // Publish-time TypeScript declarations (best-effort — a package always publishes even

@@ -168,7 +168,7 @@ function extractMarkdownLinks(source: string): { label: string; url: string }[] 
  * `createWidget`/`removeWidget` are creator-bound -- the widget registry keys mounts by
  * `(creator, name)`, so a package only ever sees/replaces its own widgets.
  */
-function makeWidgets(creator: { kind: string } | string) {
+function makeWidgets(creator: { kind: string } | string, module?: string) {
     // The creator arrives as the descriptor object (synthesized module / jsx-runtime) or
     // already-stringified (inline augmentation); normalize to the JSON string the ops key on,
     // matching the alias/trigger creator convention in smudgy.ts.
@@ -178,11 +178,12 @@ function makeWidgets(creator: { kind: string } | string) {
     const isolateToken = op_smudgy_widget_isolate_token();
     // Register this creator ONCE for image-src resolution: the host validates the descriptor
     // against the isolate's policy and returns an opaque token every <Image> build passes back
-    // (a forged __creator cannot select another package's asset root). The second arg is the
-    // importing module's in-package path for module-relative srcs inside packages; empty here
-    // (package module-relative resolution ships later), and unused for user modules, whose
-    // referrer already rides in creatorJson.
-    const imageCreatorToken = op_smudgy_widget_register_image_creator(creatorJson, "");
+    // (a forged __creator cannot select another package's asset root). `module` is the
+    // importing module's in-package path (the synthesized instance's `?mod=` value, baked as
+    // `__module`) -- the base for module-relative srcs inside packages. Host-side
+    // registration re-validates it component-wise, so a forged value cannot escape the
+    // package root. Empty/absent for user modules, whose referrer rides in creatorJson.
+    const imageCreatorToken = op_smudgy_widget_register_image_creator(creatorJson, module || "");
     const Column = (props: Record<string, any>, children: any) =>
         op_smudgy_widget_build_column(buildChildList(children), props || {});
 

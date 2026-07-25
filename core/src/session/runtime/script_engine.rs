@@ -48,7 +48,7 @@ use deno_core::url::Url;
 
 mod mapper_api;
 mod ops;
-mod package_cache;
+pub(crate) mod package_cache;
 mod package_provider;
 mod package_solver;
 
@@ -1262,10 +1262,16 @@ impl<'a> ScriptEngine<'a> {
         // --- Main isolate: local modules + trusted packages, allow-all, inspector-armed. ---
         // Main (and trusted packages, which live in main) get every smudgy capability — ungated
         // (`PACKAGE-ISOLATES-OP-CAPABILITIES.md`).
+        // Main's image-policy membership handle: starts empty; the main provider inserts
+        // each trusted package's identity as it resolves during `load_modules` below —
+        // before anything evaluates — so their `@/`/relative asset srcs verify.
+        let main_image_hosted = smudgy_cloud::image_source::HostedPackages::default();
+        if let Some(provider) = &smudgy_provider {
+            provider.set_image_hosted(main_image_hosted.clone());
+        }
         let (main_extensions, main_script_functions, main_instance) =
             // Main-isolate `getDataDir()` returns the shared server data dir. Trusted: no
-            // net/read gates; trusted-package `@/` asset reads arrive with PR2, so the
-            // membership set is empty here (their http(s)/data: srcs still work).
+            // net/read gates.
             make_extensions(
                 IsolateId::Main,
                 ops::SmudgyGrants::all(),
@@ -1274,7 +1280,7 @@ impl<'a> ScriptEngine<'a> {
                     true,
                     &server_name,
                     &server_path,
-                    std::collections::HashSet::new(),
+                    main_image_hosted,
                     &[],
                     &[],
                 ),
@@ -1548,21 +1554,29 @@ impl<'a> ScriptEngine<'a> {
                 // resolve AND what `getDataDir()` returns. Create it so a `$DATA` write has a parent.
                 let fs_data_dir = sandbox_fs_data_dir(&server_path, &spec.owner, &spec.name);
                 let _ = fs::create_dir_all(&fs_data_dir);
-                // The sandbox's image policy: its own package identity is a member (so its own
-                // `@/`/relative asset reads verify — the fetcher lands with PR2), plus its
-                // consented `net`/`read` grants ($DATA-expanded) gate http(s)/file <Image>
-                // srcs exactly as they gate `fetch`/file reads.
-                let mut image_identities = std::collections::HashSet::new();
-                image_identities.insert((
-                    spec.owner.to_ascii_lowercase(),
-                    spec.name.to_ascii_lowercase(),
-                    version.to_string(),
-                ));
+                // The sandbox's image policy: its own package identity is seeded eagerly (so
+                // its `@/`/relative asset reads verify) and the fork provider inserts each
+                // DEPENDENCY's identity as the closure resolves during module loading — a
+                // dep's assets verify too, with the version its resolve actually landed.
+                // The consented `net`/`read` grants ($DATA-expanded) gate http(s)/file
+                // <Image> srcs exactly as they gate `fetch`/file reads.
+                let image_hosted = smudgy_cloud::image_source::HostedPackages::default();
+                image_hosted.insert(
+                    &spec.owner,
+                    &spec.name,
+                    &version,
+                    pkg_cloud
+                        .as_ref()
+                        .is_some_and(|provider| provider.is_local_override(&spec.package_key())),
+                );
+                if let Some(provider) = &pkg_cloud {
+                    provider.set_image_hosted(image_hosted.clone());
+                }
                 let image_policy = build_image_policy(
                     false,
                     &params.server_name,
                     &server_path,
-                    image_identities,
+                    image_hosted,
                     &effective.net,
                     &expand_data_paths(&effective.read, &fs_data_dir),
                 );
@@ -3010,15 +3024,17 @@ fn to_allow_list(entries: Vec<String>) -> Option<Vec<String>> {
 /// Build the per-isolate [`ImageSourcePolicy`](smudgy_cloud::image_source::ImageSourcePolicy)
 /// the leaf `smudgy_widgets` <Image> ops read from `OpState`. `net`/`read` are the isolate's
 /// consented grants (already `$DATA`-expanded for `read`); empty on the trusted main isolate,
-/// where `trusted` short-circuits both gates. `package_identities` are the package identities
-/// this isolate legitimately hosts (gating `@/`/relative asset reads); a sandbox lists its own
-/// package, main lists none for now (trusted-package assets land with PR2's fetcher). A `net`
-/// entry the parser can't represent (CIDR, malformed) is dropped fail-closed and logged.
+/// where `trusted` short-circuits both gates. `hosted` is the isolate's live membership
+/// handle (gating `@/`/relative asset reads): the isolate's package provider inserts each
+/// identity as it resolves (see `SmudgyPackageProvider::set_image_hosted`), so trusted
+/// packages in main and a sandbox's dependency closure verify without knowing versions up
+/// front. A `net` entry the parser can't represent (CIDR, malformed) is dropped fail-closed
+/// and logged.
 fn build_image_policy(
     trusted: bool,
     server_name: &Arc<String>,
     server_path: &std::path::Path,
-    package_identities: std::collections::HashSet<smudgy_cloud::image_source::PackageIdentity>,
+    hosted: smudgy_cloud::image_source::HostedPackages,
     net: &[String],
     read: &[String],
 ) -> smudgy_cloud::image_source::ImageSourcePolicy {
@@ -3033,10 +3049,11 @@ fn build_image_policy(
     smudgy_cloud::image_source::ImageSourcePolicy {
         trusted,
         server_name: Arc::from(server_name.as_str()),
-        package_identities,
+        hosted_packages: hosted,
         net_grants,
         read_grants: read.iter().map(std::path::PathBuf::from).collect(),
         modules_root: server_path.join("modules"),
+        packages_root: server_path.join("packages"),
     }
 }
 

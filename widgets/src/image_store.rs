@@ -111,8 +111,14 @@ pub trait ImageFetcher: Send + Sync + 'static {
         policy: Arc<ImageSourcePolicy>,
     ) -> BoxFut<Result<DecodedImage, FetchError>>;
 
-    /// Cheap staleness probe for local-file-backed sources (`None` for others or on error).
-    fn probe(&self, source: ResolvedImageSource) -> BoxFut<Option<FileStamp>>;
+    /// Cheap staleness probe for local-file-backed sources (`None` for others or on
+    /// error). `policy` locates policy-relative sources (a local dev-override package's
+    /// on-disk asset dir).
+    fn probe(
+        &self,
+        source: ResolvedImageSource,
+        policy: Arc<ImageSourcePolicy>,
+    ) -> BoxFut<Option<FileStamp>>;
 }
 
 /// One image entry's current state. Swapped whole through the cell's `ArcSwap`.
@@ -308,7 +314,7 @@ impl ImageStore {
         source: &ResolvedImageSource,
         policy: &Arc<ImageSourcePolicy>,
     ) -> Arc<ImageEntryCell> {
-        self.ensure_keyed(&source.cache_key(), source, policy)
+        self.ensure_keyed(&source.store_key(policy), source, policy)
     }
 
     /// [`ensure`](Self::ensure) with the cache key already in hand. The per-frame resolve
@@ -510,7 +516,7 @@ impl ImageStore {
                     let policy = policy.clone();
                     let key = key.to_string();
                     let expected = *stamp;
-                    let probe = self.inner.fetcher.probe(source.clone());
+                    let probe = self.inner.fetcher.probe(source.clone(), policy.clone());
                     self.runtime().spawn(async move {
                         if probe.await.is_some_and(|current| current != expected) {
                             let flush_gen =
@@ -641,7 +647,11 @@ mod tests {
             })
         }
 
-        fn probe(&self, _source: ResolvedImageSource) -> BoxFut<Option<FileStamp>> {
+        fn probe(
+            &self,
+            _source: ResolvedImageSource,
+            _policy: Arc<ImageSourcePolicy>,
+        ) -> BoxFut<Option<FileStamp>> {
             Box::pin(async { None })
         }
     }
@@ -659,10 +669,11 @@ mod tests {
         Arc::new(ImageSourcePolicy {
             trusted: true,
             server_name: Arc::from("s"),
-            package_identities: std::collections::HashSet::new(),
+            hosted_packages: smudgy_cloud::image_source::HostedPackages::default(),
             net_grants: smudgy_cloud::image_source::NetGrants::default(),
             read_grants: Vec::new(),
             modules_root: std::path::PathBuf::from("/m"),
+            packages_root: std::path::PathBuf::from("/p"),
         })
     }
 

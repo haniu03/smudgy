@@ -37,6 +37,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -193,6 +194,67 @@ impl NetGrants {
 /// are ASCII-folded (the `PackageKey::folded` convention); version is exact.
 pub type PackageIdentity = (String, String, String);
 
+/// The engine-updatable half of an [`ImageSourcePolicy`]: which package identities this
+/// isolate legitimately hosts, and which of them are local dev-overrides (their assets read
+/// from `<server>/packages/<name>/…` on disk, not the published blob cache).
+///
+/// A shared handle rather than a snapshot because packages resolve **after** the isolate's
+/// extensions are built: main's trusted packages and a sandbox's dependency closure load
+/// inside `load_modules`, where the package provider inserts each identity as it resolves —
+/// before any module (and thus any `makeWidgets` registration) evaluates. Clones share the
+/// underlying sets; reads are lock-free (`ArcSwap` loads), inserts are rare COW swaps (once
+/// per package load per isolate).
+#[derive(Debug, Clone, Default)]
+pub struct HostedPackages {
+    identities: Arc<ArcSwap<HashSet<PackageIdentity>>>,
+    /// Folded `(owner, name)` pairs that are local dev-overrides for this server.
+    local: Arc<ArcSwap<HashSet<(String, String)>>>,
+}
+
+impl HostedPackages {
+    /// Record that this isolate hosts `owner/name@version` (folding owner/name; version
+    /// exact). `local_override` marks a local dev-override package.
+    pub fn insert(&self, owner: &str, name: &str, version: &str, local_override: bool) {
+        let identity = (
+            owner.to_ascii_lowercase(),
+            name.to_ascii_lowercase(),
+            version.to_string(),
+        );
+        if self.identities.load().contains(&identity)
+            && (!local_override || self.local.load().contains(&(identity.0.clone(), identity.1.clone())))
+        {
+            return;
+        }
+        self.identities.rcu(|set| {
+            let mut set = HashSet::clone(set);
+            set.insert(identity.clone());
+            set
+        });
+        if local_override {
+            let key = (identity.0, identity.1);
+            self.local.rcu(|set| {
+                let mut set = HashSet::clone(set);
+                set.insert(key.clone());
+                set
+            });
+        }
+    }
+
+    /// Membership check for creator registration (lock-free load + hash lookup).
+    #[must_use]
+    pub fn contains(&self, identity: &PackageIdentity) -> bool {
+        self.identities.load().contains(identity)
+    }
+
+    /// Whether `owner/name` (any case) is a local dev-override on this server.
+    #[must_use]
+    pub fn is_local_override(&self, owner: &str, name: &str) -> bool {
+        self.local
+            .load()
+            .contains(&(owner.to_ascii_lowercase(), name.to_ascii_lowercase()))
+    }
+}
+
 /// Per-isolate image-source policy, seeded into `OpState` by `core` beside
 /// [`crate::WidgetsEnabled`]. Plain data: everything here is resolved once at isolate
 /// build (grants parsed, paths `$DATA`-expanded) so per-src checks stay allocation-light.
@@ -204,8 +266,9 @@ pub struct ImageSourcePolicy {
     /// The hosting server's name (per-server HTTP-cache namespace attribution, plan D10).
     pub server_name: Arc<str>,
     /// Folded package identities this isolate legitimately hosts (root + dependency
-    /// closure for a sandbox; every trusted package for main).
-    pub package_identities: HashSet<PackageIdentity>,
+    /// closure for a sandbox; every trusted package for main), plus which are local
+    /// dev-overrides. A live shared handle — see [`HostedPackages`].
+    pub hosted_packages: HostedPackages,
     /// Consented `net` grants (empty for main — `trusted` short-circuits).
     pub net_grants: NetGrants,
     /// Consented `read` roots, `$DATA`-expanded — a sandboxed absolute-path src must fall
@@ -215,6 +278,10 @@ pub struct ImageSourcePolicy {
     /// module dir for creators with no module (inline aliases/triggers, REPL, https
     /// modules, which all coarsen to `{kind:"user"}`).
     pub modules_root: PathBuf,
+    /// `<server>/packages/` — where local dev-override package assets live on disk
+    /// (`<packages_root>/<name>/<subpath>`). The fetcher confines reads to the package's
+    /// directory post-canonicalization.
+    pub packages_root: PathBuf,
 }
 
 impl ImageSourcePolicy {
@@ -302,7 +369,7 @@ pub fn register_creator(
             // Membership gates asset reads, not the whole creator: a non-member (forged, or a
             // not-yet-enumerated legit) package can still use http(s)/data:/absolute srcs, but
             // its `@/`/relative asset lookups are denied.
-            let verified = policy.package_identities.contains(&identity);
+            let verified = policy.hosted_packages.contains(&identity);
             let module_dir = match module_subpath.map(dir_of_validated).transpose() {
                 Ok(dir) => dir.unwrap_or_default(),
                 // A hostile `?mod=` (containing `..`) invalidates the base entirely.
@@ -419,8 +486,39 @@ pub enum ResolvedImageSource {
 }
 
 impl ResolvedImageSource {
-    /// The store-map key: stable, bounded-size, content-addressed for `data:` URIs (keying
-    /// a map on a 2 MiB string would make every probe hash 2 MiB).
+    /// The **store-map** key for this source under `policy` — [`cache_key`] plus the one
+    /// policy-dependent case: a package asset whose package is a **local dev-override**
+    /// keys per server and working folder (`pkg-local://<server>/<name>/<subpath>`),
+    /// because its bytes come from that server's working tree, not the published
+    /// content-addressed blob. Without the split, a published install and the author's
+    /// live folder (or two servers' folders) collide on one process-global entry and pin
+    /// each other's bytes. Cold-path only (resolve memos cache the result): one lock-free
+    /// set load + a folded lookup.
+    ///
+    /// [`cache_key`]: Self::cache_key
+    #[must_use]
+    pub fn store_key(&self, policy: &ImageSourcePolicy) -> String {
+        if let Self::PackageAsset {
+            owner,
+            name,
+            subpath,
+            ..
+        } = self
+            && policy.hosted_packages.is_local_override(owner, name)
+        {
+            return format!(
+                "pkg-local://{}/{}/{subpath}",
+                policy.server_name,
+                name.to_ascii_lowercase()
+            );
+        }
+        self.cache_key()
+    }
+
+    /// The policy-independent store key: stable, bounded-size, content-addressed for
+    /// `data:` URIs (keying a map on a 2 MiB string would make every probe hash 2 MiB).
+    /// Store callers use [`store_key`](Self::store_key), which layers the one
+    /// policy-dependent case on top.
     #[must_use]
     pub fn cache_key(&self) -> String {
         match self {
@@ -820,13 +918,18 @@ mod tests {
     ) -> Arc<ImageSourcePolicy> {
         let (net_grants, _dropped) =
             NetGrants::parse(&net.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let hosted = HostedPackages::default();
+        for (owner, name, version) in package_identities {
+            hosted.insert(&owner, &name, &version, false);
+        }
         Arc::new(ImageSourcePolicy {
             trusted,
             server_name: Arc::from("testserver"),
-            package_identities,
+            hosted_packages: hosted,
             net_grants,
             read_grants: read.iter().map(PathBuf::from).collect(),
             modules_root: PathBuf::from("/home/u/smudgy/testserver/modules"),
+            packages_root: PathBuf::from("/home/u/smudgy/testserver/packages"),
         })
     }
 
@@ -1246,6 +1349,67 @@ mod tests {
         assert_eq!(a, SrcMemoKey::Inline("short".into()));
         let big = "x".repeat(600);
         assert!(matches!(memo_key(&big), SrcMemoKey::Large { len: 600, .. }));
+    }
+
+    // -- hosted-package membership ----------------------------------------------------------
+
+    #[test]
+    fn hosted_packages_fold_and_share_live() {
+        let hosted = HostedPackages::default();
+        let policy = Arc::new(ImageSourcePolicy {
+            trusted: true,
+            server_name: Arc::from("testserver"),
+            hosted_packages: hosted.clone(),
+            net_grants: NetGrants::default(),
+            read_grants: Vec::new(),
+            modules_root: PathBuf::from("/m"),
+            packages_root: PathBuf::from("/p"),
+        });
+        let creator_json = r#"{"kind":"package","owner":"WBK","name":"Mapper","version":"1.0.0"}"#;
+
+        // Registered before the identity lands: not verified — asset srcs break.
+        let before = register_creator(creator_json, None, policy.clone()).unwrap();
+        assert!(matches!(
+            resolve_src("@/a.png", &before, false),
+            Err(SrcError::RootEscape)
+        ));
+
+        // The provider inserts as the package resolves (any case; folded), THEN modules
+        // evaluate and register — the clone inside the policy sees the same live set.
+        hosted.insert("wbk", "MAPPER", "1.0.0", true);
+        assert!(hosted.contains(&("wbk".into(), "mapper".into(), "1.0.0".into())));
+        assert!(!hosted.contains(&("wbk".into(), "mapper".into(), "2.0.0".into())), "version exact");
+        assert!(hosted.is_local_override("WbK", "mapper"));
+        assert!(!hosted.is_local_override("wbk", "other"));
+
+        let after = register_creator(creator_json, None, policy).unwrap();
+        assert!(matches!(
+            resolve_src("@/a.png", &after, false),
+            Ok(ResolvedImageSource::PackageAsset { .. })
+        ));
+    }
+
+    #[test]
+    fn local_override_assets_key_per_server_never_by_content_identity() {
+        // A local dev-override's bytes come from the server's working tree; a published
+        // install's from the immutable blob. Same (owner, name, version, subpath) must NOT
+        // share one process-global store entry — the author's edits would stop repainting
+        // (published entry has no file stamp) or another server would display this one's
+        // working-tree file.
+        let source = ResolvedImageSource::PackageAsset {
+            owner: "WBK".into(),
+            name: "Hud".into(),
+            version: "1.0.0".into(),
+            subpath: "assets/logo.png".into(),
+        };
+        let published = policy(true, &[], &[]);
+        assert_eq!(source.store_key(&published), source.cache_key());
+
+        let local = policy(true, &[], &[]);
+        local.hosted_packages.insert("wbk", "hud", "1.0.0", true);
+        let key = source.store_key(&local);
+        assert_eq!(key, "pkg-local://testserver/hud/assets/logo.png");
+        assert_ne!(key, source.cache_key());
     }
 
     // -- panic safety ---------------------------------------------------------------------

@@ -2011,7 +2011,7 @@ impl ImageRegistry {
         let (outcome, cell) = match self.creator(token) {
             Some(creator) => match resolve_src(raw, creator, false) {
                 Ok(source) => {
-                    let store_key: Arc<str> = Arc::from(source.cache_key());
+                    let store_key: Arc<str> = Arc::from(source.store_key(&creator.policy));
                     let cell = store.ensure_keyed(&store_key, &source, &creator.policy);
                     (
                         Ok(MemoHit {
@@ -2266,7 +2266,7 @@ impl BoundSrcTable {
         // a producer is not the widget's author).
         let (resolution, cell) = match resolve_src(raw, creator, true) {
             Ok(source) => {
-                let key: Arc<str> = Arc::from(source.cache_key());
+                let key: Arc<str> = Arc::from(source.store_key(&creator.policy));
                 let cell = store.ensure_keyed(&key, &source, &creator.policy);
                 (Ok((source, key)), Some(cell))
             }

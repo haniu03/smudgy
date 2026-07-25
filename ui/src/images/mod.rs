@@ -24,6 +24,8 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use smudgy_cloud::image_source::{ImageSourcePolicy, ResolvedImageSource};
+use smudgy_cloud::package_api::PackageApiClient;
+use smudgy_core::session::runtime::image_assets::PackageAssetCache;
 use smudgy_widgets::{DecodedImage, FetchError, FileStamp, ImageFetcher, ImageStore};
 use tokio::sync::Semaphore;
 
@@ -46,6 +48,24 @@ pub fn image_store() -> ImageStore {
     STORE
         .get_or_init(|| ImageStore::new(Arc::new(UiImageFetcher::new())))
         .clone()
+}
+
+/// The authenticated package-API client the `PackageAsset` arm uses to re-resolve a version
+/// when an asset blob is missing locally (presigned content URLs are ephemeral and never
+/// cached, so a late first display needs a fresh resolve). Sessions register theirs at
+/// construction; every session shares one account, so last-write-wins is correct, and the
+/// [`CredentialSource`](smudgy_cloud::backends::CredentialSource) inside hot-swaps on
+/// login/logout.
+fn package_client_slot() -> &'static arc_swap::ArcSwapOption<PackageApiClient> {
+    static SLOT: std::sync::OnceLock<arc_swap::ArcSwapOption<PackageApiClient>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(arc_swap::ArcSwapOption::empty)
+}
+
+/// Register the package-API client asset fetches re-resolve through (see
+/// [`package_client_slot`]). Called by `session_store` per session; idempotent in effect.
+pub fn set_package_client(client: PackageApiClient) {
+    package_client_slot().store(Some(Arc::new(client)));
 }
 
 struct UiImageFetcher {
@@ -99,11 +119,156 @@ impl UiImageFetcher {
                 decode_data_uri(uri).map_err(FetchError::permanent)?,
                 None,
             )),
-            ResolvedImageSource::PackageAsset { owner, name, .. } => Err(FetchError::permanent(
-                format!("package assets ({owner}/{name}) are not loadable yet"),
-            )),
+            ResolvedImageSource::PackageAsset {
+                owner,
+                name,
+                version,
+                subpath,
+            } => load_package_asset(owner, name, version, subpath, policy).await,
         }
     }
+}
+
+/// Serve a membership-validated package asset (plan D4's `PackageAsset` arm):
+///
+/// 1. **Local dev-override** — the author's working tree at
+///    `<server>/packages/<name>/<subpath>`: read from disk with the same
+///    canonicalize-and-confine recheck as [`read_local`], and stamp for the freshness
+///    probe (editing an asset repaints).
+/// 2. **Installed** — content-addressed blob from the shared package cache, keyed by the
+///    hash the load-time resolution metadata recorded for `subpath`.
+/// 3. **Blob miss** — re-resolve the exact version over the network for a fresh presigned
+///    URL, verify the hash matches the metadata, byte-fetch (SHA-256-verified in the
+///    client), enforce the size cap, and cache the body forever (immutable versions).
+async fn load_package_asset(
+    owner: &str,
+    name: &str,
+    version: &str,
+    subpath: &str,
+    policy: &ImageSourcePolicy,
+) -> Result<(Vec<u8>, Option<FileStamp>), FetchError> {
+    if policy.hosted_packages.is_local_override(owner, name) {
+        return read_local_package_asset(&policy.packages_root, name, subpath);
+    }
+
+    let cache = PackageAssetCache::open();
+    let cached_hash = cache
+        .as_ref()
+        .and_then(|c| c.module_hash(owner, name, version, subpath));
+    if let (Some(cache), Some(hash)) = (&cache, &cached_hash)
+        && let Some(bytes) = cache.read_blob_bytes(hash)
+    {
+        if bytes.len() as u64 > MAX_BODY_BYTES {
+            return Err(FetchError::permanent(format!(
+                "{owner}/{name}@{version}/{subpath} is {} bytes; images are capped at {MAX_BODY_BYTES}",
+                bytes.len()
+            )));
+        }
+        return Ok((bytes, None));
+    }
+
+    // Blob miss: a fresh resolve for ephemeral presigned URLs. Requires the client a
+    // session registered; without one (headless tests) the asset is transiently absent.
+    let Some(client) = package_client_slot().load_full() else {
+        return Err(FetchError::transient(format!(
+            "{owner}/{name}@{version}/{subpath}: asset not cached and no package client is available"
+        )));
+    };
+    let wire = client
+        .resolve_package(owner, name, Some(version))
+        .await
+        .map_err(|err| FetchError::transient(format!("{owner}/{name}@{version}: {err}")))?;
+    let module = wire
+        .modules
+        .iter()
+        .find(|m| m.subpath == subpath)
+        .ok_or_else(|| {
+            FetchError::permanent(format!(
+                "{owner}/{name}@{version} has no module {subpath:?}"
+            ))
+        })?;
+    // The same refusal module_hash applies locally: a CODE module is not an image, and the
+    // network fallback must not become the bypass (nor waste a resolve + download per app
+    // run on a src typo that could never decode).
+    if smudgy_core::session::runtime::image_assets::is_code_module(&module.media_type, &module.subpath)
+    {
+        return Err(FetchError::permanent(format!(
+            "{owner}/{name}@{version}/{subpath} is a code module, not an image asset"
+        )));
+    }
+    // The load-time metadata is the integrity anchor when present: a re-resolve of the
+    // same immutable version must agree with what the package loaded as.
+    if let Some(hash) = &cached_hash
+        && !module.content_hash.eq_ignore_ascii_case(hash)
+    {
+        return Err(FetchError::permanent(format!(
+            "{owner}/{name}@{version}/{subpath}: re-resolved content hash disagrees with the loaded resolution"
+        )));
+    }
+    if u64::try_from(module.byte_size).is_ok_and(|size| size > MAX_BODY_BYTES) {
+        return Err(FetchError::permanent(format!(
+            "{owner}/{name}@{version}/{subpath} is {} bytes; images are capped at {MAX_BODY_BYTES}",
+            module.byte_size
+        )));
+    }
+    let bytes = client
+        .fetch_module_bytes(&module.content_url, &module.content_hash)
+        .await
+        .map_err(|err| FetchError::transient(format!("{owner}/{name}@{version}/{subpath}: {err}")))?;
+    if bytes.len() as u64 > MAX_BODY_BYTES {
+        return Err(FetchError::permanent(format!(
+            "{owner}/{name}@{version}/{subpath} is {} bytes; images are capped at {MAX_BODY_BYTES}",
+            bytes.len()
+        )));
+    }
+    if let Some(cache) = &cache {
+        cache.write_blob_bytes(&module.content_hash, &bytes);
+    }
+    Ok((bytes, None))
+}
+
+/// The on-disk path of a local dev-override package asset. Lexical only — callers either
+/// stat it (probe) or canonicalize-and-confine before reading.
+fn local_package_asset_path(packages_root: &Path, name: &str, subpath: &str) -> PathBuf {
+    let mut path = packages_root.join(name);
+    for part in subpath.split('/') {
+        path.push(part);
+    }
+    path
+}
+
+/// Read a local dev-override package asset, re-verifying post-canonicalization that the
+/// file stays inside the package's directory (the resolve-time check was lexical; symlinks
+/// resolve here). Mirrors [`read_local`], confined to `<packages_root>/<name>/`.
+fn read_local_package_asset(
+    packages_root: &Path,
+    name: &str,
+    subpath: &str,
+) -> Result<(Vec<u8>, Option<FileStamp>), FetchError> {
+    let root = dunce::canonicalize(packages_root.join(name))
+        .map_err(|e| FetchError::transient(format!("{name}: {e}")))?;
+    let path = local_package_asset_path(packages_root, name, subpath);
+    let canonical =
+        dunce::canonicalize(&path).map_err(|e| FetchError::transient(format!("{}: {e}", path.display())))?;
+    if !canonical.starts_with(&root) {
+        return Err(FetchError::permanent(format!(
+            "{} escapes its package directory after resolving links",
+            path.display()
+        )));
+    }
+    let stamp = stamp_of(&canonical);
+    if let Some(stamp) = &stamp
+        && stamp.size > MAX_BODY_BYTES
+    {
+        return Err(FetchError::permanent(format!(
+            "{} is {} bytes; images are capped at {MAX_BODY_BYTES}",
+            canonical.display(),
+            stamp.size
+        )));
+    }
+    let bytes = std::fs::read(&canonical)
+        .map_err(|e| FetchError::transient(format!("{}: {e}", canonical.display())))?;
+    Ok((bytes, stamp))
 }
 
 impl ImageFetcher for UiImageFetcher {
@@ -143,10 +308,21 @@ impl ImageFetcher for UiImageFetcher {
     fn probe(
         &self,
         source: ResolvedImageSource,
+        policy: Arc<ImageSourcePolicy>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Option<FileStamp>> + Send + 'static>> {
         Box::pin(async move {
             match &source {
                 ResolvedImageSource::LocalFile(path) => stamp_of(path),
+                // A local dev-override's assets are working-tree files: stat them so an
+                // edited asset repaints (published assets are content-addressed, immutable).
+                ResolvedImageSource::PackageAsset {
+                    owner,
+                    name,
+                    subpath,
+                    ..
+                } if policy.hosted_packages.is_local_override(owner, name) => stamp_of(
+                    &local_package_asset_path(&policy.packages_root, name, subpath),
+                ),
                 _ => None,
             }
         })
@@ -324,5 +500,35 @@ mod tests {
     #[test]
     fn garbage_is_a_decode_error_not_a_panic() {
         assert!(decode_and_orient(&[0u8; 64]).is_err());
+    }
+
+    #[test]
+    fn local_package_assets_stay_confined() {
+        let dir = std::env::temp_dir().join(format!("smudgy-imgpkg-test-{}", std::process::id()));
+        let packages = dir.join("packages");
+        let pkg = packages.join("hud");
+        std::fs::create_dir_all(pkg.join("assets")).unwrap();
+        std::fs::write(pkg.join("assets").join("logo.png"), b"not-really-png").unwrap();
+        std::fs::write(dir.join("outside.png"), b"outside").unwrap();
+
+        // A validated subpath reads fine and stamps for the freshness probe.
+        let (bytes, stamp) =
+            read_local_package_asset(&packages, "hud", "assets/logo.png").unwrap();
+        assert_eq!(bytes, b"not-really-png");
+        assert!(stamp.is_some());
+
+        // A symlink pointing out of the package directory fails the canonical confinement
+        // recheck even though the lexical subpath looked fine.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("outside.png"), pkg.join("assets").join("sneaky.png"))
+                .unwrap();
+            let err = read_local_package_asset(&packages, "hud", "assets/sneaky.png")
+                .expect_err("symlink escape must be refused");
+            assert!(!err.transient, "confinement violations are permanent");
+            assert!(err.reason.contains("escapes"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

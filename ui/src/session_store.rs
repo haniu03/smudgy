@@ -600,9 +600,12 @@ impl ManagedSession {
 
         // The image store is process-global (entries are keyed by content source, shared
         // across sessions). Register this session's repaint waker so a completed load repaints
-        // its widgets (the store pokes every live session on completion).
+        // its widgets (the store pokes every live session on completion), and the package
+        // client the PackageAsset arm re-resolves through (shares the session's
+        // hot-swappable credential slot).
         let image_store = image_store();
         image_store.register_waker(widget_root.wake_handle());
+        crate::images::set_package_client(package_client.clone());
 
         let extra_script_extensions = {
             let widget_root = WidgetRoot::clone(&widget_root);

@@ -62,9 +62,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `opacity`, and `rotation`. Remote images are cached on disk honoring
   the server's HTTP cache headers (and keep showing through network
   hiccups); a sandboxed package's image loads obey the same consented
-  `net`/`read` permissions as its `fetch()` and file access. Package
-  asset paths (`@/...` and module-relative) are recognized but load in
-  an upcoming release.
+  `net`/`read` permissions as its `fetch()` and file access. Packages
+  can ship their own images and show them with `@/assets/...` or
+  module-relative paths — published assets download lazily on first
+  display (never at load time) and cache forever; a package you're
+  authoring locally reads them straight from its folder, and edits
+  show up in about a second.
 
 ### Changed
 
