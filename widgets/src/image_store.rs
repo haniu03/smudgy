@@ -219,6 +219,17 @@ struct StoreInner {
     runtime: OnceLock<tokio::runtime::Runtime>,
 }
 
+impl Drop for StoreInner {
+    fn drop(&mut self) {
+        // A spawned fetch task holds a store clone; when it finishes LAST (tests build
+        // short-lived stores; production's is global), this Drop runs on a runtime worker,
+        // where a blocking Runtime::drop panics. Shutdown in the background instead.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 /// The global store handle (cheap to clone; all clones share one inner).
 #[derive(Clone)]
 pub struct ImageStore {
@@ -292,10 +303,21 @@ impl ImageStore {
         }
     }
 
-    /// Monotonic state-transition counter (canvas cache invalidation).
+    /// Monotonic state-transition counter (canvas cache invalidation). Acquire: pairs
+    /// with `complete()`'s Release bump so an observer of generation N+1 also observes
+    /// the entry state that transition published — a canvas that clears its geometry
+    /// cache on the bump must re-record the *new* state, not a stale `Loading`.
     #[must_use]
     pub fn completion_generation(&self) -> u64 {
-        self.inner.completion_generation.load(Ordering::Relaxed)
+        self.inner.completion_generation.load(Ordering::Acquire)
+    }
+
+    /// The existing cell for `key`, if any — one lock-free map load, no touch, no spawn.
+    /// Lets a parse path distinguish already-known sources from ones whose `ensure`
+    /// would spawn a brand-new fetch (the bound-scene new-source budget).
+    #[must_use]
+    pub fn peek(&self, key: &str) -> Option<Arc<ImageEntryCell>> {
+        self.inner.map.load().get(key).cloned()
     }
 
     /// Total decoded bytes currently held (diagnostics / future UI).
@@ -593,20 +615,26 @@ impl ImageStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// A store over an immediate 2×2 mock fetcher, for other modules' tests (canvas).
+    pub(crate) fn test_store() -> (ImageStore, Arc<MockFetcher>) {
+        let fetcher = MockFetcher::ok(2, 2);
+        (ImageStore::new(fetcher.clone()), fetcher)
+    }
+
     /// A fetcher that resolves immediately (or once `gate` releases it), counting calls.
-    struct MockFetcher {
-        calls: AtomicUsize,
+    pub(crate) struct MockFetcher {
+        pub(crate) calls: AtomicUsize,
         result: Mutex<Result<(u32, u32), FetchError>>,
         /// When present, fetches wait for a permit before resolving.
         gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     impl MockFetcher {
-        fn ok(width: u32, height: u32) -> Arc<Self> {
+        pub(crate) fn ok(width: u32, height: u32) -> Arc<Self> {
             Arc::new(Self {
                 calls: AtomicUsize::new(0),
                 result: Mutex::new(Ok((width, height))),
@@ -665,7 +693,7 @@ mod tests {
         }
     }
 
-    fn test_policy() -> Arc<ImageSourcePolicy> {
+    pub(crate) fn test_policy() -> Arc<ImageSourcePolicy> {
         Arc::new(ImageSourcePolicy {
             trusted: true,
             server_name: Arc::from("s"),

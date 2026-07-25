@@ -41,6 +41,11 @@ const MAX_DECODE_ALLOC_BYTES: u64 = 128 * 1024 * 1024;
 /// this just thrashes and delays the first image.
 const MAX_CONCURRENT_DECODES: usize = 2;
 
+/// Concurrent *remote-fetch* bound. Distinct-source fetch spawns are already budgeted at
+/// the canvas/widget layer, but a burst (or a hostile bound scene naming nonce URLs each
+/// write) must not turn into an unbounded pile of live sockets and disk-cache writes.
+const MAX_CONCURRENT_FETCHES: usize = 8;
+
 /// The process-global [`ImageStore`], built once on first use and shared by every session
 /// (entries are keyed by content source, so cross-session sharing dedups fetch/decode/upload).
 pub fn image_store() -> ImageStore {
@@ -72,6 +77,7 @@ struct UiImageFetcher {
     client: reqwest::Client,
     cache: Option<http_cache::HttpImageCache>,
     decode_permits: Arc<Semaphore>,
+    fetch_permits: Arc<Semaphore>,
 }
 
 impl UiImageFetcher {
@@ -91,6 +97,7 @@ impl UiImageFetcher {
             client,
             cache,
             decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+            fetch_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES)),
         }
     }
 
@@ -101,6 +108,14 @@ impl UiImageFetcher {
     ) -> Result<(Vec<u8>, Option<FileStamp>), FetchError> {
         match source {
             ResolvedImageSource::Remote(url) => {
+                // Bound concurrent remote loads: a flood of distinct URLs (however it got
+                // past the resolve-layer budgets) queues here instead of piling up
+                // sockets and disk-cache writes.
+                let _permit = self
+                    .fetch_permits
+                    .acquire()
+                    .await
+                    .map_err(|_| FetchError::transient("fetcher shut down"))?;
                 let grants = (!policy.trusted).then(|| policy.net_grants.clone());
                 let bytes = match &self.cache {
                     Some(cache) => {
@@ -284,11 +299,13 @@ impl ImageFetcher for UiImageFetcher {
         let client = self.client.clone();
         let cache = self.cache.clone();
         let permits = self.decode_permits.clone();
+        let fetch_permits = self.fetch_permits.clone();
         Box::pin(async move {
             let loader = UiImageFetcher {
                 client,
                 cache,
                 decode_permits: permits.clone(),
+                fetch_permits,
             };
             let (bytes, file_stamp) = loader.load_bytes(&source, &policy).await?;
             // Bound concurrent decodes; the permit spans only the CPU-bound decode.

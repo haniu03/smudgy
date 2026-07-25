@@ -382,7 +382,9 @@ function makeWidgets(creator: { kind: string } | string, module?: string) {
             typeof p.onPointer === "function"
                 ? (raw: string) => p.onPointer(JSON.parse(raw))
                 : undefined;
-        return op_smudgy_widget_build_canvas({ ...p, onPointer }, isolateToken);
+        // The image creator token lets scene `image` records resolve their `src` against
+        // this creator's validated asset root, exactly like the <Image> widget.
+        return op_smudgy_widget_build_canvas({ ...p, onPointer }, isolateToken, imageCreatorToken);
     };
 
     // Fragment: no iced analog -- it just yields its children for the parent to absorb

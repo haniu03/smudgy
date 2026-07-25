@@ -1462,6 +1462,9 @@ export function make() { return createEvent('dynamic'); }
                  { kind: \"rect\", x: 0, y: 0, width: 100, height: 8, rx: 2, fill: gradient },\n\
                  { kind: \"path\", d: \"M 0 0 A 5 5 0 0 1 10 0 Z\", stroke: { color: \"#fff\", width: 1, dash: [2, 2] } },\n\
                  { kind: \"text\", x: 4, y: 4, text: \"hp\", size: 10, color: \"#8fa\", align_x: \"center\", font: \"monospace\" },\n\
+                 { kind: \"image\", src: \"@/assets/map-bg.png\", x: 0, y: 0, width: 100, height: 50,\n\
+                   fit: \"cover\", filter: \"nearest\", rotate: 15, opacity: 0.8,\n\
+                   animate: { x: { to: 10, duration: 250 }, rotate: { to: 0, duration: 250 } } },\n\
                  { kind: \"group\", transform: { translate: [5, 5], rotate: 45, scale: [1, 2] }, children: [\n\
                    { kind: \"circle\", id: \"ring\", cx: 0, cy: 0, r: 2, transient: true,\n\
                      animate: { r: { to: 100, duration: 500, ease: \"out\", repeat: 2 } } },\n\

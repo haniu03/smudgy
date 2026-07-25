@@ -629,6 +629,44 @@ declare module "smudgy:widgets" {
         };
     }
 
+    /** A raster image drawn into a scene-unit box.
+     *
+     *  `src` accepts the same grammar as the `<Image>` widget (module-relative and `@/`
+     *  package paths, `https:`, `data:image/...`), checked against the same permissions.
+     *  When the scene arrives through a binding, sources are additionally restricted like
+     *  bound `<Image>` sources: relative/`@/` paths may not use `..`, and absolute file
+     *  paths are rejected -- whatever writes the bound path chooses these strings, and it
+     *  is not necessarily this widget's author.
+     *
+     *  While the image is still loading (or if it fails), the record draws nothing; the
+     *  rest of the scene is unaffected, and the drawing repaints when the load lands.
+     *
+     *  Paint-order caveats (fixed by the renderer, like {@link CanvasText}): images draw
+     *  above ALL fill/stroke geometry regardless of scene order -- a later rectangle
+     *  cannot cover an earlier image -- and below all text. Inside a non-uniformly scaled
+     *  group, a rotated image will not shear; it stays a rotated rectangle. */
+    export interface CanvasImage extends CanvasShapeBase {
+        kind: "image";
+        /** The image source (the `<Image>` widget's `src` grammar; SVG is not supported). */
+        src: string;
+        x?: number;
+        y?: number;
+        /** The box the image occupies, in scene units. */
+        width?: number;
+        height?: number;
+        /** How the pixels map onto the box. Default "fill" (stretch exactly, like every
+         *  other shape fills its geometry -- note this differs from the `<Image>` widget's
+         *  "contain" default). "cover" overflow is clipped at the canvas bounds. */
+        fit?: "fill" | "contain" | "cover" | "none" | "scale-down";
+        /** Scaling filter. Default "linear"; "nearest" for crisp pixel art. */
+        filter?: "linear" | "nearest";
+        /** Rotation in degrees, clockwise, about the box center. */
+        rotate?: number;
+        animate?: Partial<
+            Record<"x" | "y" | "width" | "height" | "rotate" | "opacity", NumberTween>
+        >;
+    }
+
     /** A transformed group of shapes. Transform components always apply in the order
      *  translate, then rotate, then scale, about the group's local origin. */
     export interface CanvasGroup extends CanvasShapeBase {
@@ -657,6 +695,7 @@ declare module "smudgy:widgets" {
         | CanvasPolygon
         | CanvasPath
         | CanvasText
+        | CanvasImage
         | CanvasGroup;
 
     /** A pointer event on a canvas, in scene coordinates (the same numbers you draw

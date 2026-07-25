@@ -35,15 +35,25 @@ use std::time::Instant;
 use deno_core::v8;
 use iced::widget::canvas;
 use iced::{Color, Point, Radians, Rectangle, Size, Vector, mouse, window};
+use smudgy_cloud::image_source::{
+    ImageSourcePolicy, RegisteredImageCreator, ResolvedImageSource, resolve_src,
+};
 use smudgy_cloud::{Node, StoreBindingCell, WidgetIsolate};
 
 use crate::WidgetMessage;
+use crate::image_store::{EntryState, ImageEntryCell, ImageStore};
 
 // ---------------------------------------------------------------------------------------------
 // Complexity budgets (plans/widgets-iced-primitives.md §11). Exceeding any of these rejects the
 // scene generation atomically; see the module docs for why rejection is all-or-nothing.
 
 pub(crate) const MAX_RECORDS: usize = 10_000;
+pub(crate) const MAX_IMAGE_RECORDS: usize = 256;
+/// How many NEVER-SEEN image sources one bound-scene write may spawn fetches for. A bound
+/// scene's producer (a game server, another package) mints a fresh snapshot per write and
+/// could otherwise name 256 nonce URLs each time — an unbounded fetch/disk amplifier. A
+/// legitimate scene's sources recur, hit the store map, and never charge this budget.
+pub(crate) const MAX_NEW_BOUND_SOURCES: usize = 64;
 pub(crate) const MAX_DEPTH: usize = 16;
 pub(crate) const MAX_SEGMENTS_PER_PATH: usize = 10_000;
 pub(crate) const MAX_SEGMENTS_TOTAL: usize = 100_000;
@@ -122,6 +132,116 @@ pub(crate) enum TextAlignY {
     Bottom,
 }
 
+/// How an `image` record's pixels map onto its `x/y/width/height` box. `Fill` (the
+/// default) stretches exactly to the box, like every other shape fills its geometry;
+/// the rest follow the widget `content_fit` semantics inside the box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ImageFit {
+    #[default]
+    Fill,
+    Contain,
+    Cover,
+    None,
+    ScaleDown,
+}
+
+/// A scene image's live slot: the resolution inputs retained from parse time plus a
+/// swappable store entry cell. `update()`'s per-redraw refresh walk calls [`refresh`]:
+/// it stamps recency (a canvas's cached geometry means `draw` does NOT read the cell per
+/// frame — without the walk a displayed image would go LRU-cold and become `evict_cold`'s
+/// preferred victim while still on screen) and re-`ensure`s an evicted/flushed cell from
+/// the retained `(key, source, policy)` so the image comes back after a cache clear.
+///
+/// [`refresh`]: ImageCell::refresh
+pub(crate) struct ImageCell {
+    key: Arc<str>,
+    source: ResolvedImageSource,
+    policy: Arc<ImageSourcePolicy>,
+    cell: arc_swap::ArcSwap<ImageEntryCell>,
+}
+
+impl ImageCell {
+    pub(crate) fn new(
+        key: Arc<str>,
+        source: ResolvedImageSource,
+        policy: Arc<ImageSourcePolicy>,
+        cell: Arc<ImageEntryCell>,
+    ) -> Self {
+        Self {
+            key,
+            source,
+            policy,
+            cell: arc_swap::ArcSwap::new(cell),
+        }
+    }
+
+    /// The current entry state (one lock-free cell load; stamps recency via `state()`).
+    fn state(&self) -> Arc<EntryState> {
+        self.cell.load().state()
+    }
+
+    /// Keep the slot honest across redraws: touch the LRU stamp, and when the store
+    /// evicted/flushed the cell, re-`ensure` from the retained inputs and swap the fresh
+    /// cell in. Steady state is two lock-free loads + a relaxed store; the re-ensure path
+    /// (writer lock + possible fetch spawn) only runs after an eviction — rare, and never
+    /// on the draw path (`update()` calls this, where state is mutable by design).
+    fn refresh(&self, store: &ImageStore) {
+        let cell = self.cell.load();
+        cell.touch();
+        if cell.is_evicted() {
+            self.cell
+                .store(store.ensure_keyed(&self.key, &self.source, &self.policy));
+        }
+    }
+}
+
+impl std::fmt::Debug for ImageCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ImageCell({})", self.key)
+    }
+}
+
+impl PartialEq for ImageCell {
+    fn eq(&self, other: &Self) -> bool {
+        // Same store key = same content identity (the swappable cell is derived state).
+        self.key == other.key
+    }
+}
+
+/// An `image` record: a policy-resolved raster drawn into a scene-unit box. The slot was
+/// resolved + ensured at parse time (never during draw); `slot` is `None` when no image
+/// context was available (a scene parsed outside a creator, e.g. tests) — the record then
+/// draws nothing.
+#[derive(Clone, Debug)]
+pub(crate) struct ImageSpec {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub fit: ImageFit,
+    pub nearest: bool,
+    pub rotate_deg: f32,
+    pub slot: Option<Arc<ImageCell>>,
+}
+
+impl PartialEq for ImageSpec {
+    fn eq(&self, other: &Self) -> bool {
+        let slots_match = match (&self.slot, &other.slot) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        slots_match
+            && self.x == other.x
+            && self.y == other.y
+            && self.width == other.width
+            && self.height == other.height
+            && self.fit == other.fit
+            && self.nearest == other.nearest
+            && self.rotate_deg == other.rotate_deg
+    }
+}
+
 /// Frozen `group` transform semantics: components apply translate → rotate → scale about the
 /// group's local origin, regardless of key order in the record.
 #[derive(Clone, Debug, PartialEq)]
@@ -177,6 +297,7 @@ pub(crate) enum Shape {
         commands: Vec<PathCommand>,
     },
     Text(TextSpec),
+    Image(ImageSpec),
     Group {
         transform: Transform,
         children: Vec<Record>,
@@ -194,6 +315,7 @@ impl Shape {
             Self::Polygon { .. } => "polygon",
             Self::Path { .. } => "path",
             Self::Text(_) => "text",
+            Self::Image(_) => "image",
             Self::Group { .. } => "group",
         }
     }
@@ -250,8 +372,46 @@ pub(crate) struct Record {
 pub(crate) struct ParsedScene {
     pub records: Vec<Record>,
     pub animated: usize,
+    /// Every resolved image slot in the scene (flattened through groups), collected once
+    /// at parse so `update()`'s per-redraw refresh walk is a linear pass, not a tree walk.
+    /// Empty for image-free scenes, which then skip the store-generation comparison —
+    /// unrelated image loads never clear their cached geometry. Cell-less image records
+    /// (no context) are excluded: they can never repaint.
+    pub image_cells: Vec<Arc<ImageCell>>,
     /// Per-record soft failures, logged once per generation by the consumer.
     pub warnings: Vec<String>,
+}
+
+/// What an `image` record needs to resolve its `src` at parse time (plan D7): the canvas
+/// widget's registered creator, the global store, and whether the scene arrived through a
+/// store binding (bound values are descend-only — D2's provenance rule; the producer of a
+/// bound scene is not the widget's author). `None` at a parse site means image records
+/// skip with a warning (headless tests, missing store).
+#[derive(Clone)]
+pub(crate) struct SceneImageCtx {
+    pub creator: Arc<RegisteredImageCreator>,
+    pub store: ImageStore,
+    pub bound: bool,
+}
+
+/// How an `image` record's `src` resolves during a scene parse.
+///
+/// - `Memoized`: script-thread parses (static scenes, binding fallbacks — both written by
+///   the widget's author). Resolution goes through the per-isolate `ImageRegistry` memo,
+///   so a per-frame `createWidget` re-parse of the same scene never re-runs URL parsing
+///   or `data:`-payload hashing (the exact cost the memo exists to kill).
+/// - `Live`: UI-thread parses of bound snapshot values (no `OpState` there). Direct
+///   resolution with the ctx's provenance; never-seen sources charge the ledger's
+///   [`MAX_NEW_BOUND_SOURCES`] budget when `ctx.bound`.
+pub(crate) enum SceneImages<'a> {
+    Memoized(&'a mut dyn FnMut(&str) -> ImageResolution),
+    Live(&'a SceneImageCtx),
+}
+
+/// A memoized resolver's answer for one `src`.
+pub(crate) enum ImageResolution {
+    Resolved(Arc<ImageCell>),
+    Rejected(String),
 }
 
 /// Why a whole generation was refused (the previous scene stays on screen).
@@ -283,12 +443,19 @@ struct BudgetLedger {
     text_bytes: usize,
     animated_fields: usize,
     approx_bytes: usize,
+    image_records: usize,
+    /// Never-seen (store-map-miss) image sources this parse has spawned fetches for —
+    /// charged only for bound scenes (see [`MAX_NEW_BOUND_SOURCES`]).
+    new_bound_sources: usize,
 }
 
 impl BudgetLedger {
     fn check(&self) -> Result<(), SceneReject> {
         if self.records > MAX_RECORDS {
             return Err(SceneReject::Budget("record-count"));
+        }
+        if self.image_records > MAX_IMAGE_RECORDS {
+            return Err(SceneReject::Budget("image-records"));
         }
         if self.segments > MAX_SEGMENTS_TOTAL {
             return Err(SceneReject::Budget("path-segment"));
@@ -308,17 +475,45 @@ impl BudgetLedger {
 
 /// Parse a scene value into an accepted generation, or reject it whole. The input is the
 /// store's [`Node`] shape for both sources: bound scenes load it straight from the binding
-/// cell, static scenes convert once at build.
-pub(crate) fn parse_scene(root: &Node) -> Result<ParsedScene, SceneReject> {
+/// cell, static scenes convert once at build. `images` supplies the creator/store context
+/// `image` records resolve against (their `src` is validated and `ensure`d HERE, at parse —
+/// the draw path only reads entry cells).
+pub(crate) fn parse_scene(
+    root: &Node,
+    mut images: Option<&mut SceneImages>,
+) -> Result<ParsedScene, SceneReject> {
     let Node::Array(items) = root else {
         return Err(SceneReject::NotAnArray);
     };
     let mut scene = ParsedScene::default();
     let mut ledger = BudgetLedger::default();
     let mut ids = HashSet::new();
-    scene.records = parse_records(items.items(), 0, &mut ledger, &mut ids, &mut scene.warnings)?;
+    scene.records = parse_records(
+        items.items(),
+        0,
+        &mut ledger,
+        &mut ids,
+        &mut scene.warnings,
+        images.as_deref_mut(),
+    )?;
     scene.animated = count_animated(&scene.records);
+    collect_image_cells(&scene.records, &mut scene.image_cells);
     Ok(scene)
+}
+
+/// Flatten every resolved image slot in the record tree into `out` (parse-time, once).
+fn collect_image_cells(records: &[Record], out: &mut Vec<Arc<ImageCell>>) {
+    for record in records {
+        match &record.shape {
+            Shape::Image(image) => {
+                if let Some(slot) = &image.slot {
+                    out.push(slot.clone());
+                }
+            }
+            Shape::Group { children, .. } => collect_image_cells(children, out),
+            _ => {}
+        }
+    }
 }
 
 fn count_animated(records: &[Record]) -> usize {
@@ -341,6 +536,7 @@ fn parse_records(
     ledger: &mut BudgetLedger,
     ids: &mut HashSet<String>,
     warnings: &mut Vec<String>,
+    mut images: Option<&mut SceneImages>,
 ) -> Result<Vec<Record>, SceneReject> {
     if depth > MAX_DEPTH {
         return Err(SceneReject::Budget("nesting-depth"));
@@ -350,7 +546,7 @@ fn parse_records(
         ledger.records += 1;
         ledger.approx_bytes += RECORD_OVERHEAD_BYTES;
         ledger.check()?;
-        match parse_record(item, depth, ledger, ids, warnings) {
+        match parse_record(item, depth, ledger, ids, warnings, images.as_deref_mut()) {
             Ok(record) => records.push(record),
             Err(RecordError::Reject(reject)) => return Err(reject),
             Err(RecordError::Skip(reason)) => {
@@ -500,6 +696,7 @@ fn parse_record(
     ledger: &mut BudgetLedger,
     ids: &mut HashSet<String>,
     warnings: &mut Vec<String>,
+    mut images: Option<&mut SceneImages>,
 ) -> Result<Record, RecordError> {
     let Some(kind) = node.get("kind").and_then(Node::as_str) else {
         return Err(skip("record has no \"kind\""));
@@ -599,6 +796,88 @@ fn parse_record(
                 monospace: node.get("font").and_then(Node::as_str) == Some("monospace"),
             })
         }
+        "image" => {
+            let src = node
+                .get("src")
+                .and_then(Node::as_str)
+                .ok_or_else(|| skip("image record has no \"src\" string"))?;
+            ledger.image_records += 1;
+            ledger.approx_bytes += src.len();
+            ledger.check()?;
+            let fit = match node.get("fit").and_then(Node::as_str) {
+                // A shape stretches to its box, like rect — unlike the widget's `contain`.
+                None | Some("fill") => ImageFit::Fill,
+                Some("contain") => ImageFit::Contain,
+                Some("cover") => ImageFit::Cover,
+                Some("none") => ImageFit::None,
+                Some("scale-down") => ImageFit::ScaleDown,
+                Some(other) => return Err(skip(format!("unknown image fit {other:?}"))),
+            };
+            let nearest = match node.get("filter").and_then(Node::as_str) {
+                None | Some("linear") => false,
+                Some("nearest") => true,
+                Some(other) => return Err(skip(format!("unknown image filter {other:?}"))),
+            };
+            // Resolve + ensure at parse (plan D7): the policy check runs against the canvas
+            // widget's registered creator. The draw path only ever reads the entry cell.
+            let slot = match images.as_deref_mut() {
+                None => {
+                    warnings.push(
+                        "image record has no image context here; it will draw nothing"
+                            .to_string(),
+                    );
+                    None
+                }
+                Some(SceneImages::Memoized(resolve)) => match resolve(src) {
+                    ImageResolution::Resolved(slot) => Some(slot),
+                    ImageResolution::Rejected(reason) => {
+                        return Err(skip(format!("image src rejected: {reason}")));
+                    }
+                },
+                Some(SceneImages::Live(ctx)) => match resolve_src(src, &ctx.creator, ctx.bound)
+                {
+                    Ok(source) => {
+                        let key = source.store_key(&ctx.creator.policy);
+                        // Known sources ride the existing entry; never-seen ones spawn a
+                        // fetch and (for bound scenes) charge the new-source budget.
+                        let cell = if let Some(cell) = ctx.store.peek(&key) {
+                            cell.touch();
+                            cell
+                        } else if ctx.bound
+                            && ledger.new_bound_sources >= MAX_NEW_BOUND_SOURCES
+                        {
+                            return Err(skip(
+                                "image budget: too many never-seen sources in one scene write",
+                            ));
+                        } else {
+                            if ctx.bound {
+                                ledger.new_bound_sources += 1;
+                            }
+                            ctx.store.ensure_keyed(&key, &source, &ctx.creator.policy)
+                        };
+                        Some(Arc::new(ImageCell::new(
+                            Arc::from(key),
+                            source,
+                            ctx.creator.policy.clone(),
+                            cell,
+                        )))
+                    }
+                    Err(reason) => {
+                        return Err(skip(format!("image src rejected: {reason}")));
+                    }
+                },
+            };
+            Shape::Image(ImageSpec {
+                x: f32_field(node, "x", 0.0),
+                y: f32_field(node, "y", 0.0),
+                width: f32_field(node, "width", 0.0),
+                height: f32_field(node, "height", 0.0),
+                fit,
+                nearest,
+                rotate_deg: f32_field(node, "rotate", 0.0),
+                slot,
+            })
+        }
         "group" => {
             let transform = match node.get("transform") {
                 None | Some(Node::Null) => Transform::default(),
@@ -623,9 +902,14 @@ fn parse_record(
                 }
             };
             let children = match node.get("children") {
-                Some(Node::Array(items)) => {
-                    parse_records(items.items(), depth + 1, ledger, ids, warnings)?
-                }
+                Some(Node::Array(items)) => parse_records(
+                    items.items(),
+                    depth + 1,
+                    ledger,
+                    ids,
+                    warnings,
+                    images.as_deref_mut(),
+                )?,
                 _ => return Err(skip("group record has no \"children\" array")),
             };
             Shape::Group {
@@ -684,6 +968,7 @@ fn numeric_field_allowed(shape: &Shape, field: &str) -> bool {
         Shape::Ellipse { .. } => &["cx", "cy", "rx", "ry"],
         Shape::Line { .. } => &["x1", "y1", "x2", "y2"],
         Shape::Text(_) => &["x", "y", "size"],
+        Shape::Image(_) => &["x", "y", "width", "height", "rotate"],
         Shape::Group { .. } => &["translate_x", "translate_y", "rotate", "scale"],
         Shape::Polyline { .. } | Shape::Polygon { .. } | Shape::Path { .. } => &[],
     };
@@ -692,7 +977,10 @@ fn numeric_field_allowed(shape: &Shape, field: &str) -> bool {
 
 fn color_field_allowed(shape: &Shape, field: &str) -> bool {
     match field {
-        "fill" | "stroke" => !matches!(shape, Shape::Group { .. } | Shape::Text(_)),
+        // A texture has no fill/stroke paint (record opacity routes to Image::opacity).
+        "fill" | "stroke" => {
+            !matches!(shape, Shape::Group { .. } | Shape::Text(_) | Shape::Image(_))
+        }
         "color" => matches!(shape, Shape::Text(_)),
         _ => false,
     }
@@ -1436,6 +1724,14 @@ fn apply_numeric_shape_field(shape: &mut Shape, field: &str, value: f32) {
             "size" => text.size = value,
             _ => {}
         },
+        Shape::Image(image) => match field {
+            "x" => image.x = value,
+            "y" => image.y = value,
+            "width" => image.width = value,
+            "height" => image.height = value,
+            "rotate" => image.rotate_deg = value,
+            _ => {}
+        },
         Shape::Group { transform, .. } => match field {
             "translate_x" => transform.translate.x = value,
             "translate_y" => transform.translate.y = value,
@@ -1538,9 +1834,33 @@ fn shape_path(shape: &Shape) -> Option<canvas::Path> {
                 }
             }
         }),
-        Shape::Text(_) | Shape::Group { .. } => return None,
+        Shape::Text(_) | Shape::Image(_) | Shape::Group { .. } => return None,
     };
     Some(path)
+}
+
+/// The rectangle an image's pixels actually occupy inside its record box, per `fit`.
+/// `Fill` is the box itself (a shape stretches to its geometry); the rest scale the pixel
+/// size into the box with `iced::ContentFit` semantics and center the result. A `Cover`
+/// overflow deliberately spills the box — the canvas widget's container clips at the
+/// widget bounds, matching how oversized geometry already behaves.
+fn fitted_image_bounds(image: &ImageSpec, pixel_w: f32, pixel_h: f32) -> Rectangle {
+    let box_size = Size::new(image.width, image.height);
+    let content_fit = match image.fit {
+        ImageFit::Fill => return Rectangle::new(Point::new(image.x, image.y), box_size),
+        ImageFit::Contain => iced::ContentFit::Contain,
+        ImageFit::Cover => iced::ContentFit::Cover,
+        ImageFit::None => iced::ContentFit::None,
+        ImageFit::ScaleDown => iced::ContentFit::ScaleDown,
+    };
+    let fitted = content_fit.fit(Size::new(pixel_w, pixel_h), box_size);
+    Rectangle::new(
+        Point::new(
+            image.x + (box_size.width - fitted.width) / 2.0,
+            image.y + (box_size.height - fitted.height) / 2.0,
+        ),
+        fitted,
+    )
 }
 
 fn draw_records(
@@ -1603,6 +1923,40 @@ fn draw_record(
                 }
                 draw_records(frame, children, clocks, now_s, index);
             });
+        }
+        Shape::Image(image) => {
+            let Some(slot) = &image.slot else { return };
+            // One lock-free state read. Recency is stamped here AND by `update()`'s
+            // refresh walk (this closure only re-runs when the geometry cache re-records,
+            // so the walk is what keeps a displayed-but-cached image LRU-hot).
+            // Loading/Failed draw nothing (the scene's other records stand).
+            if let EntryState::Ready {
+                handle,
+                width: pixel_w,
+                height: pixel_h,
+                ..
+            } = &*slot.state()
+            {
+                // Caveats (documented in the .d.ts, mirroring CanvasText): images paint
+                // above ALL fill/stroke geometry and below text (fixed wgpu layer order),
+                // and a rotated image inside a non-uniformly-scaled group won't shear (the
+                // frame transform reduces to a rect + rotation).
+                #[allow(clippy::cast_precision_loss)]
+                let bounds = fitted_image_bounds(image, *pixel_w as f32, *pixel_h as f32);
+                frame.draw_image(
+                    bounds,
+                    canvas::Image::new(handle.clone())
+                        .filter_method(if image.nearest {
+                            iced::widget::image::FilterMethod::Nearest
+                        } else {
+                            iced::widget::image::FilterMethod::Linear
+                        })
+                        .rotation(Radians(image.rotate_deg.to_radians()))
+                        // The alpha-scaled-paint trick other shapes use doesn't apply to
+                        // textures; record opacity routes into the image itself.
+                        .opacity(record.opacity),
+                );
+            }
         }
         Shape::Text(text) => {
             frame.fill_text(canvas::Text {
@@ -1674,6 +2028,10 @@ pub(crate) enum SceneSource {
         /// The scene drawn while the bound path is absent/null: the binding token's
         /// `fallback`, parsed once at build (empty when none was given).
         fallback: Arc<ParsedScene>,
+        /// The image-resolution context live values re-parse with (bound provenance —
+        /// descend-only srcs, no absolute paths — already baked in). `None` when the
+        /// canvas has no registered creator or store: image records skip with a warning.
+        image_ctx: Option<Arc<SceneImageCtx>>,
     },
 }
 
@@ -1742,6 +2100,10 @@ pub(crate) struct SceneProgram {
     pub view_box: Option<Rectangle>,
     pub fit: ViewFit,
     pub on_pointer: Option<PointerHandler>,
+    /// The global image store, for the completion-generation check in `update()` (a bare
+    /// relaxed atomic read per redraw, and only for scenes that contain image records).
+    /// `None` in headless runtimes.
+    pub image_store: Option<ImageStore>,
 }
 
 /// Per-widget-instance UI-side state, living in iced's widget `Tree` (the one place that is
@@ -1752,6 +2114,11 @@ pub(crate) struct CanvasState {
     clocks: HashMap<String, ClockEntry>,
     /// The `Arc::as_ptr` of the generation the clocks were last reconciled against.
     reconciled: usize,
+    /// The image store's completion generation this state last drew with. Only compared
+    /// for scenes that actually contain image records — a completion anywhere in the
+    /// process bumps the (global) counter, and image-free canvases must not clear their
+    /// cached geometry for it.
+    image_generation: u64,
     /// Monotonic-seconds timeline: `epoch` is the first instant this state ever saw, `now_s`
     /// the seconds since then as of the latest `RedrawRequested`.
     epoch: Option<Instant>,
@@ -1770,6 +2137,7 @@ impl Default for CanvasState {
             cache: canvas::Cache::new(),
             clocks: HashMap::new(),
             reconciled: 0,
+            image_generation: 0,
             epoch: None,
             now_s: 0.0,
             pressed: None,
@@ -1798,6 +2166,7 @@ impl SceneProgram {
                 cell,
                 memo,
                 fallback,
+                image_ctx,
             } => {
                 let loaded = cell.load();
                 if loaded.is_null() {
@@ -1808,7 +2177,8 @@ impl SceneProgram {
                 let mut memo = memo.lock().expect("scene memo poisoned");
                 if memo.last_seen != ptr {
                     memo.last_seen = ptr;
-                    match parse_scene(&loaded) {
+                    let mut images = image_ctx.as_deref().map(SceneImages::Live);
+                    match parse_scene(&loaded, images.as_mut()) {
                         Ok(parsed) => {
                             log_warnings(&parsed);
                             memo.parsed = Arc::new(parsed);
@@ -1908,6 +2278,26 @@ impl canvas::Program<WidgetMessage, smudgy_theme::Theme> for SceneProgram {
                     state.reconciled = generation;
                     state.cache.clear();
                     reconcile_clocks(&parsed.records, &mut state.clocks, state.now_s);
+                }
+                // An image load landing anywhere bumps the store's completion generation;
+                // a scene that draws images must re-record its cached geometry to show it
+                // (plan D7: the check lives HERE — `draw` sees an immutable state). The
+                // store's poke already scheduled this redraw. Image-free scenes skip all
+                // of this, so unrelated loads never clear their cache. The refresh walk
+                // keeps displayed slots LRU-hot (cached geometry means `draw` doesn't
+                // read them per frame) and revives evicted/flushed cells — ≤256 lock-free
+                // loads + relaxed stores per redraw, re-ensure only after an eviction.
+                if !parsed.image_cells.is_empty()
+                    && let Some(store) = &self.image_store
+                {
+                    for slot in &parsed.image_cells {
+                        slot.refresh(store);
+                    }
+                    let image_generation = store.completion_generation();
+                    if state.image_generation != image_generation {
+                        state.image_generation = image_generation;
+                        state.cache.clear();
+                    }
                 }
                 state.moved_this_frame = false;
                 // A coalesced drag position publishes now (one per frame); its publish
@@ -2022,7 +2412,35 @@ mod tests {
     }
 
     fn parse(value: serde_json::Value) -> Result<ParsedScene, SceneReject> {
-        parse_scene(&node(value))
+        parse_scene(&node(value), None)
+    }
+
+    /// An image context over the shared test store: a trusted user creator whose modules
+    /// root is `/m` (relative srcs resolve under it; the store's mock fetcher never
+    /// touches the disk).
+    fn image_ctx(bound: bool) -> SceneImageCtx {
+        let (store, _) = crate::image_store::tests::test_store();
+        let policy = crate::image_store::tests::test_policy();
+        let creator = smudgy_cloud::image_source::register_creator(
+            r#"{"kind":"user"}"#,
+            None,
+            policy,
+        )
+        .expect("user creator registers on a trusted policy");
+        SceneImageCtx {
+            creator: Arc::new(creator),
+            store,
+            bound,
+        }
+    }
+
+    fn parse_with_images(
+        value: serde_json::Value,
+        bound: bool,
+    ) -> Result<ParsedScene, SceneReject> {
+        let ctx = image_ctx(bound);
+        let mut images = SceneImages::Live(&ctx);
+        parse_scene(&node(value), Some(&mut images))
     }
 
     fn accepted(value: serde_json::Value) -> ParsedScene {
@@ -2033,28 +2451,40 @@ mod tests {
 
     #[test]
     fn parses_every_shape_kind() {
-        let scene = accepted(json!([
-            { "kind": "rect", "x": 1, "y": 2, "width": 3, "height": 4, "rx": 1, "fill": "#ff0000" },
-            { "kind": "circle", "cx": 5, "cy": 6, "r": 7, "stroke": { "color": "#00ff00", "width": 2 } },
-            { "kind": "ellipse", "cx": 1, "cy": 1, "rx": 2, "ry": 3 },
-            { "kind": "line", "x1": 0, "y1": 0, "x2": 10, "y2": 10, "stroke": {} },
-            { "kind": "polyline", "points": [[0, 0], [5, 5], [10, 0]], "stroke": {} },
-            { "kind": "polygon", "points": [[0, 0], [5, 5], [10, 0]], "fill": "red" },
-            { "kind": "path", "d": "M 0 0 L 10 10 Z", "stroke": {} },
-            { "kind": "text", "x": 4, "y": 8, "text": "HP", "size": 12, "color": "white" },
-            { "kind": "group", "transform": { "translate": [5, 5] }, "children": [
-                { "kind": "rect", "width": 1, "height": 1 },
-            ] },
-        ]));
-        assert_eq!(scene.records.len(), 9);
+        let scene = parse_with_images(
+            json!([
+                { "kind": "rect", "x": 1, "y": 2, "width": 3, "height": 4, "rx": 1, "fill": "#ff0000" },
+                { "kind": "circle", "cx": 5, "cy": 6, "r": 7, "stroke": { "color": "#00ff00", "width": 2 } },
+                { "kind": "ellipse", "cx": 1, "cy": 1, "rx": 2, "ry": 3 },
+                { "kind": "line", "x1": 0, "y1": 0, "x2": 10, "y2": 10, "stroke": {} },
+                { "kind": "polyline", "points": [[0, 0], [5, 5], [10, 0]], "stroke": {} },
+                { "kind": "polygon", "points": [[0, 0], [5, 5], [10, 0]], "fill": "red" },
+                { "kind": "path", "d": "M 0 0 L 10 10 Z", "stroke": {} },
+                { "kind": "text", "x": 4, "y": 8, "text": "HP", "size": 12, "color": "white" },
+                { "kind": "image", "src": "map-bg.png", "x": 0, "y": 0, "width": 480, "height": 320,
+                  "fit": "cover", "filter": "nearest", "rotate": 15 },
+                { "kind": "group", "transform": { "translate": [5, 5] }, "children": [
+                    { "kind": "rect", "width": 1, "height": 1 },
+                ] },
+            ]),
+            false,
+        )
+        .expect("scene should be accepted");
+        assert_eq!(scene.records.len(), 10);
         assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
         assert_eq!(scene.animated, 0);
+        assert_eq!(scene.image_cells.len(), 1);
+        let Shape::Image(image) = &scene.records[8].shape else {
+            panic!("expected image");
+        };
+        assert_eq!((image.fit, image.nearest, image.rotate_deg), (ImageFit::Cover, true, 15.0));
+        assert!(image.slot.is_some(), "src resolved and ensured at parse");
         let Shape::Rect { x, rx, .. } = &scene.records[0].shape else {
             panic!("expected rect");
         };
         assert_eq!((*x, *rx), (1.0, 1.0));
         assert_eq!(scene.records[0].fill, Some(Paint::Solid(Color::from_rgb(1.0, 0.0, 0.0))));
-        let Shape::Group { children, .. } = &scene.records[8].shape else {
+        let Shape::Group { children, .. } = &scene.records[9].shape else {
             panic!("expected group");
         };
         assert_eq!(children.len(), 1);
@@ -2462,6 +2892,179 @@ mod tests {
         );
     }
 
+    // ---- image records --------------------------------------------------------------------
+
+    #[test]
+    fn bound_scenes_budget_never_seen_sources() {
+        // One bound write may spawn at most MAX_NEW_BOUND_SOURCES fresh fetches; records
+        // past the budget skip with a warning. Already-known sources ride free.
+        let ctx = image_ctx(true);
+        let over: Vec<_> = (0..=MAX_NEW_BOUND_SOURCES)
+            .map(|i| json!({ "kind": "image", "src": format!("https://x.example/{i}.png"),
+                             "width": 1, "height": 1 }))
+            .collect();
+        let mut images = SceneImages::Live(&ctx);
+        let parsed = parse_scene(&node(serde_json::Value::Array(over.clone())), Some(&mut images))
+            .unwrap();
+        assert_eq!(parsed.records.len(), MAX_NEW_BOUND_SOURCES);
+        assert_eq!(parsed.warnings.len(), 1);
+        assert!(parsed.warnings[0].contains("image budget"), "{:?}", parsed.warnings);
+        // A re-write of the same scene: every source is now known — all records parse.
+        let mut images = SceneImages::Live(&ctx);
+        let parsed = parse_scene(&node(serde_json::Value::Array(over)), Some(&mut images))
+            .unwrap();
+        assert_eq!(parsed.records.len(), MAX_NEW_BOUND_SOURCES + 1);
+        // Static scenes are author-written: never budgeted.
+        let many: Vec<_> = (0..MAX_NEW_BOUND_SOURCES + 8)
+            .map(|i| json!({ "kind": "image", "src": format!("s{i}.png"), "width": 1, "height": 1 }))
+            .collect();
+        let parsed = parse_with_images(serde_json::Value::Array(many), false).unwrap();
+        assert_eq!(parsed.records.len(), MAX_NEW_BOUND_SOURCES + 8);
+    }
+
+    #[test]
+    fn refresh_walk_revives_evicted_cells() {
+        let ctx = image_ctx(false);
+        let mut images = SceneImages::Live(&ctx);
+        let parsed = parse_scene(
+            &node(json!([{ "kind": "image", "src": "logo.png", "width": 4, "height": 4 }])),
+            Some(&mut images),
+        )
+        .unwrap();
+        let slot = parsed.image_cells[0].clone();
+        let before = slot.cell.load_full();
+        // A flush evicts the cell; the refresh walk must swap in a fresh one.
+        ctx.store.clear();
+        assert!(before.is_evicted());
+        slot.refresh(&ctx.store);
+        let after = slot.cell.load_full();
+        assert!(!Arc::ptr_eq(&before, &after), "evicted cell was replaced");
+        assert!(!after.is_evicted());
+        // A refresh with a live cell is a no-op swap-wise.
+        slot.refresh(&ctx.store);
+        assert!(Arc::ptr_eq(&after, &slot.cell.load_full()));
+    }
+
+    #[test]
+    fn image_records_have_their_own_budget() {
+        let over: Vec<_> = (0..=MAX_IMAGE_RECORDS)
+            .map(|i| json!({ "kind": "image", "src": format!("a{i}.png"), "width": 1, "height": 1 }))
+            .collect();
+        assert_eq!(
+            parse_with_images(serde_json::Value::Array(over), false),
+            Err(SceneReject::Budget("image-records"))
+        );
+    }
+
+    #[test]
+    fn bound_scene_image_srcs_are_descend_only() {
+        // The same src: fine from a static scene (trusted user creator, unclamped), denied
+        // from a bound one (the producer of a bound scene is not the widget's author).
+        let scene = json!([
+            { "kind": "image", "src": "../outside.png", "width": 1, "height": 1 },
+        ]);
+        let parsed = parse_with_images(scene.clone(), false).unwrap();
+        assert_eq!(parsed.records.len(), 1, "static: `..` allowed for a user module");
+        let parsed = parse_with_images(scene, true).unwrap();
+        assert_eq!(parsed.records.len(), 0, "bound: descend-only");
+        assert_eq!(parsed.warnings.len(), 1);
+        assert!(parsed.warnings[0].contains("rejected"), "{:?}", parsed.warnings);
+
+        // Absolute paths are always denied for bound values.
+        let parsed = parse_with_images(
+            json!([{ "kind": "image", "src": "/etc/passwd.png", "width": 1, "height": 1 }]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(parsed.records.len(), 0);
+    }
+
+    #[test]
+    fn image_records_skip_softly() {
+        // A bad record skips (scene survives); the reasons land in warnings.
+        let parsed = parse_with_images(
+            json!([
+                { "kind": "image", "width": 1, "height": 1 },                       // no src
+                { "kind": "image", "src": "x.png", "fit": "tile" },                 // unknown fit
+                { "kind": "image", "src": "x.png", "filter": "cubic" },             // unknown filter
+                { "kind": "rect", "width": 1, "height": 1 },
+            ]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(parsed.records.len(), 1, "only the rect survives");
+        assert_eq!(parsed.warnings.len(), 3);
+
+        // No image context at all: the record skips with a warning, no panic.
+        let parsed = parse(json!([
+            { "kind": "image", "src": "x.png", "width": 1, "height": 1 },
+        ]))
+        .unwrap();
+        assert_eq!(parsed.records.len(), 1, "record kept (cell-less, draws nothing)");
+        assert_eq!(parsed.warnings.len(), 1);
+        let Shape::Image(image) = &parsed.records[0].shape else {
+            panic!("expected image");
+        };
+        assert!(image.slot.is_none());
+    }
+
+    #[test]
+    fn image_animation_gates_on_geometry_fields_only() {
+        // x/y/width/height/rotate + opacity animate; fit/filter/fill/stroke do not.
+        let ok = parse_with_images(
+            json!([{
+                "kind": "image", "src": "x.png", "width": 10, "height": 10,
+                "animate": {
+                    "x": { "to": 5, "duration": 1 },
+                    "rotate": { "to": 90, "duration": 1 },
+                    "opacity": { "to": 0, "duration": 1 },
+                },
+            }]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(ok.records.len(), 1);
+        assert_eq!(ok.animated, 1);
+
+        for field in ["fit", "filter", "fill", "stroke", "src"] {
+            let parsed = parse_with_images(
+                json!([{
+                    "kind": "image", "src": "x.png", "width": 10, "height": 10,
+                    "animate": { field: { "to": 1, "duration": 1 } },
+                }]),
+                false,
+            )
+            .unwrap();
+            assert_eq!(parsed.records.len(), 0, "animate.{field} must reject the record");
+        }
+    }
+
+    #[test]
+    fn image_fit_math_matches_content_fit() {
+        let spec = |fit| ImageSpec {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 50.0,
+            fit,
+            nearest: false,
+            rotate_deg: 0.0,
+            slot: None,
+        };
+        // Fill: the box, exactly.
+        let bounds = fitted_image_bounds(&spec(ImageFit::Fill), 40.0, 40.0);
+        assert_eq!(bounds, Rectangle::new(Point::new(10.0, 20.0), Size::new(100.0, 50.0)));
+        // Contain on a square 40x40 image in a 100x50 box: 50x50, centered horizontally.
+        let bounds = fitted_image_bounds(&spec(ImageFit::Contain), 40.0, 40.0);
+        assert_eq!(bounds, Rectangle::new(Point::new(35.0, 20.0), Size::new(50.0, 50.0)));
+        // Cover: 100x100, vertically centered spill (clipped at the widget bounds).
+        let bounds = fitted_image_bounds(&spec(ImageFit::Cover), 40.0, 40.0);
+        assert_eq!(bounds, Rectangle::new(Point::new(10.0, -5.0), Size::new(100.0, 100.0)));
+        // None: intrinsic pixels, centered.
+        let bounds = fitted_image_bounds(&spec(ImageFit::None), 40.0, 40.0);
+        assert_eq!(bounds, Rectangle::new(Point::new(40.0, 25.0), Size::new(40.0, 40.0)));
+    }
+
     // ---- pointer mapping ------------------------------------------------------------------
 
     #[test]
@@ -2471,6 +3074,7 @@ mod tests {
             view_box: Some(Rectangle::new(Point::new(10.0, 20.0), Size::new(100.0, 50.0))),
             fit: ViewFit::Fill,
             on_pointer: None,
+            image_store: None,
         };
         let scene = program.to_scene(Point::new(110.0, 90.0), Size::new(220.0, 90.0));
         assert!((scene.x - 60.0).abs() < 1e-4, "x: got {}", scene.x);
@@ -2493,6 +3097,7 @@ mod tests {
             view_box: Some(Rectangle::new(Point::ORIGIN, Size::new(480.0, 480.0))),
             fit: ViewFit::Contain,
             on_pointer: None,
+            image_store: None,
         };
         // A wide widget: height limits, content is 400x400 centered with 200px margins.
         let bounds = Size::new(800.0, 400.0);
@@ -2520,10 +3125,12 @@ mod tests {
                 cell: cell.clone(),
                 memo: Arc::new(Mutex::new(SceneMemo::default())),
                 fallback: Arc::new(ParsedScene::default()),
+                image_ctx: None,
             },
             view_box: None,
             fit: ViewFit::Fill,
             on_pointer: None,
+            image_store: None,
         };
         let first = program.current();
         assert_eq!(first.records.len(), 1);
