@@ -12,9 +12,10 @@ name: Release
 #     git commit -am "chore: bump version to x.y.z" && git push
 #     git tag v<x.y.z> && git push origin v<x.y.z>    # <-- this fires the build
 #
-# Required secrets — Windows signing (Azure Trusted Signing, OIDC — no stored
-# client secret; the Entra app needs a federated credential for this repo's
-# tag refs and the "Trusted Signing Certificate Profile Signer" role):
+# Required secrets — Windows signing (Azure Artifact Signing, OIDC — no stored
+# client secret; the Entra app has a federated credential whose subject is this
+# repo's "release" environment, and the "Artifact Signing Certificate Profile
+# Signer" role scoped to the wkalata certificate profile):
 #     AZURE_TENANT_ID  AZURE_CLIENT_ID  AZURE_SUBSCRIPTION_ID
 # Required secrets — macOS signing + notarization:
 #     SMUDGY_MAC_CERT_P12       base64 of the "Developer ID Application" .p12
