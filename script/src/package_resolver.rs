@@ -1697,9 +1697,9 @@ pub(crate) fn load_core_module(url: &ModuleSpecifier) -> Result<ModuleSource, Mo
     // api getter once here snapshots an immutable value, which is correct. The genuinely
     // live-state members are exposed as FUNCTIONS instead of value exports -- `getSessions()`
     // (the connected-session set changes) and `getProfile()` (profile fields read live) --
-    // so a stale snapshot is impossible. `mapper` is a value export here (not in the
-    // extension entry) because this synthesized module evaluates long after `mapper.ts`
-    // installs `globalThis.mapper`, so the getter yields the real, immutable mapper.
+    // so a stale snapshot is impossible. `mapper` and the `Area` constructor are value exports
+    // here because this synthesized module evaluates after the mapper extension's private
+    // handoff, so the getters yield the real, stable values without public globals.
     let code = format!(
         "const __creator = {creator};\n\
          const __api = globalThis.__smudgy_create_api(__creator);\n\
@@ -1734,6 +1734,7 @@ pub(crate) fn load_core_module(url: &ModuleSpecifier) -> Result<ModuleSource, Mo
          export const currentSession = __api.currentSession;\n\
          export const input = __api.input;\n\
          export const mapper = __api.mapper;\n\
+         export const Area = __api.Area;\n\
          export const id = __api.id;\n\
          export const createState = __api.createState;\n\
          export const createEvent = __api.createEvent;\n\
@@ -2913,6 +2914,12 @@ mod tests {
             assert!(
                 code.contains(&format!("export const {name} = __api.{name};")),
                 "missing convenience export {name}: {code}"
+            );
+        }
+        for name in ["mapper", "Area"] {
+            assert!(
+                code.contains(&format!("export const {name} = __api.{name};")),
+                "missing mapper export {name}: {code}"
             );
         }
         // The interop handle constructors + the dynamic events lookup are named exports; no

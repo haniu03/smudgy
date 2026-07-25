@@ -200,7 +200,7 @@ async fn send_granted_but_send_direct_denied() {
 async fn no_smudgy_block_denies_every_gated_op() {
     // Part A — echo granted, everything else denied: each gated op is caught and reported.
     let probe_src = r#"
-        import session, { createAlias, createTrigger, send, sendRaw, echo, line } from "smudgy:core";
+        import session, { createAlias, createTrigger, send, sendRaw, echo, line, mapper } from "smudgy:core";
         const probe = (name, fn) => {
             try { fn(); echo(name + ":NO_THROW"); }
             catch (e) { echo(name + ":DENIED:" + (e?.message ?? String(e))); }
@@ -438,7 +438,12 @@ async fn change_display_gates_line_manipulation() {
 #[tokio::test]
 async fn mapper_write_gates_set_current_location() {
     let src = r#"
-        import { echo } from "smudgy:core";
+        import { echo, mapper } from "smudgy:core";
+        const mapperGlobalLeak =
+            "mapper" in globalThis ||
+            "Area" in globalThis ||
+            "__smudgy_install_mapper" in globalThis;
+        echo(mapperGlobalLeak ? "MAPPER_GLOBAL_LEAK" : "MAPPER_GLOBALS_GONE");
         try { mapper.setCurrentLocation([0, 0], 1); echo("MAPPER_OK"); }
         catch (e) { echo("MAPPER_DENIED:" + (e?.message ?? String(e))); }
         echo("DONE");
@@ -452,7 +457,11 @@ async fn mapper_write_gates_set_current_location() {
     )
     .await;
     assert!(
-        !has_line(&denied, "MAPPER_OK") && has_line(&denied, "MAPPER_DENIED:") && has_line(&denied, "mapper-write"),
+        !has_line(&denied, "MAPPER_GLOBAL_LEAK")
+            && has_line(&denied, "MAPPER_GLOBALS_GONE")
+            && !has_line(&denied, "MAPPER_OK")
+            && has_line(&denied, "MAPPER_DENIED:")
+            && has_line(&denied, "mapper-write"),
         "without mapper-write, setCurrentLocation must throw naming the capability; transcript:\n{denied:#?}"
     );
 
@@ -465,7 +474,9 @@ async fn mapper_write_gates_set_current_location() {
     )
     .await;
     assert!(
-        has_line(&allowed, "MAPPER_OK"),
+        !has_line(&allowed, "MAPPER_GLOBAL_LEAK")
+            && has_line(&allowed, "MAPPER_GLOBALS_GONE")
+            && has_line(&allowed, "MAPPER_OK"),
         "with mapper-write, setCurrentLocation must work; transcript:\n{allowed:#?}"
     );
 }

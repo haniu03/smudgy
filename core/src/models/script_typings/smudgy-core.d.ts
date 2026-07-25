@@ -1860,6 +1860,21 @@ declare module "smudgy:core" {
   /** The current session's map API (see {@link Mapper}). */
   export const mapper: Mapper;
 
+  /**
+   * The runtime area constructor, for checks such as `area instanceof Area`.
+   * Areas are created by the mapper; the constructor is not a creation API.
+   */
+  export const Area: {
+    readonly prototype: Area;
+    [Symbol.hasInstance](value: unknown): boolean;
+  };
+
+  /**
+   * The map-area instance type. It remains globally available for annotations; this
+   * module alias lets an imported `Area` name work in both type and value positions.
+   */
+  export type Area = NonNullable<ReturnType<Mapper["getAreaById"]>>;
+
   // ---- Default export: the current-session facade -------------------------
 
   /**
@@ -1904,6 +1919,8 @@ declare module "smudgy:core" {
     readonly submission: Submission;
     /** The map API. */
     readonly mapper: Mapper;
+    /** The runtime area constructor used by the named `Area` export. */
+    readonly Area: typeof Area;
     /** The current session. */
     readonly session: Session;
     /** The current session's command input. */

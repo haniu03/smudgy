@@ -58,6 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Script automation factories now accept only the pattern/key/options-first
+  signatures introduced in 0.4; the deprecated positional-name forms have been
+  removed for 0.5.
+- Scripts must import the map API from `smudgy:core`; the deprecated ambient
+  `mapper` value has been removed. The ambient map types remain available, and
+  the `Area` constructor is now an explicit import for `instanceof` checks.
 - Package manifests and consent records now use only the canonical
   `interop: ["read", "write"]` capabilities; the deprecated
   `events: ["subscribe", "emit"]` alias has been removed for 0.5.
