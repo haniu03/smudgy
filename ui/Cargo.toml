@@ -45,6 +45,28 @@ semver = "1"
 # UTF-16 code units; iced's text_input counts graphemes). Same version iced
 # already pins in Cargo.lock.
 unicode-segmentation = "1"
+# --- <Image> widget loading (ui/src/images/) ---------------------------------------------
+# The image fetcher: dedicated HTTP client (no default headers/cookies — the shared cloud
+# client stamps a version header packages must not see), manual redirect following so every
+# hop re-validates against a sandboxed package's net grants.
+reqwest = { version = "0.12.8", default-features = true }
+# Off-thread pre-decode with explicit `Limits` (decode bombs) + selected codecs (workspace dep).
+image = { workspace = true }
+# EXIF orientation for pre-decoded RGBA (iced applies EXIF only in its own decode path).
+kamadak-exif = { workspace = true }
+# Windows-sane canonicalize for the post-lexical asset-root confinement recheck.
+dunce = { workspace = true }
+# Content-addressed blob naming + HTTP-cache meta keys.
+sha2 = "0.10"
+# HTTP-cache metadata files (meta/<server>/<hash>.json).
+serde = { workspace = true, features = ["derive"] }
+# Redirect-hop URL handling in the HTTP cache (same major cloud uses).
+url = "2"
+# data: URI payloads. Same version already in the lock.
+base64 = "0.22"
+# HTTP date parsing (Expires/Last-Modified/Date) for the RFC-9111-subset freshness math.
+httpdate = "1"
+
 # Restart Manager cooperation so the installer can upgrade over a running smudgy:
 # a window-proc subclass catches the session-end message and exits. See win_rm.rs.
 [target.'cfg(windows)'.dependencies]

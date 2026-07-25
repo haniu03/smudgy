@@ -38,6 +38,9 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 aho-corasick = { workspace = true }
+# `image_hot_path` pins the <Image>/canvas-image per-frame budget against the
+# public ImageStore + image_source grammar layers (no V8, no I/O).
+smudgy_widgets = { workspace = true }
 criterion = "0.5"
 regex = { workspace = true }
 regex-filtered = { workspace = true }
@@ -80,6 +83,10 @@ harness = false
 
 [[bench]]
 name = "store_fanout"
+harness = false
+
+[[bench]]
+name = "image_hot_path"
 harness = false
 
 [[bench]]

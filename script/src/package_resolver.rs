@@ -1719,9 +1719,21 @@ fn core_creator_json(url: &ModuleSpecifier) -> Option<String> {
     creator_json_from_path(url)
 }
 
+/// The importing module's in-package subpath from a `/pkg` widgets URL's `?mod=` query
+/// (one percent-decode via `query_pairs`). `None` when absent — non-package URLs, and
+/// package URLs minted before the query existed. The value is JS-supplied territory:
+/// consumers re-validate it component-wise before using it as a base directory.
+fn module_subpath_from_url(url: &ModuleSpecifier) -> Option<String> {
+    url.query_pairs()
+        .find(|(key, _)| key == "mod")
+        .map(|(_, value)| value.into_owned())
+}
+
 /// Recover the creator descriptor JSON from a synthesized per-importer URL's path segments.
 /// Shared by `smudgy:core` and `smudgy:widgets` (identical provenance encoding); the caller
 /// has already scheme-dispatched in `load()`, so this does not re-check the scheme.
+/// Queries (`?mod=`, `?ref=` aside) never affect the creator — widget keying stays
+/// `(creator, name)` no matter which module imported the instance.
 fn creator_json_from_path(url: &ModuleSpecifier) -> Option<String> {
     let segments: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
     let value = match segments.as_slice() {
@@ -1821,9 +1833,17 @@ pub(crate) fn load_core_module(url: &ModuleSpecifier) -> Result<ModuleSource, Mo
     ))
 }
 
-/// The per-importer `smudgy:widgets` virtual-module URL. Mirrors [`core_module_url`] exactly
+/// The per-importer `smudgy:widgets` virtual-module URL. Mirrors [`core_module_url`]
 /// (same provenance encoding) so the bound creator is recovered the same way. `createWidget`
 /// is provenance-bearing (mounts are keyed by `(isolate, origin, name)`).
+///
+/// The `/pkg` form additionally carries the importing module's in-package subpath as
+/// `?mod=…` — the base directory module-relative `<Image src>` paths resolve against. It
+/// rides as a query (NOT inside the creator JSON) so widget keying by creator is
+/// unchanged; each importing module gets its own instance (deno dedups by URL), which the
+/// plan's V8 review verified is per-frame-invariant as long as the synthesized module
+/// stays alias-only. A forged/mangled `mod` value is harmless: registration re-validates
+/// it component-wise and resolution is descend-only inside the membership-checked root.
 #[must_use]
 pub fn widgets_module_url(referrer: &str) -> ModuleSpecifier {
     if let Some(coords) = ModuleSpecifier::parse(referrer)
@@ -1831,8 +1851,10 @@ pub fn widgets_module_url(referrer: &str) -> ModuleSpecifier {
         .and_then(|url| parse_canonical(&url))
     {
         let path = format!("/pkg/{}/{}/{}", coords.key.owner, coords.key.name, coords.version);
-        return ModuleSpecifier::parse(&format!("{WIDGETS_SCHEME}://{path}"))
+        let mut url = ModuleSpecifier::parse(&format!("{WIDGETS_SCHEME}://{path}"))
             .expect("widgets package URL is well-formed for validated components");
+        url.query_pairs_mut().append_pair("mod", &coords.module_subpath);
+        return url;
     }
     if referrer.starts_with("file://") {
         let mut url = ModuleSpecifier::parse(&format!("{WIDGETS_SCHEME}:///mod"))
@@ -1874,9 +1896,19 @@ pub(crate) fn load_widgets_module(
         let creator = creator_json_from_path(url).ok_or_else(|| {
             crate::generic_loader_error(format!("invalid smudgy:widgets url {url}"))
         })?;
+        // The importing module's in-package subpath (`?mod=`), baked as a JSON string
+        // literal exactly like `__creator` (serde escaping — a quote/backslash-bearing
+        // subpath cannot break out of the literal). It rides as a SECOND argument, never
+        // merged into the creator or a props bag: the alias-only shape below is what keeps
+        // per-importer instances sharing one set of SFIs/ICs (plan D1's V8 verdict), and a
+        // props-bag merge would mint a hidden-class transition per Image build.
+        let module = module_subpath_from_url(url)
+            .map(|m| serde_json::Value::String(m).to_string())
+            .unwrap_or_else(|| "\"\"".to_string());
         format!(
             "const __creator = {creator};\n\
-             const __w = globalThis.__smudgy_make_widgets(__creator);\n\
+             const __module = {module};\n\
+             const __w = globalThis.__smudgy_make_widgets(__creator, __module);\n\
              export const createWidget = __w.createWidget;\n\
              export const removeWidget = __w.removeWidget;\n\
              export const extractMarkdownLinks = __w.extractMarkdownLinks;\n\
@@ -1894,6 +1926,7 @@ pub(crate) fn load_widgets_module(
              export const MapView = __w.MapView;\n\
              export const Canvas = __w.Canvas;\n\
              export const Space = __w.Space;\n\
+             export const Image = __w.Image;\n\
              export const Checkbox = __w.Checkbox;\n\
              export const Radio = __w.Radio;\n\
              export const Tooltip = __w.Tooltip;\n\
@@ -2634,6 +2667,76 @@ mod tests {
         // Both shapes load: the shared, provenance-free jsx-runtime and a per-importer surface.
         assert!(load_widgets_module(&widgets_jsx_runtime_url()).is_ok());
         assert!(load_widgets_module(&widgets_module_url("repl")).is_ok());
+    }
+
+    #[test]
+    fn widgets_package_urls_carry_the_importing_module_subpath() {
+        // A package referrer's in-package subpath rides as `?mod=` — the base directory
+        // module-relative <Image src> paths resolve against. The creator JSON itself must
+        // NOT change (widget keying stays (creator, name) across importing modules).
+        let url = widgets_module_url("smudgy-pkg:///wbk/hud/1.2.0/lib/panels/main.tsx");
+        assert_eq!(url.path(), "/pkg/wbk/hud/1.2.0");
+        assert_eq!(module_subpath_from_url(&url).as_deref(), Some("lib/panels/main.tsx"));
+        assert_eq!(
+            creator_json_from_path(&url).unwrap(),
+            creator_json_from_path(
+                &widgets_module_url("smudgy-pkg:///wbk/hud/1.2.0/other.tsx")
+            )
+            .unwrap(),
+            "the ?mod= query never leaks into the creator descriptor"
+        );
+        // Two importing modules mint two distinct instances (deno dedups by URL string).
+        assert_ne!(
+            url.as_str(),
+            widgets_module_url("smudgy-pkg:///wbk/hud/1.2.0/other.tsx").as_str()
+        );
+        // Non-package referrers carry no ?mod=.
+        assert_eq!(module_subpath_from_url(&widgets_module_url("repl")), None);
+    }
+
+    #[test]
+    fn widgets_module_subpath_escaping_cannot_break_the_literal() {
+        // Hostile-ish module names: quotes, hashes, percents, spaces, backslashes. URL
+        // parsing may re-spell them (percent-encoding is the canonical scheme's business,
+        // not ours) — what matters here is that WHATEVER value rides in `?mod=` is baked
+        // via serde_json string serialization, so it cannot escape the JS string literal;
+        // component validation at registration separately rejects traversal/oddities.
+        for nasty in [
+            "lib/we\"ird.tsx",
+            "lib/#frag.tsx",
+            "lib/50%off.tsx",
+            "lib/with space.tsx",
+            "lib/back\\slash.tsx",
+            "lib/../../evil.tsx",
+        ] {
+            let url = widgets_module_url(&format!("smudgy-pkg:///wbk/hud/1.2.0/{nasty}"));
+            if !url.path().starts_with("/pkg") {
+                continue; // the canonical parse rejected the spelling — nothing to bake
+            }
+            let recovered = module_subpath_from_url(&url).expect("subpath rides in ?mod=");
+            let source = load_widgets_module(&url).expect("synthesizes");
+            let ModuleSourceCode::String(code) = &source.code else {
+                panic!("string source");
+            };
+            let line = code
+                .as_str()
+                .lines()
+                .find(|l| l.starts_with("const __module"))
+                .expect("module line present");
+            // The baked literal is exactly serde's escaping of the recovered value: a
+            // single well-formed JS string, whatever the value contains.
+            assert_eq!(
+                line,
+                format!(
+                    "const __module = {};",
+                    serde_json::Value::String(recovered.clone())
+                )
+            );
+        }
+
+        // And the plain case round-trips verbatim end to end.
+        let url = widgets_module_url("smudgy-pkg:///wbk/hud/1.2.0/lib/hud.tsx");
+        assert_eq!(module_subpath_from_url(&url).as_deref(), Some("lib/hud.tsx"));
     }
 
     #[test]

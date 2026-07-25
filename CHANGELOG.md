@@ -55,6 +55,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to other servers and deactivated maps count — and waits for maps to
   finish loading first, so a package can safely offer its starter maps
   on every start without ever creating duplicates.
+- **Widgets can show images.** A new `<Image src=... />` widget
+  (`smudgy:widgets`) displays PNG, JPEG, WebP, and GIF (first frame)
+  images from an `https://` URL, an inline `data:` URI, or a local file,
+  with the usual sizing props plus `content_fit`, `filter_method`,
+  `opacity`, and `rotation`. Remote images are cached on disk honoring
+  the server's HTTP cache headers (and keep showing through network
+  hiccups); a sandboxed package's image loads obey the same consented
+  `net`/`read` permissions as its `fetch()` and file access. Packages
+  can ship their own images and show them with `@/assets/...` or
+  module-relative paths — published assets download lazily on first
+  display (never at load time) and cache forever; a package you're
+  authoring locally reads them straight from its folder, and edits
+  show up in about a second.
+- **Canvas scenes can draw images.** A new `{ kind: "image", src, x, y,
+  width, height }` shape record puts rasters in script-drawn canvases —
+  map backgrounds, item icons, portraits — with `fit`, `filter`
+  (`"nearest"` for pixel art), `rotate`, and animatable position/size/
+  rotation/opacity. Sources use the `<Image>` grammar and permissions.
+  Two renderer facts to know: images always paint above lines/fills and
+  below text regardless of scene order, and a scene fed through a
+  binding can't name local files (same rule as bound `<Image>` srcs).
+- **Per-server image cache management.** Each server's edit form now
+  shows how much disk its cached images use, with a one-click clear;
+  deleting a server removes its cache with it. A new
+  `image_cache_max_mb` setting (default 256) bounds the whole image
+  cache — the oldest-fetched entries are trimmed at startup.
 
 ### Changed
 

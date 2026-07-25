@@ -42,6 +42,59 @@ pub struct CachedResolution {
 pub struct CachedModule {
     pub subpath: String,
     pub content_hash: String,
+    /// The published media type. `default` keeps pre-field cache files readable — they
+    /// deserialize as `text/plain`, i.e. code, which matches how they were treated when
+    /// written. Distinguishes code (eagerly loaded into the module graph) from assets
+    /// (lazily fetched by the image side-channel).
+    #[serde(default = "default_cached_media_type")]
+    pub media_type: String,
+}
+
+fn default_cached_media_type() -> String {
+    "text/plain".to_string()
+}
+
+/// Whether a module belongs in the module graph (code/text, eagerly loaded as UTF-8) as
+/// opposed to a binary asset (image and friends — lazily byte-fetched via the image
+/// side-channel, never fed to V8).
+///
+/// `application/octet-stream` is the publish-side fallback for any unmapped extension, so
+/// it is ambiguous: pre-PR2, every octet-stream module that *worked* was UTF-8 code with
+/// an exotic extension (binaries failed the whole package load), so octet-stream stays
+/// code unless the subpath's extension is unmistakably binary media — those become lazy
+/// assets. A misclassified-as-code binary fails exactly as it always did (a per-module
+/// UTF-8 error); misclassified-as-asset code merely fails its import with a clear message.
+#[must_use]
+pub fn is_code_module(media_type: &str, subpath: &str) -> bool {
+    if media_type.starts_with("text/")
+        || matches!(
+            media_type,
+            "application/typescript" | "application/javascript" | "application/json"
+        )
+    {
+        return true;
+    }
+    if media_type == "application/octet-stream" {
+        return !has_binary_media_extension(subpath);
+    }
+    false
+}
+
+/// Extensions that are unmistakably binary media (never importable code), for
+/// classifying the ambiguous `application/octet-stream` publish fallback.
+fn has_binary_media_extension(subpath: &str) -> bool {
+    let ext = std::path::Path::new(subpath)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "ico" | "tiff" | "tif"
+            | "svg" | "svgz" | "mp3" | "ogg" | "wav" | "flac" | "mp4" | "webm" | "mkv"
+            | "avi" | "mov" | "woff" | "woff2" | "ttf" | "otf" | "eot" | "zip" | "gz"
+            | "tar" | "pdf"
+    )
 }
 
 /// Disk cache rooted at `<smudgy_home>/cache/packages/`.
@@ -83,12 +136,26 @@ impl PackageCache {
         fs::read_to_string(self.blob_path(content_hash)).ok()
     }
 
+    /// Byte twin of [`read_blob`](Self::read_blob), for binary (asset) bodies.
+    #[must_use]
+    pub fn read_blob_bytes(&self, content_hash: &str) -> Option<Vec<u8>> {
+        fs::read(self.blob_path(content_hash)).ok()
+    }
+
     /// Store a module body under its content hash. Best-effort; a write failure is not
     /// fatal (the provider keeps the in-memory copy and just re-downloads next time).
     ///
     /// # Errors
     /// Returns an error if the cache directory cannot be created or the file written.
     pub fn write_blob(&self, content_hash: &str, body: &str) -> Result<()> {
+        self.write_blob_bytes(content_hash, body.as_bytes())
+    }
+
+    /// Byte twin of [`write_blob`](Self::write_blob), for binary (asset) bodies.
+    ///
+    /// # Errors
+    /// Returns an error if the cache directory cannot be created or the file written.
+    pub fn write_blob_bytes(&self, content_hash: &str, body: &[u8]) -> Result<()> {
         let path = self.blob_path(content_hash);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -104,13 +171,15 @@ impl PackageCache {
         serde_json::from_str(&content).ok()
     }
 
-    /// Whether every module body for a cached resolution is present (so it can be
-    /// served fully offline).
+    /// Whether every **code** module body for a cached resolution is present (so the
+    /// module graph can be served fully offline). Asset bodies (images) are lazy — they
+    /// were possibly never downloaded, and must not hold the whole package hostage.
     #[must_use]
-    pub fn has_all_blobs(&self, resolution: &CachedResolution) -> bool {
+    pub fn has_all_code_blobs(&self, resolution: &CachedResolution) -> bool {
         resolution
             .modules
             .iter()
+            .filter(|m| is_code_module(&m.media_type, &m.subpath))
             .all(|m| self.blob_path(&m.content_hash).exists())
     }
 
@@ -158,6 +227,15 @@ mod tests {
         assert!(cache.read_blob("abc123").is_none());
         cache.write_blob("abc123", "export const x = 1;").unwrap();
         assert_eq!(cache.read_blob("abc123").as_deref(), Some("export const x = 1;"));
+        // Byte twins share the same content-addressed pool.
+        assert_eq!(
+            cache.read_blob_bytes("abc123").as_deref(),
+            Some(b"export const x = 1;".as_slice())
+        );
+        cache.write_blob_bytes("bin1", &[0u8, 159, 146, 150]).unwrap();
+        assert_eq!(cache.read_blob_bytes("bin1").as_deref(), Some([0u8, 159, 146, 150].as_slice()));
+        // A binary blob is not silently lossy-read as a string.
+        assert!(cache.read_blob("bin1").is_none());
     }
 
     #[test]
@@ -168,10 +246,19 @@ mod tests {
             version: "1.4.0".into(),
             integrity: "sum".into(),
             manifest: PackageManifest::parse(r#"{ "name": "mapper", "version": "1.4.0" }"#).unwrap(),
-            modules: vec![CachedModule {
-                subpath: "index.ts".into(),
-                content_hash: "deadbeef".into(),
-            }],
+            modules: vec![
+                CachedModule {
+                    subpath: "index.ts".into(),
+                    content_hash: "deadbeef".into(),
+                    media_type: "application/typescript".into(),
+                },
+                // An asset module: lazily fetched, so its blob must NOT gate offline use.
+                CachedModule {
+                    subpath: "assets/logo.png".into(),
+                    content_hash: "feedface".into(),
+                    media_type: "image/png".into(),
+                },
+            ],
             dependencies: Vec::new(),
         };
         assert!(cache.read_meta(&key(), "1.4.0").is_none());
@@ -179,9 +266,42 @@ mod tests {
         let loaded = cache.read_meta(&key(), "1.4.0").expect("meta round-trips");
         assert_eq!(loaded.version, "1.4.0");
 
-        // Not offline-ready until the body is cached too.
-        assert!(!cache.has_all_blobs(&loaded));
+        // Not offline-ready until the CODE body is cached; the asset never gates.
+        assert!(!cache.has_all_code_blobs(&loaded));
         cache.write_blob("deadbeef", "export const x = 1;").unwrap();
-        assert!(cache.has_all_blobs(&loaded));
+        assert!(cache.has_all_code_blobs(&loaded));
+    }
+
+    #[test]
+    fn media_type_classification() {
+        for (code, subpath) in [
+            ("application/typescript", "index.ts"),
+            ("application/javascript", "lib/x.js"),
+            ("application/json", "data.json"),
+            ("text/plain", "shader.wgsl"),
+            ("text/css", "style.css"),
+            // The publish fallback for an unmapped extension: UTF-8 code pre-PR2 —
+            // must keep loading as code (only unmistakably-binary extensions are lazy).
+            ("application/octet-stream", "lib/helper.cts"),
+            ("application/octet-stream", "LICENSE"),
+        ] {
+            assert!(is_code_module(code, subpath), "{code} {subpath} should be code");
+        }
+        for (asset, subpath) in [
+            ("image/png", "assets/logo.png"),
+            ("image/svg+xml", "assets/icon.svg"),
+            ("application/octet-stream", "assets/photo.avif"),
+            ("application/octet-stream", "sounds/hit.ogg"),
+            ("application/wasm", "lib/fast.wasm"),
+            ("audio/ogg", "sounds/hit.ogg"),
+            ("font/woff2", "fonts/ui.woff2"),
+        ] {
+            assert!(!is_code_module(asset, subpath), "{asset} {subpath} should be an asset");
+        }
+        // Pre-field cache files deserialize to text/plain, i.e. code — matching how they
+        // were treated when written.
+        let old: CachedModule =
+            serde_json::from_str(r#"{"subpath":"index.ts","content_hash":"aa"}"#).unwrap();
+        assert!(is_code_module(&old.media_type, &old.subpath));
     }
 }

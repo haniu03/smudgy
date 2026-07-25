@@ -247,6 +247,56 @@ declare module "smudgy:widgets" {
         children?: WidgetChildren;
     }
 
+    /** Props for a raster image (PNG/JPEG/GIF first frame/WebP; a leaf -- children are
+     *  ignored), loaded asynchronously by the host. While loading (or after a failure)
+     *  the widget renders an empty box honoring the explicit `width`/`height`, so set
+     *  both for stable layout; under the default `"shrink"` sizing the widget is 0x0
+     *  until the image arrives, then jumps to its intrinsic size.
+     *
+     *  `src` grammar:
+     *  - `"icons/hp.png"` / `"./hp.png"` -- relative to the module that created the
+     *    widget (matching `import "./x"`). `".."` is allowed only in user modules;
+     *    packages are descend-only and can never leave their package root.
+     *  - `"@/assets/logo.png"` -- root-relative: the package root inside a package, or
+     *    the server's `modules/` directory in user scripts and inline aliases/triggers.
+     *  - `"https://..."` / `"http://..."` -- remote, cached per the server's HTTP cache
+     *    headers. Sandboxed packages need the host covered by their consented `net`
+     *    permission.
+     *  - `"data:image/png;base64,..."` -- inline bytes, capped at 2 MiB. Each distinct
+     *    URI is validated and content-hashed once; a rebuilt widget pays only a small
+     *    bounded re-key per build, but hoisting large data: URIs out of per-frame
+     *    rebuilds (and out of bindings) is still kinder to memory.
+     *  - An absolute path -- user scripts and trusted packages only (sandboxed packages
+     *    need a covering `read` grant).
+     *
+     *  A `src` fed from a store binding is restricted to descend-only relative/`@/`
+     *  forms, `data:`, and `http(s)` -- never file paths and never `..` -- because the
+     *  binding's producer (e.g. the game, via GMCP) is not the widget's author.
+     *  Failed or denied sources render the empty placeholder and log one warning; SVG
+     *  sources are not supported yet. */
+    export interface ImageProps {
+        /** The image source (see the grammar above). Bindable: a store binding swaps
+         *  the displayed image as the bound value changes. */
+        src: Bindable<string>;
+        /** Width (pixels, `"fill"`, or `"shrink"`). Default "shrink" -- see the layout
+         *  note above. */
+        width?: Bindable<WidgetLength>;
+        /** Default "shrink". */
+        height?: Bindable<WidgetLength>;
+        /** How the image fits its box: "contain" (default), "cover", "fill", "none",
+         *  or "scale-down". */
+        content_fit?: "contain" | "cover" | "fill" | "none" | "scale-down";
+        /** Texture sampling: "linear" (default, smooth) or "nearest" (pixel art). */
+        filter_method?: "linear" | "nearest";
+        /** Opacity, 0..=1. Default 1. */
+        opacity?: Bindable<number>;
+        /** Rotation in degrees about the image center (floating: layout keeps the
+         *  unrotated bounds). */
+        rotation?: number;
+        /** A leaf -- children are ignored (present for JSX compatibility). */
+        children?: WidgetChildren;
+    }
+
     /** Props for a checkbox. Its children form the label and may include bindings.
      *
      *  A checkbox displays the value supplied through `checked`. To make it respond
@@ -579,6 +629,44 @@ declare module "smudgy:widgets" {
         };
     }
 
+    /** A raster image drawn into a scene-unit box.
+     *
+     *  `src` accepts the same grammar as the `<Image>` widget (module-relative and `@/`
+     *  package paths, `https:`, `data:image/...`), checked against the same permissions.
+     *  When the scene arrives through a binding, sources are additionally restricted like
+     *  bound `<Image>` sources: relative/`@/` paths may not use `..`, and absolute file
+     *  paths are rejected -- whatever writes the bound path chooses these strings, and it
+     *  is not necessarily this widget's author.
+     *
+     *  While the image is still loading (or if it fails), the record draws nothing; the
+     *  rest of the scene is unaffected, and the drawing repaints when the load lands.
+     *
+     *  Paint-order caveats (fixed by the renderer, like {@link CanvasText}): images draw
+     *  above ALL fill/stroke geometry regardless of scene order -- a later rectangle
+     *  cannot cover an earlier image -- and below all text. Inside a non-uniformly scaled
+     *  group, a rotated image will not shear; it stays a rotated rectangle. */
+    export interface CanvasImage extends CanvasShapeBase {
+        kind: "image";
+        /** The image source (the `<Image>` widget's `src` grammar; SVG is not supported). */
+        src: string;
+        x?: number;
+        y?: number;
+        /** The box the image occupies, in scene units. */
+        width?: number;
+        height?: number;
+        /** How the pixels map onto the box. Default "fill" (stretch exactly, like every
+         *  other shape fills its geometry -- note this differs from the `<Image>` widget's
+         *  "contain" default). "cover" overflow is clipped at the canvas bounds. */
+        fit?: "fill" | "contain" | "cover" | "none" | "scale-down";
+        /** Scaling filter. Default "linear"; "nearest" for crisp pixel art. */
+        filter?: "linear" | "nearest";
+        /** Rotation in degrees, clockwise, about the box center. */
+        rotate?: number;
+        animate?: Partial<
+            Record<"x" | "y" | "width" | "height" | "rotate" | "opacity", NumberTween>
+        >;
+    }
+
     /** A transformed group of shapes. Transform components always apply in the order
      *  translate, then rotate, then scale, about the group's local origin. */
     export interface CanvasGroup extends CanvasShapeBase {
@@ -607,6 +695,7 @@ declare module "smudgy:widgets" {
         | CanvasPolygon
         | CanvasPath
         | CanvasText
+        | CanvasImage
         | CanvasGroup;
 
     /** A pointer event on a canvas, in scene coordinates (the same numbers you draw
@@ -686,6 +775,8 @@ declare module "smudgy:widgets" {
     export function Canvas(props?: CanvasProps, children?: WidgetChildren): SmudgyElement;
     /** Empty layout space (use `width="fill"` as a flexible spacer). */
     export function Space(props?: SpaceProps, children?: WidgetChildren): SmudgyElement;
+    /** A raster image loaded from `src`. Set `width`/`height` for stable layout. */
+    export function Image(props: ImageProps, children?: WidgetChildren): SmudgyElement;
     /** A checkbox. Children are the label. */
     export function Checkbox(props?: CheckboxProps, children?: WidgetChildren): SmudgyElement;
     /** One radio button; radios sharing a `selected` source form a group. */
@@ -743,6 +834,7 @@ declare module "smudgy:widgets" {
         MapView: typeof MapView;
         Canvas: typeof Canvas;
         Space: typeof Space;
+        Image: typeof Image;
         Checkbox: typeof Checkbox;
         Radio: typeof Radio;
         Tooltip: typeof Tooltip;

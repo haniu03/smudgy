@@ -1,8 +1,13 @@
 use std::{cell::RefCell, ffi::CStr, sync::Arc};
 
+use crate::image_store::{EntryState, ImageEntryCell, ImageStore};
 use crate::{WidgetMessage, WidgetRoot};
 use deno_core::{GarbageCollected, OpState, ascii_str, op2, v8};
 use iced::alignment::{Horizontal, Vertical};
+use smudgy_cloud::image_source::{
+    ImageSourcePolicy, RegisteredImageCreator, ResolvedImageSource, SrcMemoKey, memo_key,
+    register_creator, resolve_src,
+};
 use smudgy_cloud::{Mapper, Node, StoreBindings, WidgetIsolate, WidgetsEnabled};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -105,17 +110,27 @@ deno_core::extension!(
     op_smudgy_widget_build_radio,
     op_smudgy_widget_build_tooltip,
     op_smudgy_widget_build_table,
+    op_smudgy_widget_register_image_creator,
+    op_smudgy_widget_build_image,
     op_smudgy_widget_extract_markdown_links,
   ],
   esm_entry_point = "ext:smudgy_widgets/widgets.ts",
   esm = [ dir "src/extension/ts", "widgets.ts" ],
   options = {
     widget_root: SmudgyWidgetRoot,
-    mapper: Option<Mapper>
+    mapper: Option<Mapper>,
+    // Process-global; the same handle is passed to every isolate's extension init. `None`
+    // in headless/test runtimes with no UI image loader — the build op then degrades every
+    // `<Image>` to its placeholder.
+    image_store: Option<ImageStore>
   },
   state = |state, options| {
     state.put::<SmudgyWidgetRoot>(options.widget_root);
     state.put::<Option<Mapper>>(options.mapper);
+    state.put::<Option<ImageStore>>(options.image_store);
+    // Per-isolate: creator tokens + the resolve memo (see `ImageRegistry`). Fresh per
+    // isolate build, so tokens never collide across isolates.
+    state.put::<RefCell<ImageRegistry>>(RefCell::new(ImageRegistry::default()));
   },
 );
 
@@ -1761,6 +1776,30 @@ fn op_smudgy_widget_build_map_view(state: &mut OpState) -> Element {
     })
 }
 
+/// Parse an author-written scene (a static `scene` value or a binding fallback) with
+/// image-src resolution routed through the per-isolate registry memo — per-frame
+/// `createWidget` re-parses of the same scene then never re-run URL parsing or `data:`
+/// payload hashing (the memo's whole purpose). The registry `RefCell` is re-borrowed per
+/// src, never held across reentrancy.
+fn parse_scene_memoized(
+    state: &OpState,
+    image_store: &Option<ImageStore>,
+    creator_token: u32,
+    node: &Node,
+) -> Result<crate::canvas::ParsedScene, crate::canvas::SceneReject> {
+    let registry = state.borrow::<RefCell<ImageRegistry>>();
+    let mut resolve = |src: &str| match image_store {
+        Some(store) => registry
+            .borrow_mut()
+            .ensure_image_cell(creator_token, src, store),
+        None => crate::canvas::ImageResolution::Rejected(
+            "no image store is available in this runtime".to_string(),
+        ),
+    };
+    let mut images = crate::canvas::SceneImages::Memoized(&mut resolve);
+    crate::canvas::parse_scene(node, Some(&mut images))
+}
+
 #[op2]
 #[cppgc]
 fn op_smudgy_widget_build_canvas(
@@ -1768,11 +1807,34 @@ fn op_smudgy_widget_build_canvas(
     state: &mut OpState,
     props: v8::Local<v8::Object>,
     #[string] isolate_token: &str,
+    creator_token: u32,
 ) -> Element {
-    use crate::canvas::{ParsedScene, PointerHandler, SceneMemo, SceneProgram, SceneSource};
+    use crate::canvas::{
+        ParsedScene, PointerHandler, SceneImageCtx, SceneMemo, SceneProgram, SceneSource,
+    };
 
     let width = get_dyn_length_prop!(scope, state, props, "width");
     let height = get_dyn_length_prop!(scope, state, props, "height");
+
+    // Image resolution for `image` records (plan D7). Two provenances:
+    // - Static scenes and binding fallbacks (both written by the widget's author) resolve
+    //   through the per-isolate `ImageRegistry` memo, so per-frame `createWidget` re-parses
+    //   of the same scene never re-run URL parsing or `data:` hashing.
+    // - Live bound values re-parse on the UI thread (no OpState there) with the ctx below:
+    //   bound provenance — descend-only srcs, no absolute paths (plan D2).
+    let image_store = state.try_borrow::<Option<ImageStore>>().and_then(Clone::clone);
+    let bound_image_ctx = match &image_store {
+        Some(store) => state
+            .borrow::<RefCell<ImageRegistry>>()
+            .borrow()
+            .creator(creator_token)
+            .map(|creator| SceneImageCtx {
+                creator: creator.clone(),
+                store: store.clone(),
+                bound: true,
+            }),
+        None => None,
+    };
 
     // `view_box: [x, y, w, h]` in scene units — frozen as an exact rect-to-bounds mapping
     // (non-uniform when aspects differ), so the scene<->pointer transform stays bijective.
@@ -1805,16 +1867,26 @@ fn op_smudgy_widget_build_canvas(
                 let fallback = bound
                     .fallback
                     .as_ref()
-                    .and_then(|node| match crate::canvas::parse_scene(node) {
-                        Ok(parsed) => {
-                            crate::canvas::log_warnings(&parsed);
-                            Some(parsed)
-                        }
-                        Err(reject) => {
-                            log::warn!(
-                                "smudgy canvas: binding fallback rejected ({reject}); using an empty fallback"
-                            );
-                            None
+                    .and_then(|node| {
+                        // The fallback is author-written (part of the binding declaration
+                        // in the widget's own source): static provenance, memoized.
+                        let parsed = parse_scene_memoized(
+                            state,
+                            &image_store,
+                            creator_token,
+                            node,
+                        );
+                        match parsed {
+                            Ok(parsed) => {
+                                crate::canvas::log_warnings(&parsed);
+                                Some(parsed)
+                            }
+                            Err(reject) => {
+                                log::warn!(
+                                    "smudgy canvas: binding fallback rejected ({reject}); using an empty fallback"
+                                );
+                                None
+                            }
                         }
                     })
                     .unwrap_or_default();
@@ -1822,6 +1894,10 @@ fn op_smudgy_widget_build_canvas(
                     cell: bound.cell,
                     memo: Arc::new(std::sync::Mutex::new(SceneMemo::default())),
                     fallback: Arc::new(fallback),
+                    // Live bound values re-parse on the UI thread with bound provenance:
+                    // descend-only srcs, no absolute paths (the producer of a bound scene
+                    // is not the widget's author — plan D2).
+                    image_ctx: bound_image_ctx.map(Arc::new),
                 }
             }
             None => SceneSource::Static(Arc::new(ParsedScene::default())),
@@ -1830,7 +1906,13 @@ fn op_smudgy_widget_build_canvas(
             let parsed = deno_core::serde_v8::from_v8::<serde_json::Value>(scope, value)
                 .ok()
                 .map_or_else(ParsedScene::default, |value| {
-                    match crate::canvas::parse_scene(&Node::from(value)) {
+                    let parsed = parse_scene_memoized(
+                        state,
+                        &image_store,
+                        creator_token,
+                        &Node::from(value),
+                    );
+                    match parsed {
                         Ok(parsed) => {
                             crate::canvas::log_warnings(&parsed);
                             parsed
@@ -1865,6 +1947,7 @@ fn op_smudgy_widget_build_canvas(
         view_box,
         fit,
         on_pointer,
+        image_store,
     };
 
     Element::new(move || {
@@ -1881,6 +1964,461 @@ fn op_smudgy_widget_build_canvas(
         .clip(true)
         .into()
     })
+}
+
+// ---- Image widget (plan D6) --------------------------------------------------------------
+//
+// `<Image src=... />` maps to `iced::widget::image`. The build op stays I/O-free: it resolves
+// + policy-checks the `src` (lexically, via `smudgy_cloud::image_source`) and `ensure`s the
+// process-global `ImageStore`, capturing the returned entry cell into the render closure. Per
+// frame the closure does one lock-free `cell.load()`; the ui-side fetcher performs all I/O.
+
+/// Per-isolate image state parked in `OpState`: validated creators (indexed by their 1-based
+/// token) and a bounded resolve memo so per-frame `createWidget` doesn't re-parse a `src`
+/// every frame. Fresh per isolate — a token from one isolate is meaningless in another.
+#[derive(Default)]
+struct ImageRegistry {
+    /// 1-based tokens: `creators[token - 1]`. `None` = a registration that failed membership
+    /// (forged/denied creator); its token resolves every `src` to the broken state.
+    creators: Vec<Option<Arc<RegisteredImageCreator>>>,
+    /// Per-creator bound-src resolve tables (plan D3's side-table), parallel to `creators`.
+    bound_tables: Vec<Arc<BoundSrcTable>>,
+    /// `(token, src) -> resolution + precomputed store key`. Bounded by entry count AND by
+    /// retained bytes (a `data:` source keeps its whole URI alive in the resolution —
+    /// count alone would let 4096 × 2 MiB URIs sit resident); either cap clears wholesale
+    /// (the hot path is a small set of distinct srcs; a flood just re-parses, never leaks).
+    memo: std::collections::HashMap<(u32, SrcMemoKey), Result<MemoHit, String>>,
+    /// Bytes retained by `memo` values (dominated by `data:` URI payloads).
+    memo_bytes: usize,
+}
+
+/// A memoized successful resolution: the source plus its store cache key, computed once —
+/// the per-frame path hands both to [`ImageStore::ensure_keyed`] and never re-derives the
+/// key (for a `data:` src that derivation once SHA-256'd megabytes per frame).
+struct MemoHit {
+    source: ResolvedImageSource,
+    key: Arc<str>,
+}
+
+impl MemoHit {
+    /// Bytes this entry keeps alive (memo cap accounting).
+    fn retained_bytes(&self) -> usize {
+        retained_source_bytes(&self.source) + self.key.len()
+    }
+}
+
+/// Bytes a retained [`ResolvedImageSource`] keeps alive (`data:` URIs dominate).
+fn retained_source_bytes(source: &ResolvedImageSource) -> usize {
+    match source {
+        ResolvedImageSource::Data { uri, .. } => uri.len(),
+        ResolvedImageSource::Remote(url) => url.as_str().len(),
+        ResolvedImageSource::LocalFile(path) => path.as_os_str().len(),
+        ResolvedImageSource::PackageAsset {
+            owner,
+            name,
+            version,
+            subpath,
+        } => owner.len() + name.len() + version.len() + subpath.len(),
+    }
+}
+
+/// Upper bounds on the resolve memo before a wholesale clear: entry count and retained
+/// bytes. Generous vs any realistic distinct-`src` count in one isolate; they exist only to
+/// bound a pathological flood.
+const IMAGE_MEMO_CAP: usize = 4096;
+const IMAGE_MEMO_BYTE_CAP: usize = 32 * 1024 * 1024;
+/// Registrations are one-per-`makeWidgets`-instance; anything near this is a script
+/// looping the op directly. Past it, registration returns the denied token.
+const IMAGE_CREATOR_CAP: usize = 4096;
+
+impl ImageRegistry {
+    fn register(&mut self, creator: Option<RegisteredImageCreator>) -> u32 {
+        if self.creators.len() >= IMAGE_CREATOR_CAP {
+            return 0;
+        }
+        self.creators.push(creator.map(Arc::new));
+        self.bound_tables.push(Arc::new(BoundSrcTable::default()));
+        u32::try_from(self.creators.len()).unwrap_or(0)
+    }
+
+    fn creator(&self, token: u32) -> Option<&Arc<RegisteredImageCreator>> {
+        if token == 0 {
+            return None;
+        }
+        self.creators.get((token - 1) as usize).and_then(Option::as_ref)
+    }
+
+    fn bound_table(&self, token: u32) -> Option<Arc<BoundSrcTable>> {
+        if token == 0 {
+            return None;
+        }
+        self.bound_tables.get((token - 1) as usize).cloned()
+    }
+
+    /// Ensure the memo holds a resolution for `(token, raw)` (static provenance),
+    /// spawning the store fetch on first sight; returns the memo key for a follow-up
+    /// shared-borrow read. Steady state per frame: one bounded memo-key hash + a map
+    /// probe — no URL parse, no payload hashing.
+    fn resolve_memoized(&mut self, token: u32, raw: &str, store: &ImageStore) -> (u32, SrcMemoKey) {
+        let key = (token, memo_key(raw));
+        if self.memo.contains_key(&key) {
+            return key;
+        }
+        let outcome = match self.creator(token) {
+            Some(creator) => match resolve_src(raw, creator, false) {
+                Ok(source) => {
+                    let store_key: Arc<str> = Arc::from(source.store_key(&creator.policy));
+                    let _ = store.ensure_keyed(&store_key, &source, &creator.policy);
+                    Ok(MemoHit {
+                        source,
+                        key: store_key,
+                    })
+                }
+                Err(e) => Err(e.to_string()),
+            },
+            None => Err("image creator was not registered or was denied".to_string()),
+        };
+        if let Err(reason) = &outcome {
+            log::warn!("smudgy images: '{}' rejected: {reason}", LogSrc(raw));
+        }
+        if self.memo.len() >= IMAGE_MEMO_CAP || self.memo_bytes >= IMAGE_MEMO_BYTE_CAP {
+            self.memo.clear();
+            self.memo_bytes = 0;
+        }
+        if let Ok(hit) = &outcome {
+            self.memo_bytes += hit.retained_bytes();
+        }
+        self.memo.insert(key.clone(), outcome);
+        key
+    }
+
+    /// Resolve a static `raw` for `token` and ensure its store entry, memoized by
+    /// `(token, memo_key)`. Steady state per frame: memo hit + `ensure_keyed` (borrowed
+    /// store lookup + relaxed recency touch) — no URL parse, no payload hashing, no
+    /// allocation. Bound values never come through here — they resolve in the render
+    /// closure via the creator's [`BoundSrcTable`].
+    fn ensure_static(
+        &mut self,
+        token: u32,
+        raw: &str,
+        store: &ImageStore,
+    ) -> Option<Arc<ImageEntryCell>> {
+        let key = self.resolve_memoized(token, raw, store);
+        match (self.memo.get(&key), self.creator(token)) {
+            (Some(Ok(hit)), Some(creator)) => {
+                Some(store.ensure_keyed(&hit.key, &hit.source, &creator.policy))
+            }
+            _ => None,
+        }
+    }
+
+    /// The canvas variant of [`ensure_static`](Self::ensure_static): same memo, but the
+    /// canvas retains the resolution inputs in a [`crate::canvas::ImageCell`] so its
+    /// per-redraw refresh walk can keep the slot LRU-hot and revive evicted cells. The
+    /// per-parse `Arc`/clone construction is cold relative to the scene parse around it.
+    fn ensure_image_cell(
+        &mut self,
+        token: u32,
+        raw: &str,
+        store: &ImageStore,
+    ) -> crate::canvas::ImageResolution {
+        use crate::canvas::{ImageCell, ImageResolution};
+        let key = self.resolve_memoized(token, raw, store);
+        match (self.memo.get(&key), self.creator(token)) {
+            (Some(Ok(hit)), Some(creator)) => {
+                let cell = store.ensure_keyed(&hit.key, &hit.source, &creator.policy);
+                ImageResolution::Resolved(Arc::new(ImageCell::new(
+                    hit.key.clone(),
+                    hit.source.clone(),
+                    creator.policy.clone(),
+                    cell,
+                )))
+            }
+            (Some(Err(reason)), _) => ImageResolution::Rejected(reason.clone()),
+            _ => ImageResolution::Rejected(
+                "image creator was not registered or was denied".to_string(),
+            ),
+        }
+    }
+}
+
+/// A `src` for log lines: `data:` URIs are megabytes — never print one whole.
+struct LogSrc<'a>(&'a str);
+
+impl std::fmt::Display for LogSrc<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const MAX: usize = 120;
+        if self.0.len() <= MAX {
+            f.write_str(self.0)
+        } else {
+            let cut = (0..=MAX).rev().find(|i| self.0.is_char_boundary(*i)).unwrap_or(0);
+            write!(f, "{}… ({} bytes)", &self.0[..cut], self.0.len())
+        }
+    }
+}
+
+/// Register (once, in `makeWidgets`) the calling creator for image-src resolution. Validates
+/// the JS-supplied descriptor against this isolate's [`ImageSourcePolicy`] and returns a
+/// `u32` token the `<Image>` build op passes back — so a forged `__creator` cannot select
+/// another package's asset root (a denied registration yields a token whose srcs all break).
+/// `module` is the importing module's in-package path (the `?mod=` value), `""` for none.
+#[op2(fast)]
+fn op_smudgy_widget_register_image_creator(
+    state: &mut OpState,
+    #[string] creator_json: &str,
+    #[string] module: &str,
+) -> u32 {
+    let policy = state.try_borrow::<ImageSourcePolicy>().map(|p| Arc::new(p.clone()));
+    let module = (!module.is_empty()).then_some(module);
+    let creator = policy.and_then(|policy| register_creator(creator_json, module, policy));
+    state
+        .borrow::<RefCell<ImageRegistry>>()
+        .borrow_mut()
+        .register(creator)
+}
+
+/// Content-fit mapping (`iced_core::ContentFit`); default `Contain` (the widget default).
+fn content_fit_from(value: Option<&str>) -> iced::ContentFit {
+    match value {
+        Some("cover") => iced::ContentFit::Cover,
+        Some("fill") => iced::ContentFit::Fill,
+        Some("none") => iced::ContentFit::None,
+        Some("scale-down") => iced::ContentFit::ScaleDown,
+        _ => iced::ContentFit::Contain,
+    }
+}
+
+fn filter_method_from(value: Option<&str>) -> iced::widget::image::FilterMethod {
+    match value {
+        Some("nearest") => iced::widget::image::FilterMethod::Nearest,
+        _ => iced::widget::image::FilterMethod::Linear,
+    }
+}
+
+/// Build the iced element for a resolved entry cell: the decoded image when `Ready`, else a
+/// sized placeholder honoring `width`/`height` (so an explicit box reserves space while the
+/// load is in flight or after a failure).
+fn image_element_from_cell(
+    cell: Option<&Arc<ImageEntryCell>>,
+    width: Option<iced::Length>,
+    height: Option<iced::Length>,
+    content_fit: iced::ContentFit,
+    filter: iced::widget::image::FilterMethod,
+    opacity: f32,
+    rotation_deg: f32,
+) -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer> {
+    if let Some(cell) = cell
+        && let EntryState::Ready { handle, .. } = &*cell.state()
+    {
+        let mut image = iced::widget::image(handle.clone())
+            .content_fit(content_fit)
+            .filter_method(filter)
+            .opacity(opacity)
+            .rotation(iced::Radians(rotation_deg.to_radians()));
+        if let Some(width) = width {
+            image = image.width(width);
+        }
+        if let Some(height) = height {
+            image = image.height(height);
+        }
+        return image.into();
+    }
+    // Loading / Failed / unresolved: a placeholder that reserves explicit dimensions.
+    let mut space = iced::widget::Space::new();
+    if let Some(width) = width {
+        space = space.width(width);
+    }
+    if let Some(height) = height {
+        space = space.height(height);
+    }
+    space.into()
+}
+
+#[op2]
+#[cppgc]
+fn op_smudgy_widget_build_image(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    props: v8::Local<v8::Object>,
+    creator_token: u32,
+) -> Element {
+    let width = get_dyn_length_prop!(scope, state, props, "width");
+    let height = get_dyn_length_prop!(scope, state, props, "height");
+    let opacity = get_dyn_f32_prop!(scope, state, props, "opacity");
+    let content_fit =
+        content_fit_from(get_opt_string_prop!(scope, props, "content_fit").as_deref());
+    let filter =
+        filter_method_from(get_opt_string_prop!(scope, props, "filter_method").as_deref());
+    // Degrees fit losslessly in f32 for any sane rotation; truncation is fine.
+    #[allow(clippy::cast_possible_truncation)]
+    let rotation_deg = get_number_prop!(scope, props, "rotation").unwrap_or(0.0) as f32;
+
+    let store = state.try_borrow::<Option<ImageStore>>().and_then(Clone::clone);
+
+    // `src` is either a static string or a store binding (its value changes per frame).
+    let src = get_dyn_string_prop!(scope, state, props, "src");
+
+    // Resolve a static src once, here; capture the entry cell. A bound src is resolved in the
+    // render closure (its string is only known per frame).
+    let static_cell = match (&src, &store) {
+        (Some(DynProp::Static(raw)), Some(store)) => state
+            .borrow::<RefCell<ImageRegistry>>()
+            .borrow_mut()
+            .ensure_static(creator_token, raw, store),
+        _ => None,
+    };
+
+    // For a bound src, capture what the render closure needs to resolve per distinct value.
+    let bound_ctx = match (&src, &store) {
+        (Some(DynProp::Bound { .. }), Some(store)) => {
+            let registry = state.borrow::<RefCell<ImageRegistry>>();
+            let registry = registry.borrow();
+            match (
+                registry.creator(creator_token),
+                registry.bound_table(creator_token),
+            ) {
+                (Some(creator), Some(table)) => Some(BoundImageCtx {
+                    creator: creator.clone(),
+                    store: store.clone(),
+                    table,
+                    memo: RefCell::new(None),
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
+    let default_opacity = opacity.as_ref().and_then(DynProp::get).unwrap_or(1.0);
+
+    Element::new(move || {
+        let w = width.as_ref().and_then(DynProp::get);
+        let h = height.as_ref().and_then(DynProp::get);
+        let op = opacity.as_ref().and_then(DynProp::get).unwrap_or(default_opacity);
+        // Resolve the live cell: static (captured once) or bound (per distinct value).
+        let cell = match (&static_cell, &bound_ctx, &src) {
+            (Some(cell), _, _) => Some(cell.clone()),
+            (None, Some(ctx), Some(DynProp::Bound { prop, .. })) => {
+                ctx.resolve(&prop.display_text())
+            }
+            _ => None,
+        };
+        image_element_from_cell(cell.as_ref(), w, h, content_fit, filter, op, rotation_deg)
+    })
+}
+
+/// The largest bound `src` the side-table will key by. Above this, per-frame table hashing
+/// of the raw string would itself blow the budget — oversized values (multi-KiB `data:`
+/// URIs fed through a binding) re-resolve per rebuild instead, and the `.d.ts` tells
+/// authors to hoist them.
+const BOUND_TABLE_MAX_SRC: usize = 4096;
+/// Side-table caps (entries / retained bytes) before a wholesale clear.
+const BOUND_TABLE_CAP: usize = 256;
+const BOUND_TABLE_BYTE_CAP: usize = 1024 * 1024;
+
+/// Plan D3's bound-src side-table, one per registered creator: `raw value → resolution`,
+/// read lock-free on the UI thread. Per-frame `createWidget` rebuilds give the render
+/// closure (and thus [`BoundImageCtx`]'s local memo) a one-frame lifetime — without this
+/// table every rebuild would URL-parse + policy-check the bound value on the UI thread.
+/// Failures memoize too (`Err`), so a steadily-invalid value costs one lookup per frame and
+/// warns exactly once, at insert.
+#[derive(Default)]
+struct BoundSrcTable {
+    map: arc_swap::ArcSwap<std::collections::HashMap<Box<str>, BoundResolution>>,
+    /// Guards insertions (COW map swap) and tracks retained bytes.
+    writer: std::sync::Mutex<usize>,
+}
+
+type BoundResolution = Result<(ResolvedImageSource, Arc<str>), ()>;
+
+impl BoundSrcTable {
+    /// Resolve `raw` as a bound value for `creator`, ensuring the store entry. Steady
+    /// state: one lock-free map load + hash of `raw` (≤ [`BOUND_TABLE_MAX_SRC`] bytes) +
+    /// `ensure_keyed`. First sight of a distinct value takes the writer mutex once.
+    fn resolve(
+        &self,
+        raw: &str,
+        creator: &RegisteredImageCreator,
+        store: &ImageStore,
+    ) -> Option<Arc<ImageEntryCell>> {
+        if raw.len() > BOUND_TABLE_MAX_SRC {
+            // Too big to key by: resolve fresh (pathological, documented in the .d.ts).
+            let source = resolve_src(raw, creator, true).ok()?;
+            return Some(store.ensure(&source, &creator.policy));
+        }
+        if let Some(resolution) = self.map.load().get(raw) {
+            return match resolution {
+                Ok((source, key)) => Some(store.ensure_keyed(key, source, &creator.policy)),
+                Err(()) => None,
+            };
+        }
+        // First sight of this value: resolve under the writer lock and publish.
+        let mut bytes = self.writer.lock().expect("bound table writer");
+        if let Some(resolution) = self.map.load().get(raw) {
+            // Lost the insert race; use the winner's entry.
+            return match resolution {
+                Ok((source, key)) => Some(store.ensure_keyed(key, source, &creator.policy)),
+                Err(()) => None,
+            };
+        }
+        // A bound value is treated as `bound = true` (descend-only, no absolute paths —
+        // a producer is not the widget's author).
+        let (resolution, cell) = match resolve_src(raw, creator, true) {
+            Ok(source) => {
+                let key: Arc<str> = Arc::from(source.store_key(&creator.policy));
+                let cell = store.ensure_keyed(&key, &source, &creator.policy);
+                (Ok((source, key)), Some(cell))
+            }
+            Err(reason) => {
+                log::warn!("smudgy images: bound src '{}' rejected: {reason}", LogSrc(raw));
+                (Err(()), None)
+            }
+        };
+        let mut map = (**self.map.load()).clone();
+        if map.len() >= BOUND_TABLE_CAP || *bytes >= BOUND_TABLE_BYTE_CAP {
+            map.clear();
+            *bytes = 0;
+        }
+        *bytes += raw.len()
+            + resolution
+                .as_ref()
+                .map_or(0, |(source, key)| retained_source_bytes(source) + key.len());
+        map.insert(Box::from(raw), resolution);
+        self.map.store(Arc::new(map));
+        cell
+    }
+}
+
+/// The render-closure state for a store-bound `src`: a one-frame local memo (steady value =
+/// one string compare, including memoized *failures*) over the creator's cross-frame
+/// [`BoundSrcTable`].
+struct BoundImageCtx {
+    creator: Arc<RegisteredImageCreator>,
+    store: ImageStore,
+    table: Arc<BoundSrcTable>,
+    memo: RefCell<Option<(String, Option<Arc<ImageEntryCell>>)>>,
+}
+
+impl BoundImageCtx {
+    fn resolve(&self, raw: &str) -> Option<Arc<ImageEntryCell>> {
+        {
+            let memo = self.memo.borrow();
+            if let Some((last, cell)) = memo.as_ref()
+                && last == raw
+            {
+                match cell {
+                    // Memoized failure: placeholder without re-resolving.
+                    None => return None,
+                    Some(cell) if !cell.is_evicted() => return Some(cell.clone()),
+                    // Evicted mid-display: fall through to re-ensure.
+                    Some(_) => {}
+                }
+            }
+        }
+        let cell = self.table.resolve(raw, &self.creator, &self.store);
+        *self.memo.borrow_mut() = Some((raw.to_string(), cell.clone()));
+        cell
+    }
 }
 
 #[op2]

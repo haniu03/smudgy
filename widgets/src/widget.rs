@@ -160,6 +160,20 @@ where
         &self.map_reaper
     }
 
+    /// Wake this root's repaint subscription without mutating any widget. Async state
+    /// that changes what mounted widgets draw (an image load landing) pokes this; the
+    /// subscription coalesces bursts into one wake.
+    pub fn poke(&self) {
+        self.tx.send(()).ok();
+    }
+
+    /// A weak handle to this root's repaint waker, for process-global registries (the
+    /// image store) that must not keep a closed session's channel alive.
+    #[must_use]
+    pub fn wake_handle(&self) -> std::sync::Weak<tokio::sync::watch::Sender<()>> {
+        Arc::downgrade(&self.tx)
+    }
+
     pub fn subscription<SubMessage: std::hash::Hash + Copy + Send + 'static>(
         &self,
         id: SubMessage,

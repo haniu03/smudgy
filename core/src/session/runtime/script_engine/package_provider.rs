@@ -27,7 +27,7 @@ use smudgy_script::{
     PackagePermissions, PackageProvider, ReferrerRef, ResolvedPackage,
 };
 
-use super::package_cache::{CachedModule, CachedResolution, PackageCache};
+use super::package_cache::{CachedModule, CachedResolution, PackageCache, is_code_module};
 use super::package_solver::{self, DepEdge, DepRequirement, Solve};
 use crate::models::shared_packages::{self, LockedPackage, SharedPackageLock, UpdateMode};
 
@@ -142,6 +142,12 @@ pub struct SmudgyPackageProvider {
     /// User-level (`file://`-referred) code imports of packages — read by the engine to
     /// warn when the target declares interop handles (interop.md §1/§3 residual).
     user_imports: RefCell<Vec<PackageKey>>,
+    /// The isolate's image-policy membership handle
+    /// ([`smudgy_cloud::image_source::HostedPackages`]): every successful **code-load**
+    /// resolve inserts its identity here, so `<Image>` creator registration — which runs at
+    /// module evaluation, strictly after the graph resolves — sees the package as
+    /// legitimately hosted. `None` until the engine wires it (test overrides never do).
+    image_hosted: RefCell<Option<smudgy_cloud::image_source::HostedPackages>>,
 }
 
 impl SmudgyPackageProvider {
@@ -171,7 +177,16 @@ impl SmudgyPackageProvider {
             home_packages: RefCell::new(None),
             scrubbed: RefCell::new(Vec::new()),
             user_imports: RefCell::new(Vec::new()),
+            image_hosted: RefCell::new(None),
         }
+    }
+
+    /// Wire this isolate's image-policy membership handle: every subsequent code-load
+    /// resolve records its identity (and local-override-ness) there. Call before module
+    /// loading — resolution happens during graph load, evaluation (and thus `<Image>`
+    /// creator registration) strictly after.
+    pub fn set_image_hosted(&self, hosted: smudgy_cloud::image_source::HostedPackages) {
+        *self.image_hosted.borrow_mut() = Some(hosted);
     }
 
     /// Build a sibling provider for another isolate (`PACKAGE-ISOLATES-RESOLUTION.md`). Each
@@ -211,6 +226,8 @@ impl SmudgyPackageProvider {
             home_packages: RefCell::new(None),
             scrubbed: RefCell::new(Vec::new()),
             user_imports: RefCell::new(Vec::new()),
+            // Per-isolate: the engine wires each fork to its own isolate's image policy.
+            image_hosted: RefCell::new(None),
         }
     }
 
@@ -312,11 +329,12 @@ impl SmudgyPackageProvider {
     }
 
     /// Build a resolved package entirely from the on-disk cache (for offline use). `None`
-    /// unless the version's metadata and *every* module body are cached.
+    /// unless the version's metadata and every **code** module body are cached (assets are
+    /// lazy — see the resolve loop — and must not hold offline loads hostage).
     fn build_from_cache(&self, key: &PackageKey, version: &str) -> Option<Rc<ResolvedPackage>> {
         let cache = self.disk_cache.as_ref()?;
         let meta = cache.read_meta(key, version)?;
-        if !cache.has_all_blobs(&meta) {
+        if !cache.has_all_code_blobs(&meta) {
             return None;
         }
         // Repopulate this instance's locked deps so its transitive imports stay
@@ -325,6 +343,9 @@ impl SmudgyPackageProvider {
         self.store_locked_deps(key, &meta.version, &meta.dependencies);
         let mut modules = Vec::with_capacity(meta.modules.len());
         for module in &meta.modules {
+            if !is_code_module(&module.media_type, &module.subpath) {
+                continue;
+            }
             modules.push(PackageModuleSource {
                 subpath: module.subpath.clone(),
                 text: cache.read_blob(&module.content_hash)?,
@@ -936,6 +957,14 @@ impl SmudgyPackageProvider {
 
         let mut modules = Vec::with_capacity(wire.modules.len());
         for module in &wire.modules {
+            // Assets (images and other binaries) never enter the module graph: they are
+            // fetched lazily, by hash, when something actually displays them (the image
+            // side-channel). Eagerly fetching them here both downloaded every published
+            // image at load time and garbled the whole package load on the first
+            // non-UTF-8 body. They stay in the CachedResolution written below.
+            if !is_code_module(&module.media_type, &module.subpath) {
+                continue;
+            }
             // Content-addressed: a cached body for this hash never changes, so reuse it
             // and only download misses (then cache them).
             let cached = self
@@ -984,6 +1013,7 @@ impl SmudgyPackageProvider {
                     .map(|module| CachedModule {
                         subpath: module.subpath.clone(),
                         content_hash: module.content_hash.clone(),
+                        media_type: module.media_type.clone(),
                     })
                     .collect(),
                 dependencies: wire.dependencies.clone(),
@@ -1018,7 +1048,21 @@ impl PackageProvider for SmudgyPackageProvider {
         key: &PackageKey,
         referrer: Option<&ReferrerRef>,
     ) -> Result<Rc<ResolvedPackage>, PackageError> {
-        self.resolve_impl(key, referrer, true).await
+        let resolved = self.resolve_impl(key, referrer, true).await?;
+        // A code load makes this isolate legitimately host the package: record the
+        // identity for <Image> creator registration (which evaluates strictly after the
+        // graph resolves). Stub fetches (`resolve_package_for_stub`) never do — consuming
+        // a producer is not hosting it. `integrity == "local"` is the local-dev-override
+        // marker `try_local_override` writes; local assets read from disk, not blobs.
+        if let Some(hosted) = self.image_hosted.borrow().as_ref() {
+            hosted.insert(
+                &resolved.key.owner,
+                &resolved.key.name,
+                &resolved.resolved_version,
+                resolved.integrity == "local",
+            );
+        }
+        Ok(resolved)
     }
 
     /// A stub fetch is a read of the producer's declarations, not a code load: nothing lands

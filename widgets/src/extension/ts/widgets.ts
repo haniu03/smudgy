@@ -37,6 +37,8 @@ import {
     op_smudgy_widget_build_radio,
     op_smudgy_widget_build_tooltip,
     op_smudgy_widget_build_table,
+    op_smudgy_widget_register_image_creator,
+    op_smudgy_widget_build_image,
     op_smudgy_widget_extract_markdown_links,
     op_smudgy_widget_isolate_token,
     // The `smudgy_ops` (core) session ops, used to build `Markdown`'s default link handler and
@@ -166,7 +168,7 @@ function extractMarkdownLinks(source: string): { label: string; url: string }[] 
  * `createWidget`/`removeWidget` are creator-bound -- the widget registry keys mounts by
  * `(creator, name)`, so a package only ever sees/replaces its own widgets.
  */
-function makeWidgets(creator: { kind: string } | string) {
+function makeWidgets(creator: { kind: string } | string, module?: string) {
     // The creator arrives as the descriptor object (synthesized module / jsx-runtime) or
     // already-stringified (inline augmentation); normalize to the JSON string the ops key on,
     // matching the alias/trigger creator convention in smudgy.ts.
@@ -174,6 +176,14 @@ function makeWidgets(creator: { kind: string } | string) {
     // This isolate's routing token, read once here and tagged onto button callbacks so `core`
     // dispatches an `onPress` back into the creating isolate (see op_smudgy_widget_isolate_token).
     const isolateToken = op_smudgy_widget_isolate_token();
+    // Register this creator ONCE for image-src resolution: the host validates the descriptor
+    // against the isolate's policy and returns an opaque token every <Image> build passes back
+    // (a forged __creator cannot select another package's asset root). `module` is the
+    // importing module's in-package path (the synthesized instance's `?mod=` value, baked as
+    // `__module`) -- the base for module-relative srcs inside packages. Host-side
+    // registration re-validates it component-wise, so a forged value cannot escape the
+    // package root. Empty/absent for user modules, whose referrer rides in creatorJson.
+    const imageCreatorToken = op_smudgy_widget_register_image_creator(creatorJson, module || "");
     const Column = (props: Record<string, any>, children: any) =>
         op_smudgy_widget_build_column(buildChildList(children), props || {});
 
@@ -249,6 +259,13 @@ function makeWidgets(creator: { kind: string } | string) {
 
     const Space = (props: Record<string, any>, _children?: any) =>
         op_smudgy_widget_build_space(props || {});
+
+    // A leaf image. `src` is a package-root/relative/@ path, an http(s) URL, or a data: URI
+    // (see the .d.ts grammar). Resolution + loading happen host-side; the widget renders a
+    // sized placeholder until the image is ready. The creator token carries the provenance
+    // the host validated at registration.
+    const Image = (props: Record<string, any>, _children?: any) =>
+        op_smudgy_widget_build_image(props || {}, imageCreatorToken);
 
     const Checkbox = (props: Record<string, any>, children: any) => {
         const p = props || {};
@@ -365,7 +382,9 @@ function makeWidgets(creator: { kind: string } | string) {
             typeof p.onPointer === "function"
                 ? (raw: string) => p.onPointer(JSON.parse(raw))
                 : undefined;
-        return op_smudgy_widget_build_canvas({ ...p, onPointer }, isolateToken);
+        // The image creator token lets scene `image` records resolve their `src` against
+        // this creator's validated asset root, exactly like the <Image> widget.
+        return op_smudgy_widget_build_canvas({ ...p, onPointer }, isolateToken, imageCreatorToken);
     };
 
     // Fragment: no iced analog -- it just yields its children for the parent to absorb
@@ -429,6 +448,7 @@ function makeWidgets(creator: { kind: string } | string) {
         MapView,
         Canvas,
         Space,
+        Image,
         Checkbox,
         Radio,
         Tooltip,
@@ -466,6 +486,7 @@ if ((globalThis as any).__smudgy_user_api) {
         MapView: w.MapView,
         Canvas: w.Canvas,
         Space: w.Space,
+        Image: w.Image,
         Checkbox: w.Checkbox,
         Radio: w.Radio,
         Tooltip: w.Tooltip,

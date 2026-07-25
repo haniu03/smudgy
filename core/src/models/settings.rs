@@ -198,6 +198,12 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub theme_tweaks: std::collections::HashMap<String, ThemeTweaks>,
 
+    /// Disk budget for the image cache (`<home>/cache/images/`), in MiB. A startup
+    /// LRU sweep (oldest fetches first, across all servers) trims to this; the
+    /// in-memory decoded-image cap is a separate internal constant.
+    #[serde(default = "default_image_cache_max_mb")]
+    pub image_cache_max_mb: u64,
+
     /// Separates multiple commands on one input line. Empty disables
     /// splitting entirely.
     #[serde(default = "default_command_separator")]
@@ -470,6 +476,10 @@ const fn default_terminal_font_size() -> f32 {
     16.0
 }
 
+fn default_image_cache_max_mb() -> u64 {
+    256
+}
+
 fn default_theme() -> String {
     "Smudgy".to_string()
 }
@@ -499,6 +509,7 @@ impl Default for Settings {
             terminal_line_length: None,
             theme: default_theme(),
             theme_tweaks: std::collections::HashMap::new(),
+            image_cache_max_mb: default_image_cache_max_mb(),
             command_separator: default_command_separator(),
             raw_line_prefix: default_raw_line_prefix(),
             command_input_behavior: CommandInputBehavior::default(),

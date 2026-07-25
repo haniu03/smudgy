@@ -48,7 +48,7 @@ use deno_core::url::Url;
 
 mod mapper_api;
 mod ops;
-mod package_cache;
+pub(crate) mod package_cache;
 mod package_provider;
 mod package_solver;
 
@@ -1066,7 +1066,8 @@ impl<'a> ScriptEngine<'a> {
         // token, and the caller records it on the `Isolate` so dispatch can compare the two).
         let make_extensions = |isolate_id: IsolateId,
                                smudgy_grants: ops::SmudgyGrants,
-                               data_dir: std::path::PathBuf| {
+                               data_dir: std::path::PathBuf,
+                               image_policy: smudgy_cloud::image_source::ImageSourcePolicy| {
             let instance = NEXT_ISOLATE_INSTANCE.fetch_add(1, Ordering::Relaxed);
             let script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>> =
                 Rc::new(RefCell::new(Vec::new()));
@@ -1140,6 +1141,10 @@ impl<'a> ScriptEngine<'a> {
                     session_store.borrow().bindings(),
                     // This isolate's `$DATA` dir, exposed to the script as `getDataDir()`.
                     data_dir,
+                    // This isolate's image-source policy, read by the leaf `smudgy_widgets`
+                    // <Image> build ops to resolve + gate `src` strings (a bridge type in
+                    // `smudgy_cloud`, like `WidgetsEnabled`).
+                    image_policy,
                 ),
                 mapper_api::smudgy_mapper::init(mapper.clone()),
             ];
@@ -1257,9 +1262,29 @@ impl<'a> ScriptEngine<'a> {
         // --- Main isolate: local modules + trusted packages, allow-all, inspector-armed. ---
         // Main (and trusted packages, which live in main) get every smudgy capability — ungated
         // (`PACKAGE-ISOLATES-OP-CAPABILITIES.md`).
+        // Main's image-policy membership handle: starts empty; the main provider inserts
+        // each trusted package's identity as it resolves during `load_modules` below —
+        // before anything evaluates — so their `@/`/relative asset srcs verify.
+        let main_image_hosted = smudgy_cloud::image_source::HostedPackages::default();
+        if let Some(provider) = &smudgy_provider {
+            provider.set_image_hosted(main_image_hosted.clone());
+        }
         let (main_extensions, main_script_functions, main_instance) =
-            // Main-isolate `getDataDir()` returns the shared server data dir.
-            make_extensions(IsolateId::Main, ops::SmudgyGrants::all(), server_path.clone());
+            // Main-isolate `getDataDir()` returns the shared server data dir. Trusted: no
+            // net/read gates.
+            make_extensions(
+                IsolateId::Main,
+                ops::SmudgyGrants::all(),
+                server_path.clone(),
+                build_image_policy(
+                    true,
+                    &server_name,
+                    &server_path,
+                    main_image_hosted,
+                    &[],
+                    &[],
+                ),
+            );
         let mut main_runtime = build_script_runtime(
             main_extensions,
             server_path.clone(),
@@ -1529,8 +1554,38 @@ impl<'a> ScriptEngine<'a> {
                 // resolve AND what `getDataDir()` returns. Create it so a `$DATA` write has a parent.
                 let fs_data_dir = sandbox_fs_data_dir(&server_path, &spec.owner, &spec.name);
                 let _ = fs::create_dir_all(&fs_data_dir);
-                let (extensions, script_functions, instance) =
-                    make_extensions(isolate_id.clone(), smudgy_grants, fs_data_dir.clone());
+                // The sandbox's image policy: its own package identity is seeded eagerly (so
+                // its `@/`/relative asset reads verify) and the fork provider inserts each
+                // DEPENDENCY's identity as the closure resolves during module loading — a
+                // dep's assets verify too, with the version its resolve actually landed.
+                // The consented `net`/`read` grants ($DATA-expanded) gate http(s)/file
+                // <Image> srcs exactly as they gate `fetch`/file reads.
+                let image_hosted = smudgy_cloud::image_source::HostedPackages::default();
+                image_hosted.insert(
+                    &spec.owner,
+                    &spec.name,
+                    &version,
+                    pkg_cloud
+                        .as_ref()
+                        .is_some_and(|provider| provider.is_local_override(&spec.package_key())),
+                );
+                if let Some(provider) = &pkg_cloud {
+                    provider.set_image_hosted(image_hosted.clone());
+                }
+                let image_policy = build_image_policy(
+                    false,
+                    &params.server_name,
+                    &server_path,
+                    image_hosted,
+                    &effective.net,
+                    &expand_data_paths(&effective.read, &fs_data_dir),
+                );
+                let (extensions, script_functions, instance) = make_extensions(
+                    isolate_id.clone(),
+                    smudgy_grants,
+                    fs_data_dir.clone(),
+                    image_policy,
+                );
                 let data_dir = sandbox_data_dir(&server_path, &spec.owner, &spec.name, &version);
                 // Sandbox this isolate with a restricted container built from the enforced union
                 // (`PACKAGE-ISOLATES-ENFORCEMENT.md`); `$DATA` in `read`/`write` expands to `fs_data_dir`.
@@ -2966,6 +3021,42 @@ fn to_allow_list(entries: Vec<String>) -> Option<Vec<String>> {
 /// Expand the `$DATA` placeholder in `read`/`write`/`ffi` path entries to the package's absolute
 /// data dir before they reach `deno_permissions` (`PACKAGE-ISOLATES-ENFORCEMENT.md`).
 /// Entries whose `$DATA` grant would escape the data dir are dropped (see below).
+/// Build the per-isolate [`ImageSourcePolicy`](smudgy_cloud::image_source::ImageSourcePolicy)
+/// the leaf `smudgy_widgets` <Image> ops read from `OpState`. `net`/`read` are the isolate's
+/// consented grants (already `$DATA`-expanded for `read`); empty on the trusted main isolate,
+/// where `trusted` short-circuits both gates. `hosted` is the isolate's live membership
+/// handle (gating `@/`/relative asset reads): the isolate's package provider inserts each
+/// identity as it resolves (see `SmudgyPackageProvider::set_image_hosted`), so trusted
+/// packages in main and a sandbox's dependency closure verify without knowing versions up
+/// front. A `net` entry the parser can't represent (CIDR, malformed) is dropped fail-closed
+/// and logged.
+fn build_image_policy(
+    trusted: bool,
+    server_name: &Arc<String>,
+    server_path: &std::path::Path,
+    hosted: smudgy_cloud::image_source::HostedPackages,
+    net: &[String],
+    read: &[String],
+) -> smudgy_cloud::image_source::ImageSourcePolicy {
+    let (net_grants, dropped) = smudgy_cloud::image_source::NetGrants::parse(net);
+    if !dropped.is_empty() {
+        warn!(
+            "image policy: {} net grant(s) not usable for <Image> loads (CIDR/malformed): {}",
+            dropped.len(),
+            dropped.join(", ")
+        );
+    }
+    smudgy_cloud::image_source::ImageSourcePolicy {
+        trusted,
+        server_name: Arc::from(server_name.as_str()),
+        hosted_packages: hosted,
+        net_grants,
+        read_grants: read.iter().map(std::path::PathBuf::from).collect(),
+        modules_root: server_path.join("modules"),
+        packages_root: server_path.join("packages"),
+    }
+}
+
 fn expand_data_paths(entries: &[String], data_dir: &std::path::Path) -> Vec<String> {
     entries
         .iter()
