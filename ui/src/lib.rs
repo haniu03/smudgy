@@ -259,6 +259,21 @@ fn init() -> (Smudgy, Task<Message>) {
     // persisted auto-check value while present.
     let settings = smudgy_core::models::settings::load_settings();
     prefs::apply(&settings);
+    // Startup image-cache housekeeping (plan D10): drop namespaces of servers that no
+    // longer exist and trim the disk cache to `image_cache_max_mb` (LRU by fetch time).
+    // Fire-and-forget on a plain thread — pure disk I/O, nothing awaits it.
+    {
+        let max_mb = settings.image_cache_max_mb;
+        std::thread::spawn(move || match smudgy_core::models::server::list_servers() {
+            Ok(list) => {
+                let servers: Vec<String> = list.into_iter().map(|s| s.name).collect();
+                images::startup_image_cache_sweep(&servers, max_mb);
+            }
+            // A keep-list we can't trust must not drive a destructive sweep — an
+            // empty-on-error list would read as "no servers exist, drop every namespace".
+            Err(err) => log::warn!("skipping image-cache sweep; could not list servers: {err}"),
+        });
+    }
     let area_prefs = load_area_prefs(&settings);
     let disabled_map_areas = disabled_set_from_prefs(&area_prefs);
     // Per-server cloud-map scope associations, applied to each session's mapper

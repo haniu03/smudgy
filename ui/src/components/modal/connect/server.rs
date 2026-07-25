@@ -128,9 +128,28 @@ pub(super) async fn update_server_async(
 }
 
 pub(super) async fn delete_server_async(name: String) -> Result<String, String> {
-    smudgy_core::models::server::delete_server(&name)
-        .map(|_| name) // Return the name on success for state update
-        .map_err(|e| e.to_string())
+    smudgy_core::models::server::delete_server(&name).map_err(|e| e.to_string())?;
+    // A deleted server's image-cache namespace goes with it (plan D10). Already off the
+    // UI thread here; blocking I/O is fine.
+    crate::images::on_server_deleted(&name);
+    Ok(name) // Return the name on success for state update
+}
+
+/// `1234567` → `"1.2 MB"` — decimal units, one decimal, matching user expectations for
+/// disk usage figures.
+pub(super) fn format_bytes(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let bytes = bytes as f64;
+    // Thresholds sit at the rounding boundary so 999_960 B is "1.0 MB", never "1000.0 kB".
+    if bytes >= 999_950_000.0 {
+        format!("{:.1} GB", bytes / 1_000_000_000.0)
+    } else if bytes >= 999_950.0 {
+        format!("{:.1} MB", bytes / 1_000_000.0)
+    } else if bytes >= 999.95 {
+        format!("{:.1} kB", bytes / 1_000.0)
+    } else {
+        format!("{bytes:.0} B")
+    }
 }
 
 // --- Update Logic ---
@@ -370,6 +389,17 @@ pub(super) fn view_server_form<'a>(
                 .style(builtins::button::link)
                 .on_press(Message::RequestConfirmDeleteServer(name.clone()));
 
+            // Per-server image cache management (beside the other whole-server action).
+            let cache_usage = text(match state.image_cache_usage {
+                Some(bytes) => format!("Cached images: {}", format_bytes(bytes)),
+                None => "Cached images: …".to_string(),
+            })
+            .size(13)
+            .style(builtins::text::muted);
+            let clear_cache_button = button(text("Clear image cache"))
+                .style(builtins::button::link)
+                .on_press(Message::RequestClearImageCache(name.clone()));
+
             Column::new()
                 .push(text("Edit server").size(Pixels(22.0)))
                 .push(name_field)
@@ -381,6 +411,13 @@ pub(super) fn view_server_form<'a>(
                 .push(server_error(state))
                 .push(Row::new().push(save_button).push(cancel_button).spacing(10))
                 .push(vertical_space().height(Pixels(10.0)))
+                .push(
+                    Row::new()
+                        .push(cache_usage)
+                        .push(clear_cache_button)
+                        .spacing(10)
+                        .align_y(iced::Alignment::Center),
+                )
                 .push(delete_button)
                 .spacing(15)
                 .into()

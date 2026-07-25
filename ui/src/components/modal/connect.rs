@@ -96,6 +96,10 @@ pub enum Message {
     ServerCreated(Result<Server, String>),
     ServerUpdated(Result<Server, String>),
     ServerDeleted(Result<ServerName, String>), // Pass back name on success
+    // --- Image cache (plan D10: per-server management in the edit pane) ---
+    ImageCacheUsageLoaded(u64, ServerName, u64), // (request id, server, bytes)
+    RequestClearImageCache(ServerName),
+    ImageCacheCleared(ServerName),
     // --- Profile CRUD ---
     // UI Actions (act on selected_server)
     RequestCreateProfile,
@@ -217,6 +221,12 @@ pub struct State {
     profile_form_password_stored: bool,
     /// Whether to show the password input (`true`) vs the "saved" chip (`false`).
     profile_form_password_editing: bool,
+    /// On-disk bytes of the edited server's cached images (`None` while loading).
+    /// Refreshed when the edit form opens and after "Clear image cache".
+    image_cache_usage: Option<u64>,
+    /// Monotonic id of the most recent usage request. `Task::perform` completions are
+    /// unordered: a slow pre-clear scan must not overwrite the post-clear figure.
+    image_cache_usage_request: u64,
 }
 
 // Manual `Debug` (not derived) so the live credential buffer `profile_form_password`
@@ -284,8 +294,22 @@ impl Default for State {
             profile_form_password: String::new(),
             profile_form_password_stored: false,
             profile_form_password_editing: false,
+            image_cache_usage: None,
+            image_cache_usage_request: 0,
         }
     }
+}
+
+// --- Image cache helpers (blocking I/O, run via Task::perform) ---
+
+async fn load_image_cache_usage(server: ServerName) -> (ServerName, u64) {
+    let bytes = crate::images::server_image_cache_usage_bytes(&server);
+    (server, bytes)
+}
+
+async fn clear_image_cache_async(server: ServerName) -> ServerName {
+    crate::images::clear_server_image_cache(&server);
+    server
 }
 
 // --- Auto-login password helpers ---
@@ -428,10 +452,18 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     tls_verify: server_to_edit.config.tls_verify,
                 };
                 state.server_crud_error = None;
-                state.selected_server = Some(server_name); // Ensure server remains selected
                 state.is_loading_profiles = None; // Cancel profile load
+                // The usage figure loads off-thread (it stats cache files).
+                state.image_cache_usage = None;
+                state.image_cache_usage_request += 1;
+                let request = state.image_cache_usage_request;
+                let usage_task = Task::perform(
+                    load_image_cache_usage(server_name.clone()),
+                    move |(name, bytes)| Message::ImageCacheUsageLoaded(request, name, bytes),
+                );
+                state.selected_server = Some(server_name); // Ensure server remains selected
                 // Name isn't editable in edit mode; focus the first editable field.
-                task = operation::focus(server_host_input_id());
+                task = Task::batch([operation::focus(server_host_input_id()), usage_task]);
             } else {
                 warn!("Error: Requested to edit non-existent server '{server_name}'");
             }
@@ -445,6 +477,32 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
             state.server_crud_error = None;
             task = Task::perform(delete_server_async(server_name), Message::ServerDeleted);
             // The state.server_action remains ConfirmDelete until ServerDeleted result arrives.
+        }
+        Message::ImageCacheUsageLoaded(request, server_name, bytes) => {
+            // Stale replies are dropped: an older request's answer (slow scan racing a
+            // post-clear re-read), or one for a form the user has moved on from.
+            if request == state.image_cache_usage_request
+                && matches!(&state.server_action, Some(ServerCrudAction::Edit(name)) if *name == server_name)
+            {
+                state.image_cache_usage = Some(bytes);
+            }
+        }
+        Message::RequestClearImageCache(server_name) => {
+            state.image_cache_usage = None; // shows the pending state
+            task = Task::perform(
+                clear_image_cache_async(server_name),
+                Message::ImageCacheCleared,
+            );
+        }
+        Message::ImageCacheCleared(server_name) => {
+            // Re-read rather than assume zero — a concurrent session may already be
+            // caching again.
+            state.image_cache_usage_request += 1;
+            let request = state.image_cache_usage_request;
+            task = Task::perform(
+                load_image_cache_usage(server_name),
+                move |(name, bytes)| Message::ImageCacheUsageLoaded(request, name, bytes),
+            );
         }
         Message::UpdateServerFormField(field, value) => {
             // Only update if in Create or Edit mode

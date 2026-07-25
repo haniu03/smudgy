@@ -73,6 +73,50 @@ pub fn set_package_client(client: PackageApiClient) {
     package_client_slot().store(Some(Arc::new(client)));
 }
 
+/// The disk cache handle for management operations (`None` when no home dir resolves —
+/// the same condition under which the fetcher runs uncached).
+fn disk_cache() -> Option<http_cache::HttpImageCache> {
+    smudgy_core::get_smudgy_home()
+        .ok()
+        .map(|home| http_cache::HttpImageCache::new(home.join("cache").join("images")))
+}
+
+/// Approximate on-disk bytes of `server`'s cached images (plan D10's usage display).
+/// Blocking I/O — call from a `Task::perform` executor.
+#[must_use]
+pub fn server_image_cache_usage_bytes(server: &str) -> u64 {
+    disk_cache().map_or(0, |cache| cache.server_usage_bytes(server))
+}
+
+/// "Clear image cache" for one server: drop its metadata namespace, sweep unreferenced
+/// blobs, then flush the in-memory store (global — entries are content-keyed and shared
+/// across servers, so the flush is deliberately heavy-handed: plan D10). Blocking I/O.
+pub fn clear_server_image_cache(server: &str) {
+    // Memory first: `clear()` aborts in-flight fetches, so none of them can land a
+    // `write_entry` that re-persists into the namespace we are about to drop.
+    image_store().clear();
+    if let Some(cache) = disk_cache() {
+        cache.clear_server(server);
+    }
+}
+
+/// The delete-server hook: the server's cache namespace goes with it (memory entries
+/// stay — they're content-keyed and possibly shared; the LRU handles them). Blocking I/O.
+pub fn on_server_deleted(server: &str) {
+    if let Some(cache) = disk_cache() {
+        cache.clear_server(server);
+    }
+}
+
+/// Startup housekeeping: drop namespaces of servers that no longer exist, trim to the
+/// `image_cache_max_mb` budget (LRU by fetch time), sweep unreferenced blobs. Blocking
+/// I/O — run on a background thread at app start.
+pub fn startup_image_cache_sweep(keep_servers: &[String], max_mb: u64) {
+    if let Some(cache) = disk_cache() {
+        cache.startup_sweep(keep_servers, max_mb.saturating_mul(1024 * 1024));
+    }
+}
+
 struct UiImageFetcher {
     client: reqwest::Client,
     cache: Option<http_cache::HttpImageCache>,

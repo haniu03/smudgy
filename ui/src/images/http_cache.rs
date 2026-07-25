@@ -62,7 +62,11 @@ impl HttpImageCache {
     }
 
     fn blob_path(&self, content_hash: &str) -> PathBuf {
-        let (a, b) = (&content_hash[0..2], &content_hash[2..4]);
+        // `.get` + fallback: the fetch path always passes a 64-hex digest, but the admin
+        // sweeps parse arbitrary on-disk meta JSON — a corrupt/truncated hash must not
+        // panic the housekeeping thread (it would never run again).
+        let a = content_hash.get(0..2).unwrap_or("00");
+        let b = content_hash.get(2..4).unwrap_or("00");
         self.root.join("blobs").join(a).join(b).join(content_hash)
     }
 
@@ -193,6 +197,173 @@ impl HttpImageCache {
                 Err(err)
             }
         }
+    }
+}
+
+// ---- cache administration (plan D10) --------------------------------------------------
+//
+// Everything below is management, not the fetch path: usage display, per-server clears,
+// the delete-server namespace drop, and the startup orphan/LRU sweeps. All of it is
+// syscall-heavy by nature and runs on `Task::perform` executors or a startup thread —
+// never a frame thread.
+
+impl HttpImageCache {
+    fn meta_dir(&self, server: &str) -> PathBuf {
+        self.root.join("meta").join(sanitize_segment(server))
+    }
+
+    /// Approximate bytes this server's cached images occupy on disk: the sizes of the
+    /// blobs its metadata references. A blob shared with another server counts here too
+    /// (approximate by design — plan D10).
+    #[must_use]
+    pub fn server_usage_bytes(&self, server: &str) -> u64 {
+        self.server_metas(server)
+            .map(|metas| {
+                let hashes: std::collections::HashSet<String> =
+                    metas.into_iter().map(|m| m.content_hash).collect();
+                hashes
+                    .iter()
+                    .filter_map(|hash| std::fs::metadata(self.blob_path(hash)).ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Drop one server's metadata namespace, then sweep blobs nothing references. Used by
+    /// both "Clear image cache" (which additionally flushes the in-memory store — the
+    /// caller's job, it owns the store handle) and the delete-server hook.
+    pub fn clear_server(&self, server: &str) {
+        let _ = std::fs::remove_dir_all(self.meta_dir(server));
+        self.sweep_unreferenced_blobs();
+    }
+
+    /// Remove metadata namespaces whose server no longer exists, then trim the whole
+    /// cache to `max_bytes` by dropping the oldest-fetched metas (LRU by `fetched_at`,
+    /// across all namespaces) and finally sweeping unreferenced blobs. The startup sweep.
+    pub fn startup_sweep(&self, keep_servers: &[String], max_bytes: u64) {
+        let keep: std::collections::HashSet<String> =
+            keep_servers.iter().map(|s| sanitize_segment(s)).collect();
+        if let Ok(entries) = std::fs::read_dir(self.root.join("meta")) {
+            for entry in entries.filter_map(Result::ok) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !keep.contains(&name) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        self.trim_to(max_bytes);
+        self.sweep_unreferenced_blobs();
+    }
+
+    /// Delete oldest-fetched metas until referenced-blob bytes fit `max_bytes`.
+    fn trim_to(&self, max_bytes: u64) {
+        // (fetched_at, meta path, content_hash) across every namespace.
+        let mut metas: Vec<(u64, PathBuf, String)> = Vec::new();
+        if let Ok(namespaces) = std::fs::read_dir(self.root.join("meta")) {
+            for namespace in namespaces.filter_map(Result::ok) {
+                if let Ok(entries) = std::fs::read_dir(namespace.path()) {
+                    for entry in entries.filter_map(Result::ok) {
+                        if let Some(meta) = std::fs::read(entry.path())
+                            .ok()
+                            .and_then(|raw| serde_json::from_slice::<Meta>(&raw).ok())
+                        {
+                            metas.push((meta.fetched_at, entry.path(), meta.content_hash));
+                        }
+                    }
+                }
+            }
+        }
+        // Oldest first. A blob's bytes come off the total only when its LAST referencing
+        // meta goes (shared blobs stay until every referrer is trimmed).
+        metas.sort_by_key(|(fetched_at, _, _)| *fetched_at);
+        let mut blob_sizes: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for (_, _, hash) in &metas {
+            if !blob_sizes.contains_key(hash.as_str()) {
+                let size = std::fs::metadata(self.blob_path(hash)).map_or(0, |m| m.len());
+                blob_sizes.insert(hash, size);
+            }
+        }
+        let mut total: u64 = blob_sizes.values().sum();
+        if total <= max_bytes {
+            return;
+        }
+        let mut refs: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (_, _, hash) in &metas {
+            *refs.entry(hash).or_insert(0) += 1;
+        }
+        for (_, path, hash) in &metas {
+            if total <= max_bytes {
+                break;
+            }
+            let _ = std::fs::remove_file(path);
+            let remaining = refs.entry(hash).or_insert(1);
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
+                total = total.saturating_sub(blob_sizes.get(hash.as_str()).copied().unwrap_or(0));
+            }
+        }
+    }
+
+    /// Remove blobs no meta (in any namespace) references. Temp files from dead writers
+    /// (`.tmp-*`) older than a day are litter and go too.
+    fn sweep_unreferenced_blobs(&self) {
+        let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(namespaces) = std::fs::read_dir(self.root.join("meta")) {
+            for namespace in namespaces.filter_map(Result::ok) {
+                if let Ok(entries) = std::fs::read_dir(namespace.path()) {
+                    for entry in entries.filter_map(Result::ok) {
+                        if let Some(meta) = std::fs::read(entry.path())
+                            .ok()
+                            .and_then(|raw| serde_json::from_slice::<Meta>(&raw).ok())
+                        {
+                            referenced.insert(meta.content_hash);
+                        }
+                    }
+                }
+            }
+        }
+        let blobs_root = self.root.join("blobs");
+        let Ok(level_a) = std::fs::read_dir(&blobs_root) else {
+            return;
+        };
+        for a in level_a.filter_map(Result::ok) {
+            let Ok(level_b) = std::fs::read_dir(a.path()) else {
+                continue;
+            };
+            for b in level_b.filter_map(Result::ok) {
+                let Ok(files) = std::fs::read_dir(b.path()) else {
+                    continue;
+                };
+                for file in files.filter_map(Result::ok) {
+                    let name = file.file_name().to_string_lossy().to_string();
+                    let stale_tmp = name.contains(".tmp-")
+                        && file
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .is_ok_and(|t| {
+                                t.elapsed().unwrap_or_default() > Duration::from_secs(24 * 3600)
+                            });
+                    if stale_tmp || (!name.contains(".tmp-") && !referenced.contains(&name)) {
+                        let _ = std::fs::remove_file(file.path());
+                    }
+                }
+            }
+        }
+    }
+
+    fn server_metas(&self, server: &str) -> Option<Vec<Meta>> {
+        let entries = std::fs::read_dir(self.meta_dir(server)).ok()?;
+        Some(
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    std::fs::read(entry.path())
+                        .ok()
+                        .and_then(|raw| serde_json::from_slice::<Meta>(&raw).ok())
+                })
+                .collect(),
+        )
     }
 }
 
@@ -581,6 +752,50 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains("tmp-"))
             .collect();
         assert!(leftovers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admin_usage_clear_and_sweep_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "smudgy-imgcache-admin-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let cache = HttpImageCache::new(dir.clone());
+        let meta_for = |body: &[u8], age: u64| Meta {
+            url: String::new(),
+            content_hash: hex(&Sha256::digest(body)),
+            fetched_at: now_secs() - age,
+            fresh_for: Some(3600),
+            etag: None,
+            last_modified: None,
+        };
+        let shared = vec![1u8; 1000];
+        let only_a = vec![2u8; 300];
+        let url = |s: &str| Url::parse(s).unwrap();
+        cache.write_entry("srvA", &url("https://x/shared.png"), &meta_for(&shared, 100), &shared);
+        cache.write_entry("srvB", &url("https://x/shared.png"), &meta_for(&shared, 50), &shared);
+        cache.write_entry("srvA", &url("https://x/a.png"), &meta_for(&only_a, 10), &only_a);
+
+        assert_eq!(cache.server_usage_bytes("srvA"), 1300);
+        assert_eq!(cache.server_usage_bytes("srvB"), 1000, "shared blob counts per server");
+
+        // Clearing A drops its metas and the now-unreferenced blob; the shared blob
+        // survives because B still references it.
+        cache.clear_server("srvA");
+        assert_eq!(cache.server_usage_bytes("srvA"), 0);
+        assert_eq!(cache.server_usage_bytes("srvB"), 1000);
+
+        // Orphan sweep: a dead server's namespace goes.
+        cache.write_entry("dead", &url("https://x/d.png"), &meta_for(&only_a, 5), &only_a);
+        cache.startup_sweep(&["srvB".to_string()], u64::MAX);
+        assert_eq!(cache.server_usage_bytes("dead"), 0);
+        assert_eq!(cache.server_usage_bytes("srvB"), 1000);
+
+        // LRU trim to zero empties everything.
+        cache.startup_sweep(&["srvB".to_string()], 0);
+        assert_eq!(cache.server_usage_bytes("srvB"), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

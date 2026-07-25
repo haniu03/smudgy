@@ -68,6 +68,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   display (never at load time) and cache forever; a package you're
   authoring locally reads them straight from its folder, and edits
   show up in about a second.
+- **Canvas scenes can draw images.** A new `{ kind: "image", src, x, y,
+  width, height }` shape record puts rasters in script-drawn canvases —
+  map backgrounds, item icons, portraits — with `fit`, `filter`
+  (`"nearest"` for pixel art), `rotate`, and animatable position/size/
+  rotation/opacity. Sources use the `<Image>` grammar and permissions.
+  Two renderer facts to know: images always paint above lines/fills and
+  below text regardless of scene order, and a scene fed through a
+  binding can't name local files (same rule as bound `<Image>` srcs).
+- **Per-server image cache management.** Each server's edit form now
+  shows how much disk its cached images use, with a one-click clear;
+  deleting a server removes its cache with it. A new
+  `image_cache_max_mb` setting (default 256) bounds the whole image
+  cache — the oldest-fetched entries are trimmed at startup.
 
 ### Changed
 
