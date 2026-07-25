@@ -1,0 +1,83 @@
+# Flatpak manifest for smudgy (Linux). Self-distributed single-file bundle — see
+# packaging/linux/README.md and bin/release-linux.sh for the build/bundle flow.
+#
+# Strategy: NETWORK-ENABLED build. The build module is granted --share=network so
+# cargo fetches crates and the `v8` crate downloads its prebuilt librusty_v8
+# archive normally. This is the simplest correct path for a private, non-Flathub
+# bundle; it is not bit-reproducible. To go fully offline/Flathub later, vendor
+# the cargo sources + librusty_v8 and drop the build-time network share (notes in
+# README.md).
+app-id: org.smudgy.Smudgy
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  # libclang for bindgen — deno_runtime pulls rusqlite/libsqlite3-sys, whose
+  # buildtime_bindgen step needs it, and the base SDK ships no clang.
+  - org.freedesktop.Sdk.Extension.llvm20
+command: smudgy
+
+finish-args:
+  # MUD TCP sockets + cloud/package HTTPS + jsr:/npm: script imports.
+  - --share=network
+  # X11 SHM (rendering perf); harmless under Wayland.
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  # GPU for iced's wgpu backend (Vulkan/GL). `dri`, not `all`.
+  - --device=dri
+  # User data (profiles, maps, scripts, logs) in the host's ~/Documents/smudgy,
+  # matching the Windows/macOS builds. Scoped to our own subdir — NOT the whole
+  # Documents tree — and created on first run. The wrapper passes --data-dir here.
+  - --filesystem=xdg-documents/smudgy:create
+  # Cloud session token + profile passwords via the OS keyring (Secret Service).
+  # secret-service is a D-Bus service, not a portal, so it needs an explicit grant.
+  - --talk-name=org.freedesktop.secrets
+  # URLs and the data folder open through the OpenURI/OpenDirectory portals, which
+  # need no extra grant. No --allow=devel: V8/deno_core JIT runs under the default
+  # seccomp filter. The wry/WebKitGTK smudgy_inspector sidecar is intentionally not
+  # shipped in this build (its launch degrades gracefully).
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
+  env:
+    # Keep cargo's home inside the writable build tree.
+    CARGO_HOME: /run/build/smudgy/cargo
+    # Where bindgen (via libsqlite3-sys) finds libclang.
+    LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
+
+modules:
+  - name: smudgy
+    buildsystem: simple
+    build-options:
+      # Only the build phase gets network; the finished app's sandbox is unaffected.
+      build-args:
+        - --share=network
+    build-commands:
+      # LTO release build of just the app binary, default features (regex backend;
+      # the optional hyperscan C++ backend stays off). `release-full` is the same
+      # LTO'd profile the Windows/macOS releases use (root Cargo.toml); it outputs
+      # to target/release-full/ and is slower to build than plain --release.
+      - cargo build --profile release-full -p smudgy_ui --bin smudgy
+      # Real binary under .bin; the wrapper takes the `smudgy` (command:) slot.
+      - install -Dm755 target/release-full/smudgy /app/bin/smudgy.bin
+      - install -Dm755 packaging/linux/smudgy-wrapper.sh /app/bin/smudgy
+      # Desktop entry, AppStream metainfo, icons — all basenamed by the app-id.
+      - install -Dm644 packaging/linux/org.smudgy.Smudgy.desktop
+        /app/share/applications/org.smudgy.Smudgy.desktop
+      - install -Dm644 packaging/linux/org.smudgy.Smudgy.metainfo.xml
+        /app/share/metainfo/org.smudgy.Smudgy.metainfo.xml
+      - install -Dm644 packaging/linux/org.smudgy.Smudgy.png
+        /app/share/icons/hicolor/256x256/apps/org.smudgy.Smudgy.png
+      - install -Dm644 packaging/linux/org.smudgy.Smudgy-512.png
+        /app/share/icons/hicolor/512x512/apps/org.smudgy.Smudgy.png
+    sources:
+      - type: dir
+        path: ../..
+        # Don't copy the multi-GB host build tree or VCS metadata into the sandbox.
+        skip:
+          - target
+          - .git
+          - .flatpak-builder
+          - dist

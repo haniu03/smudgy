@@ -1,0 +1,113 @@
+# Builds, signs, and packages a smudgy release.
+#
+# Prerequisites (one-time):
+#   - az login                      (DefaultAzureCredential; service principal env vars also work in CI)
+#   - Inno Setup 6
+#   - Windows SDK signtool (the Microsoft.Trusted.Signing.Client package is fetched automatically)
+#
+# Signing uses Azure Artifact Signing; the cert is short-lived, so every
+# signature is RFC 3161 timestamped against timestamp.acs.microsoft.com.
+
+param(
+    # Azure Artifact Signing endpoint for the account's region (West US 2).
+    [string]$Endpoint = 'https://wus2.codesigning.azure.net',
+    # Artifact Signing account name (Azure resource name).
+    [string]$Account = 'wbk',
+    # Certificate profile name within the account.
+    [string]$CertProfile = 'wkalata',
+    [switch]$SkipBuild
+)
+
+$ErrorActionPreference = 'Stop'
+$repoRoot = Split-Path -Parent $PSScriptRoot
+
+$signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue |
+    Where-Object FullName -Match '\\x64\\' | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName
+if (-not $signtool) { throw "signtool.exe not found; install the Windows 10/11 SDK" }
+
+# Fetch the Artifact Signing dlib (signtool plugin) from NuGet on first run.
+$toolsDir = Join-Path $repoRoot 'target\signing-tools'
+$dlib = Join-Path $toolsDir 'bin\x64\Azure.CodeSigning.Dlib.dll'
+if (-not (Test-Path $dlib)) {
+    Write-Host "==> Downloading Microsoft.Trusted.Signing.Client" -ForegroundColor Cyan
+    New-Item -ItemType Directory -Force $toolsDir | Out-Null
+    $nupkg = Join-Path $toolsDir 'client.zip'
+    Invoke-WebRequest 'https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client' -OutFile $nupkg
+    Expand-Archive $nupkg -DestinationPath $toolsDir -Force
+    Remove-Item $nupkg
+    if (-not (Test-Path $dlib)) { throw "package layout unexpected; $dlib missing" }
+}
+
+$metadata = Join-Path $toolsDir 'metadata.json'
+@{ Endpoint = $Endpoint; CodeSigningAccountName = $Account; CertificateProfileName = $CertProfile } |
+    ConvertTo-Json | Set-Content $metadata -Encoding ascii
+
+$signArgs = @('sign', '/v', '/fd', 'SHA256', '/tr', 'http://timestamp.acs.microsoft.com', '/td', 'SHA256',
+              '/dlib', $dlib, '/dmdf', $metadata)
+
+$iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+if (-not (Test-Path $iscc)) { throw "ISCC.exe (Inno Setup 6) not found" }
+
+if (-not $SkipBuild) {
+    Write-Host "==> cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md" -ForegroundColor Cyan
+    cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md
+    Write-Host "==> cargo build --profile release-full" -ForegroundColor Cyan
+    # smudgy_inspector (the bundled DevTools sidecar) is not in the workspace
+    # default-members, so name it explicitly alongside the app.
+    cargo build --profile release-full -p smudgy_ui -p smudgy_inspector
+    if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+}
+
+# The app and its bundled DevTools sidecar -- both signed and packaged.
+$exe = Join-Path $repoRoot 'target\release-full\smudgy.exe'
+$inspector = Join-Path $repoRoot 'target\release-full\smudgy_inspector.exe'
+foreach ($f in @($exe, $inspector)) {
+    if (-not (Test-Path $f)) { throw "$f not found" }
+}
+
+foreach ($f in @($exe, $inspector)) {
+    Write-Host "==> Signing $f" -ForegroundColor Cyan
+    & $signtool @signArgs $f
+    if ($LASTEXITCODE -ne 0) { throw "signing $(Split-Path -Leaf $f) failed (is 'az login' current?)" }
+}
+
+# Inno Setup invokes "smudgysign <file>" (SignTool=smudgysign $f in installer.iss)
+# to sign the uninstaller and the setup exe.
+Write-Host "==> Compiling installer" -ForegroundColor Cyan
+$iss = Join-Path $repoRoot 'assets\installer.iss'
+
+# Pick the build channel from the version stamped in installer.iss and tell the
+# installer, which uses it to choose the install identity (AppId/dir/name/data
+# dir). Mirrors core::models::settings::build_channel and bin/bump-version.sh:
+# a clean X.Y.Z is a release; a prerelease whose first identifier is `rc` (the
+# next char a digit / '-' / '.' / '+' / end) is a release candidate — both keep
+# the release install identity and so upgrade/clobber each other; any other
+# '-'/'+' suffix is a dev build, which gets its own identity (the SmudgyDevBuild
+# define) and installs side by side.
+$version = ([regex]'(?m)^#define\s+MyAppVersion\s+"([^"]+)"').Match((Get-Content -Raw $iss)).Groups[1].Value
+if (-not $version) { throw "could not read MyAppVersion from $iss" }
+$channel = 'release'
+if ($version -match '-') {
+    $prerelease = ($version -split '-', 2)[1]
+    if ($prerelease -match '^[Rr][Cc]($|[-.+0-9])') { $channel = 'release candidate' }
+}
+if ($channel -eq 'release' -and $version -match '[-+]') { $channel = 'dev' }
+Write-Host "    $version -> $channel build" -ForegroundColor Cyan
+
+# $q is Inno's escape for a double-quote; $f is the file being signed.
+$signDef = '/Ssmudgysign=$q{0}$q sign /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib $q{1}$q /dmdf $q{2}$q $f' -f $signtool, $dlib, $metadata
+$isccArgs = @($signDef)
+if ($channel -eq 'dev') { $isccArgs += '/DSmudgyDevBuild' }
+& $iscc @isccArgs $iss
+if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+$setup = Join-Path $repoRoot 'assets\Output\smudgy-setup.exe'
+Write-Host "==> Verifying signatures" -ForegroundColor Cyan
+foreach ($f in @($exe, $inspector, $setup)) {
+    $sig = Get-AuthenticodeSignature $f
+    "{0}: {1} ({2})" -f (Split-Path -Leaf $f), $sig.Status, $sig.SignerCertificate.Subject
+    if ($sig.Status -ne 'Valid') { throw "signature on $f is $($sig.Status)" }
+}
+
+Write-Host "==> Done: $setup" -ForegroundColor Green

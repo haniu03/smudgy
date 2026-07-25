@@ -1,0 +1,334 @@
+name: Release
+
+# Builds, signs, and publishes every desktop release artifact when a release TAG
+# is pushed: Linux Flatpaks (x86_64 + aarch64, GPG-signed), a Windows installer
+# (Azure Trusted Signing), and a notarized universal macOS DMG. Artifacts are
+# uploaded to the workflow run, published to the DokuWiki download namespace,
+# and attached to a GitHub Release.
+#
+# The artifact version comes from ui/Cargo.toml; the tag is only the trigger and
+# must match it (the verify-version job enforces this), so:
+#     bin/bump-version.sh <x.y.z>   # bumps the crates + installer + changelog
+#     git commit -am "chore: bump version to x.y.z" && git push
+#     git tag v<x.y.z> && git push origin v<x.y.z>    # <-- this fires the build
+#
+# Required secrets — Windows signing (Azure Artifact Signing, OIDC — no stored
+# client secret; the Entra app has a federated credential whose subject is this
+# repo's "release" environment, and the "Artifact Signing Certificate Profile
+# Signer" role scoped to the wkalata certificate profile):
+#     AZURE_TENANT_ID  AZURE_CLIENT_ID  AZURE_SUBSCRIPTION_ID
+# Required secrets — macOS signing + notarization:
+#     SMUDGY_MAC_CERT_P12       base64 of the "Developer ID Application" .p12
+#     SMUDGY_MAC_CERT_PASSWORD  the .p12 password
+#     SMUDGY_NOTARY_KEY         App Store Connect API key (.p8 file content)
+#     SMUDGY_NOTARY_KEY_ID      the key's ID
+#     SMUDGY_NOTARY_ISSUER      the key's issuer UUID
+# Required secrets — Linux signing (GPG), as before:
+#     SMUDGY_GPG_PRIVATE_KEY   (optional SMUDGY_GPG_KEYID, SMUDGY_GPG_PASSPHRASE)
+# Publishing (SSH; all platforms skip the wiki step if unset):
+#     SMUDGY_WIKI_SSH  SMUDGY_WIKI_MEDIA_DIR  SMUDGY_WIKI_SSH_KEY
+#     (optional SMUDGY_WIKI_SSH_PORT, SMUDGY_WIKI_URL)
+
+on:
+  push:
+    tags:
+      - 'v*'        # e.g. v0.5.0
+
+# Wiki media namespace the artifacts are uploaded into:
+#   <WIKI_NAMESPACE>:smudgy-v<version>-<...>  (+ .asc + the signing key on Linux)
+env:
+  WIKI_NAMESPACE: download
+
+permissions:
+  contents: read
+
+jobs:
+  verify-version:
+    name: verify tag matches crate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' ui/Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match ui/Cargo.toml version v$version — run bin/bump-version.sh and re-tag"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  flatpak:
+    name: flatpak ${{ matrix.arch }}
+    needs: verify-version
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both arches build on self-hosted Ubuntu 24.04 runners
+        # (infra/github-runner). Each arch has a `-spot` and an `-od` (on-demand)
+        # pool; `runs-on` below escalates spot → spot → on-demand by attempt.
+        # arm64 is 64 GB Graviton (the fat-LTO link OOMs GitHub's 16 GB arm
+        # runner); x64 is 32 GB.
+        include:
+          - arch: x86_64
+            spot: '["self-hosted","linux","X64","smudgy-x64-spot"]'
+            od: '["self-hosted","linux","X64","smudgy-x64-od"]'
+          - arch: aarch64
+            spot: '["self-hosted","linux","ARM64","smudgy-arm-spot"]'
+            od: '["self-hosted","linux","ARM64","smudgy-arm-od"]'
+    # Capacity escalation by attempt: attempts 1 & 2 run on spot, attempt 3 on
+    # on-demand. The rerun-release-on-failure workflow reruns failed attempts up
+    # to 3, so a spot reclaim self-heals as: spot → retry spot → on-demand.
+    runs-on: ${{ fromJSON((fromJSON(github.run_attempt) < 3) && matrix.spot || matrix.od) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install flatpak
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak dbus
+          # Ubuntu 24.04 restricts unprivileged user namespaces (AppArmor), which
+          # breaks flatpak's bwrap sandbox. Relax it for the build; no-op on
+          # kernels/images without the knob.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          flatpak remote-add --user --if-not-exists \
+            flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Import GPG signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.SMUDGY_GPG_PRIVATE_KEY }}
+          GPG_KEYID: ${{ secrets.SMUDGY_GPG_KEYID }}
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "No SMUDGY_GPG_PRIVATE_KEY secret — bundles will be UNSIGNED."
+            exit 0
+          fi
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          install -d -m 700 "$GNUPGHOME"
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          keyid="${GPG_KEYID:-$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')}"
+          # Export for the build + publish steps that follow.
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "SMUDGY_GPG_KEYID=$keyid" >> "$GITHUB_ENV"
+          echo "Imported signing key $keyid"
+
+      - name: Build the Flatpak bundle
+        # Installs org.flatpak.Builder + the 25.08 runtimes on first use, compiles
+        # natively (the aarch64 job runs on a native ARM runner), signs, and writes
+        # dist/smudgy-v<version>-<arch>.flatpak (+ .asc + smudgy-signing-key.asc)
+        # when SMUDGY_GPG_KEYID/GNUPGHOME are set (from the import step above).
+        env:
+          SMUDGY_GPG_PASSPHRASE: ${{ secrets.SMUDGY_GPG_PASSPHRASE }}
+        # dbus-run-session gives flatpak a session bus (headless runners have none,
+        # so flatpak otherwise fails with "Cannot autolaunch D-Bus").
+        run: dbus-run-session -- bin/release-linux.sh --arch ${{ matrix.arch }}
+
+      - name: Publish to DokuWiki (scp)
+        env:
+          SMUDGY_WIKI_SSH: ${{ secrets.SMUDGY_WIKI_SSH }}
+          SMUDGY_WIKI_MEDIA_DIR: ${{ secrets.SMUDGY_WIKI_MEDIA_DIR }}
+          SMUDGY_WIKI_SSH_PORT: ${{ secrets.SMUDGY_WIKI_SSH_PORT }}
+          SMUDGY_WIKI_URL: ${{ secrets.SMUDGY_WIKI_URL }}
+          SSH_KEY: ${{ secrets.SMUDGY_WIKI_SSH_KEY }}
+        run: |
+          if [ -z "$SMUDGY_WIKI_SSH" ]; then echo "SMUDGY_WIKI_SSH not set — skipping wiki publish."; exit 0; fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/wiki_deploy
+          chmod 600 ~/.ssh/wiki_deploy
+          export SMUDGY_WIKI_SSH_KEYFILE="$HOME/.ssh/wiki_deploy"
+          # Upload the bundle, its detached signature, and the public key.
+          for f in \
+              dist/smudgy-*-${{ matrix.arch }}.flatpak \
+              dist/smudgy-*-${{ matrix.arch }}.flatpak.asc \
+              dist/smudgy-signing-key.asc; do
+            [ -f "$f" ] || continue
+            bin/dokuwiki-upload.sh "$f" "$WIKI_NAMESPACE:$(basename "$f")"
+          done
+
+      - name: Attach bundle to the workflow run
+        # Capture the built+signed bundle even if the publish step failed, so it's
+        # always retrievable from the run.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: smudgy-${{ matrix.arch }}-flatpak
+          path: |
+            dist/*.flatpak
+            dist/*.asc
+          if-no-files-found: warn
+
+  windows:
+    name: windows installer
+    needs: verify-version
+    runs-on: windows-latest
+    # The Entra federated credential matches the OIDC subject exactly (no
+    # wildcards), so the job runs in the "release" environment to get a
+    # ref-independent subject: repo:smudgy-mud/smudgy:environment:release
+    environment: release
+    permissions:
+      contents: read
+      id-token: write   # OIDC federation for azure/login
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cargo-about
+        run: cargo install --locked cargo-about
+
+      # Signing uses Azure Trusted Signing through DefaultAzureCredential;
+      # azure/login's OIDC session satisfies it via the Azure CLI credential.
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build, sign, and package (release.ps1)
+        shell: pwsh
+        run: ./bin/release.ps1
+
+      - name: Collect versioned artifact
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          mkdir -p dist
+          mv assets/Output/smudgy-setup.exe "dist/smudgy-v$VERSION-setup.exe"
+          ls -la dist/
+
+      - name: Publish to DokuWiki (scp)
+        shell: bash
+        env:
+          SMUDGY_WIKI_SSH: ${{ secrets.SMUDGY_WIKI_SSH }}
+          SMUDGY_WIKI_MEDIA_DIR: ${{ secrets.SMUDGY_WIKI_MEDIA_DIR }}
+          SMUDGY_WIKI_SSH_PORT: ${{ secrets.SMUDGY_WIKI_SSH_PORT }}
+          SMUDGY_WIKI_URL: ${{ secrets.SMUDGY_WIKI_URL }}
+          SSH_KEY: ${{ secrets.SMUDGY_WIKI_SSH_KEY }}
+        run: |
+          if [ -z "$SMUDGY_WIKI_SSH" ]; then echo "SMUDGY_WIKI_SSH not set — skipping wiki publish."; exit 0; fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/wiki_deploy
+          chmod 600 ~/.ssh/wiki_deploy
+          export SMUDGY_WIKI_SSH_KEYFILE="$HOME/.ssh/wiki_deploy"
+          for f in dist/*; do
+            bin/dokuwiki-upload.sh "$f" "$WIKI_NAMESPACE:$(basename "$f")"
+          done
+
+      - name: Attach installer to the workflow run
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: smudgy-windows-setup
+          path: dist/*.exe
+          if-no-files-found: warn
+
+  macos:
+    name: macos dmg
+    needs: verify-version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install packaging tools
+        run: |
+          brew install create-dmg
+          cargo install --locked cargo-about
+          # Pin 0.7.0: release-mac.sh works around its exact CLI quirks
+          # (no package selector; -p is --profile).
+          cargo install cargo-bundle --version 0.7.0
+
+      - name: Import signing certificate into a throwaway keychain
+        env:
+          CERT_P12: ${{ secrets.SMUDGY_MAC_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.SMUDGY_MAC_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KC_PASS=$(openssl rand -hex 16)
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Let codesign use the key non-interactively.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASS" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Write notarization API key
+        env:
+          NOTARY_KEY: ${{ secrets.SMUDGY_NOTARY_KEY }}
+        run: |
+          printf '%s' "$NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
+          echo "SMUDGY_NOTARY_KEY_FILE=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+
+      - name: Build, sign, notarize, and package (release-mac.sh)
+        env:
+          SMUDGY_NOTARY_KEY_ID: ${{ secrets.SMUDGY_NOTARY_KEY_ID }}
+          SMUDGY_NOTARY_ISSUER: ${{ secrets.SMUDGY_NOTARY_ISSUER }}
+        run: bin/release-mac.sh
+
+      - name: Collect versioned artifact
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          mkdir -p dist
+          mv target/release-mac/Smudgy.dmg "dist/smudgy-v$VERSION-universal.dmg"
+          ls -la dist/
+
+      - name: Publish to DokuWiki (scp)
+        env:
+          SMUDGY_WIKI_SSH: ${{ secrets.SMUDGY_WIKI_SSH }}
+          SMUDGY_WIKI_MEDIA_DIR: ${{ secrets.SMUDGY_WIKI_MEDIA_DIR }}
+          SMUDGY_WIKI_SSH_PORT: ${{ secrets.SMUDGY_WIKI_SSH_PORT }}
+          SMUDGY_WIKI_URL: ${{ secrets.SMUDGY_WIKI_URL }}
+          SSH_KEY: ${{ secrets.SMUDGY_WIKI_SSH_KEY }}
+        run: |
+          if [ -z "$SMUDGY_WIKI_SSH" ]; then echo "SMUDGY_WIKI_SSH not set — skipping wiki publish."; exit 0; fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/wiki_deploy
+          chmod 600 ~/.ssh/wiki_deploy
+          export SMUDGY_WIKI_SSH_KEYFILE="$HOME/.ssh/wiki_deploy"
+          for f in dist/*; do
+            bin/dokuwiki-upload.sh "$f" "$WIKI_NAMESPACE:$(basename "$f")"
+          done
+
+      - name: Attach DMG to the workflow run
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: smudgy-macos-dmg
+          path: dist/*.dmg
+          if-no-files-found: warn
+
+      - name: Remove throwaway keychain and notary key
+        if: ${{ always() }}
+        run: |
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+  github-release:
+    name: attach artifacts to a GitHub Release
+    needs: [verify-version, flatpak, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist/
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag --generate-notes --title "smudgy $GITHUB_REF_NAME"
+          fi
