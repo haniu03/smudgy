@@ -18,6 +18,10 @@ thiserror = "2.0.12"
 iced = { workspace = true }
 ordered-float = { workspace = true }
 reqwest = { version = "0.12.8", features = ["json"] }
+# Image-src URL parsing + grant-host IDNA normalization (`image_source`). Same version
+# reqwest already pins; a direct dep so the security-sensitive matching never depends on
+# a re-export's semver drift.
+url = "2"
 tokio = { workspace = true, features = ["rt"] }
 arc-swap = { workspace = true }
 color-art = { workspace = true }

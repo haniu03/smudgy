@@ -6,6 +6,7 @@ pub mod connection;
 pub mod connection_geometry;
 pub mod connection_lifecycle;
 pub mod error;
+pub mod image_source;
 pub mod mapper;
 pub mod mutation;
 pub mod package_api;

@@ -247,6 +247,56 @@ declare module "smudgy:widgets" {
         children?: WidgetChildren;
     }
 
+    /** Props for a raster image (PNG/JPEG/GIF first frame/WebP; a leaf -- children are
+     *  ignored), loaded asynchronously by the host. While loading (or after a failure)
+     *  the widget renders an empty box honoring the explicit `width`/`height`, so set
+     *  both for stable layout; under the default `"shrink"` sizing the widget is 0x0
+     *  until the image arrives, then jumps to its intrinsic size.
+     *
+     *  `src` grammar:
+     *  - `"icons/hp.png"` / `"./hp.png"` -- relative to the module that created the
+     *    widget (matching `import "./x"`). `".."` is allowed only in user modules;
+     *    packages are descend-only and can never leave their package root.
+     *  - `"@/assets/logo.png"` -- root-relative: the package root inside a package, or
+     *    the server's `modules/` directory in user scripts and inline aliases/triggers.
+     *  - `"https://..."` / `"http://..."` -- remote, cached per the server's HTTP cache
+     *    headers. Sandboxed packages need the host covered by their consented `net`
+     *    permission.
+     *  - `"data:image/png;base64,..."` -- inline bytes, capped at 2 MiB. Each distinct
+     *    URI is validated and content-hashed once; a rebuilt widget pays only a small
+     *    bounded re-key per build, but hoisting large data: URIs out of per-frame
+     *    rebuilds (and out of bindings) is still kinder to memory.
+     *  - An absolute path -- user scripts and trusted packages only (sandboxed packages
+     *    need a covering `read` grant).
+     *
+     *  A `src` fed from a store binding is restricted to descend-only relative/`@/`
+     *  forms, `data:`, and `http(s)` -- never file paths and never `..` -- because the
+     *  binding's producer (e.g. the game, via GMCP) is not the widget's author.
+     *  Failed or denied sources render the empty placeholder and log one warning; SVG
+     *  sources are not supported yet. */
+    export interface ImageProps {
+        /** The image source (see the grammar above). Bindable: a store binding swaps
+         *  the displayed image as the bound value changes. */
+        src: Bindable<string>;
+        /** Width (pixels, `"fill"`, or `"shrink"`). Default "shrink" -- see the layout
+         *  note above. */
+        width?: Bindable<WidgetLength>;
+        /** Default "shrink". */
+        height?: Bindable<WidgetLength>;
+        /** How the image fits its box: "contain" (default), "cover", "fill", "none",
+         *  or "scale-down". */
+        content_fit?: "contain" | "cover" | "fill" | "none" | "scale-down";
+        /** Texture sampling: "linear" (default, smooth) or "nearest" (pixel art). */
+        filter_method?: "linear" | "nearest";
+        /** Opacity, 0..=1. Default 1. */
+        opacity?: Bindable<number>;
+        /** Rotation in degrees about the image center (floating: layout keeps the
+         *  unrotated bounds). */
+        rotation?: number;
+        /** A leaf -- children are ignored (present for JSX compatibility). */
+        children?: WidgetChildren;
+    }
+
     /** Props for a checkbox. Its children form the label and may include bindings.
      *
      *  A checkbox displays the value supplied through `checked`. To make it respond
@@ -686,6 +736,8 @@ declare module "smudgy:widgets" {
     export function Canvas(props?: CanvasProps, children?: WidgetChildren): SmudgyElement;
     /** Empty layout space (use `width="fill"` as a flexible spacer). */
     export function Space(props?: SpaceProps, children?: WidgetChildren): SmudgyElement;
+    /** A raster image loaded from `src`. Set `width`/`height` for stable layout. */
+    export function Image(props: ImageProps, children?: WidgetChildren): SmudgyElement;
     /** A checkbox. Children are the label. */
     export function Checkbox(props?: CheckboxProps, children?: WidgetChildren): SmudgyElement;
     /** One radio button; radios sharing a `selected` source form a group. */
@@ -743,6 +795,7 @@ declare module "smudgy:widgets" {
         MapView: typeof MapView;
         Canvas: typeof Canvas;
         Space: typeof Space;
+        Image: typeof Image;
         Checkbox: typeof Checkbox;
         Radio: typeof Radio;
         Tooltip: typeof Tooltip;

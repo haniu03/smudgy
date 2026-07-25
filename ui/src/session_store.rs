@@ -40,6 +40,7 @@ use smudgy_core::session::{self, SessionEvent, SessionId};
 use smudgy_core::session::{BufferUpdate, TaggedSessionEvent};
 use smudgy_map_widget::map_view;
 use smudgy_theme::builtins::container::default;
+use crate::images::image_store;
 use smudgy_widgets::{
     MapStore, MapWidgetId, TextEditorStore, WidgetRoot, with_store_context, with_text_store_context,
 };
@@ -597,13 +598,21 @@ impl ManagedSession {
         let map_store = MapStore::new();
         let text_store = TextEditorStore::new();
 
+        // The image store is process-global (entries are keyed by content source, shared
+        // across sessions). Register this session's repaint waker so a completed load repaints
+        // its widgets (the store pokes every live session on completion).
+        let image_store = image_store();
+        image_store.register_waker(widget_root.wake_handle());
+
         let extra_script_extensions = {
             let widget_root = WidgetRoot::clone(&widget_root);
             let mapper = mapper.clone();
+            let image_store = image_store.clone();
             Arc::new(move || {
                 vec![smudgy_widgets::ext::init(
                     widget_root.clone(),
                     mapper.clone(),
+                    Some(image_store.clone()),
                 )]
             })
         };

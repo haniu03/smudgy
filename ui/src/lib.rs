@@ -23,6 +23,7 @@ use windows::smudgy_window::SmudgyWindow;
 
 mod assets;
 mod cloud_account;
+mod images;
 mod pane_drag;
 mod pane_layout;
 pub mod prefs;

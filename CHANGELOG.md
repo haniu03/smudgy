@@ -55,6 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to other servers and deactivated maps count — and waits for maps to
   finish loading first, so a package can safely offer its starter maps
   on every start without ever creating duplicates.
+- **Widgets can show images.** A new `<Image src=... />` widget
+  (`smudgy:widgets`) displays PNG, JPEG, WebP, and GIF (first frame)
+  images from an `https://` URL, an inline `data:` URI, or a local file,
+  with the usual sizing props plus `content_fit`, `filter_method`,
+  `opacity`, and `rotation`. Remote images are cached on disk honoring
+  the server's HTTP cache headers (and keep showing through network
+  hiccups); a sandboxed package's image loads obey the same consented
+  `net`/`read` permissions as its `fetch()` and file access. Package
+  asset paths (`@/...` and module-relative) are recognized but load in
+  an upcoming release.
 
 ### Changed
 

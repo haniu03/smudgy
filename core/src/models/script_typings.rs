@@ -1451,7 +1451,7 @@ export function make() { return createEvent('dynamic'); }
         // `selected`) compile as authored.
         sources.insert(
             "hud.tsx".to_string(),
-            "import { createWidget, Canvas, Space, Checkbox, Radio, Row, Column, Tooltip, Table, ProgressBar, Text } from \"smudgy:widgets\";\n\
+            "import { createWidget, Canvas, Space, Image, Checkbox, Radio, Row, Column, Tooltip, Table, ProgressBar, Text } from \"smudgy:widgets\";\n\
              import type { CanvasShape, CanvasPointerEvent, CanvasFill } from \"smudgy:widgets\";\n\
              import { createState } from \"smudgy:core\";\n\
              interface Cfg { autoloot: boolean; mode: string; slot: number; scene: CanvasShape[] }\n\
@@ -1473,6 +1473,9 @@ export function make() { return createEvent('dynamic'); }
                            scene={cfg.bind('scene')}\n\
                            onPointer={(ev: CanvasPointerEvent) => { void ev.kind; void ev.x; void ev.button; }} />\n\
                    <Canvas scene={scene} />\n\
+                   <Image src=\"@/assets/logo.png\" width={64} height={64} content_fit=\"cover\" />\n\
+                   <Image src=\"https://example.com/x.png\" opacity={0.5} rotation={45} filter_method=\"nearest\" />\n\
+                   <Image src={cfg.bind('mode')} width=\"fill\" height={32} opacity={cfg.bind('slot')} />\n\
                    <Row>\n\
                      <Checkbox checked={cfg.bind('autoloot')} size={14} text_size={12}\n\
                                onToggle={(v) => { cfg.value.autoloot = v; }}>Autoloot: {cfg.bind('autoloot')}</Checkbox>\n\
@@ -1526,7 +1529,8 @@ export function make() { return createEvent('dynamic'); }
 
     /// The strict half of binding prop types: a `Binding<string>` (a typed path to a string
     /// field) offered to a numeric prop must fail to compile — `Bindable<number>` admits
-    /// `Binding<number>` and the untyped `Binding<any>`, not a known-wrong payload.
+    /// `Binding<number>` and the untyped `Binding<any>`, not a known-wrong payload. Also
+    /// covers required props: an `<Image />` without `src` must fail to compile.
     #[test]
     fn mistyped_binding_props_fail_to_compile() {
         use std::collections::BTreeMap;
@@ -1550,6 +1554,21 @@ export function make() { return createEvent('dynamic'); }
         assert!(
             !out.diagnostics.is_empty(),
             "a Binding<string> on a numeric prop must be a compile error"
+        );
+
+        // A required prop left off: `<Image />` without `src` must fail to compile.
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "img.tsx".to_string(),
+            "import { Image } from \"smudgy:widgets\";\n\
+             export const bad = <Image />;\n"
+                .to_string(),
+        );
+        let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+            .expect("the generator itself must not crash on a type error");
+        assert!(
+            !out.diagnostics.is_empty(),
+            "an <Image /> without the required `src` must be a compile error"
         );
     }
 

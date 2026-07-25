@@ -1894,6 +1894,7 @@ pub(crate) fn load_widgets_module(
              export const MapView = __w.MapView;\n\
              export const Canvas = __w.Canvas;\n\
              export const Space = __w.Space;\n\
+             export const Image = __w.Image;\n\
              export const Checkbox = __w.Checkbox;\n\
              export const Radio = __w.Radio;\n\
              export const Tooltip = __w.Tooltip;\n\

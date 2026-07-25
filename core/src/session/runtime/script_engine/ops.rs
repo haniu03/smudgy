@@ -241,6 +241,11 @@ deno_core::extension!(
     // `op_smudgy_data_dir` for the script's `getDataDir()`. A sandboxed package's
     // `.isolate-storage/<slug>/data`; the shared server dir for the main isolate.
     data_dir: std::path::PathBuf,
+    // This isolate's image-source policy (`smudgy_cloud::image_source`): parked in `OpState`
+    // for the leaf `smudgy_widgets` <Image> build ops to resolve + gate `src` strings, the
+    // same crate-DAG bridge as `WidgetsEnabled`. `trusted` for main; the consented grants +
+    // own-package membership for a sandbox.
+    image_policy: smudgy_cloud::image_source::ImageSourcePolicy,
   },
   state = |state, options| {
     state.put::<SessionId>(options.session_id);
@@ -286,6 +291,7 @@ deno_core::extension!(
     state.put::<crate::session::runtime::store::HomeRegistry>(options.home_registry);
     state.put::<smudgy_cloud::StoreBindings>(options.store_bindings);
     state.put::<PackageDataDir>(PackageDataDir(options.data_dir));
+    state.put::<smudgy_cloud::image_source::ImageSourcePolicy>(options.image_policy);
     state.put::<Capture>(Capture(false));
     state.put::<Fallthrough>(Fallthrough(None));
     // The per-isolate interop identity table (`docs/interop.md` §3): interned

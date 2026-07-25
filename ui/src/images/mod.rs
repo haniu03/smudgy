@@ -1,0 +1,328 @@
+//! The `<Image>` widget's loader: the [`smudgy_widgets::ImageFetcher`] implementation.
+//!
+//! The widget/store side (`smudgy_widgets::image_store`) owns lifecycle, memoization, and
+//! handle identity; THIS side owns all I/O and decode policy:
+//!
+//! - **Remote** srcs go through [`http_cache`] — an RFC-9111-subset disk cache under
+//!   `<smudgy_home>/cache/images/` with per-server metadata namespaces (plan D5/D10) — on a
+//!   dedicated `reqwest` client with no default headers (the shared cloud client stamps
+//!   `x-smudgy-client-version`, which package-chosen hosts must not see) and **manual**
+//!   redirect following, so every hop re-validates against a sandboxed package's `net`
+//!   grants (a client-level redirect policy can't carry per-package state).
+//! - **Local files** re-check confinement post-canonicalization (`dunce`, so Windows
+//!   doesn't grow `\\?\` prefixes) — the build op's check was lexical; symlinks resolve here.
+//! - **All raster bytes pre-decode off-thread** with explicit [`image::Limits`] (decode
+//!   bombs), EXIF orientation applied (iced only orients in its own decode path; RGBA
+//!   handles bypass it), bounded to [`MAX_CONCURRENT_DECODES`] at a time.
+//! - **SVG is rejected** (raster-only v1). When SVG lands it must NOT go through iced's
+//!   svg pipeline — usvg's default href resolver reads arbitrary local files.
+
+mod http_cache;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use base64::Engine as _;
+use smudgy_cloud::image_source::{ImageSourcePolicy, ResolvedImageSource};
+use smudgy_widgets::{DecodedImage, FetchError, FileStamp, ImageFetcher, ImageStore};
+use tokio::sync::Semaphore;
+
+/// Hard cap on any encoded image body (HTTP response, local file, package asset).
+pub const MAX_BODY_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Decode-time pixel bounds: dimensions and a transient-allocation cap. A 16384² RGBA
+/// decode would transiently allocate 1 GiB — the alloc cap is what actually bounds memory.
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_DECODE_ALLOC_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Concurrent decode bound: decodes are CPU work on the store's small runtime; more than
+/// this just thrashes and delays the first image.
+const MAX_CONCURRENT_DECODES: usize = 2;
+
+/// The process-global [`ImageStore`], built once on first use and shared by every session
+/// (entries are keyed by content source, so cross-session sharing dedups fetch/decode/upload).
+pub fn image_store() -> ImageStore {
+    static STORE: std::sync::OnceLock<ImageStore> = std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| ImageStore::new(Arc::new(UiImageFetcher::new())))
+        .clone()
+}
+
+struct UiImageFetcher {
+    client: reqwest::Client,
+    cache: Option<http_cache::HttpImageCache>,
+    decode_permits: Arc<Semaphore>,
+}
+
+impl UiImageFetcher {
+    fn new() -> Self {
+        // Dedicated client: no default headers, no cookies, explicit timeouts, and NO
+        // automatic redirects — hops are followed (and policy-checked) manually.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("a plain reqwest client always builds");
+        let cache = smudgy_core::get_smudgy_home()
+            .ok()
+            .map(|home| http_cache::HttpImageCache::new(home.join("cache").join("images")));
+        Self {
+            client,
+            cache,
+            decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+        }
+    }
+
+    async fn load_bytes(
+        &self,
+        source: &ResolvedImageSource,
+        policy: &ImageSourcePolicy,
+    ) -> Result<(Vec<u8>, Option<FileStamp>), FetchError> {
+        match source {
+            ResolvedImageSource::Remote(url) => {
+                let grants = (!policy.trusted).then(|| policy.net_grants.clone());
+                let bytes = match &self.cache {
+                    Some(cache) => {
+                        cache
+                            .fetch(&self.client, url, &policy.server_name, grants.as_ref())
+                            .await?
+                    }
+                    None => {
+                        http_cache::fetch_uncached(&self.client, url, grants.as_ref()).await?
+                    }
+                };
+                Ok((bytes, None))
+            }
+            ResolvedImageSource::LocalFile(path) => read_local(path, policy),
+            ResolvedImageSource::Data { uri, .. } => Ok((
+                decode_data_uri(uri).map_err(FetchError::permanent)?,
+                None,
+            )),
+            ResolvedImageSource::PackageAsset { owner, name, .. } => Err(FetchError::permanent(
+                format!("package assets ({owner}/{name}) are not loadable yet"),
+            )),
+        }
+    }
+}
+
+impl ImageFetcher for UiImageFetcher {
+    fn fetch(
+        &self,
+        source: ResolvedImageSource,
+        policy: Arc<ImageSourcePolicy>,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<DecodedImage, FetchError>> + Send + 'static>,
+    > {
+        // `self` is behind an `Arc<dyn ImageFetcher>` owned by the store; clone the cheap
+        // parts into the future instead of threading a self-Arc through the trait.
+        let client = self.client.clone();
+        let cache = self.cache.clone();
+        let permits = self.decode_permits.clone();
+        Box::pin(async move {
+            let loader = UiImageFetcher {
+                client,
+                cache,
+                decode_permits: permits.clone(),
+            };
+            let (bytes, file_stamp) = loader.load_bytes(&source, &policy).await?;
+            // Bound concurrent decodes; the permit spans only the CPU-bound decode.
+            let _permit = permits
+                .acquire()
+                .await
+                .map_err(|_| FetchError::transient("decoder shut down"))?;
+            // Decode failures are permanent: the same bytes will fail the same way (a
+            // *changed* remote image arrives as a different fetch, not a retry).
+            let mut decoded = tokio::task::block_in_place(|| decode_and_orient(&bytes))
+                .map_err(FetchError::permanent)?;
+            decoded.file_stamp = file_stamp;
+            Ok(decoded)
+        })
+    }
+
+    fn probe(
+        &self,
+        source: ResolvedImageSource,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Option<FileStamp>> + Send + 'static>> {
+        Box::pin(async move {
+            match &source {
+                ResolvedImageSource::LocalFile(path) => stamp_of(path),
+                _ => None,
+            }
+        })
+    }
+}
+
+fn stamp_of(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        mtime: meta.modified().ok()?,
+        size: meta.len(),
+    })
+}
+
+/// Read a policy-checked local file, re-verifying confinement on the *canonical* path (the
+/// build-op check was lexical; symlinks resolve here). Trusted isolates skip the grant
+/// recheck — they hold unrestricted read anyway.
+///
+/// Error kinds: I/O failures are transient (the file may appear or become readable — local
+/// dev sees this constantly); a grant escape or the size cap is permanent.
+fn read_local(
+    path: &Path,
+    policy: &ImageSourcePolicy,
+) -> Result<(Vec<u8>, Option<FileStamp>), FetchError> {
+    let canonical = dunce::canonicalize(path)
+        .map_err(|e| FetchError::transient(format!("{}: {e}", path.display())))?;
+    if !policy.trusted {
+        let canonical_roots: Vec<PathBuf> = policy
+            .read_grants
+            .iter()
+            .filter_map(|root| dunce::canonicalize(root).ok())
+            .collect();
+        if !canonical_roots.iter().any(|root| canonical.starts_with(root)) {
+            return Err(FetchError::permanent(format!(
+                "{} escapes the granted read roots after resolving links",
+                path.display()
+            )));
+        }
+    }
+    let stamp = stamp_of(&canonical);
+    if let Some(stamp) = &stamp
+        && stamp.size > MAX_BODY_BYTES
+    {
+        return Err(FetchError::permanent(format!(
+            "{} is {} bytes; images are capped at {MAX_BODY_BYTES}",
+            canonical.display(),
+            stamp.size
+        )));
+    }
+    let bytes = std::fs::read(&canonical)
+        .map_err(|e| FetchError::transient(format!("{}: {e}", canonical.display())))?;
+    Ok((bytes, stamp))
+}
+
+/// Decode a `data:image/...;base64,` URI's payload (shape + cap already validated at
+/// resolve time; this decodes the actual bytes).
+fn decode_data_uri(uri: &str) -> Result<Vec<u8>, String> {
+    let payload = uri
+        .split_once("base64,")
+        .map(|(_, payload)| payload)
+        .ok_or_else(|| "malformed data: URI".to_string())?;
+    base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .map_err(|e| format!("data: URI base64: {e}"))
+}
+
+/// Decode encoded bytes to straight RGBA8 with explicit limits, then apply EXIF
+/// orientation. Runs inside `block_in_place` under the decode semaphore.
+fn decode_and_orient(bytes: &[u8]) -> Result<DecodedImage, String> {
+    if bytes.len() as u64 > MAX_BODY_BYTES {
+        return Err(format!("image is {} bytes; capped at {MAX_BODY_BYTES}", bytes.len()));
+    }
+    if looks_like_svg(bytes) {
+        return Err("SVG sources are not supported yet (raster images only)".to_string());
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("unrecognized image data: {e}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(|e| format!("decode: {e}"))?;
+    // One conversion to RGBA8 (free when the codec already produced RGBA8), then orient
+    // with in-place flips / single-copy rotations — `DynamicImage`-level combinators would
+    // clone the full image once per step.
+    use image::imageops;
+    let mut rgba = decoded.into_rgba8();
+    match exif_orientation(bytes) {
+        Some(2) => imageops::flip_horizontal_in_place(&mut rgba),
+        Some(3) => imageops::rotate180_in_place(&mut rgba),
+        Some(4) => imageops::flip_vertical_in_place(&mut rgba),
+        Some(5) => {
+            rgba = imageops::rotate90(&rgba);
+            imageops::flip_horizontal_in_place(&mut rgba);
+        }
+        Some(6) => rgba = imageops::rotate90(&rgba),
+        Some(7) => {
+            rgba = imageops::rotate270(&rgba);
+            imageops::flip_horizontal_in_place(&mut rgba);
+        }
+        Some(8) => rgba = imageops::rotate270(&rgba),
+        _ => {}
+    }
+    let (width, height) = rgba.dimensions();
+    Ok(DecodedImage {
+        width,
+        height,
+        rgba: rgba.into_raw(),
+        file_stamp: None,
+    })
+}
+
+/// The EXIF `Orientation` tag (1..=8), if the container carries EXIF (JPEG mainly).
+fn exif_orientation(bytes: &[u8]) -> Option<u32> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+    exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?
+        .value
+        .get_uint(0)
+}
+
+/// Cheap SVG sniff on the leading bytes (post-whitespace/BOM `<` + "svg" nearby, or the
+/// svgz gzip magic — svgz is svg, and both are rejected in v1).
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        // gzip: could be svgz. No raster format smudgy accepts is gzip-wrapped, so treat
+        // any gzip payload as not-an-image (and say svg — the only plausible intent).
+        return true;
+    }
+    let head = &bytes[..bytes.len().min(512)];
+    let text = String::from_utf8_lossy(head);
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    trimmed.starts_with('<') && (trimmed.contains("<svg") || trimmed.contains("<?xml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png_1x1() -> Vec<u8> {
+        // A valid 1x1 opaque-red PNG, generated with the image crate itself.
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn decodes_png_to_rgba() {
+        let decoded = decode_and_orient(&png_1x1()).unwrap();
+        assert_eq!((decoded.width, decoded.height), (1, 1));
+        assert_eq!(decoded.rgba, vec![255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn rejects_svg_and_svgz() {
+        assert!(decode_and_orient(b"  <svg xmlns='x'></svg>").is_err());
+        assert!(decode_and_orient(&[0x1f, 0x8b, 0x08, 0x00]).is_err());
+    }
+
+    #[test]
+    fn data_uri_round_trips() {
+        let png = png_1x1();
+        let uri = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+        assert_eq!(decode_data_uri(&uri).unwrap(), png);
+    }
+
+    #[test]
+    fn garbage_is_a_decode_error_not_a_panic() {
+        assert!(decode_and_orient(&[0u8; 64]).is_err());
+    }
+}

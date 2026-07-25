@@ -26,7 +26,27 @@ iced = { version = "0.14", features = [
     "advanced",
     "canvas",
     "markdown",
+    # The image widget/pipeline WITHOUT `image/default`'s every-codec pull — the workspace
+    # `image` dep below selects exactly the codecs smudgy decodes (the smudgy_ui image
+    # fetcher pre-decodes to RGBA, so iced itself never runs a codec; see the Image plan).
+    "image-without-codecs",
 ] }
+# Raster decoding for the script-facing <Image> widget: the ui fetcher decodes off-thread
+# (with `image::Limits`) to RGBA handles. `default-features = false` + explicit codecs keeps
+# the binary lean; feature-unifies with the copy deno_image already pulls.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+] }
+# EXIF orientation for pre-decoded images: iced applies EXIF only in its own decode path,
+# and RGBA handles bypass it, so the fetcher must orient explicitly. Same version
+# iced_graphics's `image` feature pins.
+kamadak-exif = "0.6"
+# Windows-sane fs::canonicalize (no \\?\ verbatim prefixes) for image-asset root
+# confinement checks in the ui fetcher.
+dunce = "1"
 iced_anim = "0.3.1"
 iced_runtime = "0.14"
 # Pluggable span/metrics API (comet). A no-op unless the app is built with smudgy_ui's
