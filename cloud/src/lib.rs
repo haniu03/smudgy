@@ -22,11 +22,11 @@ pub use backends::{
 pub use cloud_api::CloudApiClient;
 pub use color::{canonicalize_css_color, parse_css_color};
 pub use connection::{
-    Connection, ConnectionArgs, ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionKind,
-    ConnectionRouting, ConnectionUpdates, CornerStyle, DEFAULT_CONNECTION_COLOR,
-    DEFAULT_CONNECTION_THICKNESS, MAX_COLOR_LEN, MAX_COORDINATE, MAX_MUTATION_OPERATIONS,
-    MAX_ROUTE_POINTS, MapPoint, PortMode, RoomSide, SegmentShape, THICKNESS_RANGE,
-    default_anchor_for_direction,
+    CORNER_INSET, Connection, ConnectionArgs, ConnectionDash, ConnectionEndpoint, ConnectionId,
+    ConnectionKind, ConnectionRouting, ConnectionUpdates, CornerStyle, DEFAULT_CONNECTION_COLOR,
+    DEFAULT_CONNECTION_THICKNESS, DIAGONAL_BEARING_RATIO, MAX_COLOR_LEN, MAX_COORDINATE,
+    MAX_MUTATION_OPERATIONS, MAX_ROUTE_POINTS, MapPoint, PortMode, RoomSide, SegmentShape,
+    THICKNESS_RANGE, default_anchor_for_bearing, default_anchor_for_direction,
 };
 pub use error::{CloudError, CloudResult};
 pub use mapper::{AreaImportDocument, AreaLoadSource, AreaLoadStat, LoadMapsSummary, Mapper};

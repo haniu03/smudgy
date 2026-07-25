@@ -17,7 +17,7 @@ use crate::{
     Connection, ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionKind,
     ConnectionRouting, CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS,
     ExitDirection, ExitId, MapPoint, PortMode, RoomNumber, RoomSide, SegmentShape,
-    connection::{default_anchor_for_direction, side_nearest_bearing},
+    connection::{default_anchor_for_bearing, default_anchor_for_direction},
 };
 
 /// One exit's connection-relevant topology, projected out of whichever
@@ -163,7 +163,7 @@ pub fn default_connection_for(
             // bearing when it is absent (East fallback without either).
             let (side_b, offset_b) = match exit.to_direction {
                 Some(direction) => default_anchor_for_direction(direction, bearing_ba),
-                None => (bearing_ba.map_or(RoomSide::East, side_nearest_bearing), 0.5),
+                None => bearing_ba.map_or((RoomSide::East, 0.5), default_anchor_for_bearing),
             };
             let kind = match (&origin_site, &destination_site) {
                 (Some(origin), Some(destination)) if origin.level != destination.level => {
@@ -338,7 +338,7 @@ fn retarget_in_place(
                     let bearing = bearing_between(room_site(to_room), room_site(origin));
                     let (side, offset) = match after.to_direction {
                         Some(direction) => default_anchor_for_direction(direction, bearing),
-                        None => (bearing.map_or(RoomSide::East, side_nearest_bearing), 0.5),
+                        None => bearing.map_or((RoomSide::East, 0.5), default_anchor_for_bearing),
                     };
                     endpoint(to_room, side, offset)
                 });

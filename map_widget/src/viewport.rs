@@ -78,7 +78,20 @@ impl Viewport {
 /// Snaps a map-space point to the room grid.
 #[must_use]
 pub fn snap(point: Point) -> Point {
-    Point::new(point.x.round(), point.y.round())
+    snap_to_step(point, Viewport::GRID_UNIT)
+}
+
+/// Snaps a map-space point to an arbitrary positive grid pitch.
+#[must_use]
+pub fn snap_to_step(point: Point, step: f32) -> Point {
+    debug_assert!(step.is_finite() && step > 0.0);
+    if !step.is_finite() || step <= 0.0 {
+        return point;
+    }
+    Point::new(
+        (point.x / step).round() * step,
+        (point.y / step).round() * step,
+    )
 }
 
 /// Snaps a map-space offset to whole grid steps, preserving the relative
@@ -86,4 +99,19 @@ pub fn snap(point: Point) -> Point {
 #[must_use]
 pub fn snap_offset(offset: Vector) -> Vector {
     Vector::new(offset.x.round(), offset.y.round())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snaps_positive_and_negative_points_to_requested_step() {
+        let snapped = snap_to_step(Point::new(1.24, -1.26), 0.1);
+        assert!((snapped.x - 1.2).abs() < 1e-6);
+        assert!((snapped.y + 1.3).abs() < 1e-6);
+        let midpoint = snap_to_step(Point::new(0.05, -0.05), 0.1);
+        assert!((midpoint.x - 0.1).abs() < 1e-6);
+        assert!((midpoint.y + 0.1).abs() < 1e-6);
+    }
 }

@@ -8,6 +8,7 @@ mod area_list;
 mod automatic_routing;
 pub mod commands;
 mod inspector;
+mod legend;
 mod modals;
 mod toolbar;
 
@@ -3458,6 +3459,7 @@ impl MapEditorWindow {
 
         let main_layout: ThemedElement<'_, Message> = layout
             .push(container(panes).width(Length::Fill).height(Length::Fill))
+            .push(legend::view(self.editor.legend_items()))
             .into();
 
         if let Some(modal) = &self.modal {

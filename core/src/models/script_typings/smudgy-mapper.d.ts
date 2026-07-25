@@ -4,17 +4,13 @@
 //  smudgy writes and overwrites this file every time a session starts. It teaches
 //  VS Code (and any TypeScript-aware editor) about the `mapper` API.
 //
-//  `mapper` is reachable two ways, both typed by the declarations below:
-//    - `import { mapper } from "smudgy:core"` (a named export) and the default
-//      export's `.mapper` member -- both typed `Mapper` by smudgy-core.d.ts, which
-//      references the global `Mapper` interface declared here;
-//    - the ambient global `mapper` (and `Area`), installed by the mapper runtime.
-//      The `mapper` value global is deprecated (removal tracked in TODO.md);
-//      import it from `smudgy:core` instead.
+//  Import the runtime values from `smudgy:core`: `mapper` is the current session's map
+//  API, and `Area` is its runtime constructor for optional `instanceof` checks. The
+//  declarations below supply the global ambient map TYPES that those exports reference.
 //
 //  These are GLOBAL ambient declarations (no `declare module`), so the names
-//  (`Mapper`, `Area`, `Room`, `Exit`, `AreaId`, ...) are visible both to bare
-//  `mapper.*` usage and to smudgy-core.d.ts's `mapper` member.
+//  (`Mapper`, `Area`, `Room`, `Exit`, `AreaId`, ...) remain visible without imports and
+//  are also referenced by smudgy-core.d.ts's module exports.
 //
 //  Edits here are lost on the next launch.
 // =============================================================================
@@ -373,11 +369,10 @@ interface Room {
 
 /**
  * A map area. You get areas from the mapper (`mapper.areas`,
- * `mapper.getAreaById`), never by constructing one; the global `Area` class
- * exists so checks like `area instanceof Area` work.
+ * `mapper.getAreaById`), never by constructing one. For a runtime check, import
+ * the constructor: `import { Area } from "smudgy:core"`.
  */
-declare class Area {
-    private constructor();
+interface Area {
     readonly id: AreaId;
     readonly name: string;
     readonly room_numbers: RoomNumber[];
@@ -565,11 +560,3 @@ interface AreasImportedIfAbsent {
     /** Names skipped because a resident map already has that name. */
     readonly skipped: string[];
 }
-
-/**
- * The current session's map API, as a global. Deprecated: import `mapper`
- * from `smudgy:core` instead.
- *
- * @deprecated Import `mapper` from `smudgy:core`.
- */
-declare const mapper: Mapper;

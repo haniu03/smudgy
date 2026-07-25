@@ -233,15 +233,21 @@ pub(super) fn redistribute_port_updates(
             .then(a.connection_id.cmp(&b.connection_id))
             .then(a.endpoint_b.cmp(&b.endpoint_b))
     });
+    let group_len = group.len();
     #[allow(clippy::cast_precision_loss)]
-    let denominator = (group.len() + 1) as f32;
+    let denominator = group_len.saturating_sub(1) as f32;
     group
         .into_iter()
         .enumerate()
         .filter(|(_, item)| item.endpoint.port_mode == smudgy_cloud::PortMode::AutoPinned)
         .filter_map(|(slot, mut item)| {
             #[allow(clippy::cast_precision_loss)]
-            let offset = (slot + 1) as f32 / denominator;
+            let offset = if group_len == 1 {
+                item.endpoint.port_offset
+            } else {
+                smudgy_cloud::CORNER_INSET
+                    + slot as f32 * (1.0 - 2.0 * smudgy_cloud::CORNER_INSET) / denominator
+            };
             if (item.endpoint.port_offset - offset).abs() <= f32::EPSILON {
                 return None;
             }

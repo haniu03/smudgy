@@ -859,12 +859,10 @@ pub struct SmudgyCapabilities {
     /// `widgets: ["create"]` — create & change on-screen widgets (`iced_jsx`).
     pub widgets: bool,
     /// `interop: ["read"]` — consume the cross-package interop surface: read/watch session-store
-    /// state and subscribe to events (client `sys:`/`map:` + other packages). The legacy
-    /// `events: ["subscribe"]` token aliases onto this at parse.
+    /// state and subscribe to events (client `sys:`/`map:` + other packages).
     pub interop_read: bool,
     /// `interop: ["write"]` — produce on the cross-package interop surface: publish session-store
-    /// state and emit events (own namespace only). The legacy `events: ["emit"]` token aliases
-    /// onto this at parse.
+    /// state and emit events (own namespace only).
     pub interop_write: bool,
     /// `panes: ["create"]` — create/close/write session output panes and route lines into them.
     pub panes: bool,
@@ -988,21 +986,6 @@ impl SmudgyCapabilities {
 /// (`PACKAGE-ISOLATES.md` form), one array of string tokens per manifest key. The booleans
 /// are projected to/from these tokens; unknown tokens are dropped on the way in (forward-compat),
 /// and `mapper_write` round-trips as `["write"]` (which re-implies `read`).
-///
-/// `events` is a legacy alias group: `events: ["subscribe"]` parses as `interop: ["read"]` and
-/// `events: ["emit"]` as `interop: ["write"]`, so pre-interop manifests and consent records keep
-/// working unmigrated. Serialization **dual-emits** it: both the canonical `interop` tokens and
-/// the legacy `events` tokens are written, so a package resaved/republished on this build — and a
-/// consent record re-serialized by ordinary use — stays readable by a pre-interop client (which
-/// drops the unknown `interop` key but still honors `events`) and by a downgraded build. Without
-/// the dual-emit the migration was one-directional and downgrade-hostile.
-///
-/// The alias is a deprecation bridge, not a second spelling: it is REMOVED at the start of the
-/// 0.5.x branch (decided 2026-07-05, with session-store phase 1), at which point serialization
-/// emits only `interop`. The version assert below this struct fails any 0.5+ build that still
-/// carries it, so the removal can't be forgotten. A manifest still declaring only `events` after
-/// the removal parses as requesting no interop capability (the ordinary unknown-key rule) — the
-/// intended hard cut.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SmudgyCapabilitiesWire {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1017,49 +1000,12 @@ struct SmudgyCapabilitiesWire {
     widgets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     interop: Vec<String>,
-    /// Legacy alias of `interop` (`emit` → `write`, `subscribe` → `read`). Parsed, and dual-emitted
-    /// beside `interop` for pre-interop/downgrade compatibility; removed at 0.5.x (see the struct
-    /// docs + the version assert below).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    events: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     panes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     gmcp: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     input: Vec<String>,
-}
-
-// Build-time sunset for the legacy `events` capability alias. `const` panics are compile
-// errors, so the first build whose crate version leaves the 0.4.x line (0.5.0-rc1 included)
-// fails HERE until the alias is deleted. Scoped to exactly what must go: the `events` wire
-// field above, its two `has_token(&wire.events, …)` fallbacks in `From<SmudgyCapabilitiesWire>`,
-// the legacy-token DUAL-EMIT in `From<SmudgyCapabilities>` (the `events` vec it fills), the
-// `legacy_events_tokens_alias_onto_interop` + `smudgy_interop_tokens_parse_and_round_trip`
-// test expectations, and this assert.
-const _: () = {
-    let major = decimal_version_component(env!("CARGO_PKG_VERSION_MAJOR"));
-    let minor = decimal_version_component(env!("CARGO_PKG_VERSION_MINOR"));
-    assert!(
-        major == 0 && minor < 5,
-        "the legacy `events` capability alias (events: [\"emit\"/\"subscribe\"] -> interop) is \
-         scheduled for removal at the start of the 0.5.x branch: delete the `events` wire field, \
-         its alias parsing in From<SmudgyCapabilitiesWire>, the alias test, and this assert"
-    );
-};
-
-/// Const-context parse of one `CARGO_PKG_VERSION_*` component (a plain decimal string) for the
-/// alias-sunset assert above.
-const fn decimal_version_component(component: &str) -> u64 {
-    let bytes = component.as_bytes();
-    let mut value = 0u64;
-    let mut i = 0;
-    while i < bytes.len() {
-        assert!(bytes[i].is_ascii_digit(), "version components are decimal");
-        value = value * 10 + (bytes[i] - b'0') as u64;
-        i += 1;
-    }
-    value
 }
 
 /// Whether `tokens` contains `tok` (trimmed, case-insensitive — manifest authors shouldn't be
@@ -1083,8 +1029,8 @@ impl From<SmudgyCapabilitiesWire> for SmudgyCapabilities {
             mapper_read: has_token(&wire.mapper, "read") || mapper_write,
             mapper_write,
             widgets: has_token(&wire.widgets, "create"),
-            interop_read: has_token(&wire.interop, "read") || has_token(&wire.events, "subscribe"),
-            interop_write: has_token(&wire.interop, "write") || has_token(&wire.events, "emit"),
+            interop_read: has_token(&wire.interop, "read"),
+            interop_write: has_token(&wire.interop, "write"),
             panes: has_token(&wire.panes, "create"),
             gmcp_send: has_token(&wire.gmcp, "send"),
             input: has_token(&wire.input, "access"),
@@ -1136,21 +1082,6 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
         if caps.interop_write {
             interop.push("write".to_string());
         }
-        // Dual-emit the legacy `events` tokens beside the canonical `interop` ones until the
-        // 0.5.x cut (the version assert by `SmudgyCapabilitiesWire` fails the build that must drop
-        // this). A pre-interop client drops the unknown `interop` key, so without the legacy
-        // tokens a manifest resaved / republished on this build — or a consent record
-        // re-serialized by mere use, then read after a downgrade — would silently lose its event
-        // capability (`NotCapable` at runtime, or a package that refuses to load). `read`→
-        // `subscribe`, `write`→`emit`; on old clients this grants only events (they have no
-        // store), which is the correct subset of the interop capability requested.
-        let mut events = Vec::new();
-        if caps.interop_read {
-            events.push("subscribe".to_string());
-        }
-        if caps.interop_write {
-            events.push("emit".to_string());
-        }
         let mut panes = Vec::new();
         if caps.panes {
             panes.push("create".to_string());
@@ -1170,7 +1101,6 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
             display,
             widgets,
             interop,
-            events,
             panes,
             gmcp,
             input,
@@ -1779,9 +1709,9 @@ pub(crate) fn load_core_module(url: &ModuleSpecifier) -> Result<ModuleSource, Mo
     // api getter once here snapshots an immutable value, which is correct. The genuinely
     // live-state members are exposed as FUNCTIONS instead of value exports -- `getSessions()`
     // (the connected-session set changes) and `getProfile()` (profile fields read live) --
-    // so a stale snapshot is impossible. `mapper` is a value export here (not in the
-    // extension entry) because this synthesized module evaluates long after `mapper.ts`
-    // installs `globalThis.mapper`, so the getter yields the real, immutable mapper.
+    // so a stale snapshot is impossible. `mapper` and the `Area` constructor are value exports
+    // here because this synthesized module evaluates after the mapper extension's private
+    // handoff, so the getters yield the real, stable values without public globals.
     let code = format!(
         "const __creator = {creator};\n\
          const __api = globalThis.__smudgy_create_api(__creator);\n\
@@ -1816,6 +1746,7 @@ pub(crate) fn load_core_module(url: &ModuleSpecifier) -> Result<ModuleSource, Mo
          export const currentSession = __api.currentSession;\n\
          export const input = __api.input;\n\
          export const mapper = __api.mapper;\n\
+         export const Area = __api.Area;\n\
          export const id = __api.id;\n\
          export const createState = __api.createState;\n\
          export const createEvent = __api.createEvent;\n\
@@ -3088,6 +3019,12 @@ mod tests {
                 "missing convenience export {name}: {code}"
             );
         }
+        for name in ["mapper", "Area"] {
+            assert!(
+                code.contains(&format!("export const {name} = __api.{name};")),
+                "missing mapper export {name}: {code}"
+            );
+        }
         // The interop handle constructors + the dynamic events lookup are named exports; no
         // string event bus (`on`/`once`/`emit`) is exported (interop.md §11).
         for name in ["createState", "createEvent", "createDerived", "events"] {
@@ -3975,14 +3912,10 @@ mod tests {
         let read_only = perms_with_smudgy(r#"{ "interop": ["read"] }"#).smudgy;
         assert!(read_only.interop_read && !read_only.interop_write);
         let json = serde_json::to_string(&caps).expect("serialize");
-        assert!(
-            json.contains(r#""interop""#) && json.contains(r#""events""#),
-            "serialization dual-emits the canonical `interop` and the legacy `events` alias so \
-             pre-interop clients (which drop the unknown `interop` key) keep the capability until \
-             the 0.5.x cut: {json}"
-        );
+        assert!(json.contains(r#""interop""#), "{json}");
+        assert!(!json.contains(r#""events""#), "{json}");
         let back: SmudgyCapabilities = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, caps, "the dual-emitted form round-trips to the same capabilities");
+        assert_eq!(back, caps, "interop capabilities round-trip");
     }
 
     #[test]
@@ -4021,28 +3954,6 @@ mod tests {
         assert!(!caps.is_within(&none));
         assert!(caps.added_since(&none).input);
         assert!(caps.is_within(&SmudgyCapabilities::all()));
-    }
-
-    #[test]
-    fn legacy_events_tokens_alias_onto_interop() {
-        // Pre-interop manifests and unmigrated lockfile consent records use
-        // `events: ["emit","subscribe"]`; each token grants the interop capability it aliases.
-        // The alias — and this test — are deleted at 0.5.x (the version assert beside
-        // `SmudgyCapabilitiesWire` enforces it).
-        let caps = perms_with_smudgy(r#"{ "events": ["emit", "subscribe"] }"#).smudgy;
-        assert!(
-            caps.interop_read && caps.interop_write,
-            "events tokens must grant the aliased interop capabilities"
-        );
-        let sub_only = perms_with_smudgy(r#"{ "events": ["subscribe"] }"#).smudgy;
-        assert!(sub_only.interop_read && !sub_only.interop_write);
-        let emit_only = perms_with_smudgy(r#"{ "events": ["emit"] }"#).smudgy;
-        assert!(emit_only.interop_write && !emit_only.interop_read);
-        // An aliased grant is *within* an interop grant and vice versa — consent comparisons
-        // can never see a difference between the spellings.
-        let canonical = perms_with_smudgy(r#"{ "interop": ["read", "write"] }"#).smudgy;
-        assert!(caps.is_within(&canonical) && canonical.is_within(&caps));
-        assert!(caps.added_since(&canonical).is_empty());
     }
 
     #[test]

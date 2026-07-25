@@ -453,10 +453,10 @@ pub struct SmudgyGrants {
     pub mapper_write: bool,
     pub widgets: bool,
     /// `interop: ["read"]` — read/watch session-store state + subscribe to any event
-    /// (`sys:`/`map:`/package). Aliased by the legacy `events: ["subscribe"]`.
+    /// (`sys:`/`map:`/package).
     pub interop_read: bool,
     /// `interop: ["write"]` — publish session-store state + emit events on the package's own
-    /// namespace. Aliased by the legacy `events: ["emit"]`.
+    /// namespace.
     pub interop_write: bool,
     /// `panes: ["create"]` — create/close/write session panes and route lines into them.
     pub panes: bool,

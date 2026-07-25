@@ -1762,50 +1762,6 @@ function derivePatternName(patternList: string[]): string {
     return patternList.join(" | ");
 }
 
-// --- Name-first deprecation shim (DEPRECATED-NAME-FIRST -- remove in 0.5) -------------
-// Before 0.4 every create* took the automation name as its first argument. Installed
-// packages are versioned artifacts that keep making such calls until re-published, so the
-// creation entry points honor the old shape through the 0.4 line: the positional name
-// moves into options.name (identical identity semantics: replace key, singleton identity,
-// registry key) and a notice is echoed once per script and function. Detection is exact,
-// never a heuristic: a new-form createAlias/createTrigger third argument can only be an
-// options object (a string or function there is the old form's script slot), and
-// TimerOptions/KeySpec are never strings. A version tripwire
-// (script_typings.rs::name_first_shim_is_removed_by_0_5) fails the build if this section
-// survives into 0.5.
-
-/** Build the once-per-function deprecation notifier for one creator. */
-function __smudgy_make_deprecation_warner(
-    creator: { kind: string; owner?: string; name?: string },
-): (fn: string, newForm: string) => void {
-    const warned = new Set<string>();
-    return (fn, newForm) => {
-        if (warned.has(fn)) return;
-        warned.add(fn);
-        echo(
-            `[deprecated] ${fn} was called name-first (from ${__smudgy_producer_spec(creator)}): ` +
-                `the name argument moved into options -- ${newForm}. ` +
-                `The old form stops working in smudgy 0.5.`,
-        );
-    };
-}
-
-/** Fold an old-form positional name into the (optional) trailing options bag. */
-function __smudgy_adopt_positional_name<T extends { name?: string }>(
-    fn: string,
-    name: unknown,
-    options: unknown,
-): T {
-    if (options !== undefined && (typeof options !== "object" || options === null)) {
-        throw new TypeError("Options must be an object");
-    }
-    const bag = (options ?? {}) as { name?: string };
-    if (bag.name !== undefined) {
-        throw new TypeError(`${fn}: a positional name and options.name cannot both be given`);
-    }
-    return { ...bag, name } as T;
-}
-
 /** Creates an alias that matches input patterns and executes a script. */
 function createAlias(
     creatorId: number,
@@ -2280,14 +2236,11 @@ class Hotkey {
  * Build the creator-bound `timers` and `hotkeys` registries plus their
  * `createTimer`/`createHotkey` factories.
  */
-function __smudgy_make_timer_hotkey_api(
-    creatorId: number,
-    warnNameFirst: (fn: string, newForm: string) => void,
-) {
+function __smudgy_make_timer_hotkey_api(creatorId: number) {
     const timerMap = new Map<string, Timer>();
     const hotkeyMap = new Map<string, Hotkey>();
 
-    const createTimerImpl = (options: TimerOptions, handler: () => void): Timer => {
+    const createTimer = (options: TimerOptions, handler: () => void): Timer => {
         if (typeof options !== "object" || options === null) {
             throw new TypeError("Options must be an object");
         }
@@ -2312,7 +2265,7 @@ function __smudgy_make_timer_hotkey_api(
         return timer;
     };
 
-    const createHotkeyImpl = (keySpec: KeySpec, handler: () => void, options: HotkeyOptions = {}): Hotkey => {
+    const createHotkey = (keySpec: KeySpec, handler: () => void, options: HotkeyOptions = {}): Hotkey => {
         if (typeof keySpec !== "object" || keySpec === null || typeof keySpec.key !== "string") {
             throw new TypeError('keySpec must be an object of the form { key, modifiers? }');
         }
@@ -2339,27 +2292,6 @@ function __smudgy_make_timer_hotkey_api(
         hotkeyMap.set(name, hotkey);
         return hotkey;
     };
-
-    // DEPRECATED-NAME-FIRST entry shims (see the shim section above; remove in 0.5). The
-    // new form never has a string first argument, so the branch is exact.
-    const createTimer = ((...args: any[]) => {
-        if (typeof args[0] === "string") {
-            warnNameFirst("createTimer", 'createTimer({ ...options, name: "..." }, handler)');
-            return createTimerImpl(
-                __smudgy_adopt_positional_name<TimerOptions>("createTimer", args[0], args[1]),
-                args[2],
-            );
-        }
-        return createTimerImpl(args[0], args[1]);
-    }) as (options: TimerOptions, handler: () => void) => Timer;
-
-    const createHotkey = ((...args: any[]) => {
-        if (typeof args[0] === "string") {
-            warnNameFirst("createHotkey", 'createHotkey(keySpec, handler, { name: "..." })');
-            return createHotkeyImpl(args[1], args[2], { name: args[0] });
-        }
-        return createHotkeyImpl(args[0], args[1], args[2]);
-    }) as (keySpec: KeySpec, handler: () => void, options?: HotkeyOptions) => Hotkey;
 
     const timers: AutomationRegistry<Timer> = Object.freeze({
         get(name: string) {
@@ -3581,28 +3513,47 @@ function __smudgy_make_event_consumer<T>(canonical: string, name: string): Event
  * `with (globalThis.__smudgy_user_api) { ... }`.
  *
  * The live-state members are getters/functions, so they stay live through `with` and the
- * default export: `mapper` is a getter (the smudgy.js facade is built before mapper.ts
- * installs `globalThis.mapper`, so the lookup MUST be deferred), `getSessions()`/`getProfile()`
+ * default export: `mapper` and `Area` are getters (the smudgy.js facade is built before mapper.ts
+ * hands them to this extension, so the lookup MUST be deferred), `getSessions()`/`getProfile()`
  * are functions (the session set + profile fields change). `session`/`id`
  * derive from a constant session id, so a snapshot is correct -- they are getters only so the
  * inline `with` object also resolves them. Only the `create*`/registry members carry
  * provenance; everything else is the shared, provenance-free set.
  *
- * None of this is installed on `globalThis`, keeping the global clean for imported jsr/npm code.
+ * None of the author-facing surface is installed on `globalThis`, keeping the global clean for
+ * imported jsr/npm code.
  */
+let __smudgy_mapper_api: any;
+let __smudgy_area_constructor: any;
+
+/** Receive the mapper extension's public values without making either one a public global. */
+function __smudgy_install_mapper(mapperApi: unknown, AreaConstructor: unknown): void {
+    if (__smudgy_mapper_api !== undefined || __smudgy_area_constructor !== undefined) {
+        throw new TypeError("smudgy mapper API was installed more than once");
+    }
+    if (
+        typeof mapperApi !== "object" ||
+        mapperApi === null ||
+        typeof AreaConstructor !== "function"
+    ) {
+        throw new TypeError("smudgy mapper extension supplied an invalid API");
+    }
+    __smudgy_mapper_api = mapperApi;
+    __smudgy_area_constructor = AreaConstructor;
+}
+
 function __smudgy_make_api(creator: { kind: string }) {
     // One strict host parse per API construction: the interned creator id carries the
     // origin, producer key, and home verdict that every creator-taking op addresses by id
     // (docs/interop-pre-gmcp-plan.md 3).
     const creatorId = __smudgy_creator_id(JSON.stringify(creator));
-    const warnNameFirst = __smudgy_make_deprecation_warner(creator);
     const registries = __smudgy_make_registries(creatorId);
-    const timerHotkey = __smudgy_make_timer_hotkey_api(creatorId, warnNameFirst);
+    const timerHotkey = __smudgy_make_timer_hotkey_api(creatorId);
 
     const api = {
         // Live/deferred accessors as object-literal getters: kept getters (not values) so the
-        // inline `with` object resolves `session`/`mapper`/`id` live, and so `mapper` defers its
-        // lookup until after mapper.ts installs `globalThis.mapper`. The session id is constant
+        // inline `with` object resolves `session`/`mapper`/`Area`/`id` live, and so the mapper
+        // values defer their lookup until after mapper.ts hands them over. The session id is constant
         // for a runtime's life, so `session`/``id` are stable in value.
         get session(): Session {
             return getCurrentSession(creatorId);
@@ -3611,7 +3562,10 @@ function __smudgy_make_api(creator: { kind: string }) {
             return getCurrentSession().id;
         },
         get mapper(): any {
-            return (globalThis as any).mapper;
+            return __smudgy_mapper_api;
+        },
+        get Area(): any {
+            return __smudgy_area_constructor;
         },
         // The current session's main command input. A getter for symmetry with
         // `session`; the handle itself is a stable addresser (session id + "main"
@@ -3643,35 +3597,12 @@ function __smudgy_make_api(creator: { kind: string }) {
         getDataDir,
         // Persisted, UI-visible user automations (create/edit the saved aliases/triggers/hotkeys).
         userAutomations,
-        // Creator-bound creation surface. The rest-args wrappers feed the
-        // DEPRECATED-NAME-FIRST shim (remove in 0.5); an old-form call is one with four
-        // arguments, or whose third argument sits in the old script slot (string or
-        // function) -- a new-form third argument can only be an options object. The casts
-        // keep the published pattern-first signatures on the facade.
-        createAlias: ((...args: any[]) => {
-            if (args.length >= 4 || typeof args[2] === "string" || typeof args[2] === "function") {
-                warnNameFirst("createAlias", 'createAlias(patterns, script, { name: "..." })');
-                return createAlias(
-                    creatorId,
-                    args[1],
-                    args[2],
-                    __smudgy_adopt_positional_name<AliasOptions>("createAlias", args[0], args[3]),
-                );
-            }
-            return createAlias(creatorId, args[0], args[1], args[2]);
-        }) as (patterns: Pattern | Pattern[], script: AutomationScript, options?: AliasOptions) => Alias,
-        createTrigger: ((...args: any[]) => {
-            if (args.length >= 4 || typeof args[2] === "string" || typeof args[2] === "function") {
-                warnNameFirst("createTrigger", 'createTrigger(patterns, script, { name: "..." })');
-                return createTrigger(
-                    creatorId,
-                    args[1],
-                    args[2],
-                    __smudgy_adopt_positional_name<TriggerOptions>("createTrigger", args[0], args[3]),
-                );
-            }
-            return createTrigger(creatorId, args[0], args[1], args[2]);
-        }) as (patterns: Pattern | TriggerPatterns, script: AutomationScript, options?: TriggerOptions) => Trigger,
+        // Creator-bound creation surface. Public arguments stay pattern/key/options-first;
+        // the creator id is internal provenance and never exposed to scripts.
+        createAlias: (patterns: Pattern | Pattern[], script: AutomationScript, options?: AliasOptions) =>
+            createAlias(creatorId, patterns, script, options),
+        createTrigger: (patterns: Pattern | TriggerPatterns, script: AutomationScript, options?: TriggerOptions) =>
+            createTrigger(creatorId, patterns, script, options),
         createTriggers: (triggers: Record<string, TriggerDef>) => createTriggers(creatorId, triggers),
         createTimer: timerHotkey.createTimer,
         createHotkey: timerHotkey.createHotkey,
@@ -3852,6 +3783,17 @@ function __smudgy_make_api(creator: { kind: string }) {
 export type SmudgyCoreApi = ReturnType<typeof __smudgy_make_api>;
 
 Object.defineProperty(globalThis, "__smudgy_create_api", { value: __smudgy_make_api });
+
+// One-shot private bridge from the later-loading mapper extension. The bridge removes itself as
+// soon as mapper.ts calls it; neither the mapper object nor the Area constructor becomes a public
+// global. This is runtime plumbing, not part of the author-facing smudgy:core contract.
+Object.defineProperty(globalThis, "__smudgy_install_mapper", {
+    configurable: true,
+    value: (mapperApi: unknown, AreaConstructor: unknown) => {
+        __smudgy_install_mapper(mapperApi, AreaConstructor);
+        delete (globalThis as any).__smudgy_install_mapper;
+    },
+});
 
 // The api bound to the user namespace, injected into inline alias/trigger scripts via
 // `with (globalThis.__smudgy_user_api) { ... }` (see core's `ScriptEngine::add_script`).

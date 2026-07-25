@@ -776,14 +776,20 @@ class Room {
     }
 }
 
-Object.defineProperty(globalThis, "mapper", { value: mapper });
-Object.defineProperty(globalThis, "Area", { value: Area });
+// smudgy.ts loads before this extension and exposes a one-shot private registrar. Hand the
+// public values to its lexical facade instead of publishing `mapper` or `Area` on globalThis.
+const installMapper = (globalThis as any).__smudgy_install_mapper;
+if (typeof installMapper !== "function") {
+    throw new TypeError("smudgy mapper registrar is unavailable");
+}
+installMapper(mapper, Area);
 
 // Drift-guard surface for `mapper_ts_impl_conforms_to_contract` (models/script_typings.rs):
 // these TYPE-ONLY exports let the conformance test assert this runtime impl satisfies the
 // published `smudgy-mapper.d.ts` contract (`Mapper`/`Area`/`Room`/`Exit`). They are fully
-// erased -- the session reaches the API through the `globalThis` installs above, never these.
+// erased -- the session reaches the API through the private handoff above, never these.
 export type MapperImpl = typeof mapper;
+export type AreaConstructorImpl = typeof Area;
 export type AreaImpl = Area;
 export type RoomImpl = Room;
 export type ExitImpl = Exit;

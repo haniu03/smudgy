@@ -44,6 +44,119 @@ pub enum SelectedConnectionHandle {
     Waypoint(usize),
 }
 
+/// Semantic canvas activity exposed to editor chrome. It deliberately avoids
+/// canvas implementation details so future tools can reuse the status legend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditorActivity {
+    #[default]
+    Idle,
+    DraggingConnectionWaypoint,
+    DraggingConnectionPort,
+}
+
+/// One reusable status-bar hint: an optional key/chord and the action it
+/// performs in the current editor context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegendItem {
+    pub key: &'static str,
+    pub action: &'static str,
+}
+
+/// Semantic subject passed to the reusable editor-legend resolver. Keeping
+/// this independent of `MapEditor` makes it straightforward for future tools
+/// (rooms, labels, shapes) to contribute hints without coupling UI chrome to
+/// canvas state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LegendContext {
+    #[default]
+    None,
+    Connection {
+        routing: smudgy_cloud::ConnectionRouting,
+        waypoint_selected: bool,
+    },
+}
+
+/// Resolves status-footer hints from semantic editor state. Presentation is a
+/// separate concern owned by the UI crate.
+#[must_use]
+pub fn resolve_legend(
+    activity: EditorActivity,
+    editable: bool,
+    context: LegendContext,
+) -> Vec<LegendItem> {
+    match activity {
+        EditorActivity::DraggingConnectionWaypoint => {
+            return vec![
+                LegendItem {
+                    key: "Alt",
+                    action: "move freely",
+                },
+                LegendItem {
+                    key: "Esc",
+                    action: "cancel",
+                },
+            ];
+        }
+        EditorActivity::DraggingConnectionPort => {
+            return vec![
+                LegendItem {
+                    key: "Drag",
+                    action: "move along the room edge",
+                },
+                LegendItem {
+                    key: "Esc",
+                    action: "cancel",
+                },
+            ];
+        }
+        EditorActivity::Idle => {}
+    }
+
+    let LegendContext::Connection {
+        routing,
+        waypoint_selected,
+    } = context
+    else {
+        return Vec::new();
+    };
+    if !editable {
+        return vec![LegendItem {
+            key: "",
+            action: "Read-only",
+        }];
+    }
+    if waypoint_selected {
+        return vec![
+            LegendItem {
+                key: "Drag",
+                action: "move point",
+            },
+            LegendItem {
+                key: "Delete",
+                action: "remove point",
+            },
+            LegendItem {
+                key: "Esc",
+                action: "stop editing",
+            },
+        ];
+    }
+
+    match routing {
+        smudgy_cloud::ConnectionRouting::Simple | smudgy_cloud::ConnectionRouting::Manual => {
+            vec![LegendItem {
+                key: "Ctrl+click",
+                action: "add a point",
+            }]
+        }
+        smudgy_cloud::ConnectionRouting::Automatic => vec![LegendItem {
+            key: "Ctrl+click or drag",
+            action: "convert to Manual",
+        }],
+        smudgy_cloud::ConnectionRouting::Stub => Vec::new(),
+    }
+}
+
 /// The active editing tool. Creation tools are momentary: the host window
 /// reverts to [`Tool::Select`] after a placement unless Shift is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -208,6 +321,10 @@ pub enum Message {
         entity: EntityId,
         additive: bool,
     },
+    GhostRoomSelected {
+        room_number: RoomNumber,
+        level: i32,
+    },
     /// Rubber-band finished: select everything intersecting `rect`
     /// (map space).
     RubberBandSelect {
@@ -257,6 +374,7 @@ pub enum Message {
         points: Vec<MapPoint>,
         selected_offset: usize,
     },
+    ActivityChanged(EditorActivity),
 }
 
 /// Which entity a drag-rect creation produces.
@@ -289,6 +407,7 @@ pub struct MapEditor {
     /// the cache and stored Connection remain untouched until the host emits
     /// one CAS command from the preview dialog.
     automatic_route_preview: Option<(ConnectionId, Arc<ConnectionGeometry>)>,
+    activity: EditorActivity,
     editable: bool,
 }
 
@@ -314,6 +433,7 @@ impl MapEditor {
             hovered_room: None,
             selected_connection_handle: None,
             automatic_route_preview: None,
+            activity: EditorActivity::Idle,
             editable: true,
         };
         editor.set_area(area_id);
@@ -327,6 +447,7 @@ impl MapEditor {
         self.hovered_room = None;
         self.selected_connection_handle = None;
         self.automatic_route_preview = None;
+        self.activity = EditorActivity::Idle;
         self.level = 0;
         self.translation = self.center_of_area().map_or_else(
             || Vector::new(0.0, 0.0),
@@ -367,6 +488,7 @@ impl MapEditor {
 
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
+        self.activity = EditorActivity::Idle;
     }
 
     /// Enables mutation affordances while preserving selection/inspection in
@@ -377,6 +499,7 @@ impl MapEditor {
             self.tool = Tool::Select;
             self.selected_connection_handle = None;
         }
+        self.activity = EditorActivity::Idle;
     }
 
     /// Installs or clears a view-only Automatic route preview.
@@ -399,6 +522,7 @@ impl MapEditor {
             self.hovered_room = None;
             self.selected_connection_handle = None;
             self.automatic_route_preview = None;
+            self.activity = EditorActivity::Idle;
         }
     }
 
@@ -417,12 +541,14 @@ impl MapEditor {
     pub fn clear_selection(&mut self) {
         self.selection.clear();
         self.selected_connection_handle = None;
+        self.activity = EditorActivity::Idle;
     }
 
     /// Replaces the selection with a single entity (e.g. one just created).
     pub fn select(&mut self, entity: EntityId) {
         self.selection.replace_with(entity);
         self.selected_connection_handle = None;
+        self.activity = EditorActivity::Idle;
     }
 
     /// Adds an entity to the selection (e.g. pasted entities arriving as
@@ -430,6 +556,7 @@ impl MapEditor {
     pub fn add_to_selection(&mut self, entity: EntityId) {
         self.selection.extend([entity]);
         self.selected_connection_handle = None;
+        self.activity = EditorActivity::Idle;
     }
 
     /// Removes an entity from the selection (e.g. after it was cut).
@@ -441,6 +568,7 @@ impl MapEditor {
         {
             self.selected_connection_handle = None;
         }
+        self.activity = EditorActivity::Idle;
     }
 
     #[must_use]
@@ -459,12 +587,46 @@ impl MapEditor {
 
     pub fn clear_selected_waypoint(&mut self) {
         self.selected_connection_handle = None;
+        self.activity = EditorActivity::Idle;
     }
 
     /// Exits port/waypoint editing while retaining the Connection selection.
     /// Returns whether a handle was active.
     pub fn clear_selected_connection_handle(&mut self) -> bool {
+        self.activity = EditorActivity::Idle;
         self.selected_connection_handle.take().is_some()
+    }
+
+    /// Context-sensitive editor hints. Connection editing is the first
+    /// consumer; callers receive structured key/action pairs so other tools
+    /// can reuse the same footer without formatting behavior in UI code.
+    #[must_use]
+    pub fn legend_items(&self) -> Vec<LegendItem> {
+        let Some(EntityId::Connection(connection_id)) = self.selection.single() else {
+            return resolve_legend(self.activity, self.editable, LegendContext::None);
+        };
+        let waypoint_selected = matches!(
+            self.selected_connection_handle,
+            Some((selected, SelectedConnectionHandle::Waypoint(_))) if selected == connection_id
+        );
+
+        let atlas = self.mapper.get_current_atlas();
+        let Some(connection) = self
+            .area_id
+            .as_ref()
+            .and_then(|area_id| atlas.get_area(area_id))
+            .and_then(|area| area.get_connection(connection_id).cloned())
+        else {
+            return resolve_legend(self.activity, self.editable, LegendContext::None);
+        };
+        resolve_legend(
+            self.activity,
+            self.editable,
+            LegendContext::Connection {
+                routing: connection.routing,
+                waypoint_selected,
+            },
+        )
     }
 
     #[must_use]
@@ -503,6 +665,12 @@ impl MapEditor {
                     self.selection.replace_with(entity);
                 }
                 self.selected_connection_handle = None;
+                self.activity = EditorActivity::Idle;
+                Update::with_event(Event::SelectionChanged)
+            }
+            Message::GhostRoomSelected { room_number, level } => {
+                self.set_level(level);
+                self.selection.replace_with(EntityId::Room(room_number));
                 Update::with_event(Event::SelectionChanged)
             }
             Message::RubberBandSelect { rect, additive } => {
@@ -569,17 +737,29 @@ impl MapEditor {
                 self.selection
                     .replace_with(EntityId::Connection(connection_id));
                 self.selected_connection_handle = Some((connection_id, handle));
+                self.automatic_route_preview = None;
+                self.activity = match handle {
+                    SelectedConnectionHandle::Waypoint(_) => {
+                        EditorActivity::DraggingConnectionWaypoint
+                    }
+                    SelectedConnectionHandle::PortA | SelectedConnectionHandle::PortB => {
+                        EditorActivity::DraggingConnectionPort
+                    }
+                };
                 Update::with_event(Event::SelectionChanged)
             }
             Message::ConnectionUpdated {
                 connection_id,
                 updates,
                 description,
-            } => Update::with_event(Event::RequestMutation(MutationRequest::UpdateConnection {
-                connection_id,
-                updates,
-                description,
-            })),
+            } => {
+                self.activity = EditorActivity::Idle;
+                Update::with_event(Event::RequestMutation(MutationRequest::UpdateConnection {
+                    connection_id,
+                    updates,
+                    description,
+                }))
+            }
             Message::WaypointInserted {
                 connection_id,
                 index,
@@ -612,6 +792,7 @@ impl MapEditor {
                         index + selected_offset.min(route_points.len() - index - 1),
                     ),
                 ));
+                self.activity = EditorActivity::Idle;
                 Update::new(
                     iced::Task::none(),
                     Some(Event::RequestMutation(MutationRequest::UpdateConnection {
@@ -624,6 +805,10 @@ impl MapEditor {
                         description: "Add connection waypoint",
                     })),
                 )
+            }
+            Message::ActivityChanged(activity) => {
+                self.activity = activity;
+                Update::none()
             }
         }
     }
@@ -915,23 +1100,146 @@ impl MapEditor {
         );
         hit
     }
+
+    /// Topmost adjacent-level room under a point, following the exact lower-
+    /// then-upper level order used by ghost rendering.
+    #[must_use]
+    fn ghost_room_at(&self, point: Point) -> Option<(RoomNumber, i32)> {
+        let atlas = self.mapper.get_current_atlas();
+        let area = atlas.get_area(self.area_id.as_ref()?)?;
+        let half_size = render::MAP_ROOM_SIZE / 2.0;
+        let mut hit = None;
+        for ghost_level in [self.level - 1, self.level + 1] {
+            area.with_rooms_in(
+                point.x - half_size,
+                point.y - half_size,
+                point.x + half_size,
+                point.y + half_size,
+                |room| {
+                    if room.get_level() == ghost_level
+                        && (room.get_x() - point.x).abs() < half_size
+                        && (room.get_y() - point.y).abs() < half_size
+                    {
+                        hit = Some((room.get_room_number(), ghost_level));
+                    }
+                },
+            );
+        }
+        hit
+    }
 }
 
-/// The compass octant pointing from one map-space point toward another
-/// (map y grows southward).
+/// The compass direction pointing from one map-space point toward another
+/// (map y grows southward). Cardinal capture is intentionally wide; a bearing
+/// must be close to a 45-degree diagonal before it produces a diagonal exit.
 #[must_use]
 pub(crate) fn direction_between(from: Point, to: Point) -> ExitDirection {
-    let angle = (to.y - from.y).atan2(to.x - from.x).to_degrees();
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let major = dx.abs().max(dy.abs());
+    let minor = dx.abs().min(dy.abs());
+    if major > 0.0 && minor / major >= smudgy_cloud::DIAGONAL_BEARING_RATIO {
+        return match (dx >= 0.0, dy >= 0.0) {
+            (true, true) => ExitDirection::Southeast,
+            (true, false) => ExitDirection::Northeast,
+            (false, true) => ExitDirection::Southwest,
+            (false, false) => ExitDirection::Northwest,
+        };
+    }
+    if dx.abs() >= dy.abs() {
+        if dx >= 0.0 {
+            ExitDirection::East
+        } else {
+            ExitDirection::West
+        }
+    } else if dy >= 0.0 {
+        ExitDirection::South
+    } else {
+        ExitDirection::North
+    }
+}
 
-    match angle {
-        a if (-22.5..22.5).contains(&a) => ExitDirection::East,
-        a if (22.5..67.5).contains(&a) => ExitDirection::Southeast,
-        a if (67.5..112.5).contains(&a) => ExitDirection::South,
-        a if (112.5..157.5).contains(&a) => ExitDirection::Southwest,
-        a if (-67.5..-22.5).contains(&a) => ExitDirection::Northeast,
-        a if (-112.5..-67.5).contains(&a) => ExitDirection::North,
-        a if (-157.5..-112.5).contains(&a) => ExitDirection::Northwest,
-        _ => ExitDirection::West,
+#[cfg(test)]
+mod direction_tests {
+    use super::*;
+
+    #[test]
+    fn cardinal_capture_is_wider_than_diagonal_capture() {
+        let origin = Point::ORIGIN;
+        assert_eq!(
+            direction_between(origin, Point::new(2.0, 1.0)),
+            ExitDirection::East
+        );
+        assert_eq!(
+            direction_between(origin, Point::new(1.0, 1.0)),
+            ExitDirection::Southeast
+        );
+        assert_eq!(
+            direction_between(origin, Point::new(-1.0, -1.0)),
+            ExitDirection::Northwest
+        );
+    }
+}
+
+#[cfg(test)]
+mod legend_tests {
+    use smudgy_cloud::ConnectionRouting;
+
+    use super::{EditorActivity, LegendContext, LegendItem, resolve_legend};
+
+    #[test]
+    fn dragging_waypoints_takes_precedence_over_selection_context() {
+        assert_eq!(
+            resolve_legend(
+                EditorActivity::DraggingConnectionWaypoint,
+                true,
+                LegendContext::Connection {
+                    routing: ConnectionRouting::Automatic,
+                    waypoint_selected: false,
+                },
+            ),
+            vec![
+                LegendItem {
+                    key: "Alt",
+                    action: "move freely",
+                },
+                LegendItem {
+                    key: "Esc",
+                    action: "cancel",
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_connection_hints_follow_routing_and_handle_state() {
+        assert_eq!(
+            resolve_legend(
+                EditorActivity::Idle,
+                true,
+                LegendContext::Connection {
+                    routing: ConnectionRouting::Manual,
+                    waypoint_selected: false,
+                },
+            ),
+            vec![LegendItem {
+                key: "Ctrl+click",
+                action: "add a point",
+            }]
+        );
+        assert_eq!(
+            resolve_legend(
+                EditorActivity::Idle,
+                true,
+                LegendContext::Connection {
+                    routing: ConnectionRouting::Manual,
+                    waypoint_selected: true,
+                },
+            )
+            .len(),
+            3
+        );
+        assert!(resolve_legend(EditorActivity::Idle, true, LegendContext::None).is_empty());
     }
 }
 

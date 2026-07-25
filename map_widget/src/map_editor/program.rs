@@ -6,6 +6,8 @@
 //! gesture lives in [`EditorProgramState`]; committed state changes are
 //! published as [`Message`]s and applied in [`MapEditor::update`].
 
+use std::sync::Arc;
+
 use iced::keyboard::{self, key::Named};
 use iced::widget::canvas::{self, stroke};
 use iced::{Color, Point, Rectangle, Size, Vector, mouse};
@@ -16,8 +18,10 @@ use smudgy_cloud::{
     ConnectionEndpoint, ConnectionId, ConnectionRouting, ConnectionUpdates, MapPoint, PortMode,
     RoomNumber, RoomSide, SegmentShape,
     connection_geometry::{
-        Handle as ConnectionHandle, distance_to_segment, port_position, stub_tip,
+        EndpointGeometry, GeometryInput, Handle as ConnectionHandle, distance_to_segment,
+        port_position, resolve, stub_tip,
     },
+    mapper::room_connection::RoomConnection,
 };
 
 use crate::{render, viewport};
@@ -41,6 +45,10 @@ const HANDLE_SCREEN_SIZE: f32 = 8.0;
 /// Smallest label/shape dimension (map units) a resize or creation drag
 /// can produce.
 const MIN_RECT_DIMENSION: f32 = 0.5;
+
+/// Stored Connection waypoints use a finer grid than rooms and other map
+/// entities.
+const CONNECTION_POINT_GRID: f32 = 0.1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandleKind {
@@ -231,6 +239,14 @@ impl MapEditor {
         }
     }
 
+    fn maybe_snap_connection(point: Point, modifiers: keyboard::Modifiers) -> Point {
+        if modifiers.alt() {
+            point
+        } else {
+            viewport::snap_to_step(point, CONNECTION_POINT_GRID)
+        }
+    }
+
     /// The resize handle under a map-space point, when a single
     /// label/shape is selected.
     fn handle_at(&self, point: Point) -> Option<(EntityId, HandleKind, Rectangle)> {
@@ -294,7 +310,7 @@ impl MapEditor {
                 if index >= points.len() {
                     return None;
                 }
-                let target = Self::maybe_snap(current, modifiers);
+                let target = Self::maybe_snap_connection(current, modifiers);
                 let mut target = MapPoint::new(target.x, target.y);
                 if connection.segment_shape == SegmentShape::Orthogonal {
                     let render = area.get_room_connections().iter().find(|render| {
@@ -442,6 +458,63 @@ impl MapEditor {
         }
     }
 
+    /// Resolves the complete view-only Connection produced by the current
+    /// drag. The Mapper cache stays untouched; release still submits one CAS
+    /// update through the same pure `connection_handle_update` helper.
+    fn connection_drag_preview(&self, state: &EditorProgramState) -> Option<RoomConnection> {
+        let Interaction::DraggingConnectionHandle {
+            connection_id,
+            handle,
+            current_map,
+        } = &state.interaction
+        else {
+            return None;
+        };
+        let updates =
+            self.connection_handle_update(*connection_id, *handle, *current_map, state.modifiers)?;
+        let atlas = self.mapper.get_current_atlas();
+        let area = atlas.get_area(self.area_id.as_ref()?)?;
+        let stored = area.get_connection(*connection_id)?;
+        let updated = updates.apply(stored);
+        let room_a = area.get_room(&updated.endpoint_a.room_number)?;
+        let room_b = updated
+            .endpoint_b
+            .and_then(|endpoint| area.get_room(&endpoint.room_number));
+        let geometry = resolve(&GeometryInput {
+            kind: updated.kind,
+            routing: updated.routing,
+            corner: updated.corner,
+            endpoint_a: EndpointGeometry {
+                room_center: MapPoint::new(room_a.get_x(), room_a.get_y()),
+                side: updated.endpoint_a.side,
+                port_offset: updated.endpoint_a.port_offset,
+            },
+            endpoint_b: updated
+                .endpoint_b
+                .zip(room_b)
+                .map(|(endpoint, room)| EndpointGeometry {
+                    room_center: MapPoint::new(room.get_x(), room.get_y()),
+                    side: endpoint.side,
+                    port_offset: endpoint.port_offset,
+                }),
+            route_points: &updated.route_points,
+            thickness: updated.thickness,
+        });
+        let mut preview = area
+            .get_room_connections()
+            .iter()
+            .find(|connection| {
+                connection.connection_id == *connection_id && connection.from_level == self.level
+            })?
+            .clone();
+        preview.geometry = Arc::new(geometry);
+        preview.routing = updated.routing;
+        preview.corner = updated.corner;
+        preview.dash = updated.dash;
+        preview.thickness = updated.thickness;
+        Some(preview)
+    }
+
     fn waypoint_insertion(
         &self,
         connection_id: ConnectionId,
@@ -465,7 +538,7 @@ impl MapEditor {
         logical.push(render.geometry.stub_tip_a);
         logical.extend(connection.route_points.iter().copied());
         logical.push(tip_b);
-        let point = Self::maybe_snap(point, modifiers);
+        let point = Self::maybe_snap_connection(point, modifiers);
         let point = MapPoint::new(point.x, point.y);
         let (index, segment) = logical.windows(2).enumerate().min_by(|(_, a), (_, b)| {
             distance_to_segment(point, a[0], a[1])
@@ -715,7 +788,12 @@ impl MapEditor {
                         state.modifiers,
                     )
                     .map_or_else(
-                        || canvas::Action::request_redraw().and_capture(),
+                        || {
+                            canvas::Action::publish(Message::ActivityChanged(
+                                super::EditorActivity::Idle,
+                            ))
+                            .and_capture()
+                        },
                         |updates| {
                             canvas::Action::publish(Message::ConnectionUpdated {
                                 connection_id,
@@ -750,6 +828,12 @@ impl canvas::Program<Message, Theme> for MapEditor {
         // even while the cursor is outside the canvas.
         if let IcedEvent::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
             state.modifiers = *modifiers;
+            if matches!(
+                state.interaction,
+                Interaction::DraggingConnectionHandle { .. }
+            ) {
+                return Some(canvas::Action::request_redraw().and_capture());
+            }
         }
 
         // Escape cancels an in-flight gesture; when idle it is left for the
@@ -760,8 +844,17 @@ impl canvas::Program<Message, Theme> for MapEditor {
         }) = event
         {
             if !matches!(state.interaction, Interaction::Idle) {
+                let connection_drag = matches!(
+                    state.interaction,
+                    Interaction::DraggingConnectionHandle { .. }
+                );
                 state.interaction = Interaction::Idle;
-                return Some(canvas::Action::request_redraw().and_capture());
+                return Some(if connection_drag {
+                    canvas::Action::publish(Message::ActivityChanged(super::EditorActivity::Idle))
+                        .and_capture()
+                } else {
+                    canvas::Action::request_redraw().and_capture()
+                });
             }
             return None;
         }
@@ -882,6 +975,17 @@ impl canvas::Program<Message, Theme> for MapEditor {
                                         .and_capture(),
                                     )
                                 }
+                            } else if let Some((room_number, level)) =
+                                self.ghost_room_at(map_position)
+                            {
+                                state.interaction = Interaction::Idle;
+                                Some(
+                                    canvas::Action::publish(Message::GhostRoomSelected {
+                                        room_number,
+                                        level,
+                                    })
+                                    .and_capture(),
+                                )
                             } else {
                                 state.interaction = Interaction::RubberBand {
                                     start_map: map_position,
@@ -1027,6 +1131,7 @@ impl canvas::Program<Message, Theme> for MapEditor {
         let area = self.area_id.as_ref().and_then(|id| atlas.get_area(id));
 
         if let Some(area) = area {
+            let drag_preview = self.connection_drag_preview(state);
             frame.with_save(|frame| {
                 frame.translate(center);
                 frame.scale(self.scaling);
@@ -1093,10 +1198,17 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     }
                 }
                 area.with_room_connections_in(min_x, min_y, max_x, max_y, |connection| {
-                    if connection.from_level == self.level {
+                    if connection.from_level == self.level
+                        && drag_preview
+                            .as_ref()
+                            .is_none_or(|preview| preview.connection_id != connection.connection_id)
+                    {
                         render::draw_connection(frame, &atlas, connection, 1.0, true, false);
                     }
                 });
+                if let Some(preview) = &drag_preview {
+                    render::draw_connection(frame, &atlas, preview, 1.0, true, false);
+                }
                 if let Some((connection_id, geometry)) = &self.automatic_route_preview
                     && let Some(connection) = area.get_room_connections().iter().find(|candidate| {
                         candidate.connection_id == *connection_id
@@ -1142,7 +1254,12 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         self.draw_selected_entities(frame, area.as_ref(), accent);
                     });
                 } else {
-                    self.draw_selection_outlines(frame, area.as_ref(), accent);
+                    self.draw_selection_outlines(
+                        frame,
+                        area.as_ref(),
+                        drag_preview.as_ref(),
+                        accent,
+                    );
                 }
 
                 // Rubber-band preview.
@@ -1267,40 +1384,23 @@ impl canvas::Program<Message, Theme> for MapEditor {
                 }
 
                 // Selected Connection ports and logical route vertices use a
-                // stable screen-space target. During a drag the active handle
-                // follows the pointer while the stored path remains an
-                // uncommitted reference until release.
+                // stable screen-space target. A drag's handles and full stroke
+                // both come from the same temporary resolved geometry.
                 if self.editable
                     && let Some(EntityId::Connection(connection_id)) = self.selection.single()
-                    && let Some(render) = area.get_room_connections().iter().find(|connection| {
-                        connection.connection_id == connection_id
-                            && connection.from_level == self.level
-                    })
+                    && let Some(connection_render) = drag_preview
+                        .as_ref()
+                        .filter(|preview| preview.connection_id == connection_id)
+                        .or_else(|| {
+                            area.get_room_connections().iter().find(|connection| {
+                                connection.connection_id == connection_id
+                                    && connection.from_level == self.level
+                            })
+                        })
                 {
-                    let dragging = match state.interaction {
-                        Interaction::DraggingConnectionHandle {
-                            connection_id: active,
-                            handle,
-                            current_map,
-                        } if active == connection_id => Some((handle, current_map)),
-                        _ => None,
-                    };
                     let radius = HANDLE_SCREEN_SIZE / self.scaling / 2.0;
-                    for handle in &render.geometry.handles {
-                        let mut position = handle.position();
-                        if dragging.is_some_and(|(active, _)| {
-                            std::mem::discriminant(&active) == std::mem::discriminant(handle)
-                                && match (active, *handle) {
-                                    (
-                                        ConnectionHandle::Waypoint(a, _),
-                                        ConnectionHandle::Waypoint(b, _),
-                                    ) => a == b,
-                                    _ => true,
-                                }
-                        }) {
-                            let (_, current) = dragging.expect("checked");
-                            position = MapPoint::new(current.x, current.y);
-                        }
+                    for handle in &connection_render.geometry.handles {
+                        let position = handle.position();
                         let path = canvas::Path::circle(Point::new(position.x, position.y), radius);
                         frame.fill(&path, accent);
                         frame.stroke(
@@ -1370,6 +1470,9 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         };
                     }
                     if self.entity_at(map_position).is_some() {
+                        return mouse::Interaction::Pointer;
+                    }
+                    if self.tool == Tool::Select && self.ghost_room_at(map_position).is_some() {
                         return mouse::Interaction::Pointer;
                     }
                 }
@@ -1466,12 +1569,24 @@ impl MapEditor {
         &self,
         frame: &mut canvas::Frame,
         area: &smudgy_cloud::mapper::area_cache::AreaCache,
+        connection_preview: Option<&RoomConnection>,
         accent: Color,
     ) {
         for entity in self.selection.iter() {
             match entity {
                 EntityId::Connection(id) => {
-                    self.stroke_connection_outline(frame, area, id, accent);
+                    if let Some(preview) = connection_preview.filter(|preview| {
+                        preview.connection_id == id && preview.from_level == self.level
+                    }) {
+                        Self::stroke_resolved_connection_outline(
+                            frame,
+                            preview,
+                            accent,
+                            self.scaling,
+                        );
+                    } else {
+                        self.stroke_connection_outline(frame, area, id, accent);
+                    }
                 }
                 EntityId::Room(number) => {
                     if let Some(room) = area.get_room(&number) {
@@ -1532,7 +1647,16 @@ impl MapEditor {
         }) else {
             return;
         };
-        let width = connection.thickness + 4.0 / self.scaling;
+        Self::stroke_resolved_connection_outline(frame, connection, accent, self.scaling);
+    }
+
+    fn stroke_resolved_connection_outline(
+        frame: &mut canvas::Frame,
+        connection: &RoomConnection,
+        accent: Color,
+        scaling: f32,
+    ) {
+        let width = connection.thickness + 4.0 / scaling;
         frame.stroke(
             &render::path_from_primitives(&connection.geometry.primitives),
             render::solid_stroke(accent, width),

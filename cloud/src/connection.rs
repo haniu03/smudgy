@@ -363,10 +363,48 @@ pub const THICKNESS_RANGE: std::ops::RangeInclusive<f32> = 0.25..=8.0;
 /// Longest accepted canonical color string, in bytes.
 pub const MAX_COLOR_LEN: usize = 64;
 
+/// Auto-pinned diagonal ports stop where a room's straight edge meets its
+/// rounded corner (`MAP_ROOM_BORDER_RADIUS / ROOM_SIZE`).
+pub const CORNER_INSET: f32 = 0.2;
+
+/// A gesture/bearing must be this diagonal before it leaves the much wider
+/// cardinal capture regions.
+pub const DIAGONAL_BEARING_RATIO: f32 = 0.75;
+
+/// Initial wall/offset nearest a bearing. Near-45-degree bearings use a
+/// rounded-corner inset; all other bearings prefer the dominant cardinal wall.
+#[must_use]
+pub fn default_anchor_for_bearing(bearing: MapPoint) -> (RoomSide, f32) {
+    let major = bearing.x.abs().max(bearing.y.abs());
+    let minor = bearing.x.abs().min(bearing.y.abs());
+    if major > 0.0 && minor / major >= DIAGONAL_BEARING_RATIO {
+        return if bearing.y < 0.0 {
+            (
+                RoomSide::North,
+                if bearing.x < 0.0 {
+                    CORNER_INSET
+                } else {
+                    1.0 - CORNER_INSET
+                },
+            )
+        } else {
+            (
+                RoomSide::South,
+                if bearing.x < 0.0 {
+                    CORNER_INSET
+                } else {
+                    1.0 - CORNER_INSET
+                },
+            )
+        };
+    }
+    (side_nearest_bearing(bearing), 0.5)
+}
+
 /// The wall and offset an endpoint is *initialized* to from an exit
 /// direction (never permanently derived — the inspector can move an endpoint
 /// to any side afterwards): compass directions anchor their named wall, with
-/// diagonals at the shared corner (NW = North wall at `0.0`, NE at `1.0`,
+/// diagonals inset from the shared corner (NW = North wall at `0.2`, NE at `0.8`,
 /// and likewise on the South wall).
 ///
 /// `partner_bearing` is the unit-ish vector from this room toward the
@@ -379,23 +417,22 @@ pub fn default_anchor_for_direction(
     partner_bearing: Option<MapPoint>,
 ) -> (RoomSide, f32) {
     match direction {
-        ExitDirection::Northwest => (RoomSide::North, 0.0),
+        ExitDirection::Northwest => (RoomSide::North, CORNER_INSET),
         ExitDirection::North => (RoomSide::North, 0.5),
-        ExitDirection::Northeast => (RoomSide::North, 1.0),
+        ExitDirection::Northeast => (RoomSide::North, 1.0 - CORNER_INSET),
         ExitDirection::East => (RoomSide::East, 0.5),
-        ExitDirection::Southwest => (RoomSide::South, 0.0),
+        ExitDirection::Southwest => (RoomSide::South, CORNER_INSET),
         ExitDirection::South => (RoomSide::South, 0.5),
-        ExitDirection::Southeast => (RoomSide::South, 1.0),
+        ExitDirection::Southeast => (RoomSide::South, 1.0 - CORNER_INSET),
         ExitDirection::West => (RoomSide::West, 0.5),
         ExitDirection::Up
         | ExitDirection::Down
         | ExitDirection::In
         | ExitDirection::Out
         | ExitDirection::Special
-        | ExitDirection::Other => (
-            partner_bearing.map_or(RoomSide::East, side_nearest_bearing),
-            0.5,
-        ),
+        | ExitDirection::Other => {
+            partner_bearing.map_or((RoomSide::East, 0.5), default_anchor_for_bearing)
+        }
     }
 }
 
@@ -443,7 +480,7 @@ mod tests {
     fn cardinal_directions_anchor_their_walls() {
         assert_eq!(
             default_anchor_for_direction(ExitDirection::Northwest, None),
-            (RoomSide::North, 0.0)
+            (RoomSide::North, CORNER_INSET)
         );
         assert_eq!(
             default_anchor_for_direction(ExitDirection::North, None),
@@ -451,7 +488,7 @@ mod tests {
         );
         assert_eq!(
             default_anchor_for_direction(ExitDirection::Southeast, None),
-            (RoomSide::South, 1.0)
+            (RoomSide::South, 1.0 - CORNER_INSET)
         );
         assert_eq!(
             default_anchor_for_direction(ExitDirection::West, None),
@@ -465,6 +502,12 @@ mod tests {
         assert_eq!(east, (RoomSide::East, 0.5));
         let north = default_anchor_for_direction(ExitDirection::In, Some(MapPoint::new(0.5, -2.0)));
         assert_eq!(north, (RoomSide::North, 0.5));
+        let northeast =
+            default_anchor_for_direction(ExitDirection::Down, Some(MapPoint::new(2.0, -2.0)));
+        assert_eq!(northeast, (RoomSide::North, 1.0 - CORNER_INSET));
+        let cardinal_bias =
+            default_anchor_for_direction(ExitDirection::Up, Some(MapPoint::new(2.0, 1.0)));
+        assert_eq!(cardinal_bias, (RoomSide::East, 0.5));
         assert_eq!(
             default_anchor_for_direction(ExitDirection::Other, None),
             (RoomSide::East, 0.5)

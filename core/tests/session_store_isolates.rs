@@ -1,7 +1,7 @@
 //! The session store across the isolate set (`docs/interop.md` §2–§3): a
 //! sandboxed package publishes into its own subtree and main-isolate code consumes it
-//! cross-isolate; the `interop:*` capabilities gate the ops (with the legacy `events` manifest
-//! tokens aliasing on); and the home-instance gate makes non-home writes inert — a forged
+//! cross-isolate; the `interop:*` capabilities gate the ops (and removed `events` manifest
+//! tokens grant nothing); and the home-instance gate makes non-home writes inert — a forged
 //! creator and a code-imported copy alike no-op with a teaching diagnostic.
 
 use std::rc::Rc;
@@ -210,10 +210,10 @@ async fn sandboxed_package_publishes_and_main_consumes_cross_isolate() {
 }
 
 /// The `interop:*` capabilities gate the store ops: an echo-only package is denied `set` (naming
-/// `interop:write`) and `watch` (naming `interop:read`); a consent whose capabilities came from
-/// the LEGACY `events` manifest tokens grants the aliased interop capabilities end-to-end.
+/// `interop:write`) and `watch` (naming `interop:read`), and the removed `events` manifest key
+/// does not silently grant either capability.
 #[tokio::test]
-async fn interop_capabilities_gate_store_ops_and_legacy_events_tokens_alias_on() {
+async fn interop_capabilities_gate_store_ops_and_removed_events_tokens_grant_nothing() {
     // Part A: echo-only — both store verbs throw, naming the missing capability.
     let server = "ss_caps_denied";
     prepare_server(server);
@@ -270,9 +270,9 @@ async fn interop_capabilities_gate_store_ops_and_legacy_events_tokens_alias_on()
         "an ungranted keys read must throw NotCapable('interop:read'); transcript:\n{lines:#?}"
     );
 
-    // Part B: a consent recorded from the legacy wire form (`events: ["emit","subscribe"]`)
-    // grants the aliased interop capabilities, so the same verbs work.
-    let server = "ss_caps_alias";
+    // Part B: an unmigrated consent using the removed wire form
+    // (`events: ["emit","subscribe"]`) grants nothing in 0.5.
+    let server = "ss_caps_removed_events";
     prepare_server(server);
     shared_packages::install_package(server, "smudgy://wbk/legacy", UpdateMode::Auto, true)
         .unwrap();
@@ -280,7 +280,8 @@ async fn interop_capabilities_gate_store_ops_and_legacy_events_tokens_alias_on()
         "session": ["echo"],
         "events": ["emit", "subscribe"],
     }))
-    .expect("legacy wire form parses");
+    .expect("unknown legacy key is ignored");
+    assert!(!legacy_caps.interop_read && !legacy_caps.interop_write);
     shared_packages::record_consent(
         server,
         "smudgy://wbk/legacy",
@@ -297,8 +298,8 @@ async fn interop_capabilities_gate_store_ops_and_legacy_events_tokens_alias_on()
         const creator = { kind: "package", owner: "wbk", name: "legacy", version: "1.0.0" };
         try {
             store.set(creator, "x", 7);
-            echo("LEGACY_SET:" + store.get("smudgy://wbk/legacy", "x"));
-        } catch (e) { echo("LEGACY_ERR:" + (e?.message ?? String(e))); }
+            echo("REMOVED_EVENTS_SET_OK");
+        } catch (e) { echo("REMOVED_EVENTS_DENIED:" + (e?.message ?? String(e))); }
     "#;
     let lines = run_session(
         9703,
@@ -307,8 +308,11 @@ async fn interop_capabilities_gate_store_ops_and_legacy_events_tokens_alias_on()
     )
     .await;
     assert!(
-        has_line(&lines, "LEGACY_SET:7"),
-        "legacy events tokens must alias onto interop read+write; transcript:\n{lines:#?}"
+        !has_line(&lines, "REMOVED_EVENTS_SET_OK")
+            && lines
+                .iter()
+                .any(|line| line.contains("REMOVED_EVENTS_DENIED:") && line.contains("interop:write")),
+        "removed events tokens must not grant interop:write; transcript:\n{lines:#?}"
     );
 }
 

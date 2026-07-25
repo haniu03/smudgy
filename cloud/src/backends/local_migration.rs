@@ -23,9 +23,9 @@
 //!   then the lower exit UUID, wins the field.
 //! - **Anchors** follow §1.5 (direction default, partner bearing for the
 //!   non-planar directions) and **ports** follow the §4.3 whole-group
-//!   distribution: every `(room, side, secrecy-class)` group is evenly
-//!   spaced at `slot / (n + 1)` in (bearing, connection UUID, endpoint role)
-//!   order.
+//!   distribution: a lone endpoint keeps its semantic default and larger
+//!   `(room, side, secrecy-class)` groups span the corner-safe `0.2..=0.8`
+//!   edge in (bearing, connection UUID, endpoint role) order.
 //!
 //! One deliberate divergence from the cloud backfill: a **local** map has no
 //! cross-area clearance concept, so a cross-area destination's secrecy is
@@ -41,7 +41,7 @@ use crate::{
     ConnectionKind, ConnectionRouting, CornerStyle, DEFAULT_CONNECTION_COLOR,
     DEFAULT_CONNECTION_THICKNESS, Exit, ExitDirection, ExitId, Label, LinkedAreaInfo, MapPoint,
     PortMode, Property, RoomNumber, RoomSide, RoomWithDetails, SegmentShape, Shape,
-    connection::{MAX_COLOR_LEN, default_anchor_for_direction},
+    connection::{CORNER_INSET, MAX_COLOR_LEN, default_anchor_for_direction},
 };
 
 /// The pre-Connection (v1) `AreaWithDetails` document shape: no
@@ -591,7 +591,9 @@ pub fn migrate_v1(legacy: LegacyAreaV1) -> AreaWithDetails {
         connections.push(connection);
     }
 
-    // --- Port distribution (backfill 4d): whole-group even spacing per
+    // --- Port distribution (backfill 4d): groups of two or more span the
+    // rounded-corner-safe straight edge; a lone endpoint keeps its semantic
+    // 0.2/0.5/0.8 default.
     // `(room, side, effective-secret class)` in (bearing, connection UUID,
     // role) order. Effective-secret = any member exit secret OR either
     // endpoint room secret OR a same-area destination room secret; a
@@ -699,11 +701,14 @@ pub fn migrate_v1(legacy: LegacyAreaV1) -> AreaWithDetails {
                 .then(a.connection.cmp(&b.connection))
                 .then(a.role_b.cmp(&b.role_b))
         });
+        if group.len() == 1 {
+            continue;
+        }
         #[allow(clippy::cast_precision_loss)] // wall groups are tiny
-        let denominator = (group.len() + 1) as f32;
+        let denominator = (group.len() - 1) as f32;
         for (slot, &idx) in group.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
-            let port = (slot + 1) as f32 / denominator;
+            let port = CORNER_INSET + slot as f32 * (1.0 - 2.0 * CORNER_INSET) / denominator;
             let wall_endpoint = &wall_endpoints[idx];
             let connection = &mut connections[by_id[&wall_endpoint.connection]];
             if wall_endpoint.role_b {
@@ -966,7 +971,11 @@ mod tests {
 
     fn assert_slot(actual: f32, slot: u32, group: u32, ctx: &str) {
         #[allow(clippy::cast_precision_loss)]
-        let expected = slot as f32 / (group + 1) as f32;
+        let expected = if group == 1 {
+            0.5
+        } else {
+            CORNER_INSET + (slot - 1) as f32 * (1.0 - 2.0 * CORNER_INSET) / (group - 1) as f32
+        };
         assert!(
             (actual - expected).abs() < 1e-5,
             "{ctx}: expected {expected}, got {actual}"
@@ -1422,6 +1431,7 @@ mod tests {
             RoomSide::North,
             "NW anchors North"
         );
+        assert!((northwest.endpoint_a.port_offset - CORNER_INSET).abs() < 1.0e-6);
     }
 
     #[test]

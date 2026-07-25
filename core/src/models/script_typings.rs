@@ -41,8 +41,9 @@ const SMUDGY_CORE_DTS: &str = include_str!("script_typings/smudgy-core.d.ts");
 const SMUDGY_PARAMS_DTS: &str = include_str!("script_typings/smudgy-params.d.ts");
 
 /// The managed ambient declarations for the `mapper` API (`Mapper`/`Area`/`Room`/`Exit`/...),
-/// declared as global ambient types so both bare `mapper.*` usage and `smudgy:core`'s typed
-/// `mapper` member resolve them. Embedded at build time, rewritten on session start.
+/// declared as global ambient types so scripts can annotate map values without imports and
+/// `smudgy:core`'s typed `mapper`/`Area` exports can reference them. Embedded at build time,
+/// rewritten on session start.
 const SMUDGY_MAPPER_DTS: &str = include_str!("script_typings/smudgy-mapper.d.ts");
 
 /// The managed ambient declarations for `smudgy:widgets` + `smudgy:widgets/jsx-runtime`
@@ -653,11 +654,14 @@ mod tests {
         assert!(core.contains("export const session: Session"));
         assert!(core.contains("export function getSessions()"));
         assert!(core.contains("export const mapper: Mapper"));
+        assert!(core.contains("export const Area:"));
 
         // The mapper + widgets ambient declarations ship alongside.
         let mapper = fs::read_to_string(dir.join(".smudgy/types/smudgy-mapper.d.ts")).unwrap();
         assert!(mapper.contains("interface Mapper"));
-        assert!(mapper.contains("declare const mapper: Mapper"));
+        assert!(mapper.contains("interface Area"));
+        assert!(!mapper.contains("declare const mapper: Mapper"));
+        assert!(!mapper.contains("declare class Area"));
         let widgets = fs::read_to_string(dir.join(".smudgy/types/smudgy-widgets.d.ts")).unwrap();
         assert!(widgets.contains("declare module \"smudgy:widgets\""));
         assert!(widgets.contains("declare module \"smudgy:widgets/jsx-runtime\""));
@@ -1621,57 +1625,43 @@ export function make() { return createEvent('dynamic'); }
         );
     }
 
-    /// The name-first deprecation shim (the `DEPRECATED-NAME-FIRST` section of `smudgy.ts`)
-    /// honors pre-0.4 `create*(name, ...)` calls with a notice through the 0.4 line only —
-    /// the contract never carried the old form, so 0.5 is where the runtime stops accepting
-    /// it. This trips the moment the crate version reaches 0.5 while the shim still exists,
-    /// so the removal cannot be forgotten in the release rush.
-    #[test]
-    fn name_first_shim_is_removed_by_0_5() {
-        let mut parts = env!("CARGO_PKG_VERSION").split(['.', '-']);
-        let major: u32 = parts.next().and_then(|p| p.parse().ok()).expect("major");
-        let minor: u32 = parts.next().and_then(|p| p.parse().ok()).expect("minor");
-        assert!(
-            (major, minor) < (0, 5) || !SMUDGY_TS.contains("DEPRECATED-NAME-FIRST"),
-            "smudgy is {} but smudgy.ts still contains the DEPRECATED-NAME-FIRST shim: the \
-             name-first create* grace window ended at 0.5 — delete the shim section, the \
-             rest-args facade wrappers, and the createTimer/createHotkey entry shims, and \
-             flip the old-form tests in script_integration.rs to expect a TypeError.",
-            env!("CARGO_PKG_VERSION"),
-        );
-    }
-
     /// Drift guard for the MAP types: the mapper runtime impl (`mapper.ts`) and the
     /// author-facing contract (`smudgy-mapper.d.ts`) are separate files, so this compiles them
     /// together and asserts (1) the impl is valid TypeScript on its own (ops are an `any` FFI
-    /// boundary via the `@ts-ignore`d `ext:core/ops` import) and (2) the impl's `mapper` object
-    /// and `Area`/`Room`/`Exit` shapes are assignable to the published global `Mapper`/`Area`/
-    /// `Room`/`Exit` — so the runtime cannot silently expose map types incompatible with what the
-    /// declarations promise authors (the regression that left external packages' `Room`/`Area`/…
-    /// usage stranded). The impl exposes these via the type-only `*Impl` exports at the end of
-    /// `mapper.ts`.
+    /// boundary via the `@ts-ignore`d `ext:core/ops` import) and (2) the impl's `mapper` object,
+    /// `Area` constructor, and `Area`/`Room`/`Exit` shapes are assignable to the published module
+    /// value and global ambient map types — so the runtime cannot silently expose map types
+    /// incompatible with what the declarations promise authors (the regression that left external
+    /// packages' `Room`/`Area`/… usage stranded). The impl exposes these via the type-only `*Impl`
+    /// exports at the end of `mapper.ts`.
     #[test]
     fn mapper_ts_impl_conforms_to_contract() {
         use std::collections::BTreeMap;
 
         let mut ambient = BTreeMap::new();
-        // The contract declares `Mapper`/`Area`/`Room`/`Exit`/`AreaId`/… as global ambient types.
+        // The contract declares `Mapper`/`Area`/`Room`/`Exit`/`AreaId`/… as global ambient types,
+        // while smudgy:core publishes the Area runtime constructor.
         ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
+        ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
 
         let mut sources = BTreeMap::new();
         sources.insert("impl.ts".to_string(), SMUDGY_MAPPER_TS.to_string());
         sources.insert(
             "check.ts".to_string(),
-            "import type { MapperImpl, AreaImpl, RoomImpl, ExitImpl } from \"./impl.ts\";\n\
+            "import { Area } from \"smudgy:core\";\n\
+             import type { MapperImpl, AreaConstructorImpl, AreaImpl, RoomImpl, ExitImpl } from \"./impl.ts\";\n\
              declare const m: MapperImpl;\n\
+             declare const areaConstructor: AreaConstructorImpl;\n\
              declare const a: AreaImpl;\n\
              declare const r: RoomImpl;\n\
              declare const e: ExitImpl;\n\
              // The runtime impl must fulfill the published global map-type contract.\n\
              export const __mapper: Mapper = m;\n\
+             export const __areaConstructor: typeof Area = areaConstructor;\n\
              export const __area: Area = a;\n\
              export const __room: Room = r;\n\
-             export const __exit: Exit = e;\n"
+             export const __exit: Exit = e;\n\
+             export const __instanceof: boolean = a instanceof Area;\n"
                 .to_string(),
         );
 
@@ -1738,11 +1728,10 @@ export function make() { return createEvent('dynamic'); }
 
     /// Coverage guard for EXTERNAL packages: compile a consumer that reaches the map the way
     /// installed `smudgy://` package scripts do — `Room`/`Area`/`Exit`/`ExitId`/`RoomNumber`/
-    /// `AreaId` as AMBIENT GLOBALS (no import) and the bare `mapper` global — against the shipped
-    /// typings. This is the surface already-published scripts compile against, so a typings/runtime
-    /// refactor that drops one of these globals silently breaks them. A clean compile proves the map
-    /// types stay exposed to `smudgy:core` consumers; a regression here is the "map types no longer
-    /// available" breakage.
+    /// `AreaId` as AMBIENT GLOBALS (no type imports), with the runtime `mapper`/`Area` values imported
+    /// from `smudgy:core` — against the shipped typings. A clean compile proves the map types stay
+    /// ambient while the two values use the module surface; a regression here is the "map types no
+    /// longer available" breakage.
     #[test]
     fn external_package_map_surface_is_typed() {
         use std::collections::BTreeMap;
@@ -1754,9 +1743,11 @@ export function make() { return createEvent('dynamic'); }
         let mut sources = BTreeMap::new();
         sources.insert(
             "consumer.ts".to_string(),
-            // `mapper` and Room/Area/Exit/ExitId/RoomNumber/AreaId are used with NO import,
-            // resolving to the global ambient declarations -- the way package scripts reach the map.
+            // Room/Area/Exit/ExitId/RoomNumber/AreaId stay global ambient types; mapper and the
+            // Area constructor are explicit runtime imports.
             r##"
+            import { mapper, Area } from "smudgy:core";
+
             function useRoom(room: Room): void {
               const aid: AreaId = room.area_id;
               const n: RoomNumber = room.room_number;
@@ -1789,7 +1780,6 @@ export function make() { return createEvent('dynamic'); }
               const w: number = e.weight; const cmd = e.command;
               void id; void fd; void fa; void fr; void ta; void tr; void td; void closed; void hidden; void locked; void w; void cmd;
             }
-            // `mapper` as a bare ambient global (package scripts reference it without importing).
             async function useMapper(room: Room): Promise<void> {
               const areas: Area[] = mapper.areas;
               const a: Area = mapper.getAreaById(room.area_id);
@@ -1801,6 +1791,7 @@ export function make() { return createEvent('dynamic'); }
               const list = mapper.listRoomsByTitleAndDescription("t", "d");
               const list2 = mapper.listRoomsByTitleDescriptionAndVisibleExits("t", "d", ["North"]);
               const newArea: Area = await mapper.createArea("Town");
+              const runtimeCheck: boolean = newArea instanceof Area;
               const newRoom: RoomNumber = mapper.createRoom(room.area_id, { title: "x" });
               const exitId: ExitId = await mapper.createRoomExit(room.area_id, room.room_number, { from_direction: "North" });
               mapper.setRoomExit(room.area_id, room.room_number, exitId, { command: "enter hole" });
@@ -1818,7 +1809,7 @@ export function make() { return createEvent('dynamic'); }
               mapper.setRoomTitle(room.area_id, room.room_number, "t");
               mapper.setRoomDescription(room.area_id, room.room_number, "d");
               mapper.renameArea(room.area_id, "n");
-              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void newRoom;
+              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void runtimeCheck; void newRoom;
             }
             export { useRoom, useArea, useExit, useMapper };
             "##

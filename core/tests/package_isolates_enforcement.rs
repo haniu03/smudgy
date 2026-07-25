@@ -971,11 +971,10 @@ async fn unconsented_package_is_denied_everything() {
 
 /// A sandboxed package that did NOT request the interop capability is denied handle
 /// `.emit`/consumer `.on` at runtime (`PACKAGE-EVENTS.md`): the gate throws `NotCapable`
-/// naming the missing capability (`interop:write`/`interop:read` — the caps the legacy
-/// `events` manifest tokens alias onto), caught and reported. Consent is echo-only (so it
-/// can report), no interop.
+/// naming the missing capability (`interop:write`/`interop:read`), caught and reported.
+/// Consent is echo-only (so it can report), no interop.
 #[tokio::test]
-async fn sandboxed_package_without_events_capability_is_denied_emit_and_subscribe() {
+async fn sandboxed_package_without_interop_capability_is_denied_emit_and_subscribe() {
     prepare_server("pi_events_denied");
 
     let src = r#"

@@ -84,6 +84,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Script automation factories now accept only the pattern/key/options-first
+  signatures introduced in 0.4; the deprecated positional-name forms have been
+  removed for 0.5.
+- Scripts must import the map API from `smudgy:core`; the deprecated ambient
+  `mapper` value has been removed. The ambient map types remain available, and
+  the `Area` constructor is now an explicit import for `instanceof` checks.
+- Package manifests and consent records now use only the canonical
+  `interop: ["read", "write"]` capabilities; the deprecated
+  `events: ["subscribe", "emit"]` alias has been removed for 0.5.
 - Creating rooms while auto-mapping no longer slows down as more maps
   are loaded: the cost of a map write now scales with the touched map,
   not with everything loaded. With 100,000 rooms loaded, an auto-mapped
@@ -92,6 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Plain-string `line.replace(...)` now preserves the style of the matched text,
+  including when the match starts exactly at a color boundary; it previously
+  restyled the replacement with the line's first color.
 - Every map overlay (`MapView`) a script ever mounted quietly kept its
   pan/zoom state and player-location tracking for the rest of the
   session, even after the widget was removed. Unmounted maps are now

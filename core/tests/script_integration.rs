@@ -23,12 +23,11 @@ const QUIET_PERIOD: Duration = Duration::from_millis(900);
 const HARNESS_TS: &str = r#"
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-// The convenience surface is not ambient in modules (globalThis is
-// minimal). A module imports what it uses from smudgy:core: `createAlias`/`echo`/
-// `send` as named exports, and the current-session facade as the default export
-// (`session`) for live accessors like `reload`/`vars`. `mapper` remains a global
-// (its own extension owns that object), so it stays ambient here.
-import session, { createAlias, echo, send, vars } from "smudgy:core";
+// The convenience surface is not ambient in modules (globalThis is minimal). A
+// module imports what it uses from smudgy:core: mapper values and
+// `createAlias`/`echo`/`send` as named exports, and the current-session facade as
+// the default export (`session`) for live accessors like `reload`/`vars`.
+import session, { Area, createAlias, echo, mapper, send, vars } from "smudgy:core";
 
 // A JS-function alias that calls reload() exercises the
 // `op_smudgy_session_reload` op (own-session route). Reloading rebuilds the
@@ -62,6 +61,13 @@ const mapperOpResult =
     mapper.listRoomsByTitleDescriptionAndVisibleExits("No title", "No description", []);
 const mapperOpOk = Array.isArray(mapperOpResult) && mapperOpResult.length === 0;
 echo(mapperOpOk ? "MAPPER_OP_OK" : "MAPPER_OP_FAIL");
+
+const mapperGlobalsGone =
+    !("mapper" in globalThis) &&
+    !("Area" in globalThis) &&
+    !("__smudgy_install_mapper" in globalThis) &&
+    typeof Area === "function";
+echo(mapperGlobalsGone ? "MAPPER_GLOBALS_GONE" : "MAPPER_GLOBALS_LEAKED");
 
 createAlias("^greet$", () => { send("hello world"); });
 createAlias("^dorel$", () => { session.reload(); });
@@ -398,6 +404,10 @@ async fn arctic_style_module_loads_and_runs_in_session() {
         "real mapper op must be registered and callable.\nTranscript:\n{transcript}"
     );
     assert!(
+        lines.iter().any(|l| l == "MAPPER_GLOBALS_GONE"),
+        "mapper and Area must be module exports, not public globals.\nTranscript:\n{transcript}"
+    );
+    assert!(
         lines.iter().any(|l| l == "hello world"),
         "function-alias send() must fire on `greet`.\nTranscript:\n{transcript}"
     );
@@ -414,7 +424,7 @@ async fn arctic_style_module_loads_and_runs_in_session() {
 /// echoes when fired, and a `setCurrentLocation` -> `getCurrentLocation` round-trip.
 const TIMERS_HOTKEYS_MAPPER_TS: &str = r#"
 import core, { createTimer, createHotkey, timers, hotkeys, echo } from "smudgy:core";
-// `mapper` is a live accessor on the default-export facade (not a named export).
+// Exercise the default-export facade's live mapper accessor; modules may also import it by name.
 const mapper = core.mapper;
 
 // A repeating timer that self-removes after 3 fires, named via options. Each tick echoes
@@ -581,28 +591,22 @@ for (const bad of ["bad/name", "a\\b", "a:b", "", "   ", "CON", ".hidden"]) {
 }
 echo(rejected === 7 ? "ILLEGAL_STILL_REJECTED" : ("ILLEGAL_LEAK rejected=" + rejected));
 
-// The retired name-first shape keeps working through the 0.4 deprecation shim: the
-// positional name lands in options.name (so it is the handle's name and registry
-// identity), and a [deprecated] notice is echoed once per function -- the second
-// createAlias call below must not add a second notice.
-const oldAlias = createAlias("oldname", "^__old_a__$", () => {});
-createAlias("oldname2", "^__old_b__$", () => {});
-const oldTrigger = createTrigger("oldtrig", "^__old_c__$", () => {});
-const oldTimer = createTimer("oldticker", { intervalMs: 1000000, repeat: false }, () => {});
-const oldHotkey = createHotkey("oldhk", { key: "F3" }, () => {});
-const shimmed =
-    oldAlias.name === "oldname" &&
-    oldTrigger.name === "oldtrig" &&
-    oldTimer.name === "oldticker" &&
-    oldHotkey.name === "oldhk";
-echo(shimmed ? "OLD_FORM_SHIMMED" : ("OLD_FORM_BROKEN a=" + oldAlias.name + " t=" + oldTrigger.name
-    + " ti=" + oldTimer.name + " hk=" + oldHotkey.name));
-
-// Both names at once is a contradiction the shim refuses rather than guesses about.
-let conflictThrew = false;
-try { createAlias("oldboth", "^__old_d__$", () => {}, { name: "otherboth" }); }
-catch (_e) { conflictThrew = true; }
-echo(conflictThrew ? "OLD_FORM_CONFLICT_THROWS" : "OLD_FORM_CONFLICT_ACCEPTED");
+// Name-first calls were accepted only through 0.4. In 0.5 all four canonical entry
+// points reject the displaced arguments through their normal TypeError validation.
+const oldForms = [
+    () => createAlias("oldname", "^__old_a__$", () => {}),
+    () => createTrigger("oldtrig", "^__old_b__$", () => {}),
+    () => createTimer("oldticker", { intervalMs: 1000000, repeat: false }, () => {}),
+    () => createHotkey("oldhk", { key: "F3" }, () => {}),
+];
+let oldFormTypeErrors = 0;
+for (const oldForm of oldForms) {
+    try { oldForm(); }
+    catch (error) { if (error instanceof TypeError) oldFormTypeErrors++; }
+}
+echo(oldFormTypeErrors === oldForms.length
+    ? "OLD_FORMS_REJECTED"
+    : `OLD_FORMS_ACCEPTED count=${oldForms.length - oldFormTypeErrors}`);
 "#;
 
 #[tokio::test]
@@ -671,28 +675,9 @@ async fn script_automation_names_match_ui_rules() {
         lines.iter().any(|l| l == "ILLEGAL_STILL_REJECTED"),
         "filesystem-illegal/empty/reserved/dot-edge names must still be rejected, matching the UI.\nTranscript:\n{transcript}"
     );
-    // The name-first deprecation shim (removed in 0.5; see the tripwire in
-    // script_typings.rs): old-form calls register under their positional name, each of the
-    // four functions notices exactly once per script, and a positional-name/options.name
-    // conflict throws.
     assert!(
-        lines.iter().any(|l| l == "OLD_FORM_SHIMMED"),
-        "name-first create* calls must keep working through the deprecation shim, with the \
-         positional name as the automation's name.\nTranscript:\n{transcript}"
-    );
-    for func in ["createAlias", "createTrigger", "createTimer", "createHotkey"] {
-        assert_eq!(
-            lines
-                .iter()
-                .filter(|l| l.starts_with("[deprecated]") && l.contains(func))
-                .count(),
-            1,
-            "{func} must emit exactly one deprecation notice per script, however many \
-             old-form calls it makes.\nTranscript:\n{transcript}"
-        );
-    }
-    assert!(
-        lines.iter().any(|l| l == "OLD_FORM_CONFLICT_THROWS"),
-        "a positional name combined with options.name must throw.\nTranscript:\n{transcript}"
+        lines.iter().any(|l| l == "OLD_FORMS_REJECTED"),
+        "name-first createAlias/createTrigger/createTimer/createHotkey calls must all throw \
+         TypeError in 0.5.\nTranscript:\n{transcript}"
     );
 }

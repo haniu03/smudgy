@@ -4210,8 +4210,8 @@ mod tests {
             .filter_map(|(_, update)| update.endpoint_a.map(|endpoint| endpoint.port_offset))
             .collect::<Vec<_>>();
         offsets.sort_by(f32::total_cmp);
-        assert!((offsets[0] - 1.0 / 3.0).abs() < 1.0e-6);
-        assert!((offsets[1] - 2.0 / 3.0).abs() < 1.0e-6);
+        assert!((offsets[0] - smudgy_cloud::CORNER_INSET).abs() < 1.0e-6);
+        assert!((offsets[1] - (1.0 - smudgy_cloud::CORNER_INSET)).abs() < 1.0e-6);
 
         let command = edit_connections(&atlas, area_id, edits, "Redistribute ports")
             .expect("one compound command");
