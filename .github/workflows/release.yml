@@ -326,9 +326,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ls -la dist/
+          # Hyphenated versions (-dev, -rc…) are prereleases: they must never
+          # become the repo's "Latest" release.
+          args=(--verify-tag --generate-notes --title "smudgy $GITHUB_REF_NAME")
+          case "$GITHUB_REF_NAME" in *-*) args+=(--prerelease) ;; esac
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --verify-tag --generate-notes --title "smudgy $GITHUB_REF_NAME"
+            gh release create "$GITHUB_REF_NAME" dist/* "${args[@]}"
           fi
