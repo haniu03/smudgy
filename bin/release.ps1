@@ -39,7 +39,12 @@ if (-not (Test-Path $dlib)) {
 }
 
 $metadata = Join-Path $toolsDir 'metadata.json'
-@{ Endpoint = $Endpoint; CodeSigningAccountName = $Account; CertificateProfileName = $CertProfile } |
+# ExcludeCredentials skips DefaultAzureCredential's managed-identity probe: on
+# machines with an IMDS endpoint but no assigned identity (GitHub-hosted runners
+# are Azure VMs), that probe retries with backoff for many minutes before the
+# chain reaches the Azure CLI credential that actually signs.
+@{ Endpoint = $Endpoint; CodeSigningAccountName = $Account; CertificateProfileName = $CertProfile
+   ExcludeCredentials = @('ManagedIdentityCredential') } |
     ConvertTo-Json | Set-Content $metadata -Encoding ascii
 
 $signArgs = @('sign', '/v', '/fd', 'SHA256', '/tr', 'http://timestamp.acs.microsoft.com', '/td', 'SHA256',
