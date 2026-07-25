@@ -173,7 +173,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install cargo-about
-        run: cargo install --locked cargo-about
+        run: cargo install --locked cargo-about --features cli
 
       # Signing uses Azure Trusted Signing through DefaultAzureCredential;
       # azure/login's OIDC session satisfies it via the Azure CLI credential.
@@ -233,7 +233,7 @@ jobs:
       - name: Install packaging tools
         run: |
           brew install create-dmg
-          cargo install --locked cargo-about
+          cargo install --locked cargo-about --features cli
           # Pin 0.7.0: release-mac.sh works around its exact CLI quirks
           # (no package selector; -p is --profile).
           cargo install cargo-bundle --version 0.7.0
