@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Smudgy
+GenericName=MUD Client
+Comment=Play text-based MUDs with scripting, automapping, triggers and aliases
+Exec=smudgy
+Icon=org.smudgy.Smudgy
+Terminal=false
+Categories=Game;RolePlaying;
+Keywords=MUD;telnet;mudclient;text;game;
+StartupNotify=true
+StartupWMClass=org.smudgy.Smudgy

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 Walter Kalata -->
+<component type="desktop-application">
+  <id>org.smudgy.Smudgy</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <name>Smudgy</name>
+  <summary>Play text-based MUDs with scripting and automapping</summary>
+  <description>
+    <p>
+      Smudgy is a modern client for text-based Multi-User Dungeons (MUDs). It pairs a
+      fast terminal with an embedded JavaScript/TypeScript scripting engine, automapping,
+      and configurable triggers, aliases, and hotkeys.
+    </p>
+    <p>
+      Scripts run in a sandboxed Deno runtime with per-package permissions, and maps,
+      profiles, and packages can sync through the optional Smudgy cloud.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.smudgy.Smudgy.desktop</launchable>
+  <developer id="org.smudgy">
+    <name>Walter Kalata</name>
+  </developer>
+  <url type="homepage">https://smudgy.org</url>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.3.6" date="2026-07-06" />
+  </releases>
+</component>
