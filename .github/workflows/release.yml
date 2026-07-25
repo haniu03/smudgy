@@ -124,28 +124,6 @@ jobs:
         # so flatpak otherwise fails with "Cannot autolaunch D-Bus").
         run: dbus-run-session -- bin/release-linux.sh --arch ${{ matrix.arch }}
 
-      - name: Publish to DokuWiki (scp)
-        env:
-          SMUDGY_WIKI_SSH: ${{ secrets.SMUDGY_WIKI_SSH }}
-          SMUDGY_WIKI_MEDIA_DIR: ${{ secrets.SMUDGY_WIKI_MEDIA_DIR }}
-          SMUDGY_WIKI_SSH_PORT: ${{ secrets.SMUDGY_WIKI_SSH_PORT }}
-          SMUDGY_WIKI_URL: ${{ secrets.SMUDGY_WIKI_URL }}
-          SSH_KEY: ${{ secrets.SMUDGY_WIKI_SSH_KEY }}
-        run: |
-          if [ -z "$SMUDGY_WIKI_SSH" ]; then echo "SMUDGY_WIKI_SSH not set — skipping wiki publish."; exit 0; fi
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/wiki_deploy
-          chmod 600 ~/.ssh/wiki_deploy
-          export SMUDGY_WIKI_SSH_KEYFILE="$HOME/.ssh/wiki_deploy"
-          # Upload the bundle, its detached signature, and the public key.
-          for f in \
-              dist/smudgy-*-${{ matrix.arch }}.flatpak \
-              dist/smudgy-*-${{ matrix.arch }}.flatpak.asc \
-              dist/smudgy-signing-key.asc; do
-            [ -f "$f" ] || continue
-            bin/dokuwiki-upload.sh "$f" "$WIKI_NAMESPACE:$(basename "$f")"
-          done
-
       - name: Attach bundle to the workflow run
         # Capture the built+signed bundle even if the publish step failed, so it's
         # always retrievable from the run.
@@ -196,24 +174,6 @@ jobs:
           mkdir -p dist
           mv assets/Output/smudgy-setup.exe "dist/smudgy-v$VERSION-setup.exe"
           ls -la dist/
-
-      - name: Publish to DokuWiki (scp)
-        shell: bash
-        env:
-          SMUDGY_WIKI_SSH: ${{ secrets.SMUDGY_WIKI_SSH }}
-          SMUDGY_WIKI_MEDIA_DIR: ${{ secrets.SMUDGY_WIKI_MEDIA_DIR }}
-          SMUDGY_WIKI_SSH_PORT: ${{ secrets.SMUDGY_WIKI_SSH_PORT }}
-          SMUDGY_WIKI_URL: ${{ secrets.SMUDGY_WIKI_URL }}
-          SSH_KEY: ${{ secrets.SMUDGY_WIKI_SSH_KEY }}
-        run: |
-          if [ -z "$SMUDGY_WIKI_SSH" ]; then echo "SMUDGY_WIKI_SSH not set — skipping wiki publish."; exit 0; fi
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/wiki_deploy
-          chmod 600 ~/.ssh/wiki_deploy
-          export SMUDGY_WIKI_SSH_KEYFILE="$HOME/.ssh/wiki_deploy"
-          for f in dist/*; do
-            bin/dokuwiki-upload.sh "$f" "$WIKI_NAMESPACE:$(basename "$f")"
-          done
 
       - name: Attach installer to the workflow run
         if: ${{ !cancelled() }}
@@ -278,23 +238,6 @@ jobs:
           mv target/release-mac/Smudgy.dmg "dist/smudgy-v$VERSION-universal.dmg"
           ls -la dist/
 
-      - name: Publish to DokuWiki (scp)
-        env:
-          SMUDGY_WIKI_SSH: ${{ secrets.SMUDGY_WIKI_SSH }}
-          SMUDGY_WIKI_MEDIA_DIR: ${{ secrets.SMUDGY_WIKI_MEDIA_DIR }}
-          SMUDGY_WIKI_SSH_PORT: ${{ secrets.SMUDGY_WIKI_SSH_PORT }}
-          SMUDGY_WIKI_URL: ${{ secrets.SMUDGY_WIKI_URL }}
-          SSH_KEY: ${{ secrets.SMUDGY_WIKI_SSH_KEY }}
-        run: |
-          if [ -z "$SMUDGY_WIKI_SSH" ]; then echo "SMUDGY_WIKI_SSH not set — skipping wiki publish."; exit 0; fi
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/wiki_deploy
-          chmod 600 ~/.ssh/wiki_deploy
-          export SMUDGY_WIKI_SSH_KEYFILE="$HOME/.ssh/wiki_deploy"
-          for f in dist/*; do
-            bin/dokuwiki-upload.sh "$f" "$WIKI_NAMESPACE:$(basename "$f")"
-          done
-
       - name: Attach DMG to the workflow run
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
@@ -335,3 +278,24 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" dist/* "${args[@]}"
           fi
+
+      # One publish for everything, and only after every platform built and the
+      # GitHub Release exists — the wiki download page never sees a partial
+      # platform mix.
+      - name: Publish to DokuWiki (scp)
+        env:
+          SMUDGY_WIKI_SSH: ${{ secrets.SMUDGY_WIKI_SSH }}
+          SMUDGY_WIKI_MEDIA_DIR: ${{ secrets.SMUDGY_WIKI_MEDIA_DIR }}
+          SMUDGY_WIKI_SSH_PORT: ${{ secrets.SMUDGY_WIKI_SSH_PORT }}
+          SMUDGY_WIKI_URL: ${{ secrets.SMUDGY_WIKI_URL }}
+          SSH_KEY: ${{ secrets.SMUDGY_WIKI_SSH_KEY }}
+        run: |
+          if [ -z "$SMUDGY_WIKI_SSH" ]; then echo "SMUDGY_WIKI_SSH not set — skipping wiki publish."; exit 0; fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/wiki_deploy
+          chmod 600 ~/.ssh/wiki_deploy
+          export SMUDGY_WIKI_SSH_KEYFILE="$HOME/.ssh/wiki_deploy"
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            bin/dokuwiki-upload.sh "$f" "$WIKI_NAMESPACE:$(basename "$f")"
+          done
