@@ -161,6 +161,10 @@ jobs:
     name: windows installer
     needs: verify-version
     runs-on: windows-latest
+    # The Entra federated credential matches the OIDC subject exactly (no
+    # wildcards), so the job runs in the "release" environment to get a
+    # ref-independent subject: repo:smudgy-mud/smudgy:environment:release
+    environment: release
     permissions:
       contents: read
       id-token: write   # OIDC federation for azure/login
