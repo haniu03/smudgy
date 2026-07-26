@@ -99,6 +99,48 @@ pub(super) fn endpoint_updates(
     })
 }
 
+/// The endpoint edit that keeps `connection`'s port at `room` agreeing with
+/// a changed exit direction: re-anchored to the direction's home slot in
+/// `AutoPinned` mode, with the orthogonal elbow repair folded in. `None`
+/// when the connection has no endpoint at `room`, the connection is a
+/// self-loop (whose arc ignores ports), or the endpoint already sits home.
+pub(super) fn endpoint_reanchor(
+    area: &AreaCache,
+    connection: &smudgy_cloud::Connection,
+    room: RoomNumber,
+    direction: ExitDirection,
+) -> Option<ConnectionUpdates> {
+    if connection.kind == smudgy_cloud::ConnectionKind::SelfLoop {
+        return None;
+    }
+    let endpoint_b = if connection.endpoint_a.room_number == room {
+        false
+    } else if connection
+        .endpoint_b
+        .is_some_and(|endpoint| endpoint.room_number == room)
+    {
+        true
+    } else {
+        return None;
+    };
+    let mut endpoint = if endpoint_b {
+        connection.endpoint_b?
+    } else {
+        connection.endpoint_a
+    };
+    let (side, offset) = smudgy_cloud::default_anchor_for_direction(direction, None);
+    if endpoint.side == side
+        && (endpoint.port_offset - offset).abs() < smudgy_cloud::connection_geometry::EPSILON
+        && endpoint.port_mode == smudgy_cloud::PortMode::AutoPinned
+    {
+        return None;
+    }
+    endpoint.side = side;
+    endpoint.port_offset = offset;
+    endpoint.port_mode = smudgy_cloud::PortMode::AutoPinned;
+    endpoint_updates(area, connection.id, endpoint, endpoint_b)
+}
+
 #[derive(Clone, Copy)]
 struct WallEndpoint {
     connection_id: ConnectionId,
@@ -857,6 +899,84 @@ impl MapEditorWindow {
         self.push_command(command)
     }
 
+    /// Commits an exit direction change with the matching Connection
+    /// endpoint re-anchor in one undo unit: the port follows the new
+    /// direction to its home slot. `to_side` targets the destination
+    /// endpoint instead (only when no member exit originates there — a
+    /// reciprocal member's own direction governs its port).
+    fn commit_exit_direction_field(
+        &mut self,
+        index: usize,
+        field: FieldId,
+        direction: ExitDirection,
+        to_side: bool,
+    ) -> Update<super::Message, super::Event> {
+        let Some(row) = self.inspector.exits.get(index) else {
+            return Update::none();
+        };
+        let exit_id = row.id;
+        let from_room = row.from_room;
+        let room_key = self
+            .selected_room_key()
+            .or_else(|| Some(RoomKey::new(self.editor.area_id()?, from_room)));
+        let Some(room_key) = room_key else {
+            return Update::none();
+        };
+        let atlas = self.mapper.get_current_atlas();
+        let connection_edit = (|| {
+            let area = atlas.get_area(&room_key.area_id)?;
+            let room = area.get_room(&room_key.room_number)?;
+            let exit = room.get_exits().iter().find(|exit| exit.id == exit_id)?;
+            let connection = area.get_connection(exit.connection_id)?;
+            let target_room = if to_side {
+                let to_room = exit.to_room_number?;
+                if exit.to_area_id != Some(room_key.area_id) {
+                    return None;
+                }
+                if area
+                    .get_room(&to_room)?
+                    .get_exits()
+                    .iter()
+                    .any(|other| other.connection_id == connection.id)
+                {
+                    return None;
+                }
+                to_room
+            } else {
+                room_key.room_number
+            };
+            endpoint_reanchor(&area, connection, target_room, direction)
+                .map(|updates| (connection.id, updates))
+        })();
+        // Re-anchoring an Automatic route's endpoint leaves its stored
+        // route stale exactly like an inspector port edit does.
+        if let Some((connection_id, _)) = &connection_edit
+            && atlas.get_area(&room_key.area_id).is_some_and(|area| {
+                area.get_connection(*connection_id)
+                    .is_some_and(|connection| connection.routing == ConnectionRouting::Automatic)
+            })
+        {
+            self.automatic_routes_maybe_stale.insert(*connection_id);
+        }
+        let command = commands::edit_exit_with_endpoint(
+            &atlas,
+            room_key,
+            exit_id,
+            field,
+            |updates| {
+                if to_side {
+                    updates.to_direction = Some(direction);
+                } else {
+                    updates.from_direction = Some(direction);
+                }
+            },
+            connection_edit,
+        );
+        let update = self.push_command(command);
+        self.inspector.resync(&self.mapper, &self.editor);
+        update
+    }
+
     /// Sends one secret-marks POST and optimistically mirrors the flags into
     /// the local cache (reverted by [`Message::SecretMarksCompleted`] on
     /// failure). Secrecy edits deliberately bypass the undo stack, like area
@@ -1200,9 +1320,7 @@ impl MapEditorWindow {
                 if let Some(row) = self.inspector.exits.get_mut(index) {
                     row.from_direction = direction;
                 }
-                self.commit_exit_field(index, FieldId::FromDirection, |updates| {
-                    updates.from_direction = Some(direction);
-                })
+                self.commit_exit_direction_field(index, FieldId::FromDirection, direction, false)
             }
             Message::ExitToAreaChanged(index, choice) => {
                 if let Some(row) = self.inspector.exits.get_mut(index) {
@@ -1252,9 +1370,7 @@ impl MapEditorWindow {
                 if let Some(row) = self.inspector.exits.get_mut(index) {
                     row.to_direction = Some(direction);
                 }
-                self.commit_exit_field(index, FieldId::Destination, move |updates| {
-                    updates.to_direction = Some(direction);
-                })
+                self.commit_exit_direction_field(index, FieldId::Destination, direction, true)
             }
             Message::ExitPathChanged(index, value) => {
                 if let Some(row) = self.inspector.exits.get_mut(index) {

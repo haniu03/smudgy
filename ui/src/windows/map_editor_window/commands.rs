@@ -1660,6 +1660,92 @@ pub fn edit_exit_field(
     )
 }
 
+/// Edits one exit field and, in the same undo unit, applies a Connection
+/// endpoint edit — the direction-change path, where the exit's new
+/// direction re-anchors the owning endpoint to its home slot. One command,
+/// one undo; coalesces on the exit field like [`edit_exit_field`].
+#[must_use]
+pub fn edit_exit_with_endpoint(
+    atlas: &Arc<AtlasCache>,
+    room_key: RoomKey,
+    exit_id: ExitId,
+    field: FieldId,
+    change: impl FnOnce(&mut ExitUpdates),
+    connection_edit: Option<(ConnectionId, ConnectionUpdates)>,
+) -> Option<Command> {
+    let area = atlas.get_area(&room_key.area_id)?;
+    let room = area.get_room(&room_key.room_number)?;
+    let exit = room.get_exits().iter().find(|exit| exit.id == exit_id)?;
+
+    let prior = exit_updates_from_cache(exit);
+    let mut updates = prior.clone();
+    change(&mut updates);
+    let destination_expressed = updates.to_area_id.is_some()
+        || updates.to_room_number.is_some()
+        || updates.to_direction.is_some();
+    updates.clear_to = (!destination_expressed && !exit.to_unknown).then_some(true);
+    let area_id = room_key.area_id;
+
+    let mut redo = vec![Mutation::UpdateExit {
+        room_key: room_key.clone(),
+        id: IdRef::Known(exit_id),
+        updates,
+    }];
+    let mut undo = vec![Mutation::UpdateExit {
+        room_key,
+        id: IdRef::Known(exit_id),
+        updates: prior,
+    }];
+    if let Some((connection_id, connection_updates)) = connection_edit {
+        let current = area.get_connection(connection_id)?;
+        // Same endpoint-B inverse rule as `edit_connection`.
+        if connection_updates.endpoint_b.is_some() && current.endpoint_b.is_none() {
+            return None;
+        }
+        let inverse = ConnectionUpdates {
+            endpoint_a: connection_updates.endpoint_a.map(|_| current.endpoint_a),
+            endpoint_b: connection_updates.endpoint_b.and(current.endpoint_b),
+            routing: connection_updates.routing.map(|_| current.routing),
+            segment_shape: connection_updates
+                .segment_shape
+                .map(|_| current.segment_shape),
+            corner: connection_updates.corner.map(|_| current.corner),
+            route_points: connection_updates
+                .route_points
+                .as_ref()
+                .map(|_| current.route_points.clone()),
+            dash: connection_updates.dash.map(|_| current.dash),
+            color: connection_updates
+                .color
+                .as_ref()
+                .map(|_| current.color.clone()),
+            thickness: connection_updates.thickness.map(|_| current.thickness),
+        };
+        redo.push(Mutation::AreaBatch {
+            area_id,
+            operations: vec![AreaMutation::UpdateConnection {
+                connection_id,
+                body: connection_updates,
+            }],
+            description: "Re-anchor connection port".to_string(),
+        });
+        undo.push(Mutation::AreaBatch {
+            area_id,
+            operations: vec![AreaMutation::UpdateConnection {
+                connection_id,
+                body: inverse,
+            }],
+            description: "Undo re-anchor connection port".to_string(),
+        });
+    }
+
+    Some(Command::new(redo, undo).coalescing(CoalesceKey {
+        entity: EntityRef::Exit(area_id, exit_id),
+        field,
+        detail: None,
+    }))
+}
+
 /// Deletes one exit; undo recreates it (with a fresh backend id tracked
 /// through a slot).
 ///
