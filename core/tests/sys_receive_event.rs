@@ -117,15 +117,17 @@ async fn sys_receive_fires_post_trigger_sees_original_and_can_gag() {
     );
 }
 
-/// The staleness guard (the `line` twin of the input API's stale-submission
-/// test): an async `sys:receive` handler that awaits past its line's routing
-/// is no longer inside any armed line window, so a `line.gag()` from its
-/// continuation throws — it must never gag (or edit) whatever line is in
-/// flight when it resumes. The gate promise is resolved by the handler run
-/// for the SECOND line, so the stale continuation resumes precisely while
-/// that line is mid-flight (resolved promises pump between the handler splice
-/// and the line's completion) — the exact window in which the old code set
-/// the shared routing cell and gagged the wrong line.
+/// The relaxed current-line contract: `line` ops are valid until the line in
+/// flight finishes processing — for ANY code that runs in that window (event
+/// recipients a handler emits to, microtask continuations pumped during the
+/// cascade), not just the trigger/`sys:receive` entry run for the line. The
+/// flip side, pinned here: a continuation that outlives its OWN line and
+/// resumes while a LATER line is mid-flight acts on that later line. The gate
+/// promise is resolved by the handler run for the second line, so the first
+/// handler's continuation resumes precisely between that line's handler
+/// splice and its completion action (resolved promises pump between actions)
+/// — its `gag()` therefore hides the SECOND line. That wrong-line window is
+/// the deliberate price of letting same-cascade recipients edit the line.
 const SYS_RECEIVE_STALE_TS: &str = r#"
 import { echo, line } from "smudgy:core";
 import { receive } from "smudgy:events/sys";
@@ -138,7 +140,7 @@ receive.on(async ({ text }) => {
         await gate;
         try {
             line.gag();
-            echo("STALE:NO_THROW");
+            echo("STALE:GAGGED");
         } catch (e) {
             echo("STALE:THREW:" + ((e as any)?.message ?? String(e)));
         }
@@ -149,7 +151,7 @@ receive.on(async ({ text }) => {
 "#;
 
 #[tokio::test]
-async fn stale_receive_continuation_throws_and_cannot_gag_a_later_line() {
+async fn continuation_resuming_during_a_later_line_acts_on_that_line() {
     // Hermetic smudgy home (first-setter-wins across this binary's tests).
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
@@ -210,24 +212,117 @@ async fn stale_receive_continuation_throws_and_cannot_gag_a_later_line() {
     tx.send(RuntimeAction::Shutdown).ok();
 
     let transcript = lines.join("\n");
-    // The stale continuation's gag must throw the current-line contract error…
+    // The continuation resumed while the second line was in flight, so its gag succeeds…
     assert!(
-        !lines.iter().any(|l| l == "STALE:NO_THROW"),
-        "a stale continuation must not act on a later line.\nTranscript:\n{transcript}"
+        lines.iter().any(|l| l == "STALE:GAGGED"),
+        "a continuation resuming while a line is in flight may act on it.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("STALE:THREW:")),
+        "the gag must not throw while a line is in flight.\nTranscript:\n{transcript}"
+    );
+    // …and gags the line that was in flight when it resumed (the second line).
+    assert!(
+        !lines.iter().any(|l| l == "second line"),
+        "the line in flight at resume time is the one the gag hides.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "first line"),
+        "the handler's own line displayed normally.\nTranscript:\n{transcript}"
+    );
+}
+
+/// The guard that remains after the relaxation: with NO line in flight —
+/// here, a continuation parked on a timer that fires after every line has
+/// been routed — a `line.gag()` still throws the current-line contract error
+/// instead of leaking into the per-line routing/transform cells (where it
+/// would silently apply to whatever line arrives next).
+const SYS_RECEIVE_IDLE_TS: &str = r#"
+import { echo, line } from "smudgy:core";
+import { receive } from "smudgy:events/sys";
+
+receive.on(async ({ text }) => {
+    if (text !== "only line") return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    try {
+        line.gag();
+        echo("IDLE:NO_THROW");
+    } catch (e) {
+        echo("IDLE:THREW:" + ((e as any)?.message ?? String(e)));
+    }
+});
+"#;
+
+#[tokio::test]
+async fn continuation_resuming_between_lines_throws() {
+    // Hermetic smudgy home (first-setter-wins across this binary's tests).
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let home_path = smudgy_core::get_smudgy_home().expect("smudgy home");
+
+    let server = "SysReceiveIdle";
+    let modules_dir = home_path.join(server).join("modules");
+    std::fs::create_dir_all(&modules_dir).unwrap();
+    std::fs::create_dir_all(home_path.join(server).join("logs")).unwrap();
+    std::fs::write(modules_dir.join("sys_receive.ts"), SYS_RECEIVE_IDLE_TS).unwrap();
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(7015),
+        server_name: Arc::new(server.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
+
+    tx.send(RuntimeAction::HandleIncomingLine(Arc::new(StyledLine::new(
+        "only line",
+        Vec::new(),
+    ))))
+    .unwrap();
+
+    let mut lines = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            for update in updates.iter() {
+                if let BufferUpdate::Append(line) = update {
+                    lines.push(line.text.clone());
+                }
+            }
+        }
+    }
+
+    tx.send(RuntimeAction::Shutdown).ok();
+
+    let transcript = lines.join("\n");
+    assert!(
+        !lines.iter().any(|l| l == "IDLE:NO_THROW"),
+        "a gag with no line in flight must not succeed.\nTranscript:\n{transcript}"
     );
     assert!(
         lines
             .iter()
-            .any(|l| l.starts_with("STALE:THREW:") && l.contains("current line")),
-        "the stale gag must throw the current-line contract error.\nTranscript:\n{transcript}"
-    );
-    // …and the line that was in flight when it resumed still displays.
-    assert!(
-        lines.iter().any(|l| l == "second line"),
-        "the later line must NOT be gagged by the stale continuation.\nTranscript:\n{transcript}"
+            .any(|l| l.starts_with("IDLE:THREW:") && l.contains("current line")),
+        "the idle gag must throw the current-line contract error.\nTranscript:\n{transcript}"
     );
     assert!(
-        lines.iter().any(|l| l == "first line"),
-        "the stale handler's own line displayed normally.\nTranscript:\n{transcript}"
+        lines.iter().any(|l| l == "only line"),
+        "the handler's own line displayed normally.\nTranscript:\n{transcript}"
     );
 }
