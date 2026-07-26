@@ -21,16 +21,13 @@
 //!   plausible), preferring the non-default value; when both members are
 //!   non-default and disagree, the exit with the lower origin room number,
 //!   then the lower exit UUID, wins the field.
-//! - **Anchors** follow §1.5 (direction default, partner bearing for the
-//!   non-planar directions) and **ports** follow the §4.3 whole-group
-//!   distribution: a lone endpoint keeps its semantic default and larger
-//!   `(room, side, secrecy-class)` groups span the corner-safe `0.2..=0.8`
-//!   edge in (bearing, connection UUID, endpoint role) order.
-//!
-//! One deliberate divergence from the cloud backfill: a **local** map has no
-//! cross-area clearance concept, so a cross-area destination's secrecy is
-//! unknown and treated as public when classifying port-layout groups (the
-//! cloud, holding every area, folds real cross-area destination secrecy in).
+//! - **Anchors** follow §1.5: every endpoint is pinned at its exit
+//!   direction's semantic home slot (cardinals at their wall midpoint,
+//!   diagonals at their corner inset, up/down/in/out at their fixed home
+//!   corners; only `Special`/`Other` consult the partner bearing). Ports are
+//!   never redistributed to make room for wall-mates — endpoints sharing a
+//!   slot simply coincide until an author moves one by hand, so an exit's
+//!   port never depends on what else the room has.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -41,7 +38,7 @@ use crate::{
     ConnectionKind, ConnectionRouting, CornerStyle, DEFAULT_CONNECTION_COLOR,
     DEFAULT_CONNECTION_THICKNESS, Exit, ExitDirection, ExitId, Label, LinkedAreaInfo, MapPoint,
     PortMode, Property, RoomNumber, RoomSide, RoomWithDetails, SegmentShape, Shape,
-    connection::{CORNER_INSET, MAX_COLOR_LEN, default_anchor_for_direction},
+    connection::{MAX_COLOR_LEN, default_anchor_for_direction},
 };
 
 /// The pre-Connection (v1) `AreaWithDetails` document shape: no
@@ -192,37 +189,12 @@ struct FlatExit {
     exit: LegacyExitV1,
 }
 
-/// One room's placement facts, for anchors, bearings, kinds, and secrecy.
+/// One room's placement facts, for anchors, bearings, and kinds.
 #[derive(Clone, Copy)]
 struct SiteInfo {
     x: f32,
     y: f32,
     level: i32,
-    is_secret: bool,
-}
-
-/// Whether a wall runs along the x axis (its bearing/offset order follows
-/// x) or the y axis.
-fn wall_axis_is_x(side: RoomSide) -> bool {
-    matches!(side, RoomSide::North | RoomSide::South)
-}
-
-/// Outbound unit-vector component of a direction along one wall axis (map
-/// space: +x East, +y South; non-planar directions have no axis).
-fn direction_component(direction: ExitDirection, axis_x: bool) -> f32 {
-    const DIAG: f32 = std::f32::consts::FRAC_1_SQRT_2;
-    let (dx, dy) = match direction {
-        ExitDirection::North => (0.0, -1.0),
-        ExitDirection::East => (1.0, 0.0),
-        ExitDirection::South => (0.0, 1.0),
-        ExitDirection::West => (-1.0, 0.0),
-        ExitDirection::Northeast => (DIAG, -DIAG),
-        ExitDirection::Southeast => (DIAG, DIAG),
-        ExitDirection::Southwest => (-DIAG, DIAG),
-        ExitDirection::Northwest => (-DIAG, -DIAG),
-        _ => (0.0, 0.0),
-    };
-    if axis_x { dx } else { dy }
 }
 
 fn side_ordinal(side: RoomSide) -> usize {
@@ -242,32 +214,11 @@ fn endpoint(room_number: RoomNumber, side: RoomSide, port_offset: f32) -> Connec
 }
 
 /// §1.5 anchor via [`default_anchor_for_direction`], with the backfill's
-/// bearing plumbing: cardinal/diagonal directions ignore the bearing;
-/// non-planar ones anchor on the wall nearest it (East `0.5` on a zero
-/// bearing).
+/// bearing plumbing: named directions have fixed home slots and ignore the
+/// bearing; only `Special`/`Other` anchor on the wall nearest it (East `0.5`
+/// on a zero bearing).
 fn anchor_for(direction: ExitDirection, bearing: MapPoint) -> (RoomSide, f32) {
     default_anchor_for_direction(direction, Some(bearing))
-}
-
-/// Per-connection member facts for the port pass: any member secret, any
-/// same-area destination room secret, and the members' outbound direction
-/// (mirrors the backfill's `min(from_direction::text)`; a two-member
-/// Connection never consults it).
-#[derive(Default)]
-struct MemberFacts {
-    member_secret: bool,
-    dest_secret: bool,
-    outbound: Option<ExitDirection>,
-}
-
-/// One wall attachment in the §4.3 port-distribution pass.
-struct WallEndpoint {
-    connection: ConnectionId,
-    role_b: bool,
-    room: RoomNumber,
-    side: RoomSide,
-    secret: bool,
-    bearing: f32,
 }
 
 /// Migrates one v1 area document to the v2 Connection contract. The §8.1
@@ -296,7 +247,6 @@ pub fn migrate_v1(legacy: LegacyAreaV1) -> AreaWithDetails {
                     x: room.x,
                     y: room.y,
                     level: room.level,
-                    is_secret: room.is_secret,
                 },
             )
         })
@@ -324,7 +274,6 @@ pub fn migrate_v1(legacy: LegacyAreaV1) -> AreaWithDetails {
                     x: 0.0,
                     y: 0.0,
                     level: 0,
-                    is_secret: false,
                 },
             );
             rooms.push(LegacyRoomV1 {
@@ -453,7 +402,6 @@ pub fn migrate_v1(legacy: LegacyAreaV1) -> AreaWithDetails {
             x: 0.0,
             y: 0.0,
             level: 0,
-            is_secret: false,
         });
         let b_pos = site(b.room).unwrap_or(a_pos);
         let (a_side, a_port) = anchor_for(
@@ -511,7 +459,6 @@ pub fn migrate_v1(legacy: LegacyAreaV1) -> AreaWithDetails {
             x: 0.0,
             y: 0.0,
             level: 0,
-            is_secret: false,
         });
         let dest_site = same_area(e)
             .then_some(e.to_room_number)
@@ -591,136 +538,6 @@ pub fn migrate_v1(legacy: LegacyAreaV1) -> AreaWithDetails {
         connections.push(connection);
     }
 
-    // --- Port distribution (backfill 4d): groups of two or more span the
-    // rounded-corner-safe straight edge; a lone endpoint keeps its semantic
-    // 0.2/0.5/0.8 default.
-    // `(room, side, effective-secret class)` in (bearing, connection UUID,
-    // role) order. Effective-secret = any member exit secret OR either
-    // endpoint room secret OR a same-area destination room secret; a
-    // cross-area destination's secrecy is unknown locally and counts as
-    // public (see the module docs).
-    let mut member_facts: HashMap<ConnectionId, MemberFacts> = HashMap::new();
-    for flat in &exits {
-        let facts = member_facts.entry(membership[&flat.exit.id]).or_default();
-        facts.member_secret |= flat.exit.is_secret;
-        facts.dest_secret |= same_area(&flat.exit)
-            && flat
-                .exit
-                .to_room_number
-                .and_then(site)
-                .is_some_and(|dest| dest.is_secret);
-        facts.outbound = match facts.outbound {
-            Some(existing) if existing.to_string() <= flat.exit.from_direction.to_string() => {
-                Some(existing)
-            }
-            _ => Some(flat.exit.from_direction),
-        };
-    }
-
-    let mut wall_endpoints: Vec<WallEndpoint> = Vec::new();
-    for connection in &connections {
-        let facts = member_facts.entry(connection.id).or_default();
-        let any_member_secret = facts.member_secret;
-        let any_dest_secret = facts.dest_secret;
-        let any_outbound = facts.outbound;
-
-        let roles: [(bool, Option<&ConnectionEndpoint>); 2] = [
-            (false, Some(&connection.endpoint_a)),
-            (true, connection.endpoint_b.as_ref()),
-        ];
-        for (role_b, this_end) in roles {
-            let Some(this_end) = this_end else { continue };
-            let other_end = if role_b {
-                Some(&connection.endpoint_a)
-            } else {
-                connection.endpoint_b.as_ref()
-            };
-            let own_secret = site(this_end.room_number).is_some_and(|s| s.is_secret);
-            let partner_secret = other_end
-                .and_then(|other| site(other.room_number))
-                .is_some_and(|s| s.is_secret);
-            let secret = any_member_secret || any_dest_secret || own_secret || partner_secret;
-
-            let axis_x = wall_axis_is_x(this_end.side);
-            let bearing = match other_end {
-                // Two-room links: partner room center along the wall axis.
-                Some(other) if other.room_number != this_end.room_number => {
-                    let own = site(this_end.room_number).unwrap_or(SiteInfo {
-                        x: 0.0,
-                        y: 0.0,
-                        level: 0,
-                        is_secret: false,
-                    });
-                    let partner = site(other.room_number).unwrap_or(own);
-                    if axis_x {
-                        partner.x - own.x
-                    } else {
-                        partner.y - own.y
-                    }
-                }
-                // Self-loops: the other endpoint's outward normal component.
-                Some(other) => {
-                    let outward = other.side.outward();
-                    if axis_x { outward.x } else { outward.y }
-                }
-                // Dangling/external: the member exit's outbound component.
-                None => any_outbound.map_or(0.0, |d| direction_component(d, axis_x)),
-            };
-            wall_endpoints.push(WallEndpoint {
-                connection: connection.id,
-                role_b,
-                room: this_end.room_number,
-                side: this_end.side,
-                secret,
-                bearing,
-            });
-        }
-    }
-
-    let mut groups: HashMap<(RoomNumber, usize, bool), Vec<usize>> = HashMap::new();
-    for (idx, wall_endpoint) in wall_endpoints.iter().enumerate() {
-        groups
-            .entry((
-                wall_endpoint.room,
-                side_ordinal(wall_endpoint.side),
-                wall_endpoint.secret,
-            ))
-            .or_default()
-            .push(idx);
-    }
-    let by_id: HashMap<ConnectionId, usize> = connections
-        .iter()
-        .enumerate()
-        .map(|(idx, connection)| (connection.id, idx))
-        .collect();
-    for group in groups.values_mut() {
-        group.sort_by(|&x, &y| {
-            let (a, b) = (&wall_endpoints[x], &wall_endpoints[y]);
-            a.bearing
-                .total_cmp(&b.bearing)
-                .then(a.connection.cmp(&b.connection))
-                .then(a.role_b.cmp(&b.role_b))
-        });
-        if group.len() == 1 {
-            continue;
-        }
-        #[allow(clippy::cast_precision_loss)] // wall groups are tiny
-        let denominator = (group.len() - 1) as f32;
-        for (slot, &idx) in group.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
-            let port = CORNER_INSET + slot as f32 * (1.0 - 2.0 * CORNER_INSET) / denominator;
-            let wall_endpoint = &wall_endpoints[idx];
-            let connection = &mut connections[by_id[&wall_endpoint.connection]];
-            if wall_endpoint.role_b {
-                if let Some(b) = connection.endpoint_b.as_mut() {
-                    b.port_offset = port;
-                }
-            } else {
-                connection.endpoint_a.port_offset = port;
-            }
-        }
-    }
-
     // --- Assemble the v2 document: every exit keeps its identity and gains
     // exactly its Connection membership.
     let rooms: Vec<RoomWithDetails> = rooms
@@ -781,6 +598,7 @@ mod tests {
     #![allow(clippy::too_many_lines)]
 
     use super::*;
+    use crate::connection::CORNER_INSET;
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -969,13 +787,7 @@ mod tests {
         endpoints
     }
 
-    fn assert_slot(actual: f32, slot: u32, group: u32, ctx: &str) {
-        #[allow(clippy::cast_precision_loss)]
-        let expected = if group == 1 {
-            0.5
-        } else {
-            CORNER_INSET + (slot - 1) as f32 * (1.0 - 2.0 * CORNER_INSET) / (group - 1) as f32
-        };
+    fn assert_port(actual: f32, expected: f32, ctx: &str) {
         assert!(
             (actual - expected).abs() < 1e-5,
             "{ctx}: expected {expected}, got {actual}"
@@ -1039,12 +851,11 @@ mod tests {
         assert_eq!(c.endpoint_b.expect("B").room_number, RoomNumber(2));
         assert_eq!(c.endpoint_a.side, RoomSide::East);
         assert_eq!(c.endpoint_b.expect("B").side, RoomSide::West);
-        assert_slot(c.endpoint_a.port_offset, 1, 1, "solo wall port A");
-        assert_slot(
+        assert_port(c.endpoint_a.port_offset, 0.5, "cardinal wall midpoint A");
+        assert_port(
             c.endpoint_b.expect("B").port_offset,
-            1,
-            1,
-            "solo wall port B",
+            0.5,
+            "cardinal wall midpoint B",
         );
         assert_eq!(c.kind, ConnectionKind::Internal);
         assert_eq!(c.routing, ConnectionRouting::Simple);
@@ -1173,16 +984,14 @@ mod tests {
         assert_backfill_invariants(&migrated, 3);
         assert_eq!(migrated.connections.len(), 3, "ambiguity never pairs");
 
-        // §4.3 spacing: room 1's north wall carries three endpoints whose
-        // bearings all tie, so the order falls to Connection UUID and the
-        // slots are 1/4, 2/4, 3/4.
+        // Pinned ports: all three endpoints on each shared wall keep the
+        // direction's wall midpoint and simply coincide — a port never moves
+        // to make room for wall-mates.
         for (room, side) in [(1, RoomSide::North), (2, RoomSide::South)] {
-            let mut endpoints = wall_ports(&migrated, room, side);
+            let endpoints = wall_ports(&migrated, room, side);
             assert_eq!(endpoints.len(), 3);
-            endpoints.sort_by_key(|(id, _)| *id);
-            for (i, (_, port)) in endpoints.iter().enumerate() {
-                let slot = u32::try_from(i).expect("slot") + 1;
-                assert_slot(*port, slot, 3, "tied bearings order by Connection UUID");
+            for (_, port) in endpoints {
+                assert_port(port, 0.5, "pinned cardinal midpoint");
             }
         }
     }
@@ -1362,27 +1171,26 @@ mod tests {
         assert_eq!(loop2.endpoint_a.side, RoomSide::East);
         assert_eq!(loop2.endpoint_b.expect("B").side, RoomSide::West);
 
-        // Room 1's east/west walls each hold two loop endpoints whose
-        // bearings tie at zero: Connection UUID orders the slots 1/3, 2/3.
+        // Pinned ports: every loop endpoint keeps its direction's wall
+        // midpoint even where two loops share a wall.
         for side in [RoomSide::East, RoomSide::West] {
-            let mut endpoints = wall_ports(&migrated, 1, side);
+            let endpoints = wall_ports(&migrated, 1, side);
             assert_eq!(endpoints.len(), 2);
-            endpoints.sort_by_key(|(id, _)| *id);
-            assert_slot(endpoints[0].1, 1, 2, "lower Connection UUID first");
-            assert_slot(endpoints[1].1, 2, 2, "higher Connection UUID second");
+            for (_, port) in endpoints {
+                assert_port(port, 0.5, "pinned loop endpoint");
+            }
         }
 
-        // Same-wall loop: both endpoints share (room 2, North); the tied
-        // group orders by endpoint role, A before B.
+        // Same-wall loop: both endpoints share (room 2, North) and both keep
+        // the midpoint; the loop arc, not port spacing, separates them.
         let loop3 = conn_of(&migrated, fx_exit_id(0x07, 3));
         assert_eq!(loop3.endpoint_a.side, RoomSide::North);
         assert_eq!(loop3.endpoint_b.expect("B").side, RoomSide::North);
-        assert_slot(loop3.endpoint_a.port_offset, 1, 2, "role A first");
-        assert_slot(
+        assert_port(loop3.endpoint_a.port_offset, 0.5, "pinned loop role A");
+        assert_port(
             loop3.endpoint_b.expect("B").port_offset,
-            2,
-            2,
-            "role B second",
+            0.5,
+            "pinned loop role B",
         );
     }
 
@@ -1461,7 +1269,7 @@ mod tests {
         assert!(c.endpoint_b.is_none(), "cross-area keeps only endpoint A");
         assert_eq!(c.endpoint_a.room_number, RoomNumber(1));
         assert_eq!(c.endpoint_a.side, RoomSide::East);
-        assert_slot(c.endpoint_a.port_offset, 1, 1, "solo wall port");
+        assert_port(c.endpoint_a.port_offset, 0.5, "cardinal wall midpoint");
     }
 
     #[test]
@@ -1501,26 +1309,26 @@ mod tests {
         let c = &migrated.connections[0];
         assert_eq!(c.kind, ConnectionKind::CrossLevel);
         assert_eq!(c.endpoint_a.room_number, RoomNumber(1));
-        // Up/Down are non-planar and the partner bearing is zero: §1.5
-        // East/0.5 fallback on both walls.
+        // Up owns the top-right corner (East wall, north end) and Down the
+        // bottom-left (West wall, south end) — fixed home slots, so the
+        // vertical link never contests a real east exit's wall midpoint.
         assert_eq!(c.endpoint_a.side, RoomSide::East);
-        assert_eq!(c.endpoint_b.expect("B").side, RoomSide::East);
-        assert_slot(c.endpoint_a.port_offset, 1, 1, "solo wall port A");
-        assert_slot(
+        assert_port(c.endpoint_a.port_offset, CORNER_INSET, "up = top-right");
+        assert_eq!(c.endpoint_b.expect("B").side, RoomSide::West);
+        assert_port(
             c.endpoint_b.expect("B").port_offset,
-            1,
-            1,
-            "solo wall port B",
+            1.0 - CORNER_INSET,
+            "down = bottom-left",
         );
     }
 
     #[test]
-    fn fixture_k_secret_layout_classes() {
-        // Hub room 1; destinations east of it at distinct y (wall-axis
-        // bearings); room 4 is a secret destination, room 6 a secret
-        // origin. Exit 5 leaves the area — a LOCAL map cannot know a
-        // cross-area destination's secrecy, so unlike the cloud backfill it
-        // classifies as PUBLIC (see the module docs).
+    fn fixture_k_secrecy_never_shapes_ports() {
+        // Hub room 1; destinations east of it at distinct y; room 4 is a
+        // secret destination, room 6 a secret origin, exit 5 leaves the
+        // area. Ports are pinned per direction, so none of that secrecy can
+        // reach a public coordinate — every east endpoint keeps the wall
+        // midpoint regardless of what shares the wall.
         let cross = fx_area_id(0x0e);
         let area = fx_area_id(0x0d);
         let migrated = migrate_v1(
@@ -1601,25 +1409,14 @@ mod tests {
             .collect();
         assert_eq!(ports.len(), 6, "six endpoints share room 1's east wall");
 
-        let public_a = conn_of(&migrated, fx_exit_id(0x0d, 1)); // -> room 2, bearing -3
-        let secret_exit = conn_of(&migrated, fx_exit_id(0x0d, 2)); // secret member, -1
-        let secret_dest = conn_of(&migrated, fx_exit_id(0x0d, 3)); // -> secret room 4, +1
-        let public_b = conn_of(&migrated, fx_exit_id(0x0d, 4)); // -> room 5, +3
-        let cross_ext = conn_of(&migrated, fx_exit_id(0x0d, 5)); // external, bearing 0
-        let secret_origin = conn_of(&migrated, fx_exit_id(0x0d, 6)); // from secret room 6, +5
+        let cross_ext = conn_of(&migrated, fx_exit_id(0x0d, 5)); // external
+        let secret_origin = conn_of(&migrated, fx_exit_id(0x0d, 6)); // from secret room 6
 
-        // Public class: THREE endpoints (the external one included — its
-        // cross-area destination's secrecy is unknown locally) spaced 1/4,
-        // 2/4, 3/4 in bearing order.
-        assert_slot(ports[&public_a.id], 1, 3, "public bearing -3");
-        assert_slot(ports[&cross_ext.id], 2, 3, "public bearing 0 (cross-area)");
-        assert_slot(ports[&public_b.id], 3, 3, "public bearing +3");
-
-        // Effective-secret class: THREE endpoints spaced 1/4..3/4 among
-        // themselves.
-        assert_slot(ports[&secret_exit.id], 1, 3, "secret bearing -1");
-        assert_slot(ports[&secret_dest.id], 2, 3, "secret bearing +1");
-        assert_slot(ports[&secret_origin.id], 3, 3, "secret bearing +5");
+        // Every endpoint — public, secret-adjacent, and external alike —
+        // keeps the East midpoint; secrecy has nothing to influence.
+        for (id, port) in &ports {
+            assert_port(*port, 0.5, &format!("pinned east midpoint for {id}"));
+        }
 
         assert!(
             cross_ext.endpoint_b.is_none(),
@@ -1828,10 +1625,12 @@ mod tests {
     }
 
     #[test]
-    fn fixture_n_crowded_wall_port_distribution() {
-        // Three rooms north of room 1 at distinct x (bearings -3, 0, +3);
-        // two one-ways share a destination so their bearings tie and the
-        // Connection-UUID tie break decides their slots.
+    fn fixture_n_crowded_wall_ports_stay_pinned() {
+        // Four one-way north exits fan out to three rooms above room 1. The
+        // origin ports all keep the North midpoint (coinciding by design);
+        // the arrival ports — whose exits carry no to_direction — still
+        // derive from the bearing back toward the origin, exercising the
+        // diagonal corner insets.
         let area = fx_area_id(0x11);
         let migrated = migrate_v1(
             FixtureBuilder::new(0x11)
@@ -1884,34 +1683,30 @@ mod tests {
         assert_backfill_invariants(&migrated, 4);
         assert_eq!(migrated.connections.len(), 4);
 
-        let ports: HashMap<ConnectionId, f32> = wall_ports(&migrated, 1, RoomSide::North)
-            .into_iter()
-            .collect();
+        let ports: Vec<(ConnectionId, f32)> = wall_ports(&migrated, 1, RoomSide::North);
         assert_eq!(ports.len(), 4);
+        for (_, port) in &ports {
+            assert_port(*port, 0.5, "origin north exits stay at the midpoint");
+        }
 
-        let west = conn_of(&migrated, fx_exit_id(0x11, 1));
-        let mid1 = conn_of(&migrated, fx_exit_id(0x11, 2));
-        let mid2 = conn_of(&migrated, fx_exit_id(0x11, 3));
-        let east = conn_of(&migrated, fx_exit_id(0x11, 4));
-
-        assert_slot(ports[&west.id], 1, 4, "westernmost partner first");
-        assert_slot(ports[&east.id], 4, 4, "easternmost partner last");
-        let (lo, hi) = if mid1.id < mid2.id {
-            (mid1, mid2)
-        } else {
-            (mid2, mid1)
-        };
-        assert_slot(ports[&lo.id], 2, 4, "tied bearing, lower Connection UUID");
-        assert_slot(ports[&hi.id], 3, 4, "tied bearing, higher Connection UUID");
-
-        // Their arrival endpoints share room 3's south wall (partner
-        // bearing ties again) and must follow the SAME uuid order.
-        let south: HashMap<ConnectionId, f32> = wall_ports(&migrated, 3, RoomSide::South)
-            .into_iter()
-            .collect();
+        // Arrival defaults from the bearing back toward room 1: room 2 sits
+        // up-left (return bearing SE, ratio 3:4 = exactly diagonal) → South
+        // wall at the SE corner inset; room 3 straight above → South
+        // midpoint for both tied one-ways; room 4 up-right → SW inset.
+        let arrivals = [
+            (2, 1.0 - CORNER_INSET, "southeast corner inset"),
+            (4, CORNER_INSET, "southwest corner inset"),
+        ];
+        for (room, expected, ctx) in arrivals {
+            let wall = wall_ports(&migrated, room, RoomSide::South);
+            assert_eq!(wall.len(), 1);
+            assert_port(wall[0].1, expected, ctx);
+        }
+        let south = wall_ports(&migrated, 3, RoomSide::South);
         assert_eq!(south.len(), 2);
-        assert_slot(south[&lo.id], 1, 2, "consistent UUID order across walls");
-        assert_slot(south[&hi.id], 2, 2, "consistent UUID order across walls");
+        for (_, port) in south {
+            assert_port(port, 0.5, "tied arrivals both keep the midpoint");
+        }
     }
 
     #[test]

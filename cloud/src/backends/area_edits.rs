@@ -599,12 +599,16 @@ fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudResult<()> {
                     room_center: MapPoint::new(room_a.x, room_a.y),
                     side: connection.endpoint_a.side,
                     port_offset: connection.endpoint_a.port_offset,
+                    // Orthogonality validation runs on the wall-normal
+                    // contract tips; stub axes never enter into it.
+                    stub: connection_geometry::StubAxis::Normal,
                 },
                 endpoint_b: endpoint_b.map(|(endpoint, room)| {
                     connection_geometry::EndpointGeometry {
                         room_center: MapPoint::new(room.x, room.y),
                         side: endpoint.side,
                         port_offset: endpoint.port_offset,
+                        stub: connection_geometry::StubAxis::Normal,
                     }
                 }),
                 route_points: &connection.route_points,

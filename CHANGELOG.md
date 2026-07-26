@@ -84,6 +84,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Map links meet rooms the way the exit reads.** Compass exits keep
+  their short wall stubs, and diagonal exits' stubs now leave the corner
+  diagonally — but up/down, in/out, and portal links drop the stub
+  entirely, running straight from the room's edge. Maps that draw up or
+  down as a diagonal neighbor get a clean diagonal line instead of a
+  nub-and-bend.
+- **Exits sit where their direction says.** A connection endpoint now
+  pins at its exit direction's home spot — east at the middle of the east
+  wall, up in the top-right corner, down in the bottom-left, in and out
+  at the other two corners — and is never nudged aside to make room for
+  neighbors on the same wall. (A room with both an up and an east exit
+  previously showed the east line pushed toward a corner.) The editor's
+  Redistribute command remains for deliberately fanning out a crowded
+  wall.
 - **Terminal text stays on the grid.** The terminal font no longer merges
   character pairs like `=>` or `fi` into single glyphs — every character
   keeps its own column, which most MUD output assumes. Fonts with heavy
@@ -114,6 +128,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Connections attached near a room's corner no longer float in the gap
+  left by the rounded outline: ports follow the drawn edge around the
+  corner, meeting the adjacent wall at the corner's diagonal. Dragging an
+  endpoint now also snaps to the wall midpoint and corner slots — hold
+  Alt to place it freely.
 - Plain-string `line.replace(...)` now preserves the style of the matched text,
   including when the match starts exactly at a color boundary; it previously
   restyled the replacement with the line's first color.

@@ -10,8 +10,9 @@
 //! The rules deliberately mirror the server's, simplified for a single-user
 //! tier: auto-pair only the unique direction-compatible reciprocal
 //! one-member candidate; otherwise a fresh one-member Connection with the
-//! direction-default anchors. Bearing-slotted port distribution is a server
-//! concern — local tiers use the plain defaults.
+//! direction-default anchors. Ports are pinned at those semantic defaults on
+//! every tier — nothing redistributes them to make room for wall-mates;
+//! authors move them by hand in the inspector when two coincide.
 
 use crate::{
     Connection, ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionKind,
