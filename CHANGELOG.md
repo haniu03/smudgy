@@ -84,6 +84,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Terminal text stays on the grid.** The terminal font no longer merges
+  character pairs like `=>` or `fi` into single glyphs — every character
+  keeps its own column, which most MUD output assumes. Fonts with heavy
+  contextual shaping (Monaspace, Lilex, Fira) now line up box-drawn maps
+  and ASCII tables correctly. A new **Font ligatures** checkbox in
+  Preferences → Appearance turns the merging back on, live. Ligatures in
+  the rest of the app are unaffected.
+- **Missing characters borrow from a monospaced font.** When the terminal
+  font lacks a character, the replacement glyph is now drawn from another
+  monospaced font (preferring the best coverage for the text at hand)
+  instead of whatever proportional font the system suggested — so
+  box-drawing, arrows, and other exotic characters no longer break column
+  alignment or line height.
 - Script automation factories now accept only the pattern/key/options-first
   signatures introduced in 0.4; the deprecated positional-name forms have been
   removed for 0.5.

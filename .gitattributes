@@ -2,3 +2,8 @@
 # the repo is checked out on Windows (this repo is developed on Windows). A
 # CRLF in the shebang or a command line breaks the script on a Mac.
 *.sh text eol=lf
+
+# Dependency source patches (applied by `cargo patch-crate`) must keep LF: the
+# crates they patch ship with LF sources, and a CRLF checkout would make every
+# hunk fail to match.
+patches/*.patch text eol=lf

@@ -66,6 +66,19 @@ if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISC
 if (-not (Test-Path $iscc)) { throw "ISCC.exe (Inno Setup 6) not found" }
 
 if (-not $SkipBuild) {
+    # Materialize the patch-crate-managed dependency patches (patches/*.patch ->
+    # target/patch/): [patch.crates-io] points there, so every cargo invocation
+    # below (cargo-about included) fails to resolve on a fresh checkout or
+    # after a `cargo clean` until they exist.
+    if (-not (Get-Command cargo-patch-crate -ErrorAction SilentlyContinue)) {
+        Write-Host "==> cargo install --locked patch-crate" -ForegroundColor Cyan
+        cargo install --locked patch-crate
+        if ($LASTEXITCODE -ne 0) { throw "cargo install patch-crate failed" }
+    }
+    Write-Host "==> cargo patch-crate --force" -ForegroundColor Cyan
+    cargo patch-crate --force
+    if ($LASTEXITCODE -ne 0) { throw "cargo patch-crate failed" }
+
     Write-Host "==> cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md" -ForegroundColor Cyan
     cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md
     Write-Host "==> cargo build --profile release-full" -ForegroundColor Cyan

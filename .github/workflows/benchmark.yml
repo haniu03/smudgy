@@ -337,10 +337,28 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
+            ~/.cargo/bin/cargo-patch-crate*
             source/target/
           key: benchmark-m8a-rust-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('source/Cargo.lock', 'baseline/Cargo.lock', 'candidate/Cargo.lock') }}
           restore-keys: |
             benchmark-m8a-rust-${{ env.RUST_TOOLCHAIN }}-
+
+      # Checkouts that patch dependency sources via patch-crate (patches/ +
+      # [patch.crates-io] into target/patch/) can't even resolve until the
+      # patched crates are materialized. Guarded per checkout: baselines from
+      # before the patches/ directory existed need (and tolerate) nothing.
+      - name: Materialize dependency source patches
+        if: needs.resolve.outputs.kind != 'smoke'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "${HOME}/.cargo/env"
+          for dir in source baseline candidate; do
+            [[ -d "${dir}/patches" ]] || continue
+            command -v cargo-patch-crate >/dev/null 2>&1 ||
+              cargo install --locked patch-crate
+            (cd "${dir}" && cargo patch-crate --force)
+          done
 
       - name: Run canonical Criterion suite
         if: needs.resolve.outputs.kind == 'main' || needs.resolve.outputs.kind == 'release'

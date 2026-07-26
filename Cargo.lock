@@ -1486,8 +1486,6 @@ dependencies = [
 [[package]]
 name = "cosmic-text"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "173852283a9a57a3cbe365d86e74dc428a09c50421477d5ad6fe9d9509e37737"
 dependencies = [
  "bitflags 2.13.1",
  "fontdb",
@@ -5706,8 +5704,6 @@ dependencies = [
 [[package]]
 name = "iced_graphics"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234ca1c2cec4155055f68fa5fad1b5242c496ac8238d80a259bca382fb44a102"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
@@ -10578,11 +10574,13 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "cosmic-text",
  "dunce",
  "fontdb",
  "httpdate",
  "iced",
  "iced_anim",
+ "iced_graphics",
  "iced_runtime",
  "image",
  "kamadak-exif",

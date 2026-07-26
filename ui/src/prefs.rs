@@ -157,6 +157,11 @@ pub const BUNDLED_FONT_FAMILIES: &[&str] = &[
 pub struct TerminalPrefs {
     pub font: Font,
     pub font_size: f32,
+    /// Allow the terminal font's ligature/contextual substitutions. Mirrored
+    /// into the `iced_graphics` shaping registry by [`sync_terminal_ligatures`];
+    /// kept in the snapshot so a toggle bumps `generation` and re-shapes
+    /// every cached paragraph.
+    pub ligatures: bool,
     pub line_height: f32,
     /// Maximum line length in columns; `None` wraps at the pane width.
     pub line_length: Option<u16>,
@@ -219,6 +224,7 @@ impl TerminalPrefs {
         Self {
             font: font_for_family(&settings.terminal_font_family),
             font_size,
+            ligatures: settings.terminal_font_ligatures,
             line_height: (font_size * 1.25).round(),
             // Clamp here too: hand-edited settings.json bypasses the UI
             // validation, and 0 columns would shape zero-width paragraphs.
@@ -374,8 +380,32 @@ pub fn apply_tweaks(base: &TerminalPalette, tweaks: &ThemeTweaks) -> TerminalPal
     palette
 }
 
-static PREFS: LazyLock<ArcSwap<TerminalPrefs>> =
-    LazyLock::new(|| ArcSwap::from_pointee(TerminalPrefs::from_settings(&Settings::default(), 0)));
+static PREFS: LazyLock<ArcSwap<TerminalPrefs>> = LazyLock::new(|| {
+    let prefs = TerminalPrefs::from_settings(&Settings::default(), 0);
+    sync_terminal_ligatures(None, &prefs.font, prefs.ligatures);
+    ArcSwap::from_pointee(prefs)
+});
+
+/// By default the terminal family shapes without ligatures: MUD output assumes
+/// a fixed character grid, and ligature/contextual substitutions (fi, `=>`,
+/// Monaspace's texture healing) break column alignment. Registered per family
+/// with the patched `iced_graphics` shaping registry
+/// (patches/iced_graphics+0.14.0.patch), so UI families keep their ligatures;
+/// a family that stops being the terminal font gets its ligatures back, and
+/// the "Font ligatures" preference re-enables them in place.
+fn sync_terminal_ligatures(previous: Option<&Font>, current: &Font, ligatures: bool) {
+    use iced::font::Family;
+    if let Some(Font {
+        family: Family::Name(old),
+        ..
+    }) = previous
+    {
+        iced_graphics::text::set_ligatures_enabled(old, true);
+    }
+    if let Family::Name(name) = current.family {
+        iced_graphics::text::set_ligatures_enabled(name, ligatures);
+    }
+}
 
 /// The current preferences snapshot (lock-free).
 #[must_use]
@@ -391,7 +421,11 @@ pub fn current() -> Arc<TerminalPrefs> {
 pub fn apply(settings: &Settings) {
     let current = PREFS.load();
     let mut next = TerminalPrefs::from_settings(settings, current.generation);
+    if next.font != current.font || next.ligatures != current.ligatures {
+        sync_terminal_ligatures(Some(&current.font), &next.font, next.ligatures);
+    }
     let visually_equal = next.font == current.font
+        && next.ligatures == current.ligatures
         && next.font_size == current.font_size
         && next.line_height == current.line_height
         && next.line_length == current.line_length

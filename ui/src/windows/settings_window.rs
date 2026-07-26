@@ -113,6 +113,7 @@ pub enum Message {
     SessionRevoked(Result<(), CloudError>),
 
     PrefFontSelected(String),
+    PrefFontLigaturesToggled(bool),
     PrefFontSizeChanged(String),
     PrefFontSizeSubmitted,
     PrefLineLengthChanged(String),
@@ -615,6 +616,10 @@ impl SettingsWindow {
             // whole model; numeric buffers that don't parse commit nothing.
             Message::PrefFontSelected(family) => {
                 self.settings.terminal_font_family = family;
+                self.settings_changed()
+            }
+            Message::PrefFontLigaturesToggled(enabled) => {
+                self.settings.terminal_font_ligatures = enabled;
                 self.settings_changed()
             }
             // Typing only edits the buffer; commits happen on Enter so a
@@ -1259,6 +1264,11 @@ impl SettingsWindow {
                 .width(280),
             ]
             .spacing(2),
+        );
+        col = col.push(
+            checkbox(self.settings.terminal_font_ligatures)
+                .label("Enable font ligature support")
+                .on_toggle(Message::PrefFontLigaturesToggled),
         );
         col = col.push(pref_input(
             "Font size",

@@ -49,10 +49,23 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
+            ~/.cargo/bin/cargo-patch-crate*
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+
+      # The workspace patches dependency sources via patch-crate (see patches/
+      # and the workspace manifest): [patch.crates-io] points into target/patch/,
+      # so cargo resolution fails until the patched crates are materialized.
+      # --force rebuilds them from patches/*.patch even when a restored cache
+      # carries a stale target/patch from an earlier commit.
+      - name: Materialize dependency source patches
+        shell: bash
+        run: |
+          command -v cargo-patch-crate >/dev/null 2>&1 ||
+            cargo install --locked patch-crate
+          cargo patch-crate --force
 
       - name: Check workspace
         run: cargo check --workspace --all-targets --all-features --locked

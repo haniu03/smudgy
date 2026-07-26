@@ -22,6 +22,11 @@ serde_json = { workspace = true }
 iced = { workspace = true }
 iced_anim = { workspace = true }
 iced_runtime = { workspace = true }
+# The (patch-crate patched) shaping registry: the terminal font family opts out
+# of ligatures at shaping time (see patches/iced_graphics+0.14.0.patch and the
+# workspace manifest's [workspace.metadata.patch] note). Same version iced pins,
+# so it resolves to the single patched copy.
+iced_graphics = "0.14"
 log = { workspace = true }
 smudgy_widgets = { workspace = true }
 
@@ -35,6 +40,11 @@ chrono = { workspace = true }
 # System font enumeration for the Preferences tab (same version cosmic-text
 # already pins in Cargo.lock).
 fontdb = "0.23"
+# Not used directly — enables cosmic-text's `monospace_fallback` via feature
+# unification on the copy iced_graphics links, so missing-glyph fallback in
+# monospace text stays on monospace faces (matching advance width) instead of
+# grabbing any face and wrecking terminal-grid column alignment.
+cosmic-text = { version = "0.15", default-features = false, features = ["monospace_fallback"] }
 # Open the download page in the system browser when the cloud reports this
 # client is out of date (HTTP 426).
 open = "5"

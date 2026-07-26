@@ -1,0 +1,48 @@
+diff --git a/src/shape.rs b/src/shape.rs
+index ff654b1..1c86990 100644
+--- a/src/shape.rs
++++ b/src/shape.rs
+@@ -301,11 +301,41 @@ fn shape_run(
+ 
+     let fonts = font_system.get_font_matches(&attrs);
+ 
+-    let default_families = [&attrs.family];
++    // A named family that resolves to a monospace face gets the generic
++    // Monospace family appended as a second default: missing glyphs then go
++    // through the monospace-aware fallback machinery (coverage-ranked
++    // monospace candidates) instead of falling straight through to the
++    // proportional script/common fallback lists. Generic Monospace requests
++    // already engage that machinery via the `Family::Monospace` check in
++    // `FontFallbackIter::next_item`; named monospace families would
++    // otherwise never reach it.
++    let primary_is_monospace = cfg!(feature = "monospace_fallback") && {
++        let db = font_system.db();
++        let family_name = db.family_name(&attrs.family);
++        fonts
++            .iter()
++            .filter(|m_key| m_key.font_weight_diff == 0)
++            .find(|m_key| {
++                db.face(m_key.id).is_some_and(|face| {
++                    face.families.iter().any(|(name, _)| name == family_name)
++                })
++            })
++            .is_some_and(|m_key| font_system.is_monospace(m_key.id))
++    };
++
++    let mono_family = crate::Family::Monospace;
++    let default_families_with_mono = [&attrs.family, &mono_family];
++    let default_families_named = [&attrs.family];
++    let default_families: &[&crate::Family<'_>] = if primary_is_monospace {
++        &default_families_with_mono
++    } else {
++        &default_families_named
++    };
++
+     let mut font_iter = FontFallbackIter::new(
+         font_system,
+         &fonts,
+-        &default_families,
++        default_families,
+         &scripts,
+         &line[start_run..end_run],
+         attrs.weight,
