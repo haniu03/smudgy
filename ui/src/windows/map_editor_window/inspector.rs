@@ -2933,70 +2933,102 @@ fn connection_view(
         state.connection.is_secret,
     ));
 
+    // Up/down endpoints are represented by their fixed level triangle: no
+    // port to place, so the wall/offset row gives way to a note.
+    let render_item = area
+        .get_room_connections()
+        .iter()
+        .find(|item| item.connection_id == connection_id);
+    let level_endpoint = |endpoint_b: bool| {
+        render_item.is_some_and(|item| {
+            let stub = if endpoint_b { item.stub_b } else { item.stub_a };
+            matches!(
+                stub,
+                smudgy_cloud::connection_geometry::StubAxis::Level { .. }
+            )
+        })
+    };
+
     // Link
     content = content.push(field_label("Link"));
     content = content.push(text(format!("{} · {endpoints}", connection.kind)).size(12));
-    content = content.push(
-        row![
-            pick_list(
-                &RoomSide::ALL[..],
-                Some(state.connection.endpoint_a_side),
-                |side| super::Message::Inspector(Message::ConnectionEndpointSideChanged(
-                    false, side
-                )),
-            )
-            .text_size(12)
-            .width(Length::FillPortion(2)),
-            text_input("port 0–1", &state.connection.endpoint_a_offset)
-                .on_input(|value| super::Message::Inspector(
-                    Message::ConnectionEndpointOffsetChanged(false, value),
-                ))
+    if level_endpoint(false) {
+        content = content.push(
+            text("Anchored at its level triangle (up/down exit)")
                 .size(12)
-                .width(Length::FillPortion(1)),
-            button(text("Auto").size(11))
-                .style(builtins::button::secondary)
-                .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
-                    false,
-                ))),
-            button(text("Redistribute").size(11))
-                .style(builtins::button::secondary)
-                .on_press(super::Message::Inspector(
-                    Message::ConnectionRedistributePorts(false,)
-                )),
-        ]
-        .spacing(6),
-    );
-    if state.connection.has_endpoint_b {
+                .style(muted_text),
+        );
+    } else {
         content = content.push(
             row![
                 pick_list(
                     &RoomSide::ALL[..],
-                    Some(state.connection.endpoint_b_side),
+                    Some(state.connection.endpoint_a_side),
                     |side| super::Message::Inspector(Message::ConnectionEndpointSideChanged(
-                        true, side
-                    ),),
+                        false, side
+                    )),
                 )
                 .text_size(12)
                 .width(Length::FillPortion(2)),
-                text_input("port 0–1", &state.connection.endpoint_b_offset)
+                text_input("port 0–1", &state.connection.endpoint_a_offset)
                     .on_input(|value| super::Message::Inspector(
-                        Message::ConnectionEndpointOffsetChanged(true, value),
+                        Message::ConnectionEndpointOffsetChanged(false, value),
                     ))
                     .size(12)
                     .width(Length::FillPortion(1)),
                 button(text("Auto").size(11))
                     .style(builtins::button::secondary)
                     .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
-                        true,
+                        false,
                     ))),
                 button(text("Redistribute").size(11))
                     .style(builtins::button::secondary)
                     .on_press(super::Message::Inspector(
-                        Message::ConnectionRedistributePorts(true,)
+                        Message::ConnectionRedistributePorts(false,)
                     )),
             ]
             .spacing(6),
         );
+    }
+    if state.connection.has_endpoint_b {
+        if level_endpoint(true) {
+            content = content.push(
+                text("Anchored at its level triangle (up/down exit)")
+                    .size(12)
+                    .style(muted_text),
+            );
+        } else {
+            content = content.push(
+                row![
+                    pick_list(
+                        &RoomSide::ALL[..],
+                        Some(state.connection.endpoint_b_side),
+                        |side| super::Message::Inspector(Message::ConnectionEndpointSideChanged(
+                            true, side
+                        ),),
+                    )
+                    .text_size(12)
+                    .width(Length::FillPortion(2)),
+                    text_input("port 0–1", &state.connection.endpoint_b_offset)
+                        .on_input(|value| super::Message::Inspector(
+                            Message::ConnectionEndpointOffsetChanged(true, value),
+                        ))
+                        .size(12)
+                        .width(Length::FillPortion(1)),
+                    button(text("Auto").size(11))
+                        .style(builtins::button::secondary)
+                        .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
+                            true,
+                        ))),
+                    button(text("Redistribute").size(11))
+                        .style(builtins::button::secondary)
+                        .on_press(super::Message::Inspector(
+                            Message::ConnectionRedistributePorts(true,)
+                        )),
+                ]
+                .spacing(6),
+            );
+        }
     }
 
     if state.exits.len() == 1 {

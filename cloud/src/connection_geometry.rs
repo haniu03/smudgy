@@ -508,8 +508,15 @@ pub fn resolve(input: &GeometryInput<'_>) -> ConnectionGeometry {
 
     resolve_stroke(&mut geometry, input, port_a, tip_a, port_b, tip_b);
 
-    geometry.handles.push(Handle::PortA(port_a));
-    if let Some(port) = port_b {
+    // Up/down endpoints have no draggable port: their representation is the
+    // fixed level triangle, and their wall attachment follows the exit
+    // direction's home slot rather than manual placement.
+    if !matches!(input.endpoint_a.stub, StubAxis::Level { .. }) {
+        geometry.handles.push(Handle::PortA(port_a));
+    }
+    if let (Some(port), Some(b)) = (port_b, input.endpoint_b)
+        && !matches!(b.stub, StubAxis::Level { .. })
+    {
         geometry.handles.push(Handle::PortB(port));
     }
     // Waypoint handles exist exactly for the vertices the centerline
@@ -1484,6 +1491,13 @@ mod tests {
         assert!(center.nearly_equals(MapPoint::new(LEVEL_MARKER_OFFSET, -LEVEL_MARKER_OFFSET)));
         assert!(g.hit_test(center, 0.01), "triangle footprint is clickable");
         assert!(g.bounds.contains(center), "bounds cover the marker");
+        // The up endpoint's representation is the fixed triangle: no port
+        // handle; the cardinal endpoint keeps its own.
+        assert!(
+            g.handles.iter().all(|h| !matches!(h, Handle::PortA(_))),
+            "level endpoint must not grow a port handle"
+        );
+        assert!(g.handles.iter().any(|h| matches!(h, Handle::PortB(_))));
     }
 
     #[test]
