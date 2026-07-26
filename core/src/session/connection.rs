@@ -7,7 +7,7 @@ use std::time::Duration;
 use futures::channel::mpsc;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWriteExt, Interest},
-    net::TcpStream,
+    net::{TcpSocket, TcpStream},
     select,
     sync::{
         mpsc::{Sender, UnboundedSender, WeakSender, error::TrySendError},
@@ -389,21 +389,57 @@ impl GameStream {
         }
     }
 
-    /// Write all of `bytes` to the stream and flush. The flush matters for TLS: rustls
-    /// buffers plaintext into the session record, so without it a lone interactive command
-    /// would sit unsent until the next write. On plain TCP `flush` is a no-op (`nodelay` is
-    /// already set), so flushing uniformly costs nothing there.
-    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+    /// Write all of `bytes` to the stream and flush, requiring forward
+    /// progress (see [`write_all_with_stall_guard`]): a peer that has stopped
+    /// reading entirely fails the write with `TimedOut` after `stall` instead
+    /// of parking it for the OS's own multi-minute TCP timeout.
+    async fn write_all_stall_guarded(&mut self, bytes: &[u8], stall: Duration) -> io::Result<()> {
         match self {
-            Self::Plain(stream) => {
-                stream.write_all(bytes).await?;
-                stream.flush().await
-            }
-            Self::Tls(stream) => {
-                stream.write_all(bytes).await?;
-                stream.flush().await
-            }
+            Self::Plain(stream) => write_all_with_stall_guard(stream, bytes, stall).await,
+            Self::Tls(stream) => write_all_with_stall_guard(stream, bytes, stall).await,
         }
+    }
+}
+
+/// Write all of `bytes` and flush, requiring forward progress: every accepted
+/// byte resets a `stall` clock, so a slowly draining peer is never cut off, but
+/// one that has stopped reading entirely (a zero TCP window) fails the write
+/// with `TimedOut` once the clock runs out.
+///
+/// The flush (same budget) matters for TLS: rustls buffers plaintext into the
+/// session record, so without it a lone interactive command would sit unsent
+/// until the next write. On plain TCP `flush` is a no-op (`nodelay` is already
+/// set), so flushing uniformly costs nothing there.
+///
+/// Kernel buffering bounds how quickly a dead peer trips this: a write parks
+/// only once the send buffer fills, which the explicitly pinned
+/// [`SEND_BUFFER_BYTES`] keeps small on every platform (Windows's dynamic
+/// send buffering would otherwise absorb tens of megabytes first).
+async fn write_all_with_stall_guard<S>(
+    stream: &mut S,
+    mut bytes: &[u8],
+    stall: Duration,
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    fn stalled(stall: Duration) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("no write progress within {stall:?}"),
+        )
+    }
+    while !bytes.is_empty() {
+        match tokio::time::timeout(stall, stream.write(bytes)).await {
+            Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(Ok(written)) => bytes = &bytes[written..],
+            Ok(Err(err)) => return Err(err),
+            Err(_elapsed) => return Err(stalled(stall)),
+        }
+    }
+    match tokio::time::timeout(stall, stream.flush()).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(stalled(stall)),
     }
 }
 
@@ -439,6 +475,52 @@ impl TlsMode {
 /// (no data loss; the tail reads on the next wake) and does not affect the plain path.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The zero-progress budget for one outbound write. A slowly draining peer is never cut
+/// off — every accepted byte resets the clock — but a peer that has stopped reading
+/// entirely (a zero TCP window; the OS would otherwise park the write for its own
+/// multi-minute timeout) forfeits the connection. Tearing down closes the frame queue,
+/// which also unparks a runtime producer awaiting queue capacity — without this, a full
+/// queue against a wedged server leaves the whole session (including its `Disconnect`
+/// handling) frozen until the TCP stack gives up.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The socket send-buffer size, pinned at connect. The value is generous for a
+/// client whose outbound is keystrokes and subnegotiation frames, and pinning
+/// it is load-bearing on Windows: an explicit `SO_SNDBUF` disables winsock's
+/// dynamic send buffering, which otherwise absorbs an effectively unbounded
+/// outbound backlog against a peer that stopped reading — hiding a wedged
+/// server from the write stall guard and re-introducing, in the kernel, the
+/// retained-memory growth the bounded frame queue exists to prevent.
+const SEND_BUFFER_BYTES: u32 = 256 * 1024;
+
+/// Resolve `addr` and connect, trying each candidate address like
+/// `TcpStream::connect` does, but with the send buffer pinned before the
+/// connect (see [`SEND_BUFFER_BYTES`]). A refused buffer size is logged and
+/// ignored: it is a tuning knob, never worth failing the connection over.
+async fn connect_tcp(addr: &str) -> io::Result<TcpStream> {
+    let mut last_error = None;
+    for candidate in tokio::net::lookup_host(addr).await? {
+        let socket = if candidate.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        }?;
+        if let Err(err) = socket.set_send_buffer_size(SEND_BUFFER_BYTES) {
+            warn!("Failed to pin the socket send buffer size: {err}");
+        }
+        match socket.connect(candidate).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "address resolved to no candidates",
+        )
+    }))
+}
+
 /// Connect the transport: TCP, then a TLS handshake if requested. `host` is the server name
 /// for certificate verification and SNI (a DNS name or IP literal).
 async fn connect_stream(addr: &str, host: &str, tls: TlsMode) -> io::Result<GameStream> {
@@ -447,7 +529,7 @@ async fn connect_stream(addr: &str, host: &str, tls: TlsMode) -> io::Result<Game
     // tests have no script runtime), so install it here too — idempotent.
     static PROVIDER: OnceLock<()> = OnceLock::new();
 
-    let stream = TcpStream::connect(addr).await?;
+    let stream = connect_tcp(addr).await?;
     stream.set_nodelay(true)?;
     if tls == TlsMode::Off {
         return Ok(GameStream::Plain(stream));
@@ -674,6 +756,9 @@ pub struct Connection {
     /// reports the real size in its first NAWS answer; later changes ride
     /// [`OutboundFrame::WindowSize`].
     window_size: Arc<std::sync::atomic::AtomicU32>,
+    /// Zero-progress write budget handed to each connect task
+    /// ([`WRITE_STALL_TIMEOUT`]); a field so tests can shrink it.
+    write_stall_timeout: Duration,
 }
 
 fn clear_socket_sender(socket_tx: &RwLock<Option<WeakSender<OutboundFrame>>>) {
@@ -695,6 +780,7 @@ impl std::fmt::Debug for Connection {
             .field("on_connect", &self.on_connect.is_some())
             .field("raw_wanted", &self.raw_wanted)
             .field("window_size", &self.window_size)
+            .field("write_stall_timeout", &self.write_stall_timeout)
             .finish()
     }
 }
@@ -715,6 +801,7 @@ impl Connection {
             on_connect: None,
             raw_wanted,
             window_size,
+            write_stall_timeout: WRITE_STALL_TIMEOUT,
         }
     }
 
@@ -832,6 +919,7 @@ impl Connection {
         let on_connect = self.on_connect.take();
         let raw_wanted = self.raw_wanted.clone();
         let window_size = self.window_size.clone();
+        let write_stall_timeout = self.write_stall_timeout;
 
         spawn_io_task(async move {
             let mut vt_parser = VTParser::new();
@@ -866,145 +954,298 @@ impl Connection {
                 .ok();
             info!("Connecting to {addr}...");
 
-            let connect_result = match tokio::time::timeout(
-                CONNECT_TIMEOUT,
-                connect_stream(&addr, &host, tls),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_elapsed) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("timed out after {}s", CONNECT_TIMEOUT.as_secs()),
-                )),
-            };
-            match connect_result {
-                Ok(mut stream) => {
-                    runtime_tx
-                        .send(RuntimeAction::Echo(Arc::new("Connected.".to_string())))
-                        .ok();
-                    info!("Connected");
+            // Set once the transport is up: selects the full teardown
+            // (Disconnected + notice) over the connect-phase exits below.
+            let mut connected = false;
+            // Raw wire log, created on successful connect; declared here so the
+            // teardown can flush it after the run future is dropped.
+            let mut raw_log: Option<BufWriter<File>> = None;
 
-                    if let Some(on_connect) = on_connect {
-                        on_connect();
-                    }
-
+            // Everything that talks to the server — DNS, TCP, the TLS
+            // handshake, and the whole read/write loop — runs inside one
+            // future raced against the disconnect signal, so a user's
+            // disconnect preempts ANY await point: a write parked on a wedged
+            // peer (when the frame queue is full, the session runtime is
+            // parked awaiting capacity and cannot dispatch its own Disconnect;
+            // the signal here is the only escape), a mid-batch read, or a
+            // black-holed handshake that otherwise only CONNECT_TIMEOUT ends.
+            let run = async {
+                let connect_result =
+                    match tokio::time::timeout(CONNECT_TIMEOUT, connect_stream(&addr, &host, tls))
+                        .await
                     {
-                        let Ok(mut sender) = socket_tx.write() else {
-                            warn!("Failed to register socket sender because its lock is poisoned");
-                            return;
-                        };
-                        sender.replace(write_to_socket_tx.downgrade());
-                    }
+                        Ok(result) => result,
+                        Err(_elapsed) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("timed out after {}s", CONNECT_TIMEOUT.as_secs()),
+                        )),
+                    };
+                match connect_result {
+                    Ok(mut stream) => {
+                        runtime_tx
+                            .send(RuntimeAction::Echo(Arc::new("Connected.".to_string())))
+                            .ok();
+                        info!("Connected");
 
-                    runtime_tx.send(RuntimeAction::Connected).ok();
-
-                    // Raw wire log: exact bytes as received, including ANSI
-                    // escape sequences and CR/LF. One file per connection;
-                    // failure to create it is non-fatal.
-                    let mut raw_log = raw_log_path.and_then(|path| match File::create(&path) {
-                        Ok(file) => Some(BufWriter::with_capacity(65536, file)),
-                        Err(err) => {
-                            warn!("Failed to create raw log {}: {err:?}", path.display());
-                            None
+                        if let Some(on_connect) = on_connect {
+                            on_connect();
                         }
-                    });
 
-                    // Set when the loop exits because a disconnect was requested
-                    // (user-initiated, or this connection superseded by a new
-                    // one) rather than because the socket dropped underneath us.
-                    let mut graceful = false;
+                        {
+                            let Ok(mut sender) = socket_tx.write() else {
+                                warn!(
+                                    "Failed to register socket sender because its lock is poisoned"
+                                );
+                                return;
+                            };
+                            sender.replace(write_to_socket_tx.downgrade());
+                        }
 
-                    // The read buffer, reused across wakes (fill/try_fill clear it).
-                    let mut data: Vec<u8> = Vec::with_capacity(READ_CHUNK_CAPACITY);
+                        runtime_tx.send(RuntimeAction::Connected).ok();
+                        connected = true;
 
-                    loop {
-                        select! {
-                            res = stream.fill(&mut data) => {
-                                // Batched drain. `fill` awaits the next chunk (the Plain path
-                                // via readiness, bypassing tokio's coop budget so a fast
-                                // producer resolves synchronously); `try_fill` drains the rest
-                                // without blocking. Read up to READ_BATCH_BUDGET bytes, commit
-                                // the batch downstream as one unit, then yield so other
-                                // connections on this worker get a turn (see READ_BATCH_BUDGET).
-                                let mut batched = 0usize;
-                                // Decompressed bytes fed since the last mid-burst yield —
-                                // per-wake, so pacing restarts fresh each readable wake.
-                                let mut fed_since_yield = 0usize;
-                                // Whether any bytes were fed this wake; gates the end-of-batch
-                                // commit and yield.
-                                let mut fed = false;
-                                // Socket EOF or a failed reply write: tear the connection down,
-                                // after the end-of-batch commit delivers what already parsed.
-                                let mut dead = false;
-                                // The current chunk's byte count; `None` ends the drain.
-                                let mut read = match res {
-                                    Ok(n) if n > 0 => Some(n),
-                                    // EOF (`0`): tear down after the commit.
-                                    Ok(_) => {
-                                        dead = true;
-                                        None
-                                    }
-                                    Err(err) => {
-                                        warn!("Socket read from {addr} failed: {err}");
-                                        dead = true;
-                                        None
-                                    }
-                                };
+                        // Raw wire log: exact bytes as received, including ANSI
+                        // escape sequences and CR/LF. One file per connection;
+                        // failure to create it is non-fatal.
+                        raw_log = raw_log_path.and_then(|path| match File::create(&path) {
+                            Ok(file) => Some(BufWriter::with_capacity(65536, file)),
+                            Err(err) => {
+                                warn!("Failed to create raw log {}: {err:?}", path.display());
+                                None
+                            }
+                        });
 
-                                    'batch: while let Some(n) = read {
-                                            {
-                                                // Route the read through the MCCP stage. Plain
-                                                // bytes feed the parser directly; when a
-                                                // compression-start marker halts the parser
-                                                // mid-buffer, the remainder — and every later
-                                                // read — inflates in bounded chunks that feed
-                                                // the same parser. The raw log records the
-                                                // post-inflate telnet stream (readable), never
-                                                // zlib bytes. Negotiation replies flush per
-                                                // feed, not per batch, so handshakes stay
-                                                // timely even inside a large burst.
-                                                let mut slice: &[u8] = &data;
-                                                'route: while !slice.is_empty() {
-                                                    if inflow.is_plain() {
-                                                        let consumed = feed_inbound(
-                                                            slice,
-                                                            &mut telnet,
-                                                            &mut vt_parser,
-                                                            &mut vt_processor,
-                                                            &mut telnet_replies,
-                                                            &runtime_tx,
-                                                            &mut protocol,
-                                                            &mut transcode,
-                                                        );
-                                                        log_raw(&mut raw_log, &slice[..consumed]);
-                                                        fed = true;
-                                                        if !telnet_replies.is_empty()
-                                                            && let Err(err) =
-                                                                stream.write_all(&telnet_replies).await
-                                                        {
-                                                            warn!(
-                                                                "Failed to write telnet reply to {addr}: {err}"
+                        // The read buffer, reused across wakes (fill/try_fill clear it).
+                        let mut data: Vec<u8> = Vec::with_capacity(READ_CHUNK_CAPACITY);
+
+                        loop {
+                            select! {
+                                res = stream.fill(&mut data) => {
+                                    // Batched drain. `fill` awaits the next chunk (the Plain path
+                                    // via readiness, bypassing tokio's coop budget so a fast
+                                    // producer resolves synchronously); `try_fill` drains the rest
+                                    // without blocking. Read up to READ_BATCH_BUDGET bytes, commit
+                                    // the batch downstream as one unit, then yield so other
+                                    // connections on this worker get a turn (see READ_BATCH_BUDGET).
+                                    let mut batched = 0usize;
+                                    // Decompressed bytes fed since the last mid-burst yield —
+                                    // per-wake, so pacing restarts fresh each readable wake.
+                                    let mut fed_since_yield = 0usize;
+                                    // Whether any bytes were fed this wake; gates the end-of-batch
+                                    // commit and yield.
+                                    let mut fed = false;
+                                    // Socket EOF or a failed reply write: tear the connection down,
+                                    // after the end-of-batch commit delivers what already parsed.
+                                    let mut dead = false;
+                                    // The current chunk's byte count; `None` ends the drain.
+                                    let mut read = match res {
+                                        Ok(n) if n > 0 => Some(n),
+                                        // EOF (`0`): tear down after the commit.
+                                        Ok(_) => {
+                                            dead = true;
+                                            None
+                                        }
+                                        Err(err) => {
+                                            warn!("Socket read from {addr} failed: {err}");
+                                            dead = true;
+                                            None
+                                        }
+                                    };
+
+                                        'batch: while let Some(n) = read {
+                                                {
+                                                    // Route the read through the MCCP stage. Plain
+                                                    // bytes feed the parser directly; when a
+                                                    // compression-start marker halts the parser
+                                                    // mid-buffer, the remainder — and every later
+                                                    // read — inflates in bounded chunks that feed
+                                                    // the same parser. The raw log records the
+                                                    // post-inflate telnet stream (readable), never
+                                                    // zlib bytes. Negotiation replies flush per
+                                                    // feed, not per batch, so handshakes stay
+                                                    // timely even inside a large burst.
+                                                    let mut slice: &[u8] = &data;
+                                                    'route: while !slice.is_empty() {
+                                                        if inflow.is_plain() {
+                                                            let consumed = feed_inbound(
+                                                                slice,
+                                                                &mut telnet,
+                                                                &mut vt_parser,
+                                                                &mut vt_processor,
+                                                                &mut telnet_replies,
+                                                                &runtime_tx,
+                                                                &mut protocol,
+                                                                &mut transcode,
                                                             );
-                                                            dead = true;
-                                                            break 'route;
-                                                        }
-                                                        slice = &slice[consumed..];
-                                                        // Arm the inflater from the parser's latch,
-                                                        // not from a non-empty tail: a start marker
-                                                        // at the exact end of a read consumes the
-                                                        // whole buffer, yet the compressed stream —
-                                                        // arriving in the NEXT read — must still
-                                                        // inflate. The latch fires in both cases; a
-                                                        // marker for a declined option never sets it.
-                                                        if let Some(start) = telnet.take_compression_started() {
-                                                            // Begin the matching inflater; an
-                                                            // un-offered MCCPX encoding (`None`) or a
-                                                            // decoder init failure is disconnect-grade.
-                                                            match codec_for(start).map(|c| inflow.begin(c)) {
-                                                                Some(Ok(())) => {}
-                                                                _ => {
-                                                                    warn!("MCCPX: unusable compression start; disconnecting");
+                                                            log_raw(&mut raw_log, &slice[..consumed]);
+                                                            fed = true;
+                                                            if !telnet_replies.is_empty()
+                                                                && let Err(err) = stream
+                                                                    .write_all_stall_guarded(
+                                                                        &telnet_replies,
+                                                                        write_stall_timeout,
+                                                                    )
+                                                                    .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to write telnet reply to {addr}: {err}"
+                                                                );
+                                                                dead = true;
+                                                                break 'route;
+                                                            }
+                                                            slice = &slice[consumed..];
+                                                            // Arm the inflater from the parser's latch,
+                                                            // not from a non-empty tail: a start marker
+                                                            // at the exact end of a read consumes the
+                                                            // whole buffer, yet the compressed stream —
+                                                            // arriving in the NEXT read — must still
+                                                            // inflate. The latch fires in both cases; a
+                                                            // marker for a declined option never sets it.
+                                                            if let Some(start) = telnet.take_compression_started() {
+                                                                // Begin the matching inflater; an
+                                                                // un-offered MCCPX encoding (`None`) or a
+                                                                // decoder init failure is disconnect-grade.
+                                                                match codec_for(start).map(|c| inflow.begin(c)) {
+                                                                    Some(Ok(())) => {}
+                                                                    _ => {
+                                                                        warn!("MCCPX: unusable compression start; disconnecting");
+                                                                        runtime_tx
+                                                                            .send(RuntimeAction::Echo(Arc::new(
+                                                                                "Compression error — disconnecting.".to_string(),
+                                                                            )))
+                                                                            .ok();
+                                                                        dead = true;
+                                                                        break 'route;
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else {
+                                                            // Drain the decoder within this read:
+                                                            // step until it needs new input or the
+                                                            // stream ends. zstd can buffer output
+                                                            // internally when a step's buffer fills,
+                                                            // so once `slice` empties we keep stepping
+                                                            // (empty input flushes the buffered tail
+                                                            // and the End marker) instead of stranding
+                                                            // it until the next socket read.
+                                                            loop {
+                                                            match inflow.step(slice, &mut inflate_buf) {
+                                                                Ok(step) => {
+                                                                    let (consumed, ended) = match step {
+                                                                        inflow::InflateStep::Progress { consumed } => (consumed, false),
+                                                                        inflow::InflateStep::End { consumed } => (consumed, true),
+                                                                    };
+                                                                    slice = &slice[consumed..];
+                                                                    if !inflate_buf.is_empty() {
+                                                                        log_raw(&mut raw_log, &inflate_buf);
+                                                                        // Set before the feed/write, like
+                                                                        // the plain branch: a reply-write
+                                                                        // failure mid-inflate must still
+                                                                        // let the end-of-batch commit
+                                                                        // deliver the lines already fed.
+                                                                        fed = true;
+                                                                        // Decompressed bytes count toward
+                                                                        // the batch budget, so a high-ratio
+                                                                        // burst re-enters `select!` (and
+                                                                        // checks disconnect) after bounded
+                                                                        // *work*, not bounded compressed
+                                                                        // input.
+                                                                        batched += inflate_buf.len();
+                                                                        let mut plain: &[u8] = &inflate_buf;
+                                                                        while !plain.is_empty() {
+                                                                            let fed_n = feed_inbound(
+                                                                                plain,
+                                                                                &mut telnet,
+                                                                                &mut vt_parser,
+                                                                                &mut vt_processor,
+                                                                                &mut telnet_replies,
+                                                                                &runtime_tx,
+                                                                                &mut protocol,
+                                                                                &mut transcode,
+                                                                            );
+                                                                            plain = &plain[fed_n..];
+                                                                            if !telnet_replies.is_empty()
+                                                                                && let Err(err) = stream
+                                                                                    .write_all_stall_guarded(
+                                                                                        &telnet_replies,
+                                                                                        write_stall_timeout,
+                                                                                    )
+                                                                                    .await
+                                                                            {
+                                                                                warn!(
+                                                                                    "Failed to write telnet reply to {addr}: {err}"
+                                                                                );
+                                                                                dead = true;
+                                                                                break 'route;
+                                                                            }
+                                                                        }
+                                                                        fed_since_yield += inflate_buf.len();
+                                                                        if fed_since_yield >= READ_BATCH_BUDGET {
+                                                                            // A high-ratio burst: keep the
+                                                                            // commit cadence and give other
+                                                                            // connections a turn without
+                                                                            // stashing compressed input.
+                                                                            vt_processor.notify_end_of_buffer();
+                                                                            tokio::task::yield_now().await;
+                                                                            fed_since_yield = 0;
+                                                                        }
+                                                                    }
+                                                                    // A compression-start marker nested in
+                                                                    // the decompressed bytes (a protocol
+                                                                    // violation) armed the latch during the
+                                                                    // feed above; discard it here — AFTER
+                                                                    // the feed, so a marker in the same
+                                                                    // chunk that ends the stream can't
+                                                                    // survive `inflow.end()` and re-enter
+                                                                    // compression on the plain tail.
+                                                                    let _ = telnet.take_compression_started();
+                                                                    if ended {
+                                                                        // Orderly stream end: back to
+                                                                        // plain telnet. Clear both
+                                                                        // compression options' negotiated
+                                                                        // state (only one was on; the
+                                                                        // other clear is a no-op) so a
+                                                                        // later WILL renegotiates cleanly
+                                                                        // and releases the one-wrapper
+                                                                        // claim. The tail (`slice`) is
+                                                                        // plain again — the outer `'route`
+                                                                        // loop routes it.
+                                                                        inflow.end();
+                                                                        telnet.clear_remote(telnet::option::MCCP2);
+                                                                        telnet.clear_remote(telnet::option::MCCPX);
+                                                                        break;
+                                                                    } else if consumed == 0 && inflate_buf.is_empty() {
+                                                                        // Decoder drained: it needs new
+                                                                        // input (arriving in a later read).
+                                                                        break;
+                                                                    }
+                                                                }
+                                                                Err(err) => {
+                                                                    // Unrecoverable by construction: no
+                                                                    // plaintext boundary can be re-found in
+                                                                    // a desynced stream. Best-effort DONT
+                                                                    // for whichever compression option is
+                                                                    // live (the channel is desynced, so it
+                                                                    // may not land), then tear down.
+                                                                    warn!("Compression stream error; disconnecting: {err:?}");
+                                                                    let compression_option =
+                                                                        if telnet.remote_enabled(telnet::option::MCCPX) {
+                                                                            telnet::option::MCCPX
+                                                                        } else {
+                                                                            telnet::option::MCCP2
+                                                                        };
+                                                                    let dont = [
+                                                                        telnet::command::IAC,
+                                                                        telnet::command::DONT,
+                                                                        compression_option,
+                                                                    ];
+                                                                    stream
+                                                                        .write_all_stall_guarded(
+                                                                            &dont,
+                                                                            write_stall_timeout,
+                                                                        )
+                                                                        .await
+                                                                        .ok();
                                                                     runtime_tx
                                                                         .send(RuntimeAction::Echo(Arc::new(
                                                                             "Compression error — disconnecting.".to_string(),
@@ -1014,268 +1255,172 @@ impl Connection {
                                                                     break 'route;
                                                                 }
                                                             }
-                                                        }
-                                                    } else {
-                                                        // Drain the decoder within this read:
-                                                        // step until it needs new input or the
-                                                        // stream ends. zstd can buffer output
-                                                        // internally when a step's buffer fills,
-                                                        // so once `slice` empties we keep stepping
-                                                        // (empty input flushes the buffered tail
-                                                        // and the End marker) instead of stranding
-                                                        // it until the next socket read.
-                                                        loop {
-                                                        match inflow.step(slice, &mut inflate_buf) {
-                                                            Ok(step) => {
-                                                                let (consumed, ended) = match step {
-                                                                    inflow::InflateStep::Progress { consumed } => (consumed, false),
-                                                                    inflow::InflateStep::End { consumed } => (consumed, true),
-                                                                };
-                                                                slice = &slice[consumed..];
-                                                                if !inflate_buf.is_empty() {
-                                                                    log_raw(&mut raw_log, &inflate_buf);
-                                                                    // Set before the feed/write, like
-                                                                    // the plain branch: a reply-write
-                                                                    // failure mid-inflate must still
-                                                                    // let the end-of-batch commit
-                                                                    // deliver the lines already fed.
-                                                                    fed = true;
-                                                                    // Decompressed bytes count toward
-                                                                    // the batch budget, so a high-ratio
-                                                                    // burst re-enters `select!` (and
-                                                                    // checks disconnect) after bounded
-                                                                    // *work*, not bounded compressed
-                                                                    // input.
-                                                                    batched += inflate_buf.len();
-                                                                    let mut plain: &[u8] = &inflate_buf;
-                                                                    while !plain.is_empty() {
-                                                                        let fed_n = feed_inbound(
-                                                                            plain,
-                                                                            &mut telnet,
-                                                                            &mut vt_parser,
-                                                                            &mut vt_processor,
-                                                                            &mut telnet_replies,
-                                                                            &runtime_tx,
-                                                                            &mut protocol,
-                                                                            &mut transcode,
-                                                                        );
-                                                                        plain = &plain[fed_n..];
-                                                                        if !telnet_replies.is_empty()
-                                                                            && let Err(err) = stream
-                                                                                .write_all(&telnet_replies)
-                                                                                .await
-                                                                        {
-                                                                            warn!(
-                                                                                "Failed to write telnet reply to {addr}: {err}"
-                                                                            );
-                                                                            dead = true;
-                                                                            break 'route;
-                                                                        }
-                                                                    }
-                                                                    fed_since_yield += inflate_buf.len();
-                                                                    if fed_since_yield >= READ_BATCH_BUDGET {
-                                                                        // A high-ratio burst: keep the
-                                                                        // commit cadence and give other
-                                                                        // connections a turn without
-                                                                        // stashing compressed input.
-                                                                        vt_processor.notify_end_of_buffer();
-                                                                        tokio::task::yield_now().await;
-                                                                        fed_since_yield = 0;
-                                                                    }
-                                                                }
-                                                                // A compression-start marker nested in
-                                                                // the decompressed bytes (a protocol
-                                                                // violation) armed the latch during the
-                                                                // feed above; discard it here — AFTER
-                                                                // the feed, so a marker in the same
-                                                                // chunk that ends the stream can't
-                                                                // survive `inflow.end()` and re-enter
-                                                                // compression on the plain tail.
-                                                                let _ = telnet.take_compression_started();
-                                                                if ended {
-                                                                    // Orderly stream end: back to
-                                                                    // plain telnet. Clear both
-                                                                    // compression options' negotiated
-                                                                    // state (only one was on; the
-                                                                    // other clear is a no-op) so a
-                                                                    // later WILL renegotiates cleanly
-                                                                    // and releases the one-wrapper
-                                                                    // claim. The tail (`slice`) is
-                                                                    // plain again — the outer `'route`
-                                                                    // loop routes it.
-                                                                    inflow.end();
-                                                                    telnet.clear_remote(telnet::option::MCCP2);
-                                                                    telnet.clear_remote(telnet::option::MCCPX);
-                                                                    break;
-                                                                } else if consumed == 0 && inflate_buf.is_empty() {
-                                                                    // Decoder drained: it needs new
-                                                                    // input (arriving in a later read).
-                                                                    break;
-                                                                }
                                                             }
-                                                            Err(err) => {
-                                                                // Unrecoverable by construction: no
-                                                                // plaintext boundary can be re-found in
-                                                                // a desynced stream. Best-effort DONT
-                                                                // for whichever compression option is
-                                                                // live (the channel is desynced, so it
-                                                                // may not land), then tear down.
-                                                                warn!("Compression stream error; disconnecting: {err:?}");
-                                                                let compression_option =
-                                                                    if telnet.remote_enabled(telnet::option::MCCPX) {
-                                                                        telnet::option::MCCPX
-                                                                    } else {
-                                                                        telnet::option::MCCP2
-                                                                    };
-                                                                let dont = [
-                                                                    telnet::command::IAC,
-                                                                    telnet::command::DONT,
-                                                                    compression_option,
-                                                                ];
-                                                                stream.write_all(&dont).await.ok();
-                                                                runtime_tx
-                                                                    .send(RuntimeAction::Echo(Arc::new(
-                                                                        "Compression error — disconnecting.".to_string(),
-                                                                    )))
-                                                                    .ok();
-                                                                dead = true;
-                                                                break 'route;
-                                                            }
-                                                        }
                                                         }
                                                     }
                                                 }
-                                            }
-                                            if dead {
-                                                break 'batch;
-                                            }
-                                            batched += n;
-                                            if batched >= READ_BATCH_BUDGET {
-                                                break 'batch;
-                                            }
-                                            // Drain the rest of what's already available; a
-                                            // batch ends at WouldBlock (`None`) or the budget.
-                                            read = match stream.try_fill(&mut data) {
-                                                Ok(Some(m)) if m > 0 => Some(m),
-                                                // WouldBlock: the batch is drained.
-                                                Ok(None) => None,
-                                                // EOF (`Some(0)`): tear down.
-                                                Ok(Some(_)) => {
-                                                    dead = true;
-                                                    None
+                                                if dead {
+                                                    break 'batch;
                                                 }
-                                                Err(err) => {
-                                                    warn!("Socket read from {addr} failed: {err}");
-                                                    dead = true;
-                                                    None
+                                                batched += n;
+                                                if batched >= READ_BATCH_BUDGET {
+                                                    break 'batch;
                                                 }
-                                            };
-                                    }
+                                                // Drain the rest of what's already available; a
+                                                // batch ends at WouldBlock (`None`) or the budget.
+                                                read = match stream.try_fill(&mut data) {
+                                                    Ok(Some(m)) if m > 0 => Some(m),
+                                                    // WouldBlock: the batch is drained.
+                                                    Ok(None) => None,
+                                                    // EOF (`Some(0)`): tear down.
+                                                    Ok(Some(_)) => {
+                                                        dead = true;
+                                                        None
+                                                    }
+                                                    Err(err) => {
+                                                        warn!("Socket read from {addr} failed: {err}");
+                                                        dead = true;
+                                                        None
+                                                    }
+                                                };
+                                        }
 
-                                    if fed {
-                                        // Once per batch, not per chunk: a line straddling a
-                                        // chunk boundary keeps accumulating instead of taking a
-                                        // spurious partial-line round trip through the trigger
-                                        // engine and a retraction.
-                                        vt_processor.notify_end_of_buffer();
-                                    }
-                                    if dead {
-                                        break;
-                                    }
-                                    if fed {
-                                        tokio::task::yield_now().await;
-                                    }
-                            }
-                            Some(frame) = write_to_socket_rx.recv() => {
-                                let mut outcome = match &frame {
-                                    OutboundFrame::Text(text) => {
-                                        if transcode.is_passthrough() {
-                                            stream.write_all(text.as_bytes()).await
-                                        } else {
-                                            // Encode to the active charset and double any
-                                            // 0xFF the encoding produced (UTF-8 output can
-                                            // never contain one; legacy encodings can).
+                                        if fed {
+                                            // Once per batch, not per chunk: a line straddling a
+                                            // chunk boundary keeps accumulating instead of taking a
+                                            // spurious partial-line round trip through the trigger
+                                            // engine and a retraction.
+                                            vt_processor.notify_end_of_buffer();
+                                        }
+                                        if dead {
+                                            break;
+                                        }
+                                        if fed {
+                                            tokio::task::yield_now().await;
+                                        }
+                                }
+                                Some(frame) = write_to_socket_rx.recv() => {
+                                    let mut outcome = match &frame {
+                                        OutboundFrame::Text(text) => {
+                                            if transcode.is_passthrough() {
+                                                stream
+                                                    .write_all_stall_guarded(
+                                                        text.as_bytes(),
+                                                        write_stall_timeout,
+                                                    )
+                                                    .await
+                                            } else {
+                                                // Encode to the active charset and double any
+                                                // 0xFF the encoding produced (UTF-8 output can
+                                                // never contain one; legacy encodings can).
+                                                stream
+                                                    .write_all_stall_guarded(
+                                                        transcode.encode_outbound(text),
+                                                        write_stall_timeout,
+                                                    )
+                                                    .await
+                                            }
+                                        }
+                                        OutboundFrame::Raw(bytes) => {
                                             stream
-                                                .write_all(transcode.encode_outbound(text))
+                                                .write_all_stall_guarded(bytes, write_stall_timeout)
                                                 .await
                                         }
+                                        OutboundFrame::WindowSize => Ok(()),
+                                    };
+                                    // Emit a changed NAWS report after every queued frame. That
+                                    // makes a full queue safely coalesce a WindowSize wakeup:
+                                    // one of the already-pending frames will observe the shared
+                                    // size cell as soon as capacity starts draining.
+                                    telnet_replies.clear();
+                                    if outcome.is_ok()
+                                        && telnet.local_enabled(telnet::option::NAWS)
+                                        && protocol.send_naws_if_changed(&mut telnet_replies)
+                                    {
+                                        outcome = stream
+                                            .write_all_stall_guarded(
+                                                &telnet_replies,
+                                                write_stall_timeout,
+                                            )
+                                            .await;
                                     }
-                                    OutboundFrame::Raw(bytes) => stream.write_all(bytes).await,
-                                    OutboundFrame::WindowSize => Ok(()),
-                                };
-                                // Emit a changed NAWS report after every queued frame. That
-                                // makes a full queue safely coalesce a WindowSize wakeup:
-                                // one of the already-pending frames will observe the shared
-                                // size cell as soon as capacity starts draining.
-                                telnet_replies.clear();
-                                if outcome.is_ok()
-                                    && telnet.local_enabled(telnet::option::NAWS)
-                                    && protocol.send_naws_if_changed(&mut telnet_replies)
-                                {
-                                    outcome = stream.write_all(&telnet_replies).await;
+                                    if let Err(err) = outcome {
+                                        warn!("Socket write to {addr} failed: {err}");
+                                        break;
+                                    }
                                 }
-                                if let Err(err) = outcome {
-                                    warn!("Socket write to {addr} failed: {err}");
+                                else => {
                                     break;
                                 }
                             }
-                            _ = &mut disconnect_rx => {
-                                graceful = true;
-                                break;
-                            }
-                            else => {
-                                break;
-                            }
                         }
                     }
-
-                    // End-of-stream decoder flush: a socket that closed mid-character
-                    // (a converting connection's pending multibyte lead byte) surfaces
-                    // as U+FFFD on the final line instead of vanishing.
-                    let tail = transcode.finish();
-                    if !tail.is_empty() {
-                        feed_utf8(&mut vt_parser, &mut vt_processor, tail.as_bytes());
-                        vt_processor.notify_end_of_buffer();
+                    Err(err) => {
+                        warn!("Connection to {addr} failed: {err}");
+                        // Name the reason in the session view — a TLS handshake failure
+                        // (self-signed / expired / name mismatch) gives no other hint, and the
+                        // policy is never a silent fallback to plaintext.
+                        runtime_tx
+                            .send(RuntimeAction::Echo(Arc::new(format!(
+                                "Connection failed: {err}"
+                            ))))
+                            .map_err(|_| {
+                                warn!("Error notifying runtime of connection failure; ignoring");
+                            })
+                            .ok();
                     }
-
-                    if let Some(mut writer) = raw_log.take()
-                        && let Err(err) = writer.flush()
-                    {
-                        warn!("Failed to flush raw log: {err:?}");
-                    }
-
-                    // Silently ignore errors here; when a session is closing the runtime may already be gone by the time
-                    // we get here
-                    runtime_tx
-                        .send(RuntimeAction::Disconnected)
-                        .map(|()| {
-                            // A requested disconnect reads as a clean "Disconnected.";
-                            // an unexpected socket drop reads as "Connection lost".
-                            let notice = if graceful {
-                                "Disconnected."
-                            } else {
-                                "Connection lost"
-                            };
-                            runtime_tx
-                                .send(RuntimeAction::Echo(Arc::new(notice.to_string())))
-                                .ok();
-                        })
-                        .ok();
                 }
-                Err(err) => {
-                    warn!("Connection to {addr} failed: {err}");
-                    // Name the reason in the session view — a TLS handshake failure
-                    // (self-signed / expired / name mismatch) gives no other hint, and the
-                    // policy is never a silent fallback to plaintext.
-                    runtime_tx
-                        .send(RuntimeAction::Echo(Arc::new(format!(
-                            "Connection failed: {err}"
-                        ))))
-                        .map_err(|_| {
-                            warn!("Error notifying runtime of connection failure; ignoring");
-                        })
-                        .ok();
+            };
+
+            // A requested disconnect (user-initiated, or this connection
+            // superseded by a new one) reads as a clean "Disconnected."; every
+            // other exit — stream EOF, a write/stall error, a failed connect —
+            // reads as loss or failure. `run` is consumed here, releasing its
+            // borrows before the teardown below uses them.
+            let graceful = select! {
+                () = run => false,
+                _ = &mut disconnect_rx => true,
+            };
+
+            if connected {
+                // End-of-stream decoder flush: a socket that closed mid-character
+                // (a converting connection's pending multibyte lead byte) surfaces
+                // as U+FFFD on the final line instead of vanishing.
+                let tail = transcode.finish();
+                if !tail.is_empty() {
+                    feed_utf8(&mut vt_parser, &mut vt_processor, tail.as_bytes());
+                    vt_processor.notify_end_of_buffer();
                 }
+
+                if let Some(mut writer) = raw_log.take()
+                    && let Err(err) = writer.flush()
+                {
+                    warn!("Failed to flush raw log: {err:?}");
+                }
+
+                // Silently ignore errors here; when a session is closing the runtime may already be gone by the time
+                // we get here
+                runtime_tx
+                    .send(RuntimeAction::Disconnected)
+                    .map(|()| {
+                        let notice = if graceful {
+                            "Disconnected."
+                        } else {
+                            "Connection lost"
+                        };
+                        runtime_tx
+                            .send(RuntimeAction::Echo(Arc::new(notice.to_string())))
+                            .ok();
+                    })
+                    .ok();
+            } else if graceful {
+                // The disconnect landed before the transport ever came up: the
+                // attempt is abandoned with an echo alone. `Connected` (and
+                // `sys:connect`) never fired, so no `Disconnected` unwind —
+                // the runtime's connect/disconnect events stay strictly paired.
+                runtime_tx
+                    .send(RuntimeAction::Echo(Arc::new("Disconnected.".to_string())))
+                    .ok();
             }
             trace!("Connection cleaning up");
             clear_socket_sender(&socket_tx);
@@ -1603,6 +1748,222 @@ mod tests {
         })
         .await
         .expect("the full burst should drain without drops or deadlock");
+    }
+
+    /// Large enough to overwhelm the pinned send buffer ([`SEND_BUFFER_BYTES`])
+    /// plus the shrunken peer receive buffer many times over, so a write
+    /// against a peer that never reads parks mid-write on a zero TCP window —
+    /// the wedged-server condition. The pinned send buffer is what makes this
+    /// portable: Windows's dynamic send buffering otherwise absorbs the whole
+    /// frame (measured: 64 MiB accepted in ~5ms against a 4 KB receive buffer)
+    /// and the write never parks.
+    fn wedge_frame() -> Arc<[u8]> {
+        Arc::from(vec![b'x'; 64 * 1024 * 1024])
+    }
+
+    /// Accepts one connection and never reads from it, holding the socket open
+    /// until released: the kernel buffers fill and the client's write parks
+    /// indefinitely, exactly like a wedged (zero-window) server. The receive
+    /// buffer is shrunk before listening (accepted sockets inherit it) because
+    /// loopback defaults can otherwise absorb tens of megabytes and let the
+    /// write complete instead of wedging.
+    fn never_reading_server() -> (u16, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .set_recv_buffer_size(4096)
+            .expect("shrink receive buffer");
+        socket
+            .bind("127.0.0.1:0".parse().expect("loopback address"))
+            .expect("bind");
+        let listener = socket.listen(8).expect("listen");
+        let port = listener.local_addr().expect("listener address").port();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept");
+            release_rx.await.ok();
+        });
+        (port, release_tx, server)
+    }
+
+    async fn expect_connected(runtime_rx: &mut tokio_mpsc::UnboundedReceiver<RuntimeAction>) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(runtime_rx.recv().await, Some(RuntimeAction::Connected)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("connection should become ready");
+    }
+
+    /// A scripted zero-window peer: accepts a fixed number of bytes, then
+    /// never accepts another.
+    struct WedgedWriter {
+        accept: usize,
+    }
+
+    impl tokio::io::AsyncWrite for WedgedWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if self.accept == 0 {
+                // No waker is registered: only the stall guard's timer can
+                // end the write, exactly like a peer that never reads again.
+                return std::task::Poll::Pending;
+            }
+            let written = self.accept.min(buf.len());
+            self.accept -= written;
+            std::task::Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A slow but healthy peer: accepts exactly one byte per write call.
+    struct TrickleWriter;
+
+    impl tokio::io::AsyncWrite for TrickleWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(usize::from(!buf.is_empty())))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stall_guard_times_out_a_peer_that_stopped_accepting_bytes() {
+        let mut wedged = WedgedWriter { accept: 10 };
+        let error = write_all_with_stall_guard(&mut wedged, &[b'x'; 64], Duration::from_millis(50))
+            .await
+            .expect_err("a zero-window peer must time the write out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn stall_guard_lets_a_slowly_draining_peer_finish() {
+        write_all_with_stall_guard(&mut TrickleWriter, &[b'x'; 256], Duration::from_millis(50))
+            .await
+            .expect("byte-at-a-time progress is never a stall");
+    }
+
+    #[tokio::test]
+    async fn disconnect_preempts_a_write_wedged_on_a_peer_that_stopped_reading() {
+        let (port, release_tx, server) = never_reading_server();
+
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+        expect_connected(&mut runtime_rx).await;
+
+        connection
+            .write_raw(wedge_frame())
+            .await
+            .expect("the frame should be queued");
+        // Give the socket task time to pick the frame up and park inside the
+        // write before asking for the disconnect.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        connection.disconnect();
+
+        let mut disconnected = false;
+        let mut reported_disconnect = false;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let action = runtime_rx.recv().await.expect("runtime action");
+                match action {
+                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Echo(text) if text.as_str() == "Disconnected." => {
+                        reported_disconnect = true;
+                    }
+                    _ => {}
+                }
+                if disconnected && reported_disconnect {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("disconnect should preempt the wedged write, not wait out TCP");
+
+        release_tx.send(()).ok();
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_write_times_out_and_unparks_a_producer_awaiting_capacity() {
+        let (port, release_tx, server) = never_reading_server();
+
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.write_stall_timeout = Duration::from_millis(300);
+        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+        expect_connected(&mut runtime_rx).await;
+
+        connection
+            .write_raw(wedge_frame())
+            .await
+            .expect("the frame should be queued");
+
+        // Fill the queue behind the wedged frame until a write parks awaiting
+        // capacity, then keep writing: the stall timeout must tear the socket
+        // down and surface an error here instead of leaving the producer
+        // parked for the TCP stack's own timeout.
+        let producer = async { while connection.write(Arc::new("n".to_string())).await.is_ok() {} };
+        let watcher = async {
+            let mut disconnected = false;
+            let mut reported_loss = false;
+            loop {
+                let action = runtime_rx.recv().await.expect("runtime action");
+                match action {
+                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Echo(text) if text.as_str() == "Connection lost" => {
+                        reported_loss = true;
+                    }
+                    _ => {}
+                }
+                if disconnected && reported_loss {
+                    break;
+                }
+            }
+        };
+
+        timeout(Duration::from_secs(10), async {
+            tokio::join!(producer, watcher);
+        })
+        .await
+        .expect("the stall timeout should tear down the socket and unpark the producer");
+
+        release_tx.send(()).ok();
+        server.await.expect("server task");
     }
 
     #[tokio::test]
