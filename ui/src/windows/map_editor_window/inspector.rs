@@ -53,11 +53,14 @@ pub(super) fn endpoint_updates(
 ) -> Option<ConnectionUpdates> {
     let connection = area.get_connection(connection_id)?;
     let mut route_points = None;
+    // Without endpoint B there is no active tip-to-tip route to repair —
+    // dormant stored points stay untouched and the endpoint simply moves.
     if connection.segment_shape == SegmentShape::Orthogonal
         && matches!(
             connection.routing,
             ConnectionRouting::Manual | ConnectionRouting::Automatic
         )
+        && connection.endpoint_b.is_some()
     {
         let render = area.get_room_connections().iter().find(|item| {
             item.connection_id == connection_id && item.geometry.stub_tip_b.is_some()
@@ -129,7 +132,23 @@ pub(super) fn endpoint_reanchor(
     } else {
         connection.endpoint_a
     };
-    let (side, offset) = smudgy_cloud::default_anchor_for_direction(direction, None);
+    // `Special`/`Other` have no compass semantics; give them the partner
+    // bearing so the anchor lands toward the destination, exactly as
+    // connection creation does.
+    let bearing = (|| {
+        let this = area.get_room(&room)?;
+        let other_number = if endpoint_b {
+            connection.endpoint_a.room_number
+        } else {
+            connection.endpoint_b?.room_number
+        };
+        let other = area.get_room(&other_number)?;
+        Some(smudgy_cloud::MapPoint::new(
+            other.get_x() - this.get_x(),
+            other.get_y() - this.get_y(),
+        ))
+    })();
+    let (side, offset) = smudgy_cloud::default_anchor_for_direction(direction, bearing);
     if endpoint.side == side
         && (endpoint.port_offset - offset).abs() < smudgy_cloud::connection_geometry::EPSILON
         && endpoint.port_mode == smudgy_cloud::PortMode::AutoPinned
@@ -959,30 +978,46 @@ impl MapEditorWindow {
             endpoint_reanchor(&area, connection, target_room, direction)
                 .map(|updates| (connection.id, updates))
         })();
-        // Re-anchoring an Automatic route's endpoint leaves its stored
-        // route stale exactly like an inspector port edit does.
-        if let Some((connection_id, _)) = &connection_edit
-            && atlas.get_area(&room_key.area_id).is_some_and(|area| {
-                area.get_connection(*connection_id)
-                    .is_some_and(|connection| connection.routing == ConnectionRouting::Automatic)
-            })
-        {
-            self.automatic_routes_maybe_stale.insert(*connection_id);
-        }
-        let command = commands::edit_exit_with_endpoint(
-            &atlas,
-            room_key,
-            exit_id,
-            field,
-            |updates| {
-                if to_side {
-                    updates.to_direction = Some(direction);
-                } else {
-                    updates.from_direction = Some(direction);
+        let change = |updates: &mut smudgy_cloud::ExitUpdates| {
+            if to_side {
+                updates.to_direction = Some(direction);
+            } else {
+                updates.from_direction = Some(direction);
+            }
+        };
+        let command = match &connection_edit {
+            // With an endpoint re-anchor, one atomic two-mutation batch —
+            // deliberately not coalescing (see edit_exit_with_endpoint).
+            Some((connection_id, updates)) => {
+                // Re-anchoring an Automatic route's endpoint leaves its
+                // stored route stale exactly like an inspector port edit.
+                if atlas.get_area(&room_key.area_id).is_some_and(|area| {
+                    area.get_connection(*connection_id).is_some_and(|connection| {
+                        connection.routing == ConnectionRouting::Automatic
+                    })
+                }) {
+                    self.automatic_routes_maybe_stale.insert(*connection_id);
                 }
-            },
-            connection_edit,
-        );
+                // Up/down endpoints have no port handle, so a selected one
+                // vanishes with this change; drop it rather than let
+                // keyboard nudges edit an invisible port. (Other
+                // directions keep their handles — the enum is positionless,
+                // so the selection stays valid at the new anchor.)
+                if matches!(direction, ExitDirection::Up | ExitDirection::Down) {
+                    self.editor.clear_selected_connection_handle();
+                }
+                commands::edit_exit_with_endpoint(
+                    &atlas,
+                    room_key,
+                    exit_id,
+                    change,
+                    *connection_id,
+                    updates.clone(),
+                )
+            }
+            // No endpoint to move: the plain coalescing exit edit.
+            None => commands::edit_exit_field(&atlas, room_key, exit_id, field, change),
+        };
         let update = self.push_command(command);
         self.inspector.resync(&self.mapper, &self.editor);
         update
@@ -1565,7 +1600,10 @@ impl MapEditorWindow {
             }
             Message::ConnectionColorChanged(value) => {
                 self.inspector.connection.color = value.clone();
-                if !value.is_empty() && smudgy_cloud::canonicalize_css_color(&value).is_none() {
+                // An empty buffer stays uncommitted (the input shows it as
+                // invalid) rather than committing a value the mirror would
+                // silently rewrite to the default.
+                if smudgy_cloud::canonicalize_css_color(&value).is_none() {
                     return Update::none();
                 }
                 self.commit_connection_field(
@@ -3228,6 +3266,7 @@ fn connection_view(
 
     if state.exits.len() == 1 {
         let selected = &state.exits[0];
+        let mut has_reciprocal_candidate = false;
         for candidate in area.get_connections() {
             if candidate.id == connection_id {
                 continue;
@@ -3259,6 +3298,7 @@ fn connection_view(
                     .to_direction
                     .is_none_or(|direction| direction == selected.from_direction);
             if reciprocal {
+                has_reciprocal_candidate = true;
                 content = content.push(
                     button(text("Pair with reciprocal connection").size(12))
                         .style(builtins::button::secondary)
@@ -3269,12 +3309,27 @@ fn connection_view(
             }
         }
 
-        // One-way → two-way without hunting for an existing reciprocal:
-        // creates the return exit on the destination room, attached to this
-        // link. Only for same-area, non-redacted destinations.
+        // One-way → two-way when no reciprocal exists to Pair with:
+        // creates the return exit on the destination room, attached to
+        // this link. Only for same-area, non-redacted, non-loop
+        // destinations whose return direction is still free.
+        let return_free = || {
+            let to_room = selected.to_room.trim().parse::<i32>().ok().map(RoomNumber)?;
+            let destination = area.get_room(&to_room)?;
+            let return_direction = selected
+                .to_direction
+                .unwrap_or_else(|| selected.from_direction.opposite());
+            Some(!destination.get_exits().iter().any(|other| {
+                other.from_direction == return_direction
+                    || (other.to_area_id == Some(area_id)
+                        && other.to_room_number == Some(selected.from_room))
+            }))
+        };
         if selected.to_area == Some(area_id)
-            && !selected.to_room.trim().is_empty()
             && !selected.to_unknown
+            && !has_reciprocal_candidate
+            && connection.kind != smudgy_cloud::ConnectionKind::SelfLoop
+            && return_free() == Some(true)
         {
             content = content.push(
                 button(text("Add return direction").size(12))

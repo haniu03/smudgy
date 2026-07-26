@@ -1551,7 +1551,12 @@ pub fn add_return_exit(
     connection_id: ConnectionId,
 ) -> Option<Command> {
     let area = atlas.get_area(&area_id)?;
-    area.get_connection(connection_id)?;
+    let connection = area.get_connection(connection_id)?;
+    // A two-member self-loop is invalid membership; the loop arc already
+    // covers both senses visually.
+    if connection.kind == smudgy_cloud::ConnectionKind::SelfLoop {
+        return None;
+    }
     let mut members = area.get_rooms().iter().flat_map(|room| {
         room.get_exits()
             .iter()
@@ -1566,23 +1571,37 @@ pub fn add_return_exit(
     if exit.to_area_id != Some(area_id) {
         return None;
     }
-    area.get_room(&to_room)?;
+    let destination = area.get_room(&to_room)?;
+    let return_direction = exit
+        .to_direction
+        .unwrap_or_else(|| exit.from_direction.opposite());
+    // Refuse when the destination already answers: an exit in the return
+    // direction would collide, and an existing exit back toward the origin
+    // is a reciprocal that should be Paired instead of duplicated.
+    if destination.get_exits().iter().any(|other| {
+        other.from_direction == return_direction
+            || (other.to_area_id == Some(area_id) && other.to_room_number == Some(from_room))
+    }) {
+        return None;
+    }
 
+    let cleared = area.effective_access().is_cleared_for_secrets();
     let new_id = ExitId::new();
     let body = ExitArgs {
         id: Some(new_id),
         connection_id: Some(connection_id),
-        is_secret: None,
-        from_direction: exit
-            .to_direction
-            .unwrap_or_else(|| exit.from_direction.opposite()),
+        // The return of a secret/closed/locked passage is the same
+        // passage: mirror those, but not the direction-specific
+        // path/command.
+        is_secret: (cleared && exit.is_secret).then_some(true),
+        from_direction: return_direction,
         to_area_id: Some(area_id),
         to_room_number: Some(from_room),
         to_direction: Some(exit.from_direction),
         path: None,
-        is_hidden: false,
-        is_closed: false,
-        is_locked: false,
+        is_hidden: exit.is_hidden,
+        is_closed: exit.is_closed,
+        is_locked: exit.is_locked,
         weight: exit.weight,
         command: None,
     };
@@ -1727,18 +1746,20 @@ pub fn edit_exit_field(
     )
 }
 
-/// Edits one exit field and, in the same undo unit, applies a Connection
-/// endpoint edit — the direction-change path, where the exit's new
-/// direction re-anchors the owning endpoint to its home slot. One command,
-/// one undo; coalesces on the exit field like [`edit_exit_field`].
+/// Edits one exit field and applies a Connection endpoint edit in the same
+/// atomic `AreaBatch` — the direction-change path, where the exit's new
+/// direction re-anchors the owning endpoint to its home slot. One validated
+/// envelope, one undo unit. Deliberately NOT coalescing: this two-mutation
+/// shape must never merge with the single-mutation commands sharing the
+/// exit-field coalescing keys, or one side's undo/redo gets discarded.
 #[must_use]
 pub fn edit_exit_with_endpoint(
     atlas: &Arc<AtlasCache>,
     room_key: RoomKey,
     exit_id: ExitId,
-    field: FieldId,
     change: impl FnOnce(&mut ExitUpdates),
-    connection_edit: Option<(ConnectionId, ConnectionUpdates)>,
+    connection_id: ConnectionId,
+    connection_updates: ConnectionUpdates,
 ) -> Option<Command> {
     let area = atlas.get_area(&room_key.area_id)?;
     let room = area.get_room(&room_key.room_number)?;
@@ -1753,64 +1774,61 @@ pub fn edit_exit_with_endpoint(
     updates.clear_to = (!destination_expressed && !exit.to_unknown).then_some(true);
     let area_id = room_key.area_id;
 
-    let mut redo = vec![Mutation::UpdateExit {
-        room_key: room_key.clone(),
-        id: IdRef::Known(exit_id),
-        updates,
-    }];
-    let mut undo = vec![Mutation::UpdateExit {
-        room_key,
-        id: IdRef::Known(exit_id),
-        updates: prior,
-    }];
-    if let Some((connection_id, connection_updates)) = connection_edit {
-        let current = area.get_connection(connection_id)?;
-        // Same endpoint-B inverse rule as `edit_connection`.
-        if connection_updates.endpoint_b.is_some() && current.endpoint_b.is_none() {
-            return None;
-        }
-        let inverse = ConnectionUpdates {
-            endpoint_a: connection_updates.endpoint_a.map(|_| current.endpoint_a),
-            endpoint_b: connection_updates.endpoint_b.and(current.endpoint_b),
-            routing: connection_updates.routing.map(|_| current.routing),
-            segment_shape: connection_updates
-                .segment_shape
-                .map(|_| current.segment_shape),
-            corner: connection_updates.corner.map(|_| current.corner),
-            route_points: connection_updates
-                .route_points
-                .as_ref()
-                .map(|_| current.route_points.clone()),
-            dash: connection_updates.dash.map(|_| current.dash),
-            color: connection_updates
-                .color
-                .as_ref()
-                .map(|_| current.color.clone()),
-            thickness: connection_updates.thickness.map(|_| current.thickness),
-        };
-        redo.push(Mutation::AreaBatch {
-            area_id,
-            operations: vec![AreaMutation::UpdateConnection {
-                connection_id,
-                body: connection_updates,
-            }],
-            description: "Re-anchor connection port".to_string(),
-        });
-        undo.push(Mutation::AreaBatch {
-            area_id,
-            operations: vec![AreaMutation::UpdateConnection {
-                connection_id,
-                body: inverse,
-            }],
-            description: "Undo re-anchor connection port".to_string(),
-        });
+    let current = area.get_connection(connection_id)?;
+    // Same endpoint-B inverse rule as `edit_connection`.
+    if connection_updates.endpoint_b.is_some() && current.endpoint_b.is_none() {
+        return None;
     }
+    let inverse = ConnectionUpdates {
+        endpoint_a: connection_updates.endpoint_a.map(|_| current.endpoint_a),
+        endpoint_b: connection_updates.endpoint_b.and(current.endpoint_b),
+        routing: connection_updates.routing.map(|_| current.routing),
+        segment_shape: connection_updates
+            .segment_shape
+            .map(|_| current.segment_shape),
+        corner: connection_updates.corner.map(|_| current.corner),
+        route_points: connection_updates
+            .route_points
+            .as_ref()
+            .map(|_| current.route_points.clone()),
+        dash: connection_updates.dash.map(|_| current.dash),
+        color: connection_updates
+            .color
+            .as_ref()
+            .map(|_| current.color.clone()),
+        thickness: connection_updates.thickness.map(|_| current.thickness),
+    };
 
-    Some(Command::new(redo, undo).coalescing(CoalesceKey {
-        entity: EntityRef::Exit(area_id, exit_id),
-        field,
-        detail: None,
-    }))
+    Some(Command::new(
+        vec![Mutation::AreaBatch {
+            area_id,
+            operations: vec![
+                AreaMutation::UpdateExit {
+                    exit_id,
+                    body: updates,
+                },
+                AreaMutation::UpdateConnection {
+                    connection_id,
+                    body: connection_updates,
+                },
+            ],
+            description: "Change exit direction".to_string(),
+        }],
+        vec![Mutation::AreaBatch {
+            area_id,
+            operations: vec![
+                AreaMutation::UpdateExit {
+                    exit_id,
+                    body: prior,
+                },
+                AreaMutation::UpdateConnection {
+                    connection_id,
+                    body: inverse,
+                },
+            ],
+            description: "Undo change exit direction".to_string(),
+        }],
+    ))
 }
 
 /// Deletes one exit; undo recreates it (with a fresh backend id tracked

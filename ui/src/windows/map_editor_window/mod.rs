@@ -1793,6 +1793,33 @@ impl MapEditorWindow {
                                 }
                                 SelectedConnectionHandle::Waypoint(_) => unreachable!(),
                             };
+                            // The stored selection can outlive the handle
+                            // (an up/down endpoint has no port); refuse to
+                            // nudge a port the geometry no longer offers.
+                            let port_exists = area
+                                .get_room_connections()
+                                .iter()
+                                .find(|item| {
+                                    item.connection_id == connection_id
+                                        && item.from_level == self.editor.level()
+                                })
+                                .is_some_and(|item| {
+                                    item.geometry.handles.iter().any(|offered| {
+                                        use smudgy_cloud::connection_geometry::Handle;
+                                        match handle {
+                                            SelectedConnectionHandle::PortA => {
+                                                matches!(offered, Handle::PortA(_))
+                                            }
+                                            SelectedConnectionHandle::PortB => {
+                                                matches!(offered, Handle::PortB(_))
+                                            }
+                                            SelectedConnectionHandle::Waypoint(_) => false,
+                                        }
+                                    })
+                                });
+                            if !port_exists {
+                                return Update::none();
+                            }
                             // Port offsets are normalized wall coordinates.
                             // Keep the same fine/default/coarse relationship
                             // as waypoint nudging without jumping an entire
