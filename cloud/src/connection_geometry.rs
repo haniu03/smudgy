@@ -186,6 +186,39 @@ impl StubAxis {
     }
 }
 
+/// Whether an endpoint's *rendered* representation is the fixed corner
+/// level triangle rather than anything anchored at its wall port — the
+/// cases whose port placement is meaningless and whose editing handle is
+/// therefore withheld:
+///
+/// - cross-level halves (the `ToLevel` triangle/fading stub anchors on the
+///   room center and exit direction, never the port);
+/// - the level-marker stubs: `Stub` routing outside the marker kinds, and
+///   dangling up/down exits (the [`ConnectionGeometry::level_markers`]
+///   emission cases).
+///
+/// Same-level up/down *lines* meet the room at their port, and cross-area
+/// (`External`) up/down stubs anchor their area marker on the port-derived
+/// tip — both keep placeable ports.
+#[must_use]
+pub fn renders_as_level_triangle(
+    kind: ConnectionKind,
+    routing: ConnectionRouting,
+    stub: StubAxis,
+) -> bool {
+    if !matches!(stub, StubAxis::Level { .. }) {
+        return false;
+    }
+    match kind {
+        ConnectionKind::CrossLevel => true,
+        ConnectionKind::Dangling => true,
+        ConnectionKind::External => false,
+        ConnectionKind::Internal | ConnectionKind::SelfLoop => {
+            routing == ConnectionRouting::Stub
+        }
+    }
+}
+
 /// The center of a room's up/down level triangle: ▲ at the top-right corner,
 /// ▼ at the bottom-left, [`LEVEL_MARKER_OFFSET`] out along both axes.
 #[must_use]
@@ -508,14 +541,15 @@ pub fn resolve(input: &GeometryInput<'_>) -> ConnectionGeometry {
 
     resolve_stroke(&mut geometry, input, port_a, tip_a, port_b, tip_b);
 
-    // Up/down endpoints have no draggable port: their representation is the
-    // fixed level triangle, and their wall attachment follows the exit
-    // direction's home slot rather than manual placement.
-    if !matches!(input.endpoint_a.stub, StubAxis::Level { .. }) {
+    // Endpoints whose rendered representation is the fixed level triangle
+    // have no draggable port — the triangle ignores port placement. Up/down
+    // endpoints that still render port-anchored strokes (same-level lines,
+    // cross-area stubs) keep theirs.
+    if !renders_as_level_triangle(input.kind, input.routing, input.endpoint_a.stub) {
         geometry.handles.push(Handle::PortA(port_a));
     }
     if let (Some(port), Some(b)) = (port_b, input.endpoint_b)
-        && !matches!(b.stub, StubAxis::Level { .. })
+        && !renders_as_level_triangle(input.kind, input.routing, b.stub)
     {
         geometry.handles.push(Handle::PortB(port));
     }
@@ -1498,6 +1532,71 @@ mod tests {
             "level endpoint must not grow a port handle"
         );
         assert!(g.handles.iter().any(|h| matches!(h, Handle::PortB(_))));
+    }
+
+    #[test]
+    fn ports_hide_only_where_the_triangle_is_the_representation() {
+        let up = StubAxis::for_direction(ExitDirection::Up);
+        let down = StubAxis::for_direction(ExitDirection::Down);
+        let port_handles = |g: &ConnectionGeometry| {
+            g.handles
+                .iter()
+                .filter(|h| matches!(h, Handle::PortA(_) | Handle::PortB(_)))
+                .count()
+        };
+
+        // Same-level (same z) up/down link: a Simple line meets each port,
+        // so both ports stay placeable.
+        let same_level = GeometryInput {
+            kind: ConnectionKind::Internal,
+            routing: ConnectionRouting::Simple,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: up,
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: Some(EndpointGeometry {
+                stub: down,
+                ..endpoint(1.0, -1.0, RoomSide::West, 0.8)
+            }),
+            route_points: &[],
+            thickness: 1.0,
+        };
+        assert_eq!(port_handles(&resolve(&same_level)), 2);
+
+        // Cross-area up exit: the wall stub and area marker anchor on the
+        // port, which stays placeable.
+        let external = GeometryInput {
+            kind: ConnectionKind::External,
+            routing: ConnectionRouting::Simple,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: up,
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: None,
+            route_points: &[],
+            thickness: 1.0,
+        };
+        assert_eq!(port_handles(&resolve(&external)), 1);
+
+        // Cross-level link: both representations are triangles; no ports.
+        let cross_level = GeometryInput {
+            kind: ConnectionKind::CrossLevel,
+            routing: ConnectionRouting::Simple,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: up,
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: Some(EndpointGeometry {
+                stub: down,
+                ..endpoint(0.0, -4.0, RoomSide::West, 0.8)
+            }),
+            route_points: &[],
+            thickness: 1.0,
+        };
+        assert_eq!(port_handles(&resolve(&cross_level)), 0);
     }
 
     #[test]

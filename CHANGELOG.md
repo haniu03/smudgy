@@ -145,9 +145,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Up/down stub exits draw as their triangles.** An unlinked up or down
   exit shows a hollow ▲/▼ at its fixed room corner — stroke only, so a
   real cross-level link's filled triangle still reads as linked — and
-  the triangle is what you click, select, and see highlighted. Up/down
-  endpoints no longer expose a draggable wall port; their anchor follows
-  the direction's home corner.
+  the triangle is what you click, select, and see highlighted. Endpoints
+  whose representation *is* the triangle (cross-level links, up/down
+  stubs) no longer expose a draggable wall port; up/down links drawn as
+  lines on the same level, and up/down exits to other maps, keep their
+  placeable ports.
 - **Changing an exit's direction moves its port along.** Switching an
   exit from north to east (or to up/down, or any direction) re-anchors
   the connection's endpoint at the new direction's home slot in the same

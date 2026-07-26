@@ -998,12 +998,22 @@ impl MapEditorWindow {
                 }) {
                     self.automatic_routes_maybe_stale.insert(*connection_id);
                 }
-                // Up/down endpoints have no port handle, so a selected one
-                // vanishes with this change; drop it rather than let
-                // keyboard nudges edit an invisible port. (Other
-                // directions keep their handles — the enum is positionless,
-                // so the selection stays valid at the new anchor.)
-                if matches!(direction, ExitDirection::Up | ExitDirection::Down) {
+                // If the endpoint will now render as its level triangle,
+                // its port handle vanishes with this change; drop a
+                // selected one rather than let keyboard nudges edit an
+                // invisible port. (All other cases keep their handles —
+                // the enum is positionless, so the selection stays valid
+                // at the new anchor.)
+                let becomes_triangle = atlas.get_area(&room_key.area_id).is_some_and(|area| {
+                    area.get_connection(*connection_id).is_some_and(|connection| {
+                        smudgy_cloud::connection_geometry::renders_as_level_triangle(
+                            connection.kind,
+                            connection.routing,
+                            smudgy_cloud::connection_geometry::StubAxis::for_direction(direction),
+                        )
+                    })
+                });
+                if becomes_triangle {
                     self.editor.clear_selected_connection_handle();
                 }
                 commands::edit_exit_with_endpoint(
@@ -3163,8 +3173,9 @@ fn connection_view(
         },
     );
 
-    // Up/down endpoints are represented by their fixed level triangle: no
-    // port to place, so the wall/offset row gives way to a note.
+    // Endpoints rendered as their fixed level triangle have no port to
+    // place, so the wall/offset row gives way to a note. Same-level
+    // up/down lines and cross-area up/down stubs keep the port editor.
     let render_item = area
         .get_room_connections()
         .iter()
@@ -3172,9 +3183,10 @@ fn connection_view(
     let level_endpoint = |endpoint_b: bool| {
         render_item.is_some_and(|item| {
             let stub = if endpoint_b { item.stub_b } else { item.stub_a };
-            matches!(
+            smudgy_cloud::connection_geometry::renders_as_level_triangle(
+                item.kind,
+                item.routing,
                 stub,
-                smudgy_cloud::connection_geometry::StubAxis::Level { .. }
             )
         })
     };
