@@ -1507,11 +1507,34 @@ impl MapEditorWindow {
                 updates,
                 description,
             } => {
+                // Canvas port drags are endpoint edits: they coalesce with
+                // the inspector's endpoint field (not with waypoint edits)
+                // and leave an Automatic route stale exactly like the
+                // inspector path does.
+                let endpoint_edit = updates.endpoint_a.is_some() || updates.endpoint_b.is_some();
+                let field = if endpoint_edit {
+                    commands::FieldId::Endpoint
+                } else {
+                    commands::FieldId::RoutePoints
+                };
+                if endpoint_edit
+                    && self
+                        .mapper
+                        .get_current_atlas()
+                        .get_area(&area_id)
+                        .is_some_and(|area| {
+                            area.get_connection(connection_id).is_some_and(|connection| {
+                                connection.routing == smudgy_cloud::ConnectionRouting::Automatic
+                            })
+                        })
+                {
+                    self.automatic_routes_maybe_stale.insert(connection_id);
+                }
                 let update = self.push_command(commands::edit_connection(
                     &self.mapper.get_current_atlas(),
                     area_id,
                     connection_id,
-                    commands::FieldId::RoutePoints,
+                    field,
                     updates,
                     description,
                 ));

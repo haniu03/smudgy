@@ -172,6 +172,14 @@ pub enum Interaction {
         original: Rectangle,
         current_map: Point,
     },
+    /// A left press on a Connection port/vertex handle that hasn't crossed
+    /// the drag threshold: a bare click selects the handle and must emit no
+    /// mutation (and no Automatic→Manual conversion).
+    PendingConnectionHandle {
+        connection_id: ConnectionId,
+        handle: ConnectionHandle,
+        start_screen: Point,
+    },
     /// A Connection port or stored route vertex. The cache is untouched
     /// during the drag; release emits one coalesced semantic update.
     DraggingConnectionHandle {
@@ -736,6 +744,12 @@ impl MapEditor {
                         .and_capture(),
                 )
             }
+            // A click that never crossed the drag threshold: the handle was
+            // selected on press; no mutation, no undo entry, no
+            // Automatic→Manual conversion.
+            Interaction::PendingConnectionHandle { .. } => {
+                Some(canvas::Action::request_redraw().and_capture())
+            }
             Interaction::DraggingConnectionHandle {
                 connection_id,
                 handle,
@@ -872,10 +886,10 @@ impl canvas::Program<Message, Theme> for MapEditor {
                             if let Some((connection_id, handle)) =
                                 self.connection_handle_at(map_position)
                             {
-                                state.interaction = Interaction::DraggingConnectionHandle {
+                                state.interaction = Interaction::PendingConnectionHandle {
                                     connection_id,
                                     handle,
-                                    current_map: map_position,
+                                    start_screen: cursor_position,
                                 };
                                 return Some(
                                     canvas::Action::publish(Message::ConnectionHandleSelected {
@@ -1041,6 +1055,38 @@ impl canvas::Program<Message, Theme> for MapEditor {
                                     current_map: map_position,
                                 };
                             }
+                        }
+                        Some(canvas::Action::request_redraw().and_capture())
+                    }
+                    Interaction::PendingConnectionHandle {
+                        connection_id,
+                        handle,
+                        start_screen,
+                    } => {
+                        if (cursor_position - *start_screen).x.abs() > DRAG_THRESHOLD
+                            || (cursor_position - *start_screen).y.abs() > DRAG_THRESHOLD
+                        {
+                            let (connection_id, handle) = (*connection_id, *handle);
+                            state.interaction = Interaction::DraggingConnectionHandle {
+                                connection_id,
+                                handle,
+                                current_map: map_position,
+                            };
+                            // The drag legend appears when a drag actually
+                            // starts — a bare click never was one.
+                            return Some(
+                                canvas::Action::publish(Message::ActivityChanged(
+                                    match handle {
+                                        ConnectionHandle::Waypoint(..) => {
+                                            super::EditorActivity::DraggingConnectionWaypoint
+                                        }
+                                        ConnectionHandle::PortA(_) | ConnectionHandle::PortB(_) => {
+                                            super::EditorActivity::DraggingConnectionPort
+                                        }
+                                    },
+                                ))
+                                .and_capture(),
+                            );
                         }
                         Some(canvas::Action::request_redraw().and_capture())
                     }
@@ -1461,7 +1507,8 @@ impl canvas::Program<Message, Theme> for MapEditor {
             | Interaction::DraggingExit { .. }
             | Interaction::DrawingRect { .. } => mouse::Interaction::Crosshair,
             Interaction::DraggingHandle { handle, .. } => resize_cursor(handle),
-            Interaction::DraggingConnectionHandle { .. } => mouse::Interaction::Grabbing,
+            Interaction::DraggingConnectionHandle { .. }
+            | Interaction::PendingConnectionHandle { .. } => mouse::Interaction::Grabbing,
             _ => {
                 if let Some(cursor_position) = cursor.position_in(bounds) {
                     let map_position = self.viewport().project(cursor_position, bounds.size());

@@ -73,6 +73,8 @@ pub enum LegendContext {
     Connection {
         routing: smudgy_cloud::ConnectionRouting,
         waypoint_selected: bool,
+        /// A port handle is selected: arrow keys slide it along its wall.
+        port_selected: bool,
     },
 }
 
@@ -119,6 +121,7 @@ pub fn resolve_legend(
     let LegendContext::Connection {
         routing,
         waypoint_selected,
+        port_selected,
     } = context
     else {
         return Vec::new();
@@ -145,6 +148,22 @@ pub fn resolve_legend(
             },
         ];
     }
+    if port_selected {
+        return vec![
+            LegendItem {
+                key: "Drag",
+                action: "move port",
+            },
+            LegendItem {
+                key: "←→↑↓",
+                action: "slide along the wall (its axis only)",
+            },
+            LegendItem {
+                key: "Esc",
+                action: "stop editing",
+            },
+        ];
+    }
 
     match routing {
         smudgy_cloud::ConnectionRouting::Simple | smudgy_cloud::ConnectionRouting::Manual => {
@@ -153,11 +172,16 @@ pub fn resolve_legend(
                 action: "add a point",
             }]
         }
+        // Dragging the line body is deliberately inert; only Ctrl+click and
+        // handle drags convert an Automatic route.
         smudgy_cloud::ConnectionRouting::Automatic => vec![LegendItem {
-            key: "Ctrl+click or drag",
-            action: "convert to Manual",
+            key: "Ctrl+click",
+            action: "add a point (converts to Manual)",
         }],
-        smudgy_cloud::ConnectionRouting::Stub => Vec::new(),
+        smudgy_cloud::ConnectionRouting::Stub => vec![LegendItem {
+            key: "",
+            action: "Stub routing draws no route, so there is nothing to edit",
+        }],
     }
 }
 
@@ -647,6 +671,13 @@ impl MapEditor {
             self.selected_connection_handle,
             Some((selected, SelectedConnectionHandle::Waypoint(_))) if selected == connection_id
         );
+        let port_selected = matches!(
+            self.selected_connection_handle,
+            Some((
+                selected,
+                SelectedConnectionHandle::PortA | SelectedConnectionHandle::PortB,
+            )) if selected == connection_id
+        );
 
         let atlas = self.mapper.get_current_atlas();
         let Some(connection) = self
@@ -663,6 +694,7 @@ impl MapEditor {
             LegendContext::Connection {
                 routing: connection.routing,
                 waypoint_selected,
+                port_selected,
             },
         )
     }
@@ -820,14 +852,10 @@ impl MapEditor {
                     .replace_with(EntityId::Connection(connection_id));
                 self.selected_connection_handle = Some((connection_id, handle));
                 self.automatic_route_preview = None;
-                self.activity = match handle {
-                    SelectedConnectionHandle::Waypoint(_) => {
-                        EditorActivity::DraggingConnectionWaypoint
-                    }
-                    SelectedConnectionHandle::PortA | SelectedConnectionHandle::PortB => {
-                        EditorActivity::DraggingConnectionPort
-                    }
-                };
+                // A press is selection only; the canvas reports the drag
+                // activity separately once the pointer crosses the drag
+                // threshold, so the legend doesn't flip on a bare click.
+                self.activity = EditorActivity::Idle;
                 Update::with_event(Event::SelectionChanged)
             }
             Message::ConnectionUpdated {
@@ -1294,6 +1322,7 @@ mod legend_tests {
                 LegendContext::Connection {
                     routing: ConnectionRouting::Automatic,
                     waypoint_selected: false,
+                    port_selected: false,
                 },
             ),
             vec![
@@ -1318,6 +1347,7 @@ mod legend_tests {
                 LegendContext::Connection {
                     routing: ConnectionRouting::Manual,
                     waypoint_selected: false,
+                    port_selected: false,
                 },
             ),
             vec![LegendItem {
@@ -1332,12 +1362,41 @@ mod legend_tests {
                 LegendContext::Connection {
                     routing: ConnectionRouting::Manual,
                     waypoint_selected: true,
+                    port_selected: false,
                 },
             )
             .len(),
             3
         );
         assert!(resolve_legend(EditorActivity::Idle, true, LegendContext::None).is_empty());
+        // A selected port advertises its wall-axis nudge; Stub routing
+        // explains itself instead of showing an empty footer.
+        assert_eq!(
+            resolve_legend(
+                EditorActivity::Idle,
+                true,
+                LegendContext::Connection {
+                    routing: ConnectionRouting::Simple,
+                    waypoint_selected: false,
+                    port_selected: true,
+                },
+            )
+            .len(),
+            3
+        );
+        assert_eq!(
+            resolve_legend(
+                EditorActivity::Idle,
+                true,
+                LegendContext::Connection {
+                    routing: ConnectionRouting::Stub,
+                    waypoint_selected: false,
+                    port_selected: false,
+                },
+            )
+            .len(),
+            1
+        );
     }
 }
 
