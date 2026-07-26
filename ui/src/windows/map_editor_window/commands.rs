@@ -818,6 +818,63 @@ pub fn delete_selection(
     let mut seeds = Vec::new();
     let mut next_slot: SlotId = 0;
 
+    // Explicitly selected Connections delete as links in their own right —
+    // except those whose every member exit rides a selected room's cascade
+    // delete, which stay on the room path exactly as before (their exits
+    // are restored by the room undo and a fresh link derives). The link
+    // deletes run before the room deletes (a cascaded-away link can't be
+    // deleted twice) and their restores run after every room is back.
+    let selected_room_set: HashSet<RoomNumber> = selection.rooms().collect();
+    let mut restored_connections: HashSet<ConnectionId> = HashSet::new();
+    let mut link_deletes = Vec::new();
+    let mut link_restores = Vec::new();
+    let mut selected_connections: Vec<ConnectionId> = selection.connections().collect();
+    selected_connections.sort();
+    for connection_id in selected_connections {
+        let Some(connection) = area.get_connection(connection_id) else {
+            continue;
+        };
+        let mut members = Vec::new();
+        for room in area.get_rooms() {
+            for exit in room.get_exits() {
+                if exit.connection_id == connection_id {
+                    members.push((room.get_room_number(), exit));
+                }
+            }
+        }
+        if !members.is_empty()
+            && members
+                .iter()
+                .all(|(room_number, _)| selected_room_set.contains(room_number))
+        {
+            continue;
+        }
+        members.sort_by_key(|(_, exit)| exit.id.0);
+        restored_connections.insert(connection_id);
+        link_deletes.push(AreaMutation::DeleteLink { connection_id });
+        let mut restore = vec![AreaMutation::CreateConnection {
+            body: ConnectionArgs::from(connection),
+        }];
+        for (room_number, exit) in &members {
+            restore.push(AreaMutation::CreateExit {
+                room_number: *room_number,
+                body: restore_exit_args(exit, connection_id, cleared),
+            });
+        }
+        link_restores.push(Mutation::AreaBatch {
+            area_id,
+            operations: restore,
+            description: "Restore deleted link".to_string(),
+        });
+    }
+    if !link_deletes.is_empty() {
+        redo.push(Mutation::AreaBatch {
+            area_id,
+            operations: link_deletes,
+            description: "Delete links".to_string(),
+        });
+    }
+
     for room_number in selection.rooms() {
         let Some(room) = area.get_room(&room_number) else {
             continue;
@@ -854,6 +911,12 @@ pub fn delete_selection(
         }
 
         for exit in room.get_exits() {
+            // This exit's whole link is being deleted and restored (with
+            // its identities) by the explicit-connection path above; a
+            // second recreation here would duplicate it.
+            if restored_connections.contains(&exit.connection_id) {
+                continue;
+            }
             if exit.to_unknown {
                 // The destination was redacted ("Unknown map") and is
                 // unknowable client-side, but the room delete cascades the
@@ -988,12 +1051,14 @@ pub fn delete_selection(
         return None;
     }
 
-    // Rooms must exist again before their properties and exits restore.
+    // Rooms must exist again before their properties and exits restore,
+    // and both before explicitly-deleted links reattach to them.
     let mut undo = Vec::new();
     if !undo_rooms.is_empty() {
         undo.push(Mutation::UpsertRooms(area_id, undo_rooms));
     }
     undo.extend(undo_late);
+    undo.extend(link_restores);
 
     let mut command = Command::new(redo, undo);
     for (slot, id) in seeds {
@@ -2407,13 +2472,18 @@ pub fn snapshot_selection(
                 },
             ))
         });
+    // Fully-contained links ride the room copy; explicitly selected
+    // connections join on their own (paste attaches them to same-numbered
+    // rooms when their rooms aren't part of the snapshot).
+    let explicitly_selected: HashSet<ConnectionId> = selection.connections().collect();
     let eligible_connections: HashSet<_> = area
         .get_connections()
         .iter()
         .filter(|connection| {
             connection.endpoint_b.is_some_and(|endpoint_b| {
-                selected_rooms.contains(&connection.endpoint_a.room_number)
-                    && selected_rooms.contains(&endpoint_b.room_number)
+                (selected_rooms.contains(&connection.endpoint_a.room_number)
+                    && selected_rooms.contains(&endpoint_b.room_number))
+                    || explicitly_selected.contains(&connection.id)
             })
         })
         .map(|connection| connection.id)
@@ -2751,11 +2821,13 @@ pub fn paste_clipboard(
     clipboard: &EntityClipboard,
     level: i32,
     offset: Vector,
-) -> Option<(Command, Vec<RoomNumber>)> {
+) -> (Option<Command>, Vec<RoomNumber>, usize) {
     if clipboard.is_empty() {
-        return None;
+        return (None, Vec::new(), 0);
     }
-    let area = atlas.get_area(&target_area_id)?;
+    let Some(area) = atlas.get_area(&target_area_id) else {
+        return (None, Vec::new(), 0);
+    };
     let same_area = clipboard.source_area_id == Some(target_area_id);
     // Secrecy flags may only be sent when the viewer is cleared on the
     // *target* (the server uniform-404s otherwise); an uncleared viewer's
@@ -2767,6 +2839,13 @@ pub fn paste_clipboard(
     let mut undo = Vec::new();
     let mut next_slot: SlotId = 0;
     let mut pasted_rooms = Vec::new();
+    let mut skipped_connections = 0usize;
+
+    let mut compound = Vec::new();
+    // Links pasted onto *existing* rooms aren't covered by the room-delete
+    // cascade on undo; they need explicit deletes.
+    let mut undo_links = Vec::new();
+    let mut mapping: HashMap<RoomNumber, RoomNumber> = HashMap::new();
 
     if !clipboard.rooms.is_empty() {
         let occupied: HashSet<RoomNumber> = area
@@ -2779,14 +2858,13 @@ pub fn paste_clipboard(
             .iter()
             .map(|room| room.room_number)
             .collect();
-        let mapping = remap_room_numbers(
+        mapping = remap_room_numbers(
             &source_numbers,
             &occupied,
             area.next_room_number(),
             !same_area,
         );
 
-        let mut compound = Vec::new();
         let mut legacy_exits = Vec::new();
         for room in &clipboard.rooms {
             let number = mapping[&room.room_number];
@@ -2826,55 +2904,6 @@ pub fn paste_clipboard(
                 legacy_exits.push((number, exit));
             }
         }
-
-        let origin = clipboard.connection_origin.unwrap_or_default();
-        for connection in &clipboard.connections {
-            let new_connection_id = ConnectionId::new();
-            let mut body = connection.body.clone();
-            body.id = new_connection_id;
-            body.endpoint_a.room_number = *mapping.get(&body.endpoint_a.room_number)?;
-            if let Some(endpoint) = body.endpoint_b.as_mut() {
-                endpoint.room_number = *mapping.get(&endpoint.room_number)?;
-            }
-            for point in &mut body.route_points {
-                point.x += origin.x + offset.x;
-                point.y += origin.y + offset.y;
-            }
-            compound.push(AreaMutation::CreateConnection { body });
-            for (from_room, exit) in &connection.members {
-                let room_number = *mapping.get(from_room)?;
-                let destination = classify_pasted_exit(exit, source_area_id, &mapping, |id| {
-                    atlas.get_area(&id).is_some()
-                });
-                let (to_area_id, to_room_number, to_direction) = match destination {
-                    PastedExitDestination::Remapped(number) => {
-                        (Some(target_area_id), Some(number), exit.to_direction)
-                    }
-                    PastedExitDestination::Live(area_id, number) => {
-                        (Some(area_id), Some(number), exit.to_direction)
-                    }
-                    PastedExitDestination::Dangling => (None, None, None),
-                };
-                compound.push(AreaMutation::CreateExit {
-                    room_number,
-                    body: ExitArgs {
-                        id: Some(ExitId::new()),
-                        connection_id: Some(new_connection_id),
-                        is_secret: cleared.then_some(exit.is_secret),
-                        from_direction: exit.from_direction,
-                        to_area_id,
-                        to_room_number,
-                        to_direction,
-                        path: exit.path.clone(),
-                        is_hidden: exit.is_hidden,
-                        is_closed: exit.is_closed,
-                        is_locked: exit.is_locked,
-                        weight: exit.weight,
-                        command: exit.command.clone(),
-                    },
-                });
-            }
-        }
         for (room_number, exit) in legacy_exits {
             let destination = classify_pasted_exit(exit, source_area_id, &mapping, |id| {
                 atlas.get_area(&id).is_some()
@@ -2907,23 +2936,145 @@ pub fn paste_clipboard(
                 },
             });
         }
+    }
+
+    // Connections paste with or without their rooms: endpoints resolve
+    // through the paste mapping first, then to the same-numbered existing
+    // room. Links attached to existing rooms lose their stored route (it
+    // belongs to the source layout) and are skipped entirely when a member
+    // direction is already taken there — a same-area duplicate paste is a
+    // deliberate no-op, not an ambiguous second exit.
+    let origin = clipboard.connection_origin.unwrap_or_default();
+    for connection in &clipboard.connections {
+        let resolve = |number: RoomNumber| {
+            mapping
+                .get(&number)
+                .copied()
+                .or_else(|| area.get_room(&number).is_some().then_some(number))
+        };
+        let source_a = connection.body.endpoint_a.room_number;
+        let Some(endpoint_a_room) = resolve(source_a) else {
+            skipped_connections += 1;
+            continue;
+        };
+        let endpoint_b_room = match connection.body.endpoint_b {
+            Some(endpoint) => match resolve(endpoint.room_number) {
+                Some(number) => Some((endpoint.room_number, number)),
+                None => {
+                    skipped_connections += 1;
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let remapped = mapping.contains_key(&source_a)
+            || endpoint_b_room
+                .is_some_and(|(source, _)| mapping.contains_key(&source));
+
+        let mut members = Vec::new();
+        let mut viable = true;
+        for (from_room, exit) in &connection.members {
+            let Some(room_number) = resolve(*from_room) else {
+                viable = false;
+                break;
+            };
+            if !mapping.contains_key(from_room)
+                && area.get_room(&room_number).is_some_and(|room| {
+                    room.get_exits()
+                        .iter()
+                        .any(|other| other.from_direction == exit.from_direction)
+                })
+            {
+                viable = false;
+                break;
+            }
+            // Members of an internal link point at its other endpoint;
+            // resolve the destination through the same room resolution.
+            let (to_area_id, to_room_number, to_direction) =
+                match exit.to_room_number.and_then(resolve) {
+                    Some(number) => (Some(target_area_id), Some(number), exit.to_direction),
+                    None => (None, None, None),
+                };
+            members.push((room_number, exit, to_area_id, to_room_number, to_direction));
+        }
+        if !viable {
+            skipped_connections += 1;
+            continue;
+        }
+
+        let new_connection_id = ConnectionId::new();
+        let mut body = connection.body.clone();
+        body.id = new_connection_id;
+        body.endpoint_a.room_number = endpoint_a_room;
+        if let (Some(endpoint), Some((_, number))) = (body.endpoint_b.as_mut(), endpoint_b_room) {
+            endpoint.room_number = number;
+        }
+        if remapped {
+            for point in &mut body.route_points {
+                point.x += origin.x + offset.x;
+                point.y += origin.y + offset.y;
+            }
+        } else {
+            body.route_points.clear();
+            if matches!(
+                body.routing,
+                ConnectionRouting::Manual | ConnectionRouting::Automatic
+            ) {
+                body.routing = ConnectionRouting::Simple;
+            }
+            body.segment_shape = SegmentShape::Direct;
+            undo_links.push(AreaMutation::DeleteLink {
+                connection_id: new_connection_id,
+            });
+        }
+        compound.push(AreaMutation::CreateConnection { body });
+        for (room_number, exit, to_area_id, to_room_number, to_direction) in members {
+            compound.push(AreaMutation::CreateExit {
+                room_number,
+                body: ExitArgs {
+                    id: Some(ExitId::new()),
+                    connection_id: Some(new_connection_id),
+                    is_secret: cleared.then_some(exit.is_secret),
+                    from_direction: exit.from_direction,
+                    to_area_id,
+                    to_room_number,
+                    to_direction,
+                    path: exit.path.clone(),
+                    is_hidden: exit.is_hidden,
+                    is_closed: exit.is_closed,
+                    is_locked: exit.is_locked,
+                    weight: exit.weight,
+                    command: exit.command.clone(),
+                },
+            });
+        }
+    }
+
+    if !compound.is_empty() {
         if compound.len() > smudgy_cloud::MAX_MUTATION_OPERATIONS {
-            return None;
+            return (None, Vec::new(), 0);
         }
         redo.push(Mutation::AreaBatch {
             area_id: target_area_id,
             operations: compound,
-            description: format!("Paste {} rooms and contained links", pasted_rooms.len()),
+            description: if pasted_rooms.is_empty() {
+                "Paste links".to_string()
+            } else {
+                format!("Paste {} rooms and contained links", pasted_rooms.len())
+            },
         });
-        undo.push(Mutation::AreaBatch {
-            area_id: target_area_id,
-            operations: pasted_rooms
+        let mut undo_ops = undo_links;
+        undo_ops.extend(
+            pasted_rooms
                 .iter()
                 .map(|room_number| AreaMutation::DeleteRoom {
                     room_number: *room_number,
-                })
-                .collect(),
-            description: "Undo room paste".to_string(),
+                }),
+        );
+        undo.push(Mutation::AreaBatch {
+            area_id: target_area_id,
+            operations: undo_ops,
+            description: "Undo paste".to_string(),
         });
     }
 
@@ -2965,7 +3116,8 @@ pub fn paste_clipboard(
         });
     }
 
-    Some((Command::new(redo, undo), pasted_rooms))
+    let command = (!redo.is_empty()).then(|| Command::new(redo, undo));
+    (command, pasted_rooms, skipped_connections)
 }
 
 /// Edits one label field; coalesces with consecutive edits to the same
@@ -3737,6 +3889,147 @@ mod tests {
         assert!(area.get_labels()[0].is_secret, "label secrecy restored");
     }
 
+    /// Links room 1 → room 2 (two-way) and returns the connection id.
+    async fn link_rooms(
+        mapper: &Mapper,
+        stack: &mut CommandStack,
+        area_id: AreaId,
+        from: i32,
+        to: i32,
+    ) -> ConnectionId {
+        let command = create_exit_with_options(
+            area_id,
+            RoomNumber(from),
+            ExitDirection::East,
+            &NewExitTarget::Room(RoomNumber(to)),
+            ExitDirection::West,
+            NewLinkOptions::default(),
+        );
+        let _ = stack.push_and_apply(mapper, command);
+        let atlas = mapper.get_current_atlas();
+        let area = atlas.get_area(&area_id).expect("area");
+        area.get_connections()
+            .iter()
+            .find(|connection| {
+                connection.endpoint_a.room_number == RoomNumber(from)
+                    || connection
+                        .endpoint_b
+                        .is_some_and(|endpoint| endpoint.room_number == RoomNumber(from))
+            })
+            .expect("connection")
+            .id
+    }
+
+    #[tokio::test]
+    async fn multi_delete_removes_selected_connection_and_undo_restores_it() {
+        let mapper = test_mapper();
+        let area_id =
+            area_with_rooms(&mapper, &[(1, 0.0, 0.0), (2, 4.0, 0.0), (3, 8.0, 0.0)]).await;
+        let mut stack = CommandStack::default();
+        let connection_id = link_rooms(&mapper, &mut stack, area_id, 1, 2).await;
+
+        // Room 3 plus the link — a mixed selection whose connection used to
+        // be silently skipped.
+        let selection: Selection = [
+            EntityId::Room(RoomNumber(3)),
+            EntityId::Connection(connection_id),
+        ]
+        .into_iter()
+        .collect();
+        let command = delete_selection(&mapper.get_current_atlas(), area_id, &selection)
+            .expect("command");
+        let _ = stack.push_and_apply(&mapper, command);
+
+        {
+            let atlas = mapper.get_current_atlas();
+            let area = atlas.get_area(&area_id).expect("area");
+            assert!(area.get_room(&RoomNumber(3)).is_none(), "room deleted");
+            assert!(
+                area.get_connection(connection_id).is_none(),
+                "explicitly selected link deleted"
+            );
+            assert!(
+                area.get_room(&RoomNumber(1))
+                    .is_some_and(|room| room.get_exits().is_empty()),
+                "member exits deleted with the link"
+            );
+        }
+
+        let _ = stack.undo(&mapper);
+        let atlas = mapper.get_current_atlas();
+        let area = atlas.get_area(&area_id).expect("area");
+        assert!(area.get_room(&RoomNumber(3)).is_some(), "room restored");
+        assert!(
+            area.get_connection(connection_id).is_some(),
+            "link restored with its identity"
+        );
+        let exits: Vec<_> = area
+            .get_rooms()
+            .iter()
+            .flat_map(|room| room.get_exits())
+            .filter(|exit| exit.connection_id == connection_id)
+            .collect();
+        assert_eq!(exits.len(), 2, "both member exits restored exactly once");
+    }
+
+    #[tokio::test]
+    async fn connection_only_paste_attaches_to_same_numbered_rooms_once() {
+        let mapper = test_mapper();
+        let source = area_with_rooms(&mapper, &[(1, 0.0, 0.0), (2, 4.0, 0.0)]).await;
+        let mut stack = CommandStack::default();
+        let connection_id = link_rooms(&mapper, &mut stack, source, 1, 2).await;
+
+        let selection: Selection = [EntityId::Connection(connection_id)].into_iter().collect();
+        let clipboard = snapshot_selection(
+            &mapper.get_current_atlas(),
+            source,
+            &selection,
+            true,
+            false,
+        );
+        assert!(clipboard.rooms.is_empty());
+        assert_eq!(
+            clipboard.connections.len(),
+            1,
+            "an explicitly selected link snapshots without its rooms"
+        );
+
+        let target = area_with_rooms(&mapper, &[(1, 100.0, 0.0), (2, 104.0, 0.0)]).await;
+        let (command, pasted, skipped) = paste_clipboard(
+            &mapper.get_current_atlas(),
+            target,
+            &clipboard,
+            0,
+            Vector::new(0.0, 0.0),
+        );
+        assert!(pasted.is_empty());
+        assert_eq!(skipped, 0);
+        let _ = stack.push_and_apply(&mapper, command.expect("command"));
+        {
+            let atlas = mapper.get_current_atlas();
+            let area = atlas.get_area(&target).expect("area");
+            assert_eq!(area.get_connections().len(), 1, "link attached");
+            let exits: Vec<_> = area
+                .get_rooms()
+                .iter()
+                .flat_map(|room| room.get_exits())
+                .collect();
+            assert_eq!(exits.len(), 2, "both traversals attached");
+        }
+
+        // Pasting again would collide with the directions just created:
+        // the link skips (with a count) instead of duplicating exits.
+        let (command, _, skipped) = paste_clipboard(
+            &mapper.get_current_atlas(),
+            target,
+            &clipboard,
+            0,
+            Vector::new(0.0, 0.0),
+        );
+        assert!(command.is_none(), "nothing pastes");
+        assert_eq!(skipped, 1);
+    }
+
     #[tokio::test]
     async fn paste_creates_offset_copies_and_undo_removes_them() {
         let mapper = test_mapper();
@@ -3771,14 +4064,14 @@ mod tests {
         };
 
         let mut stack = CommandStack::default();
-        let (command, pasted_rooms) = paste_clipboard(
+        let (command, pasted_rooms, _) = paste_clipboard(
             &mapper.get_current_atlas(),
             area_id,
             &clipboard,
             3,
             Vector::new(1.0, 1.0),
-        )
-        .expect("command");
+        );
+        let command = command.expect("command");
         assert!(pasted_rooms.is_empty());
         let _ = stack.push_and_apply(&mapper, command);
 
@@ -3882,14 +4175,14 @@ mod tests {
             "snapshot must not erase the transparent background"
         );
 
-        let (command, _) = paste_clipboard(
+        let (command, _, _) = paste_clipboard(
             &mapper.get_current_atlas(),
             area_id,
             &clipboard,
             0,
             Vector::new(1.0, 1.0),
-        )
-        .expect("paste command");
+        );
+        let command = command.expect("paste command");
         let Mutation::CreateLabel { args, .. } = command.redo[0].clone() else {
             panic!("expected a label create");
         };
@@ -4180,14 +4473,14 @@ mod tests {
         assert_eq!(dangling.members[0].1.to_area_id, None);
         assert_eq!(dangling.members[0].1.to_room_number, None);
 
-        let (command, pasted) = paste_clipboard(
+        let (command, pasted, _) = paste_clipboard(
             &mapper.get_current_atlas(),
             target,
             &clipboard,
             0,
             Vector::new(0.0, 0.0),
-        )
-        .expect("command");
+        );
+        let command = command.expect("command");
         // Room 1 keeps its number (vacant in the target); room 2 collides
         // with the target's own room 2 and reallocates.
         assert_eq!(pasted, vec![RoomNumber(1), RoomNumber(3)]);
@@ -4284,14 +4577,14 @@ mod tests {
             true,
             false,
         );
-        let (command, pasted) = paste_clipboard(
+        let (command, pasted, _) = paste_clipboard(
             &mapper.get_current_atlas(),
             area_id,
             &clipboard,
             0,
             Vector::new(1.0, 1.0),
-        )
-        .expect("command");
+        );
+        let command = command.expect("command");
         assert_eq!(
             pasted,
             vec![RoomNumber(3), RoomNumber(4)],

@@ -1720,13 +1720,23 @@ impl MapEditorWindow {
             Vector::new(0.0, 0.0)
         };
 
-        let Some((command, pasted_rooms)) = commands::paste_clipboard(
+        let (command, pasted_rooms, skipped_connections) = commands::paste_clipboard(
             &self.mapper.get_current_atlas(),
             area_id,
             &clipboard,
             self.editor.level(),
             offset,
-        ) else {
+        );
+        if skipped_connections > 0 {
+            self.editor_notice = Some((
+                Instant::now(),
+                format!(
+                    "{skipped_connections} copied link{} couldn't attach here (missing rooms or occupied directions).",
+                    if skipped_connections == 1 { "" } else { "s" }
+                ),
+            ));
+        }
+        let Some(command) = command else {
             return Update::none();
         };
         let update = self.push_command(Some(command));
