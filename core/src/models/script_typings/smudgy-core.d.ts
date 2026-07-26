@@ -1760,15 +1760,17 @@ declare module "smudgy:core" {
    * The line being processed accepts changes until its processing finishes
    * and it is delivered. That window covers the whole cascade the line runs
    * — its trigger and `receive` handlers, plus anything they set in motion
-   * that runs before delivery, such as handlers of events they emit. Once
-   * the line has been delivered there is no line to edit: any edit,
-   * `gag()`, `redirect()`, or `copy()` then throws rather than landing on
-   * whatever line comes next. One caution for `async` handlers: code that
-   * resumes after an `await` acts on whichever line is being processed when
-   * it resumes — during a burst of output that can be a later line. Reads
-   * stay safe anywhere (`text` is `""` and `styles` an empty array outside
-   * the window). Already-printed lines reached through `buffer.line(n)` can
-   * be edited at any time.
+   * that runs before delivery, such as handlers of events they emit. When no
+   * line is being processed there is no line to edit: any edit, `gag()`,
+   * `redirect()`, or `copy()` throws. One caution for deferred code — an
+   * `async` handler resuming after an `await`, a timer callback, anything
+   * that runs later: it acts on whichever line is being processed when it
+   * runs. Between lines that is the throw above; during a burst of output it
+   * can be a later line, edited silently. Capture what you need before
+   * deferring, and reach a specific line again through `buffer.line(n)`.
+   * Reads stay safe anywhere (`text` is `""` and `styles` an empty array
+   * outside the window). Already-printed lines reached through
+   * `buffer.line(n)` can be edited at any time.
    *
    * The text-search methods (`replace`, `highlight`, `remove`) find their
    * target by string; the `*At` forms take byte offsets (e.g. from `styles`).
@@ -1830,8 +1832,10 @@ declare module "smudgy:core" {
 
   /** The line being processed right now. Meaningful while a line is being
    *  processed (its trigger and `receive` cascade and anything that runs
-   *  before it is delivered): elsewhere reads come back empty and edits
-   *  throw (see {@link Line}). */
+   *  before it is delivered): with no line in flight, reads come back empty
+   *  and edits throw. Deferred code (an `await` continuation, a timer) acts
+   *  on whichever line is in flight when it runs — during a burst, a later
+   *  line (see {@link Line}). */
   export const line: Line;
   /** This session's recent-lines buffer. */
   export const buffer: Buffer;
