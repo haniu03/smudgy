@@ -428,6 +428,10 @@ pub struct MapEditor {
 impl MapEditor {
     const MIN_SCALING: f32 = 2.0;
     const MAX_SCALING: f32 = 200.0;
+    /// Must stay comfortably above the worst-case overhang of a level
+    /// treatment glyph past its Connection's stroke bounds (~0.8 map units:
+    /// [`render::LEVEL_TREATMENT_REACH`] with the port dragged to the
+    /// opposite wall), or edge-of-viewport glyphs get culled.
     const SPATIAL_QUERY_PADDING: f32 = 1.0;
     /// Opacity of the ghosted adjacent levels.
     const GHOST_OPACITY: f32 = 0.15;
@@ -504,6 +508,12 @@ impl MapEditor {
 
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
+        // Connection hover is a Select-tool affordance; hover state is only
+        // republished on cursor movement, so clear it here rather than glow
+        // under the wrong tool.
+        if tool != Tool::Select {
+            self.hovered_connection = None;
+        }
         self.activity = EditorActivity::Idle;
     }
 
@@ -952,19 +962,30 @@ impl MapEditor {
         let half_size = render::MAP_ROOM_SIZE / 2.0;
 
         let mut connection_ids = HashSet::new();
+        // Padded so a rubber band tight around a level treatment glyph
+        // (which can sit outside the stroke bounds) still finds its half.
+        let glyph_pad = render::LEVEL_TREATMENT_REACH + render::MAP_ROOM_SIZE;
         area.with_room_connections_in(
-            rect.x,
-            rect.y,
-            rect.x + rect.width,
-            rect.y + rect.height,
+            rect.x - glyph_pad,
+            rect.y - glyph_pad,
+            rect.x + rect.width + glyph_pad,
+            rect.y + rect.height + glyph_pad,
             |connection| {
-                if connection.from_level == self.level
-                    && connection.geometry.bounds.max_x >= rect.x
+                if connection.from_level != self.level {
+                    return;
+                }
+                let bounds_hit = connection.geometry.bounds.max_x >= rect.x
                     && connection.geometry.bounds.min_x <= rect.x + rect.width
                     && connection.geometry.bounds.max_y >= rect.y
-                    && connection.geometry.bounds.min_y <= rect.y + rect.height
-                    && connection_ids.insert(connection.connection_id)
-                {
+                    && connection.geometry.bounds.min_y <= rect.y + rect.height;
+                // The drawn level glyph is selectable exactly as drawn; both
+                // treatment forms are axis-aligned, so a box test is exact.
+                let glyph_hit = !bounds_hit
+                    && render::level_treatment(connection, false).is_some_and(|treatment| {
+                        let (min, max) = treatment.bounding_box();
+                        rects_intersect(rect, min.x, min.y, max.x - min.x, max.y - min.y)
+                    });
+                if (bounds_hit || glyph_hit) && connection_ids.insert(connection.connection_id) {
                     hits.push(EntityId::Connection(connection.connection_id));
                 }
             },
@@ -1021,8 +1042,11 @@ impl MapEditor {
         let map_point = MapPoint::new(point.x, point.y);
         // Level treatments (corner triangles, fading directional stubs) can
         // reach outside a cross-level Connection's stroke bounds; pad the
-        // spatial query so their halves stay candidates.
-        let reach = tolerance + render::LEVEL_TREATMENT_REACH;
+        // spatial query so their halves stay candidates. The extra room
+        // width covers the worst case of a port dragged to the wall
+        // opposite the exit direction, where the stroke envelope starts on
+        // the far side of the room the glyph hangs off.
+        let reach = tolerance + render::LEVEL_TREATMENT_REACH + render::MAP_ROOM_SIZE;
         let mut hits = Vec::new();
         let mut seen = HashSet::new();
         area.with_room_connections_in(

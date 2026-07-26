@@ -81,6 +81,9 @@ enum FadePhase {
 impl MapView {
     const MIN_SCALING: f32 = 2.0;
     const MAX_SCALING: f32 = 200.0;
+    /// Must stay comfortably above the worst-case overhang of a level
+    /// treatment glyph past its Connection's stroke bounds (~0.8 map
+    /// units); see the editor's constant of the same name.
     const SPATIAL_QUERY_PADDING: f32 = 1.0;
 
     pub fn new(mapper: Mapper, area_id: AreaId) -> Self {

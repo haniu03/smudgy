@@ -1756,15 +1756,12 @@ impl MapEditorWindow {
                                 else {
                                     return Update::none();
                                 };
-                                let Some(tip_b) = render.geometry.stub_tip_b else {
-                                    return Update::none();
-                                };
                                 let Some(points) =
                                     smudgy_cloud::connection_geometry::reroute_for_waypoint_move(
                                         &connection.route_points,
                                         index,
                                         render.geometry.stub_tip_a,
-                                        tip_b,
+                                        render.geometry.stub_tip_b,
                                         target,
                                     )
                                 else {

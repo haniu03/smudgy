@@ -309,7 +309,7 @@ fn level_triangle_path(cx: f32, cy: f32, up: bool) -> canvas::Path {
 }
 
 /// Draws a small filled up (▲) or down (▼) triangle centered at `(cx, cy)`.
-fn draw_level_triangle(frame: &mut canvas::Frame, cx: f32, cy: f32, up: bool, color: Color) {
+pub fn draw_level_triangle(frame: &mut canvas::Frame, cx: f32, cy: f32, up: bool, color: Color) {
     frame.fill(&level_triangle_path(cx, cy, up), color);
 }
 
@@ -376,6 +376,26 @@ pub enum LevelTreatment {
 }
 
 impl LevelTreatment {
+    /// The treatment's axis-aligned footprint (both forms are axis-aligned:
+    /// triangles by construction, fading stubs because they exist only for
+    /// planar cardinals), as `(min, max)` corners.
+    #[must_use]
+    pub fn bounding_box(&self) -> (Point, Point) {
+        match *self {
+            LevelTreatment::Triangle { center, .. } => {
+                let r = smudgy_cloud::connection_geometry::LEVEL_MARKER_RADIUS;
+                (
+                    Point::new(center.x - r, center.y - r),
+                    Point::new(center.x + r, center.y + r),
+                )
+            }
+            LevelTreatment::FadingStub { edge, tip } => (
+                Point::new(edge.x.min(tip.x), edge.y.min(tip.y)),
+                Point::new(edge.x.max(tip.x), edge.y.max(tip.y)),
+            ),
+        }
+    }
+
     /// Distance from `point` to the treatment's visible footprint (the
     /// triangle acts as a filled glyph: inside is distance zero).
     #[must_use]

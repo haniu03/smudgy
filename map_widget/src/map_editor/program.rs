@@ -319,7 +319,7 @@ impl MapEditor {
                         &connection.route_points,
                         index,
                         render.geometry.stub_tip_a,
-                        render.geometry.stub_tip_b?,
+                        render.geometry.stub_tip_b,
                         target,
                     )?
                 } else {
@@ -821,6 +821,18 @@ impl canvas::Program<Message, Theme> for MapEditor {
             return None;
         }
 
+        // Hover state is only republished on in-canvas cursor movement, so
+        // the cursor leaving the canvas must clear it explicitly or the
+        // hover glow outlives the pointer.
+        if matches!(event, IcedEvent::Mouse(mouse::Event::CursorLeft))
+            && (self.hovered_room.is_some() || self.hovered_connection.is_some())
+        {
+            return Some(canvas::Action::publish(Message::SetHovered {
+                room: None,
+                connection: None,
+            }));
+        }
+
         // Releases finish gestures even when the cursor has left the canvas.
         if let IcedEvent::Mouse(mouse::Event::ButtonReleased(button)) = event {
             match button {
@@ -1231,6 +1243,7 @@ impl canvas::Program<Message, Theme> for MapEditor {
                 // otherwise invisible hit band discoverable. Selected
                 // connections already get the full outline below.
                 if let Some(hovered) = self.hovered_connection
+                    && self.tool == Tool::Select
                     && matches!(state.interaction, Interaction::Idle)
                     && !self.selection.contains(EntityId::Connection(hovered))
                     && let Some(connection) = area.get_room_connections().iter().find(|item| {
@@ -1241,6 +1254,7 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         frame,
                         connection,
                         render::apply_opacity(accent, 0.35),
+                        false,
                     );
                 }
 
@@ -1590,7 +1604,10 @@ impl MapEditor {
                     if let Some(preview) = connection_preview.filter(|preview| {
                         preview.connection_id == id && preview.from_level == self.level
                     }) {
-                        Self::stroke_resolved_connection_outline(frame, preview, accent);
+                        // Preview during a drag: also stroke the (normally
+                        // hidden) wall stubs so a cross-level port drag has
+                        // moving feedback beyond the handle dot.
+                        Self::stroke_resolved_connection_outline(frame, preview, accent, true);
                     } else {
                         self.stroke_connection_outline(frame, area, id, accent);
                     }
@@ -1654,42 +1671,70 @@ impl MapEditor {
         }) else {
             return;
         };
-        Self::stroke_resolved_connection_outline(frame, connection, accent);
+        Self::stroke_resolved_connection_outline(frame, connection, accent, false);
     }
 
-    /// Accent-strokes the *visible* form of one Connection half: the stroked
+    /// Accent-halos the *visible* form of one Connection half — the stroked
     /// primitives (plus any corner level markers) for planar halves, or the
-    /// level-change treatment glyph for cross-level halves — never the
-    /// undrawn wall stubs behind a treatment. Stroke widths are pixel-space,
-    /// so the highlight stays legible at any zoom.
+    /// level-change treatment glyph for cross-level halves — then redraws
+    /// the entity over its halo so color, dash (including the secret dash),
+    /// and the ▲/▼ glyph shape stay legible while highlighted. Stroke widths
+    /// are pixel-space, so the halo is visible at any zoom.
+    ///
+    /// `stroke_hidden_stubs` additionally halos the wall stubs behind a
+    /// level treatment: they are not normally drawn, but a cross-level port
+    /// drag needs moving feedback beyond the handle dot.
     fn stroke_resolved_connection_outline(
         frame: &mut canvas::Frame,
         connection: &RoomConnection,
         accent: Color,
+        stroke_hidden_stubs: bool,
     ) {
-        let width = connection.thickness + 4.0;
+        let halo = connection.thickness + 4.0;
         if let Some(treatment) = render::level_treatment(connection, false) {
+            if stroke_hidden_stubs {
+                frame.stroke(
+                    &render::path_from_primitives(&connection.geometry.primitives),
+                    render::solid_stroke(accent, halo),
+                );
+            }
             match treatment {
                 render::LevelTreatment::Triangle { center, up } => {
-                    render::draw_level_triangle_outline(
-                        frame, center.x, center.y, up, accent, width,
-                    );
+                    render::draw_level_triangle_outline(frame, center.x, center.y, up, accent, halo);
+                    render::draw_level_triangle(frame, center.x, center.y, up, connection.color);
                 }
                 render::LevelTreatment::FadingStub { edge, tip } => {
+                    let line = canvas::Path::line(edge, tip);
+                    frame.stroke(&line, render::solid_stroke(accent, halo));
                     frame.stroke(
-                        &canvas::Path::line(edge, tip),
-                        render::solid_stroke(accent, width),
+                        &line,
+                        render::solid_stroke(connection.color, connection.thickness),
                     );
                 }
             }
             return;
         }
+        let path = render::path_from_primitives(&connection.geometry.primitives);
+        frame.stroke(&path, render::solid_stroke(accent, halo));
         frame.stroke(
-            &render::path_from_primitives(&connection.geometry.primitives),
-            render::solid_stroke(accent, width),
+            &path,
+            render::connection_stroke(
+                connection.color,
+                connection.thickness,
+                connection.dash,
+                connection.is_secret,
+            ),
         );
         for &(center, up) in &connection.geometry.level_markers {
-            render::draw_level_triangle_outline(frame, center.x, center.y, up, accent, width);
+            render::draw_level_triangle_outline(frame, center.x, center.y, up, accent, halo);
+            render::draw_level_triangle_outline(
+                frame,
+                center.x,
+                center.y,
+                up,
+                connection.color,
+                connection.thickness,
+            );
         }
     }
 }

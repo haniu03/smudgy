@@ -672,13 +672,15 @@ pub fn reroute_for_port_move(
 /// neighboring elbow along the shared leg's axis. At the route's ends the
 /// anchor tips cannot move, so the target clamps onto the tip-adjacent leg's
 /// axis instead. Returns the updated interior points, or `None` when `index`
-/// is out of range.
+/// is out of range — or when the *last* vertex is moved on a route with no
+/// far tip (`tip_b` is only required for that vertex, so interior points of
+/// a route whose endpoint B is gone remain editable).
 #[must_use]
 pub fn reroute_for_waypoint_move(
     route_points: &[MapPoint],
     index: usize,
     tip_a: MapPoint,
-    tip_b: MapPoint,
+    tip_b: Option<MapPoint>,
     target: MapPoint,
 ) -> Option<Vec<MapPoint>> {
     let mut points = route_points.to_vec();
@@ -686,7 +688,7 @@ pub fn reroute_for_waypoint_move(
     let mut target = target;
     let previous = if index == 0 { tip_a } else { points[index - 1] };
     let next = if index + 1 == points.len() {
-        tip_b
+        tip_b?
     } else {
         points[index + 1]
     };
@@ -780,7 +782,11 @@ fn resolve_stroke(
             if let StubAxis::Level { up } = input.endpoint_a.stub {
                 // A dangling up/down exit is its corner triangle; no tail
                 // line and no centerline, so nothing grows an arrowhead.
+                // The triangle center doubles as the exposed "tip" so the
+                // marker anchors (the redacted-destination "?" and label)
+                // hang off the glyph instead of the bare wall port.
                 push_level_marker(geometry, input.endpoint_a.room_center, up);
+                geometry.stub_tip_a = level_marker_center(input.endpoint_a.room_center, up);
             } else {
                 let direction = stub_direction(input.endpoint_a.side, input.endpoint_a.stub);
                 let tip = forced_stub_tip(port_a, input.endpoint_a.side, input.endpoint_a.stub);
@@ -903,11 +909,14 @@ fn finalize_bounds(geometry: &mut ConnectionGeometry, input: &GeometryInput<'_>,
         .expand(input.thickness.max(0.0) * BASE_STROKE_WIDTH / 2.0 + ARROW_SIZE + BOUNDS_PAD);
 }
 
-/// Records an up/down level-triangle marker at its fixed room corner.
+/// Records an up/down level-triangle marker at its fixed room corner. A
+/// Stub-routed self-loop puts both endpoints on one room; the duplicate
+/// marker is dropped rather than double-stroked.
 fn push_level_marker(geometry: &mut ConnectionGeometry, room_center: MapPoint, up: bool) {
-    geometry
-        .level_markers
-        .push((level_marker_center(room_center, up), up));
+    let marker = (level_marker_center(room_center, up), up);
+    if !geometry.level_markers.contains(&marker) {
+        geometry.level_markers.push(marker);
+    }
 }
 
 /// Appends a sharp polyline as primitives + one flattened subpath.
@@ -1592,7 +1601,7 @@ mod tests {
             &points,
             1,
             tip_a,
-            tip_b,
+            Some(tip_b),
             MapPoint::new(2.5, 2.5),
         )
         .expect("in range");
@@ -1606,7 +1615,7 @@ mod tests {
             &points,
             0,
             tip_a,
-            tip_b,
+            Some(tip_b),
             MapPoint::new(2.5, 0.5),
         )
         .expect("in range");
@@ -1614,7 +1623,11 @@ mod tests {
         // stored neighbor drags its x.
         assert!(moved[0].nearly_equals(MapPoint::new(2.5, 0.0)));
         assert!(moved[1].nearly_equals(MapPoint::new(2.5, 2.0)));
-        assert!(reroute_for_waypoint_move(&points, 2, tip_a, tip_b, tip_a).is_none());
+        assert!(reroute_for_waypoint_move(&points, 2, tip_a, Some(tip_b), tip_a).is_none());
+        // Interior vertices stay editable without a far tip; the last one
+        // needs it.
+        assert!(reroute_for_waypoint_move(&points, 0, tip_a, None, tip_a).is_some());
+        assert!(reroute_for_waypoint_move(&points, 1, tip_a, None, tip_a).is_none());
     }
 
     #[test]
