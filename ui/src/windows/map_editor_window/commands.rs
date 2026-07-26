@@ -1536,6 +1536,73 @@ pub fn unlink_exit(area_id: AreaId, exit_id: ExitId, old_connection_id: Connecti
     )
 }
 
+/// Makes a one-way link two-way: creates the reciprocal exit on the
+/// destination room, attached to the same Connection (whose kind the
+/// backend re-derives from the final member topology). The new exit's
+/// direction is the stored return direction, or the opposite of the
+/// forward direction. Undo deletes exactly that exit.
+///
+/// Refuses links that are not exactly one member, have no same-area
+/// destination (dangling/external), or whose destination was redacted.
+#[must_use]
+pub fn add_return_exit(
+    atlas: &Arc<AtlasCache>,
+    area_id: AreaId,
+    connection_id: ConnectionId,
+) -> Option<Command> {
+    let area = atlas.get_area(&area_id)?;
+    area.get_connection(connection_id)?;
+    let mut members = area.get_rooms().iter().flat_map(|room| {
+        room.get_exits()
+            .iter()
+            .filter(|exit| exit.connection_id == connection_id)
+            .map(move |exit| (room.get_room_number(), exit))
+    });
+    let (from_room, exit) = members.next()?;
+    if members.next().is_some() || exit.to_unknown {
+        return None;
+    }
+    let to_room = exit.to_room_number?;
+    if exit.to_area_id != Some(area_id) {
+        return None;
+    }
+    area.get_room(&to_room)?;
+
+    let new_id = ExitId::new();
+    let body = ExitArgs {
+        id: Some(new_id),
+        connection_id: Some(connection_id),
+        is_secret: None,
+        from_direction: exit
+            .to_direction
+            .unwrap_or_else(|| exit.from_direction.opposite()),
+        to_area_id: Some(area_id),
+        to_room_number: Some(from_room),
+        to_direction: Some(exit.from_direction),
+        path: None,
+        is_hidden: false,
+        is_closed: false,
+        is_locked: false,
+        weight: exit.weight,
+        command: None,
+    };
+    Some(Command::new(
+        vec![Mutation::AreaBatch {
+            area_id,
+            operations: vec![AreaMutation::CreateExit {
+                room_number: to_room,
+                body,
+            }],
+            description: "Add return direction".to_string(),
+        }],
+        vec![Mutation::AreaBatch {
+            area_id,
+            operations: vec![AreaMutation::DeleteExit { exit_id: new_id }],
+            description: "Remove return direction".to_string(),
+        }],
+    ))
+}
+
 /// Pair two reciprocal one-member links, keeping the selected visual route.
 /// Undo semantically splits the moved member, then restores its old visuals.
 #[must_use]

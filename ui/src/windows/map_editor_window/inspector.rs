@@ -30,6 +30,7 @@ use smudgy_map_widget::render::parse_color;
 
 use crate::assets::{bootstrap_icons, fonts};
 use crate::components::color_picker::{self, ColorPicker};
+use crate::components::stroke_sample::StrokeSample;
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::update::Update;
@@ -325,7 +326,11 @@ pub enum Message {
     ConnectionCornerChanged(CornerStyle),
     ConnectionDashChanged(ConnectionDash),
     ConnectionColorChanged(String),
-    ConnectionThicknessChanged(String),
+    /// A width row in the visual stroke panel was clicked.
+    ConnectionThicknessPicked(f32),
+    ThicknessPanelToggled,
+    DashPanelToggled,
+    ConnectionAddReturn,
     ConnectionEndpointSideChanged(bool, RoomSide),
     ConnectionEndpointOffsetChanged(bool, String),
     ConnectionEndpointReset(bool),
@@ -385,6 +390,7 @@ pub enum ColorField {
     LabelBackground,
     ShapeFill,
     ShapeStroke,
+    Connection,
 }
 
 /// An area option in the exit-destination picker.
@@ -525,6 +531,10 @@ pub struct State {
     new_area_property_value: String,
     /// The open color picker, if any, and the field it edits.
     picker: Option<(ColorField, ColorPicker)>,
+    /// The visual stroke-width sample panel is open.
+    thickness_panel_open: bool,
+    /// The visual dash-style sample panel is open.
+    dash_panel_open: bool,
     /// Secrecy of the single selected room/label/shape.
     is_secret: bool,
     /// Error from the last secret-marks call (preserved across resyncs;
@@ -544,6 +554,7 @@ impl State {
             ColorField::LabelBackground => &self.label.background,
             ColorField::ShapeFill => &self.shape.background,
             ColorField::ShapeStroke => &self.shape.stroke_color,
+            ColorField::Connection => &self.connection.color,
         }
     }
 }
@@ -1542,6 +1553,7 @@ impl MapEditorWindow {
             }
             Message::ConnectionDashChanged(dash) => {
                 self.inspector.connection.dash = dash;
+                self.inspector.dash_panel_open = false;
                 self.commit_connection_field(
                     FieldId::DashStyle,
                     ConnectionUpdates {
@@ -1565,14 +1577,12 @@ impl MapEditorWindow {
                     "Change connection color",
                 )
             }
-            Message::ConnectionThicknessChanged(value) => {
-                self.inspector.connection.thickness = value.clone();
-                let Ok(thickness) = value.parse::<f32>() else {
-                    return Update::none();
-                };
+            Message::ConnectionThicknessPicked(thickness) => {
+                self.inspector.thickness_panel_open = false;
                 if !smudgy_cloud::THICKNESS_RANGE.contains(&thickness) {
                     return Update::none();
                 }
+                self.inspector.connection.thickness = thickness.to_string();
                 self.commit_connection_field(
                     FieldId::Thickness,
                     ConnectionUpdates {
@@ -1581,6 +1591,29 @@ impl MapEditorWindow {
                     },
                     "Change connection thickness",
                 )
+            }
+            Message::ThicknessPanelToggled => {
+                self.inspector.thickness_panel_open = !self.inspector.thickness_panel_open;
+                self.inspector.dash_panel_open = false;
+                Update::none()
+            }
+            Message::DashPanelToggled => {
+                self.inspector.dash_panel_open = !self.inspector.dash_panel_open;
+                self.inspector.thickness_panel_open = false;
+                Update::none()
+            }
+            Message::ConnectionAddReturn => {
+                let Some((area_id, connection_id)) = self.selected_connection_id() else {
+                    return Update::none();
+                };
+                let command = commands::add_return_exit(
+                    &self.mapper.get_current_atlas(),
+                    area_id,
+                    connection_id,
+                );
+                let update = self.push_command(command);
+                self.inspector.resync(&self.mapper, &self.editor);
+                update
             }
             Message::ConnectionEndpointSideChanged(endpoint_b, side) => {
                 let Some((area_id, connection_id)) = self.selected_connection_id() else {
@@ -2074,6 +2107,9 @@ impl MapEditorWindow {
                             }
                             ColorField::ShapeStroke => {
                                 self.update_inspector(Message::ShapeStrokeColorChanged(hex))
+                            }
+                            ColorField::Connection => {
+                                self.update_inspector(Message::ConnectionColorChanged(hex))
                             }
                         }
                     }
@@ -2832,13 +2868,28 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
         "Exits"
     }));
 
-    for (index, exit) in state.exits.iter().enumerate() {
-        if index > 0 {
+    // With a perspective anchor, the traversal leaving the anchor room
+    // lists first — matching the endpoint editors' From/To order.
+    let area = window.editor.area_id().and_then(|id| atlas.get_area(&id));
+    let mut order: Vec<usize> = (0..state.exits.len()).collect();
+    if connection_selected && let Some(anchor) = window.editor.connection_anchor() {
+        order.sort_by_key(|&index| state.exits[index].from_room != anchor);
+    }
+
+    for (position, &index) in order.iter().enumerate() {
+        let exit = &state.exits[index];
+        if position > 0 {
             section = section.push(rule::horizontal(1));
         }
         if connection_selected {
+            let title = area
+                .as_ref()
+                .and_then(|area| area.get_room(&exit.from_room))
+                .map(|room| room.get_title())
+                .filter(|title| !title.is_empty())
+                .map_or_else(String::new, |title| format!(" · {title}"));
             section = section.push(
-                text(format!("From room {}", exit.from_room))
+                text(format!("From room {}{title}", exit.from_room))
                     .size(12)
                     .style(muted_text),
             );
@@ -3032,22 +3083,47 @@ fn connection_view(
     let Some(connection) = area.get_connection(connection_id) else {
         return content.push(text("Connection no longer exists"));
     };
-    let endpoints = connection.endpoint_b.map_or_else(
-        || format!("Room {} outward", connection.endpoint_a.room_number),
-        |endpoint| {
-            format!(
-                "Room {} {} to room {} {}",
-                connection.endpoint_a.room_number,
-                connection.endpoint_a.side,
-                endpoint.room_number,
-                endpoint.side
-            )
-        },
-    );
     content = content.push(secret_aware_heading(
         "Connection".to_string(),
         state.connection.is_secret,
     ));
+
+    // The perspective anchor: when the selection came from one of this
+    // connection's rooms, that room is the "From" end regardless of the
+    // stored endpoint order.
+    let anchor = window.editor.connection_anchor();
+    let flipped = anchor.is_some_and(|room| {
+        connection
+            .endpoint_b
+            .is_some_and(|endpoint| endpoint.room_number == room)
+            && connection.endpoint_a.room_number != room
+    });
+    let room_label = |number: RoomNumber| {
+        area.get_room(&number)
+            .map(|room| room.get_title())
+            .filter(|title| !title.is_empty())
+            .map_or_else(
+                || format!("room {number}"),
+                |title| format!("room {number} · {title}"),
+            )
+    };
+    let endpoints = connection.endpoint_b.map_or_else(
+        || format!("{} outward", room_label(connection.endpoint_a.room_number)),
+        |endpoint| {
+            let (from, to) = if flipped {
+                (endpoint, connection.endpoint_a)
+            } else {
+                (connection.endpoint_a, endpoint)
+            };
+            format!(
+                "{} {} to {} {}",
+                room_label(from.room_number),
+                from.side,
+                room_label(to.room_number),
+                to.side
+            )
+        },
+    );
 
     // Up/down endpoints are represented by their fixed level triangle: no
     // port to place, so the wall/offset row gives way to a note.
@@ -3065,86 +3141,89 @@ fn connection_view(
         })
     };
 
-    // Link
-    content = content.push(field_label("Link"));
-    content = content.push(text(format!("{} · {endpoints}", connection.kind)).size(12));
-    if level_endpoint(false) {
-        content = content.push(
-            text("Anchored at its level triangle (up/down exit)")
-                .size(12)
+    // One labeled endpoint editor; `role` is the perspective label the
+    // anchor ordering assigns ("From"/"To").
+    let endpoint_editor = |endpoint_b: bool, role: &'static str| -> ThemedElement<'_, super::Message> {
+        let endpoint = if endpoint_b {
+            connection.endpoint_b.unwrap_or(connection.endpoint_a)
+        } else {
+            connection.endpoint_a
+        };
+        let mut col = Column::new().spacing(4);
+        col = col.push(
+            text(format!("{role} · {}", room_label(endpoint.room_number)))
+                .size(11)
                 .style(muted_text),
         );
-    } else {
-        content = content.push(
+        if level_endpoint(endpoint_b) {
+            col = col.push(
+                text("Anchored at its level triangle (up/down exit)")
+                    .size(12)
+                    .style(muted_text),
+            );
+            return col.into();
+        }
+        let (side, offset_buffer) = if endpoint_b {
+            (
+                state.connection.endpoint_b_side,
+                &state.connection.endpoint_b_offset,
+            )
+        } else {
+            (
+                state.connection.endpoint_a_side,
+                &state.connection.endpoint_a_offset,
+            )
+        };
+        col = col.push(
             row![
-                pick_list(
-                    &RoomSide::ALL[..],
-                    Some(state.connection.endpoint_a_side),
-                    |side| super::Message::Inspector(Message::ConnectionEndpointSideChanged(
-                        false, side
-                    )),
-                )
+                pick_list(&RoomSide::ALL[..], Some(side), move |side| {
+                    super::Message::Inspector(Message::ConnectionEndpointSideChanged(
+                        endpoint_b, side,
+                    ))
+                })
                 .text_size(12)
                 .width(Length::FillPortion(2)),
-                text_input("port 0–1", &state.connection.endpoint_a_offset)
-                    .on_input(|value| super::Message::Inspector(
-                        Message::ConnectionEndpointOffsetChanged(false, value),
+                text_input("port 0–1", offset_buffer)
+                    .on_input(move |value| super::Message::Inspector(
+                        Message::ConnectionEndpointOffsetChanged(endpoint_b, value),
                     ))
                     .size(12)
                     .width(Length::FillPortion(1)),
                 button(text("Auto").size(11))
                     .style(builtins::button::secondary)
                     .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
-                        false,
+                        endpoint_b,
                     ))),
                 button(text("Redistribute").size(11))
                     .style(builtins::button::secondary)
                     .on_press(super::Message::Inspector(
-                        Message::ConnectionRedistributePorts(false,)
+                        Message::ConnectionRedistributePorts(endpoint_b)
                     )),
             ]
             .spacing(6),
         );
-    }
-    if state.connection.has_endpoint_b {
-        if level_endpoint(true) {
-            content = content.push(
-                text("Anchored at its level triangle (up/down exit)")
-                    .size(12)
-                    .style(muted_text),
-            );
-        } else {
-            content = content.push(
-                row![
-                    pick_list(
-                        &RoomSide::ALL[..],
-                        Some(state.connection.endpoint_b_side),
-                        |side| super::Message::Inspector(Message::ConnectionEndpointSideChanged(
-                            true, side
-                        ),),
-                    )
-                    .text_size(12)
-                    .width(Length::FillPortion(2)),
-                    text_input("port 0–1", &state.connection.endpoint_b_offset)
-                        .on_input(|value| super::Message::Inspector(
-                            Message::ConnectionEndpointOffsetChanged(true, value),
-                        ))
-                        .size(12)
-                        .width(Length::FillPortion(1)),
-                    button(text("Auto").size(11))
-                        .style(builtins::button::secondary)
-                        .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
-                            true,
-                        ))),
-                    button(text("Redistribute").size(11))
-                        .style(builtins::button::secondary)
-                        .on_press(super::Message::Inspector(
-                            Message::ConnectionRedistributePorts(true,)
-                        )),
-                ]
-                .spacing(6),
+        let offset_valid = offset_buffer
+            .parse::<f32>()
+            .is_ok_and(|offset| (0.0..=1.0).contains(&offset));
+        if !offset_valid {
+            col = col.push(
+                text("port offset must be between 0 and 1")
+                    .size(11)
+                    .style(builtins::text::danger),
             );
         }
+        col.into()
+    };
+
+    // Link
+    content = content.push(field_label("Link"));
+    content = content.push(text(format!("{} · {endpoints}", connection.kind)).size(12));
+    if state.connection.has_endpoint_b {
+        let (first, second) = if flipped { (true, false) } else { (false, true) };
+        content = content.push(endpoint_editor(first, "From"));
+        content = content.push(endpoint_editor(second, "To"));
+    } else {
+        content = content.push(endpoint_editor(false, "From"));
     }
 
     if state.exits.len() == 1 {
@@ -3188,6 +3267,24 @@ fn connection_view(
                         ))),
                 );
             }
+        }
+
+        // One-way → two-way without hunting for an existing reciprocal:
+        // creates the return exit on the destination room, attached to this
+        // link. Only for same-area, non-redacted destinations.
+        if selected.to_area == Some(area_id)
+            && !selected.to_room.trim().is_empty()
+            && !selected.to_unknown
+        {
+            content = content.push(
+                button(text("Add return direction").size(12))
+                    .style(builtins::button::secondary)
+                    .on_press_maybe(
+                        window
+                            .can_edit_active_area()
+                            .then_some(super::Message::Inspector(Message::ConnectionAddReturn)),
+                    ),
+            );
         }
     }
 
@@ -3301,31 +3398,118 @@ fn connection_view(
     // Appearance
     content = content.push(rule::horizontal(1));
     content = content.push(field_label("Appearance"));
-    content = content.push(
-        pick_list(
-            &ConnectionDash::ALL[..],
-            Some(state.connection.dash),
-            |dash| super::Message::Inspector(Message::ConnectionDashChanged(dash)),
-        )
-        .text_size(12),
-    );
+    content = content.push(color_input(
+        window,
+        ColorField::Connection,
+        "Color",
+        "CSS color",
+        &state.connection.color,
+        false,
+        Message::ConnectionColorChanged,
+    ));
+
+    // Width and dash are chosen visually: the buttons render the current
+    // stroke, and their panels render every choice as it would draw with
+    // the connection's current color/dash/width.
+    let sample_color =
+        parse_color(&state.connection.color).unwrap_or(iced::Color::from_rgb8(164, 164, 164));
+    let current_thickness = state
+        .connection
+        .thickness
+        .parse::<f32>()
+        .unwrap_or(DEFAULT_CONNECTION_THICKNESS);
+    let sample = |thickness: f32, dash: ConnectionDash| StrokeSample {
+        color: sample_color,
+        thickness,
+        dash,
+    };
     content = content.push(
         row![
-            text_input("CSS color", &state.connection.color)
-                .on_input(
-                    |value| super::Message::Inspector(Message::ConnectionColorChanged(value),)
-                )
-                .size(12)
-                .width(Length::FillPortion(2)),
-            text_input("width", &state.connection.thickness)
-                .on_input(
-                    |value| super::Message::Inspector(Message::ConnectionThicknessChanged(value),)
-                )
-                .size(12)
-                .width(Length::FillPortion(1)),
+            column![
+                field_label("Width"),
+                button(sample(current_thickness, state.connection.dash).view(Length::Fill, 18.0))
+                    .style(builtins::button::secondary)
+                    .padding(3)
+                    .width(Length::Fill)
+                    .on_press(super::Message::Inspector(Message::ThicknessPanelToggled)),
+            ]
+            .spacing(2)
+            .width(Length::FillPortion(1)),
+            column![
+                field_label("Style"),
+                button(sample(current_thickness, state.connection.dash).view(Length::Fill, 18.0))
+                    .style(builtins::button::secondary)
+                    .padding(3)
+                    .width(Length::Fill)
+                    .on_press(super::Message::Inspector(Message::DashPanelToggled)),
+            ]
+            .spacing(2)
+            .width(Length::FillPortion(1)),
         ]
         .spacing(6),
     );
+    if state.thickness_panel_open {
+        const WIDTH_CHOICES: [f32; 11] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut panel = Column::new().spacing(2);
+        let width_row = |thickness: f32, label: String| {
+            button(
+                row![
+                    text(label).size(11).width(44.0),
+                    sample(thickness, state.connection.dash).view(Length::Fill, 16.0),
+                ]
+                .spacing(6)
+                .align_y(Vertical::Center),
+            )
+            .style(if (thickness - current_thickness).abs() < 0.005 {
+                builtins::button::primary
+            } else {
+                builtins::button::toolbar
+            })
+            .padding(3)
+            .width(Length::Fill)
+            .on_press(super::Message::Inspector(Message::ConnectionThicknessPicked(
+                thickness,
+            )))
+        };
+        // A stored width outside the offered list stays visible and
+        // reselectable rather than silently vanishing.
+        if !WIDTH_CHOICES
+            .iter()
+            .any(|choice| (choice - current_thickness).abs() < 0.005)
+        {
+            panel = panel.push(width_row(current_thickness, format!("{current_thickness}")));
+        }
+        for choice in WIDTH_CHOICES {
+            panel = panel.push(width_row(choice, format!("{choice}")));
+        }
+        content = content.push(panel);
+    }
+    if state.dash_panel_open {
+        let mut panel = Column::new().spacing(2);
+        for dash in ConnectionDash::ALL {
+            panel = panel.push(
+                button(
+                    row![
+                        text(dash.to_string()).size(11).width(44.0),
+                        sample(current_thickness, dash).view(Length::Fill, 16.0),
+                    ]
+                    .spacing(6)
+                    .align_y(Vertical::Center),
+                )
+                .style(if dash == state.connection.dash {
+                    builtins::button::primary
+                } else {
+                    builtins::button::toolbar
+                })
+                .padding(3)
+                .width(Length::Fill)
+                .on_press(super::Message::Inspector(Message::ConnectionDashChanged(
+                    dash,
+                ))),
+            );
+        }
+        content = content.push(panel);
+    }
     content = content.push(
         button(text("Reset route and appearance").size(12))
             .style(builtins::button::secondary)

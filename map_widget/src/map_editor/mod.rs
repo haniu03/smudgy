@@ -416,6 +416,11 @@ pub struct MapEditor {
     /// accent glow so the invisible hit band and click cycling are
     /// discoverable.
     hovered_connection: Option<ConnectionId>,
+    /// The room the user came *from* when the selection transitioned room →
+    /// one of its connections. Presentation-only: the inspector shows the
+    /// connection from this room's perspective (it is the "From" end),
+    /// whatever the stored endpoint order says.
+    connection_anchor: Option<RoomNumber>,
     selected_connection_handle: Option<(ConnectionId, SelectedConnectionHandle)>,
     /// Accepted solver output awaiting user confirmation. This is view-only:
     /// the cache and stored Connection remain untouched until the host emits
@@ -450,6 +455,7 @@ impl MapEditor {
             player_location: None,
             hovered_room: None,
             hovered_connection: None,
+            connection_anchor: None,
             selected_connection_handle: None,
             automatic_route_preview: None,
             activity: EditorActivity::Idle,
@@ -465,6 +471,7 @@ impl MapEditor {
         self.selection.clear();
         self.hovered_room = None;
         self.hovered_connection = None;
+        self.connection_anchor = None;
         self.selected_connection_handle = None;
         self.automatic_route_preview = None;
         self.activity = EditorActivity::Idle;
@@ -547,6 +554,7 @@ impl MapEditor {
             self.selection.clear();
             self.hovered_room = None;
             self.hovered_connection = None;
+            self.connection_anchor = None;
             self.selected_connection_handle = None;
             self.automatic_route_preview = None;
             self.activity = EditorActivity::Idle;
@@ -568,6 +576,7 @@ impl MapEditor {
 
     pub fn clear_selection(&mut self) {
         self.selection.clear();
+        self.connection_anchor = None;
         self.selected_connection_handle = None;
         self.activity = EditorActivity::Idle;
     }
@@ -575,6 +584,7 @@ impl MapEditor {
     /// Replaces the selection with a single entity (e.g. one just created).
     pub fn select(&mut self, entity: EntityId) {
         self.selection.replace_with(entity);
+        self.connection_anchor = None;
         self.selected_connection_handle = None;
         self.activity = EditorActivity::Idle;
     }
@@ -662,6 +672,30 @@ impl MapEditor {
         self.hovered_room.as_ref()
     }
 
+    /// The perspective anchor of the selected connection: the room the
+    /// selection transitioned from, when it was one of the connection's
+    /// endpoints. See the field docs.
+    #[must_use]
+    pub fn connection_anchor(&self) -> Option<RoomNumber> {
+        self.connection_anchor
+    }
+
+    fn connection_has_endpoint(&self, connection_id: ConnectionId, room: RoomNumber) -> bool {
+        let atlas = self.mapper.get_current_atlas();
+        self.area_id
+            .as_ref()
+            .and_then(|id| atlas.get_area(id))
+            .and_then(|area| {
+                area.get_connection(connection_id).map(|connection| {
+                    connection.endpoint_a.room_number == room
+                        || connection
+                            .endpoint_b
+                            .is_some_and(|endpoint| endpoint.room_number == room)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Updates the player marker, returning whether it actually moved. The
     /// editor canvas has no animation pumping redraws of its own, so the
     /// caller queues a repaint only when this returns `true`.
@@ -687,6 +721,21 @@ impl MapEditor {
                 Update::none()
             }
             Message::ClickSelect { entity, additive } => {
+                // A room → its-connection transition remembers the room as
+                // the perspective anchor; re-clicking the same connection
+                // (click cycling) keeps it. Everything else forgets it.
+                self.connection_anchor = match entity {
+                    EntityId::Connection(id) => match self.selection.single() {
+                        Some(EntityId::Room(room)) if self.connection_has_endpoint(id, room) => {
+                            Some(room)
+                        }
+                        Some(EntityId::Connection(previous)) if previous == id => {
+                            self.connection_anchor
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 if additive {
                     self.selection.toggle(entity);
                 } else {
@@ -703,6 +752,7 @@ impl MapEditor {
             }
             Message::RubberBandSelect { rect, additive } => {
                 let hits = self.entities_in_rect(rect);
+                self.connection_anchor = None;
                 if additive {
                     self.selection.extend(hits);
                 } else {
