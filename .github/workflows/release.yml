@@ -156,18 +156,41 @@ jobs:
       - name: Install cargo-about
         run: cargo install --locked cargo-about --features cli
 
-      # Signing uses Azure Trusted Signing through DefaultAzureCredential;
-      # azure/login's OIDC session satisfies it via the Azure CLI credential.
-      - name: Azure login (OIDC)
+      # Signing uses Azure Artifact Signing through DefaultAzureCredential,
+      # satisfied by azure/login's Azure CLI session. The federated (OIDC)
+      # assertion az stores is valid for only ~5 minutes and is redeemed for the
+      # code-signing scope on FIRST use — which is after the ~45-minute build if
+      # everything runs in one step (AADSTS700024). So: validate the federation
+      # early, build unsigned, log in AGAIN for a fresh assertion, warm the
+      # code-signing access token (az caches it ~1h, covering every signtool
+      # invocation including Inno Setup's), then sign and package.
+      - name: Azure login (OIDC, early federation check)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build, sign, and package (release.ps1)
+      - name: Build (unsigned)
         shell: pwsh
-        run: ./bin/release.ps1
+        run: ./bin/release.ps1 -BuildOnly
+
+      - name: Azure login (fresh assertion for signing)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign and package (release.ps1 -SkipBuild)
+        shell: pwsh
+        run: |
+          # Warm the code-signing access token while the fresh assertion is
+          # valid; best-effort — the first signtool call lands inside the
+          # assertion window regardless.
+          az account get-access-token --resource https://codesigning.azure.net --output none
+          if ($LASTEXITCODE -ne 0) { Write-Warning 'token warm-up failed; relying on the fresh login assertion' }
+          ./bin/release.ps1 -SkipBuild
 
       - name: Collect versioned artifact
         shell: bash

@@ -15,8 +15,13 @@ param(
     [string]$Account = 'wbk',
     # Certificate profile name within the account.
     [string]$CertProfile = 'wkalata',
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # Build the binaries and stop before signing/packaging. CI splits the run
+    # this way: the federated login assertion used for signing lives only ~5
+    # minutes, so the workflow re-authenticates between build and sign.
+    [switch]$BuildOnly
 )
+if ($BuildOnly -and $SkipBuild) { throw '-BuildOnly and -SkipBuild are mutually exclusive' }
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -75,6 +80,11 @@ $exe = Join-Path $repoRoot 'target\release-full\smudgy.exe'
 $inspector = Join-Path $repoRoot 'target\release-full\smudgy_inspector.exe'
 foreach ($f in @($exe, $inspector)) {
     if (-not (Test-Path $f)) { throw "$f not found" }
+}
+
+if ($BuildOnly) {
+    Write-Host "==> Build complete (-BuildOnly); signing/packaging deferred" -ForegroundColor Green
+    exit 0
 }
 
 foreach ($f in @($exe, $inspector)) {
