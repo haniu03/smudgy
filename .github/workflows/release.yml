@@ -140,6 +140,9 @@ jobs:
     name: windows installer
     needs: verify-version
     runs-on: windows-latest
+    # Build is ~45 min cold + a few minutes of signing; anything past this is a
+    # hang (e.g. a stalled credential probe), so fail fast instead of eating 6h.
+    timeout-minutes: 90
     # The Entra federated credential matches the OIDC subject exactly (no
     # wildcards), so the job runs in the "release" environment to get a
     # ref-independent subject: repo:smudgy-mud/smudgy:environment:release

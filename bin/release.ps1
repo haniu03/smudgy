@@ -39,15 +39,21 @@ if (-not (Test-Path $dlib)) {
 }
 
 $metadata = Join-Path $toolsDir 'metadata.json'
-# ExcludeCredentials skips DefaultAzureCredential's managed-identity probe: on
-# machines with an IMDS endpoint but no assigned identity (GitHub-hosted runners
-# are Azure VMs), that probe retries with backoff for many minutes before the
-# chain reaches the Azure CLI credential that actually signs.
+# ExcludeCredentials pins DefaultAzureCredential to exactly the Azure CLI
+# credential (`az login` locally, azure/login OIDC in CI). Every other probe is
+# a stall risk on build machines: the managed-identity probe retries against an
+# identity-less IMDS endpoint for minutes, and CI images ship Visual Studio and
+# the Az PowerShell module, whose credential providers spawn subprocesses that
+# have been observed to hang indefinitely.
 @{ Endpoint = $Endpoint; CodeSigningAccountName = $Account; CertificateProfileName = $CertProfile
-   ExcludeCredentials = @('ManagedIdentityCredential') } |
+   ExcludeCredentials = @(
+       'EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential',
+       'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
+       'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential'
+   ) } |
     ConvertTo-Json | Set-Content $metadata -Encoding ascii
 
-$signArgs = @('sign', '/v', '/fd', 'SHA256', '/tr', 'http://timestamp.acs.microsoft.com', '/td', 'SHA256',
+$signArgs = @('sign', '/v', '/debug', '/fd', 'SHA256', '/tr', 'http://timestamp.acs.microsoft.com', '/td', 'SHA256',
               '/dlib', $dlib, '/dmdf', $metadata)
 
 $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
