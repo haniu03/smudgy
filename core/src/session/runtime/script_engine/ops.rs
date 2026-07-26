@@ -2922,18 +2922,21 @@ pub struct LineNotCurrent;
 
 /// The current-line gate shared by the ambient `line` mutators (gag/redirect/
 /// copy and the current-line transforms): a line must be in flight — installed
-/// by dispatch and not yet consumed by its completion action, whose queued
-/// `Arc` is what keeps this `Weak` alive. A live line means the per-line
-/// routing/transform cells will still be applied to it, so mutation is valid
-/// from ANY code that runs before the line completes: trigger and
-/// `sys:receive` handlers, event recipients they emit to, and microtask
-/// continuations pumped during the line's cascade. The deliberate trade-off:
-/// a continuation that outlives its own line and resumes while a LATER line
-/// is in flight edits that later line — same-cascade event recipients and
-/// continuations are common enough that per-entry arming (which rejected
-/// them along with the stale case) cost more than the narrow wrong-line
-/// window it closed. The submission ops still solve staleness for
-/// `sys:input` with a script-side capture ([`with_submission`]).
+/// by dispatch when its processing begins, cleared (`set_current_line(None)`)
+/// at the top of its completion arm. The explicit clear is load-bearing:
+/// completion does NOT drop the line's last strong reference (the recent-lines
+/// ring still holds one), so `strong_count()` alone would leave this gate
+/// open long after delivery. While the line is in flight its per-line
+/// routing/transform cells are still pending, so mutation is valid from ANY
+/// code that runs before completion: trigger and `sys:receive` handlers,
+/// event recipients they emit to (which per-entry arming also admitted), and
+/// async continuations that resume mid-cascade (which it did not — admitting
+/// a handler that awaits and resumes while its own line is still in flight is
+/// what this time-scoped gate buys). The trade-off: time-scoped is not
+/// causally scoped, so code with no tie to the line — a timer, another
+/// package's continuation, a continuation that outlived its own line — edits
+/// whatever line is in flight when it runs. The submission ops still solve
+/// staleness for `sys:input` with a script-side capture ([`with_submission`]).
 fn ensure_current_line(state: &OpState) -> Result<(), LineNotCurrent> {
     let current_line = state.borrow::<Rc<RefCell<Weak<StyledLine>>>>();
     if current_line.borrow().strong_count() > 0 {

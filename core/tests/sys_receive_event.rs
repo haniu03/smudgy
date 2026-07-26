@@ -12,7 +12,10 @@ use smudgy_core::session::runtime::RuntimeAction;
 use smudgy_core::session::styled_line::StyledLine;
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
 
-const QUIET_PERIOD: Duration = Duration::from_millis(900);
+/// Inter-event drain window. Must comfortably outlast the idle test's 150ms
+/// timer even when a missed waker defers its callback to the session run
+/// loop's 500ms safety tick (worst case ~650ms after the line).
+const QUIET_PERIOD: Duration = Duration::from_millis(2000);
 
 // A trigger edits every line (`hello` → `HELLO`); a `sys:receive` handler echoes the payload text
 // and gags any line mentioning `SECRET`. The trigger's edit is staged, not applied, when
@@ -117,9 +120,9 @@ async fn sys_receive_fires_post_trigger_sees_original_and_can_gag() {
     );
 }
 
-/// The relaxed current-line contract: `line` ops are valid until the line in
-/// flight finishes processing — for ANY code that runs in that window (event
-/// recipients a handler emits to, microtask continuations pumped during the
+/// The current-line window: `line` ops are valid until the line in flight
+/// finishes processing — for ANY code that runs in that window (event
+/// recipients a handler emits to, async continuations that resume during the
 /// cascade), not just the trigger/`sys:receive` entry run for the line. The
 /// flip side, pinned here: a continuation that outlives its OWN line and
 /// resumes while a LATER line is mid-flight acts on that later line. The gate
@@ -127,7 +130,8 @@ async fn sys_receive_fires_post_trigger_sees_original_and_can_gag() {
 /// handler's continuation resumes precisely between that line's handler
 /// splice and its completion action (resolved promises pump between actions)
 /// — its `gag()` therefore hides the SECOND line. That wrong-line window is
-/// the deliberate price of letting same-cascade recipients edit the line.
+/// the deliberate price of letting a handler's own mid-line `await`
+/// continuations act on their line.
 const SYS_RECEIVE_STALE_TS: &str = r#"
 import { echo, line } from "smudgy:core";
 import { receive } from "smudgy:events/sys";
@@ -232,11 +236,14 @@ async fn continuation_resuming_during_a_later_line_acts_on_that_line() {
     );
 }
 
-/// The guard that remains after the relaxation: with NO line in flight —
-/// here, a continuation parked on a timer that fires after every line has
-/// been routed — a `line.gag()` still throws the current-line contract error
-/// instead of leaking into the per-line routing/transform cells (where it
-/// would silently apply to whatever line arrives next).
+/// With NO line in flight — here, a continuation parked on a timer that
+/// fires after every line has been routed — `line.gag()` throws the
+/// current-line contract error instead of leaking into the per-line
+/// routing/transform cells (where it would silently apply to whatever line
+/// arrives next). This also pins dispatch's completion-time
+/// `set_current_line(None)` clears as load-bearing: when the timer fires,
+/// the processed line is still strongly held by the recent-lines ring, so a
+/// gate keyed on `Arc` liveness alone would let this gag through.
 const SYS_RECEIVE_IDLE_TS: &str = r#"
 import { echo, line } from "smudgy:core";
 import { receive } from "smudgy:events/sys";
