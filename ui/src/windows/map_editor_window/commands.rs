@@ -1268,6 +1268,13 @@ pub fn edit_connection(
 ) -> Option<Command> {
     let area = atlas.get_area(&area_id)?;
     let current = area.get_connection(connection_id)?;
+    // `ConnectionUpdates` deliberately cannot clear endpoint B (topology
+    // changes travel through the semantic link operations), so an edit that
+    // would *set* it on a connection without one has no expressible inverse.
+    // Refuse it rather than record an undo that silently keeps the endpoint.
+    if updates.endpoint_b.is_some() && current.endpoint_b.is_none() {
+        return None;
+    }
     let inverse = ConnectionUpdates {
         endpoint_a: updates.endpoint_a.map(|_| current.endpoint_a),
         endpoint_b: updates.endpoint_b.and(current.endpoint_b),
@@ -1352,6 +1359,10 @@ pub fn edit_connections(
     let mut undo = Vec::with_capacity(edits.len());
     for (connection_id, updates) in edits {
         let current = area.get_connection(connection_id)?;
+        // Same endpoint-B inverse rule as `edit_connection` above.
+        if updates.endpoint_b.is_some() && current.endpoint_b.is_none() {
+            return None;
+        }
         let inverse = ConnectionUpdates {
             endpoint_a: updates.endpoint_a.map(|_| current.endpoint_a),
             endpoint_b: updates.endpoint_b.and(current.endpoint_b),

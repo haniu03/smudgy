@@ -19,7 +19,7 @@ use smudgy_cloud::{
     PortMode, RoomNumber, RoomSide, SegmentShape,
     connection_geometry::{
         EndpointGeometry, GeometryInput, Handle as ConnectionHandle, distance_to_segment,
-        port_position, resolve, stub_tip,
+        port_position, resolve, reroute_for_port_move, reroute_for_waypoint_move, stub_tip,
     },
     mapper::room_connection::RoomConnection,
 };
@@ -306,54 +306,27 @@ impl MapEditor {
         let connection = area.get_connection(connection_id)?;
         match handle {
             ConnectionHandle::Waypoint(index, _) => {
-                let mut points = connection.route_points.clone();
-                if index >= points.len() {
+                if index >= connection.route_points.len() {
                     return None;
                 }
                 let target = Self::maybe_snap_connection(current, modifiers);
-                let mut target = MapPoint::new(target.x, target.y);
-                if connection.segment_shape == SegmentShape::Orthogonal {
+                let target = MapPoint::new(target.x, target.y);
+                let points = if connection.segment_shape == SegmentShape::Orthogonal {
                     let render = area.get_room_connections().iter().find(|render| {
                         render.connection_id == connection_id && render.from_level == self.level
                     })?;
-                    let previous = if index == 0 {
-                        render.geometry.stub_tip_a
-                    } else {
-                        points[index - 1]
-                    };
-                    let next = if index + 1 == points.len() {
-                        render.geometry.stub_tip_b?
-                    } else {
-                        points[index + 1]
-                    };
-                    let old = points[index];
-                    let previous_horizontal =
-                        (old.y - previous.y).abs() <= (old.x - previous.x).abs();
-                    let next_horizontal = (old.y - next.y).abs() <= (old.x - next.x).abs();
-                    if index == 0 {
-                        if previous_horizontal {
-                            target.y = previous.y;
-                        } else {
-                            target.x = previous.x;
-                        }
-                    } else if previous_horizontal {
-                        points[index - 1].y = target.y;
-                    } else {
-                        points[index - 1].x = target.x;
-                    }
-                    if index + 1 == points.len() {
-                        if next_horizontal {
-                            target.y = next.y;
-                        } else {
-                            target.x = next.x;
-                        }
-                    } else if next_horizontal {
-                        points[index + 1].y = target.y;
-                    } else {
-                        points[index + 1].x = target.x;
-                    }
-                }
-                points[index] = target;
+                    reroute_for_waypoint_move(
+                        &connection.route_points,
+                        index,
+                        render.geometry.stub_tip_a,
+                        render.geometry.stub_tip_b?,
+                        target,
+                    )?
+                } else {
+                    let mut points = connection.route_points.clone();
+                    points[index] = target;
+                    points
+                };
                 Some(ConnectionUpdates {
                     routing: Some(ConnectionRouting::Manual),
                     route_points: Some(points),
@@ -386,22 +359,13 @@ impl MapEditor {
                         ),
                         endpoint.side,
                     );
-                    let mut points = connection.route_points.clone();
-                    if let Some(first) = points.first_mut() {
-                        if (first.y - render.geometry.stub_tip_a.y).abs()
-                            <= (first.x - render.geometry.stub_tip_a.x).abs()
-                        {
-                            first.y = new_tip.y;
-                        } else {
-                            first.x = new_tip.x;
-                        }
-                    } else if let Some(other_tip) = render.geometry.stub_tip_b
-                        && (new_tip.x - other_tip.x).abs() > f32::EPSILON
-                        && (new_tip.y - other_tip.y).abs() > f32::EPSILON
-                    {
-                        points.push(MapPoint::new(new_tip.x, other_tip.y));
-                    }
-                    route_points = Some(points);
+                    route_points = Some(reroute_for_port_move(
+                        &connection.route_points,
+                        render.geometry.stub_tip_a,
+                        render.geometry.stub_tip_b,
+                        new_tip,
+                        false,
+                    ));
                 }
                 Some(ConnectionUpdates {
                     endpoint_a: Some(endpoint),
@@ -437,19 +401,13 @@ impl MapEditor {
                         ),
                         endpoint.side,
                     );
-                    let mut points = connection.route_points.clone();
-                    if let Some(last) = points.last_mut() {
-                        if (last.y - old_tip.y).abs() <= (last.x - old_tip.x).abs() {
-                            last.y = new_tip.y;
-                        } else {
-                            last.x = new_tip.x;
-                        }
-                    } else if (render.geometry.stub_tip_a.x - new_tip.x).abs() > f32::EPSILON
-                        && (render.geometry.stub_tip_a.y - new_tip.y).abs() > f32::EPSILON
-                    {
-                        points.push(MapPoint::new(render.geometry.stub_tip_a.x, new_tip.y));
-                    }
-                    route_points = Some(points);
+                    route_points = Some(reroute_for_port_move(
+                        &connection.route_points,
+                        old_tip,
+                        Some(render.geometry.stub_tip_a),
+                        new_tip,
+                        true,
+                    ));
                 }
                 Some(ConnectionUpdates {
                     endpoint_b: Some(endpoint),

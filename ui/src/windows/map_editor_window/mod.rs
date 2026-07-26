@@ -1743,12 +1743,11 @@ impl MapEditorWindow {
                             let Some(point) = connection.route_points.get(index).copied() else {
                                 return Update::none();
                             };
-                            let mut points = connection.route_points.clone();
-                            let mut target = smudgy_cloud::MapPoint::new(
+                            let target = smudgy_cloud::MapPoint::new(
                                 point.x + dx as f32 * step,
                                 point.y + dy as f32 * step,
                             );
-                            if connection.segment_shape == SegmentShape::Orthogonal {
+                            let points = if connection.segment_shape == SegmentShape::Orthogonal {
                                 let Some(render) =
                                     area.get_room_connections().iter().find(|item| {
                                         item.connection_id == connection_id
@@ -1757,47 +1756,26 @@ impl MapEditorWindow {
                                 else {
                                     return Update::none();
                                 };
-                                let previous = if index == 0 {
-                                    render.geometry.stub_tip_a
-                                } else {
-                                    points[index - 1]
+                                let Some(tip_b) = render.geometry.stub_tip_b else {
+                                    return Update::none();
                                 };
-                                let next = if index + 1 == points.len() {
-                                    let Some(tip) = render.geometry.stub_tip_b else {
-                                        return Update::none();
-                                    };
-                                    tip
-                                } else {
-                                    points[index + 1]
+                                let Some(points) =
+                                    smudgy_cloud::connection_geometry::reroute_for_waypoint_move(
+                                        &connection.route_points,
+                                        index,
+                                        render.geometry.stub_tip_a,
+                                        tip_b,
+                                        target,
+                                    )
+                                else {
+                                    return Update::none();
                                 };
-                                let previous_horizontal =
-                                    (point.y - previous.y).abs() <= (point.x - previous.x).abs();
-                                let next_horizontal =
-                                    (point.y - next.y).abs() <= (point.x - next.x).abs();
-                                if index == 0 {
-                                    if previous_horizontal {
-                                        target.y = previous.y;
-                                    } else {
-                                        target.x = previous.x;
-                                    }
-                                } else if previous_horizontal {
-                                    points[index - 1].y = target.y;
-                                } else {
-                                    points[index - 1].x = target.x;
-                                }
-                                if index + 1 == points.len() {
-                                    if next_horizontal {
-                                        target.y = next.y;
-                                    } else {
-                                        target.x = next.x;
-                                    }
-                                } else if next_horizontal {
-                                    points[index + 1].y = target.y;
-                                } else {
-                                    points[index + 1].x = target.x;
-                                }
-                            }
-                            points[index] = target;
+                                points
+                            } else {
+                                let mut points = connection.route_points.clone();
+                                points[index] = target;
+                                points
+                            };
                             (
                                 ConnectionUpdates {
                                     routing: Some(ConnectionRouting::Manual),

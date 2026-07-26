@@ -70,38 +70,18 @@ pub(super) fn endpoint_updates(
             ),
             endpoint.side,
         );
-        let mut points = connection.route_points.clone();
-        if endpoint_b {
-            let old_tip = render.geometry.stub_tip_b?;
-            if let Some(last) = points.last_mut() {
-                if (last.y - old_tip.y).abs() <= (last.x - old_tip.x).abs() {
-                    last.y = new_tip.y;
-                } else {
-                    last.x = new_tip.x;
-                }
-            } else if (render.geometry.stub_tip_a.x - new_tip.x).abs() > f32::EPSILON
-                && (render.geometry.stub_tip_a.y - new_tip.y).abs() > f32::EPSILON
-            {
-                points.push(smudgy_cloud::MapPoint::new(
-                    render.geometry.stub_tip_a.x,
-                    new_tip.y,
-                ));
-            }
-        } else if let Some(first) = points.first_mut() {
-            if (first.y - render.geometry.stub_tip_a.y).abs()
-                <= (first.x - render.geometry.stub_tip_a.x).abs()
-            {
-                first.y = new_tip.y;
-            } else {
-                first.x = new_tip.x;
-            }
-        } else if let Some(other_tip) = render.geometry.stub_tip_b
-            && (new_tip.x - other_tip.x).abs() > f32::EPSILON
-            && (new_tip.y - other_tip.y).abs() > f32::EPSILON
-        {
-            points.push(smudgy_cloud::MapPoint::new(new_tip.x, other_tip.y));
-        }
-        route_points = Some(points);
+        let (old_tip, other_tip) = if endpoint_b {
+            (render.geometry.stub_tip_b?, Some(render.geometry.stub_tip_a))
+        } else {
+            (render.geometry.stub_tip_a, render.geometry.stub_tip_b)
+        };
+        route_points = Some(smudgy_cloud::connection_geometry::reroute_for_port_move(
+            &connection.route_points,
+            old_tip,
+            other_tip,
+            new_tip,
+            endpoint_b,
+        ));
     }
 
     Some(if endpoint_b {

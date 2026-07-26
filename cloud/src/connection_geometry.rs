@@ -576,6 +576,101 @@ pub fn orthogonalize_route(
     (path.len() <= crate::MAX_ROUTE_POINTS).then_some(path)
 }
 
+/// Adjusts an active orthogonal route for one endpoint's port move. The
+/// endpoint-adjacent stored elbow follows the moved anchor tip along the
+/// leg's off-axis; when the route has no stored vertices and the straight
+/// tip-to-tip leg would turn diagonal, the single elbow that keeps the route
+/// orthogonal is inserted instead (vertical leg at A's tip, horizontal at
+/// B's). Canvas dragging, inspector entry, and keyboard nudging all route
+/// through here; the renderer never repairs a diagonal leg.
+///
+/// `old_tip` is the moved endpoint's anchor tip before the move, `other_tip`
+/// the far endpoint's (absent for dangling routes, which never need the
+/// inserted elbow). Off-axis drift below [`EPSILON`] needs no elbow —
+/// [`orthogonal_violation`] tolerates it by the same threshold.
+#[must_use]
+pub fn reroute_for_port_move(
+    route_points: &[MapPoint],
+    old_tip: MapPoint,
+    other_tip: Option<MapPoint>,
+    new_tip: MapPoint,
+    endpoint_b: bool,
+) -> Vec<MapPoint> {
+    let mut points = route_points.to_vec();
+    let adjacent = if endpoint_b {
+        points.last_mut()
+    } else {
+        points.first_mut()
+    };
+    if let Some(elbow) = adjacent {
+        if (elbow.y - old_tip.y).abs() <= (elbow.x - old_tip.x).abs() {
+            elbow.y = new_tip.y;
+        } else {
+            elbow.x = new_tip.x;
+        }
+    } else if let Some(other) = other_tip
+        && (new_tip.x - other.x).abs() >= EPSILON
+        && (new_tip.y - other.y).abs() >= EPSILON
+    {
+        points.push(if endpoint_b {
+            MapPoint::new(other.x, new_tip.y)
+        } else {
+            MapPoint::new(new_tip.x, other.y)
+        });
+    }
+    points
+}
+
+/// Moves one stored orthogonal-route vertex to `target`, dragging each
+/// neighboring elbow along the shared leg's axis. At the route's ends the
+/// anchor tips cannot move, so the target clamps onto the tip-adjacent leg's
+/// axis instead. Returns the updated interior points, or `None` when `index`
+/// is out of range.
+#[must_use]
+pub fn reroute_for_waypoint_move(
+    route_points: &[MapPoint],
+    index: usize,
+    tip_a: MapPoint,
+    tip_b: MapPoint,
+    target: MapPoint,
+) -> Option<Vec<MapPoint>> {
+    let mut points = route_points.to_vec();
+    let old = *points.get(index)?;
+    let mut target = target;
+    let previous = if index == 0 { tip_a } else { points[index - 1] };
+    let next = if index + 1 == points.len() {
+        tip_b
+    } else {
+        points[index + 1]
+    };
+    let previous_horizontal = (old.y - previous.y).abs() <= (old.x - previous.x).abs();
+    let next_horizontal = (old.y - next.y).abs() <= (old.x - next.x).abs();
+    if index == 0 {
+        if previous_horizontal {
+            target.y = previous.y;
+        } else {
+            target.x = previous.x;
+        }
+    } else if previous_horizontal {
+        points[index - 1].y = target.y;
+    } else {
+        points[index - 1].x = target.x;
+    }
+    if index + 1 == points.len() {
+        if next_horizontal {
+            target.y = next.y;
+        } else {
+            target.x = next.x;
+        }
+    } else if next_horizontal {
+        points[index + 1].y = target.y;
+    } else {
+        points[index + 1].x = target.x;
+    }
+    points[index] = target;
+    Some(points)
+}
+
 /// Distance from `point` to the segment `a..b`.
 #[must_use]
 pub fn distance_to_segment(point: MapPoint, a: MapPoint, b: MapPoint) -> f32 {
@@ -1264,6 +1359,98 @@ mod tests {
             "tail continues along the diagonal, got {:?}",
             line[line.len() - 1]
         );
+    }
+
+    #[test]
+    fn port_move_drags_the_adjacent_elbow_along_its_leg_axis() {
+        // tip_a (0.4, 0) → elbow (2.0, 0): a horizontal leg, so a port move
+        // to y = 1 pulls the elbow's y along and leaves x alone.
+        let points = [MapPoint::new(2.0, 0.0), MapPoint::new(2.0, 3.0)];
+        let moved = reroute_for_port_move(
+            &points,
+            MapPoint::new(0.4, 0.0),
+            Some(MapPoint::new(3.6, 3.0)),
+            MapPoint::new(0.4, 1.0),
+            false,
+        );
+        assert!(moved[0].nearly_equals(MapPoint::new(2.0, 1.0)));
+        assert!(moved[1].nearly_equals(points[1]), "far elbow untouched");
+
+        // The same move on endpoint B adjusts the *last* elbow instead.
+        let moved = reroute_for_port_move(
+            &points,
+            MapPoint::new(3.6, 3.0),
+            Some(MapPoint::new(0.4, 0.0)),
+            MapPoint::new(3.6, 2.0),
+            true,
+        );
+        assert!(moved[0].nearly_equals(points[0]), "near elbow untouched");
+        // tip_b→last elbow leg is horizontal ((3,-0.6) style comparisons):
+        // |last.y - old.y| = 0 <= |last.x - old.x| = 1.6, so y follows.
+        assert!(moved[1].nearly_equals(MapPoint::new(2.0, 2.0)));
+    }
+
+    #[test]
+    fn empty_route_gains_one_elbow_only_when_the_leg_turns_diagonal() {
+        let tip_a = MapPoint::new(0.4, 0.0);
+        let tip_b = MapPoint::new(3.6, 0.0);
+        // Straight leg stays empty.
+        let moved = reroute_for_port_move(&[], tip_a, Some(tip_b), MapPoint::new(0.4, 0.0), false);
+        assert!(moved.is_empty());
+        // A vertical port move breaks the axis: one elbow appears, vertical
+        // leg on A's side.
+        let new_tip = MapPoint::new(0.4, 1.0);
+        let moved = reroute_for_port_move(&[], tip_a, Some(tip_b), new_tip, false);
+        assert_eq!(moved.len(), 1);
+        assert!(moved[0].nearly_equals(MapPoint::new(0.4, 0.0)));
+        assert_eq!(orthogonal_violation(new_tip, &moved, tip_b), None);
+        // Moving B inserts the mirror elbow: vertical at A, horizontal at B.
+        let new_tip = MapPoint::new(3.6, 1.0);
+        let moved = reroute_for_port_move(&[], tip_b, Some(tip_a), new_tip, true);
+        assert_eq!(moved.len(), 1);
+        assert!(moved[0].nearly_equals(MapPoint::new(0.4, 1.0)));
+        assert_eq!(orthogonal_violation(tip_a, &moved, new_tip), None);
+        // No far tip (dangling): nothing to elbow toward.
+        assert!(reroute_for_port_move(&[], tip_a, None, new_tip, false).is_empty());
+    }
+
+    #[test]
+    fn waypoint_move_adjusts_both_neighbors_and_clamps_at_the_tips() {
+        let tip_a = MapPoint::new(0.4, 0.0);
+        let tip_b = MapPoint::new(3.6, 2.0);
+        let points = [
+            MapPoint::new(2.0, 0.0),
+            MapPoint::new(2.0, 2.0),
+        ];
+        // The interior-facing move: dragging index 1 pulls its stored
+        // neighbor's shared axis and clamps onto the tip-b leg.
+        let moved = reroute_for_waypoint_move(
+            &points,
+            1,
+            tip_a,
+            tip_b,
+            MapPoint::new(2.5, 2.5),
+        )
+        .expect("in range");
+        // prev leg (2,0)→(2,2) is vertical → neighbor x follows target.
+        assert!(moved[0].nearly_equals(MapPoint::new(2.5, 0.0)));
+        // next leg (2,2)→tip_b is horizontal → target clamps to y = 2.
+        assert!(moved[1].nearly_equals(MapPoint::new(2.5, 2.0)));
+        assert_eq!(orthogonal_violation(tip_a, &moved, tip_b), None);
+        // First-vertex moves clamp onto the tip-a leg instead of moving it.
+        let moved = reroute_for_waypoint_move(
+            &points,
+            0,
+            tip_a,
+            tip_b,
+            MapPoint::new(2.5, 0.5),
+        )
+        .expect("in range");
+        // tip_a leg is horizontal → y clamps to tip_a's; vertical leg to the
+        // stored neighbor drags its x.
+        assert!(moved[0].nearly_equals(MapPoint::new(2.5, 0.0)));
+        assert!(moved[1].nearly_equals(MapPoint::new(2.5, 2.0)));
+        assert!(reroute_for_waypoint_move(&points, 2, tip_a, tip_b, tip_a).is_none());
     }
 
     #[test]
