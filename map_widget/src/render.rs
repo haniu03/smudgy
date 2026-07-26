@@ -46,8 +46,10 @@ pub const MAP_PLAYER_INDICATOR_RADIUS: f32 = MAP_ROOM_SIZE / 4.0;
 pub const MIN_SCALING_FOR_MAP_GRID: f32 = 20.0;
 pub const MIN_SCALING_FOR_MAP_GRID_OPAQUE: f32 = 50.0;
 
-const LEVEL_STUB_HALF_SIZE: f32 = 0.08;
-const LEVEL_STUB_OFFSET: f32 = MAP_ROOM_SIZE / 2.0 + 0.09;
+/// Level-triangle glyph metrics come from the geometry pipeline so the drawn
+/// glyph and the hit/bounds footprint can never disagree.
+const LEVEL_STUB_HALF_SIZE: f32 = smudgy_cloud::connection_geometry::LEVEL_MARKER_HALF_SIZE;
+const LEVEL_STUB_OFFSET: f32 = smudgy_cloud::connection_geometry::LEVEL_MARKER_OFFSET;
 
 /// Dash pattern (in map units) for secret connections.
 const SECRET_DASH_SEGMENTS: &[f32] = &[0.12, 0.08];
@@ -288,8 +290,8 @@ pub fn draw_grid(frame: &mut canvas::Frame, region: &Region, scaling: f32) {
     }
 }
 
-/// Draws a small up (▲) or down (▼) triangle centered at `(cx, cy)`.
-fn draw_level_triangle(frame: &mut canvas::Frame, cx: f32, cy: f32, up: bool, color: Color) {
+/// The ▲/▼ glyph path centered at `(cx, cy)`.
+fn level_triangle_path(cx: f32, cy: f32, up: bool) -> canvas::Path {
     let dir = if up { -1.0 } else { 1.0 };
 
     let mut path = canvas::path::Builder::new();
@@ -303,20 +305,28 @@ fn draw_level_triangle(frame: &mut canvas::Frame, cx: f32, cy: f32, up: bool, co
         cy - dir * LEVEL_STUB_HALF_SIZE,
     ));
     path.close();
-
-    frame.fill(&path.build(), color);
+    path.build()
 }
 
-/// Draws the small triangle marking an Up (▲, top-right corner) or Down
-/// (▼, bottom-left corner) connection on a room.
-pub fn draw_level_stub(frame: &mut canvas::Frame, x: f32, y: f32, up: bool, color: Color) {
-    let (cx, cy) = if up {
-        (x + LEVEL_STUB_OFFSET, y - LEVEL_STUB_OFFSET)
-    } else {
-        (x - LEVEL_STUB_OFFSET, y + LEVEL_STUB_OFFSET)
-    };
-    draw_level_triangle(frame, cx, cy, up, color);
+/// Draws a small filled up (▲) or down (▼) triangle centered at `(cx, cy)`.
+fn draw_level_triangle(frame: &mut canvas::Frame, cx: f32, cy: f32, up: bool, color: Color) {
+    frame.fill(&level_triangle_path(cx, cy, up), color);
 }
+
+/// Draws the stroke-only ▲/▼ triangle marking an up/down *stub* exit — the
+/// hollow look distinguishes "an exit leaves this way" from a linked
+/// cross-level Connection's filled triangle.
+pub fn draw_level_triangle_outline(
+    frame: &mut canvas::Frame,
+    cx: f32,
+    cy: f32,
+    up: bool,
+    color: Color,
+    width: f32,
+) {
+    frame.stroke(&level_triangle_path(cx, cy, up), solid_stroke(color, width));
+}
+
 
 /// The center of a cross-level exit's level triangle when the exit carries a
 /// compass direction: placed on that side of the room rather than the fixed
@@ -348,6 +358,95 @@ fn cardinal_unit(direction: ExitDirection) -> Option<Vector> {
     }
 }
 
+/// How far the largest level-change treatment reaches from the room center:
+/// the fading directional stub's tip. Hit-testing pads its spatial query by
+/// this much so treatment glyphs outside a Connection's stroke bounds stay
+/// clickable.
+pub const LEVEL_TREATMENT_REACH: f32 = MAP_ROOM_SIZE / 2.0 + CROSS_LEVEL_STUB_REACH;
+
+/// The rendered level-change treatment of one cross-level Connection half —
+/// one authority shared by drawing and editor hit-testing, so exactly the
+/// visible glyph is the clickable target.
+#[derive(Debug, Clone, Copy)]
+pub enum LevelTreatment {
+    /// A ▲ (`up`) or ▼ triangle centered on the point.
+    Triangle { center: Point, up: bool },
+    /// The fading directional stub from the room's edge to its outward tip.
+    FadingStub { edge: Point, tip: Point },
+}
+
+impl LevelTreatment {
+    /// Distance from `point` to the treatment's visible footprint (the
+    /// triangle acts as a filled glyph: inside is distance zero).
+    #[must_use]
+    pub fn distance_to(&self, point: MapPoint) -> f32 {
+        match *self {
+            LevelTreatment::Triangle { center, .. } => (point
+                .distance(MapPoint::new(center.x, center.y))
+                - smudgy_cloud::connection_geometry::LEVEL_MARKER_RADIUS)
+                .max(0.0),
+            LevelTreatment::FadingStub { edge, tip } => {
+                smudgy_cloud::connection_geometry::distance_to_segment(
+                    point,
+                    MapPoint::new(edge.x, edge.y),
+                    MapPoint::new(tip.x, tip.y),
+                )
+            }
+        }
+    }
+}
+
+/// The level-change treatment a cross-level half renders with, or `None` for
+/// non-cross-level halves. `suppress_level_stubs` mirrors
+/// [`draw_connection`]'s parameter: ghost passes collapse everything to the
+/// compact corner triangle.
+#[must_use]
+pub fn level_treatment(
+    connection: &RoomConnection,
+    suppress_level_stubs: bool,
+) -> Option<LevelTreatment> {
+    let RoomConnectionEnd::ToLevel {
+        level, direction, ..
+    } = &connection.to
+    else {
+        return None;
+    };
+    let up = *level > connection.from_level;
+    let (x, y) = (connection.room.get_x(), connection.room.get_y());
+    let corner = || {
+        let center =
+            smudgy_cloud::connection_geometry::level_marker_center(MapPoint::new(x, y), up);
+        LevelTreatment::Triangle {
+            center: Point::new(center.x, center.y),
+            up,
+        }
+    };
+    if suppress_level_stubs {
+        // Ghost passes keep the compact corner triangle.
+        return Some(corner());
+    }
+    if connection.routing == ConnectionRouting::Stub {
+        // Stub routing re-anchors the level triangle to the endpoint's side.
+        let (cx, cy) = level_stub_anchor(x, y, *direction, up);
+        return Some(LevelTreatment::Triangle {
+            center: Point::new(cx, cy),
+            up,
+        });
+    }
+    if let Some(unit) = cardinal_unit(*direction) {
+        // A fade-only directional gradient stub (no glyph) for planar
+        // cardinals.
+        let half = MAP_ROOM_SIZE / 2.0;
+        let reach = half + CROSS_LEVEL_STUB_REACH;
+        return Some(LevelTreatment::FadingStub {
+            edge: Point::new(x + unit.x * half, y + unit.y * half),
+            tip: Point::new(x + unit.x * reach, y + unit.y * reach),
+        });
+    }
+    // Diagonal or non-planar (Up/Down): fall back to the corner.
+    Some(corner())
+}
+
 /// Draws a cross-level cardinal exit as a directional stub in the exit's
 /// compass direction, fading from full opacity at the room's edge toward
 /// [`CROSS_LEVEL_FADE_FLOOR`] at its tip so it reads as leaving for the
@@ -357,23 +456,11 @@ fn cardinal_unit(direction: ExitDirection) -> Option<Vector> {
 fn draw_cross_level_stub(
     frame: &mut canvas::Frame,
     connection: &RoomConnection,
-    x: f32,
-    y: f32,
-    unit: Vector,
+    edge: Point,
+    tip: Point,
     opacity: f32,
     is_secret: bool,
 ) {
-    let half = MAP_ROOM_SIZE / 2.0;
-    let edge = Point {
-        x: x + unit.x * half,
-        y: y + unit.y * half,
-    };
-    let reach = half + CROSS_LEVEL_STUB_REACH;
-    let tip = Point {
-        x: x + unit.x * reach,
-        y: y + unit.y * reach,
-    };
-
     let near = apply_opacity(connection.color, opacity);
     let far = apply_opacity(connection.color, opacity * CROSS_LEVEL_FADE_FLOOR);
     let fade = gradient::Linear::new(edge, tip)
@@ -516,30 +603,36 @@ pub fn draw_connection(
                 ..Default::default()
             });
         }
-        RoomConnectionEnd::ToLevel { level, direction, .. } => {
+        RoomConnectionEnd::ToLevel { .. } => {
             // Cross-level halves draw a marker treatment only — the shared
             // geometry carries both rooms' stubs, so stroking it from each
             // half would double-draw.
-            let up = *level > connection.from_level;
-            let (x, y) = (connection.room.get_x(), connection.room.get_y());
             let marker_color = apply_opacity(connection.color, fill_opacity);
-            if suppress_level_stubs {
-                // Ghost passes keep the compact corner triangle.
-                draw_level_stub(frame, x, y, up, marker_color);
-            } else if connection.routing == ConnectionRouting::Stub {
-                // Stub routing re-anchors the level triangle to the
-                // endpoint's side.
-                let (cx, cy) = level_stub_anchor(x, y, *direction, up);
-                draw_level_triangle(frame, cx, cy, up, marker_color);
-            } else if let Some(unit) = cardinal_unit(*direction) {
-                // A fade-only directional gradient stub (no glyph) for
-                // planar cardinals.
-                draw_cross_level_stub(frame, connection, x, y, unit, opacity, is_secret);
-            } else {
-                // Diagonal or non-planar (Up/Down): fall back to the corner.
-                draw_level_stub(frame, x, y, up, marker_color);
+            match level_treatment(connection, suppress_level_stubs) {
+                Some(LevelTreatment::Triangle { center, up }) => {
+                    draw_level_triangle(frame, center.x, center.y, up, marker_color);
+                }
+                Some(LevelTreatment::FadingStub { edge, tip }) => {
+                    draw_cross_level_stub(frame, connection, edge, tip, opacity, is_secret);
+                }
+                None => {}
             }
         }
+    }
+
+    // Up/down stub exits: the geometry swapped their wall stubs for corner
+    // level markers — drawn stroke-only, so a hollow ▲/▼ reads "an exit
+    // leaves this way" against the filled triangle of a linked cross-level
+    // Connection.
+    for &(center, up) in &geometry.level_markers {
+        draw_level_triangle_outline(
+            frame,
+            center.x,
+            center.y,
+            up,
+            fill_color,
+            connection.thickness,
+        );
     }
 }
 

@@ -21,7 +21,7 @@ use smudgy_cloud::{
         EndpointGeometry, GeometryInput, Handle as ConnectionHandle, distance_to_segment,
         port_position, resolve, reroute_for_port_move, reroute_for_waypoint_move, stub_tip,
     },
-    mapper::room_connection::RoomConnection,
+    mapper::{RoomKey, room_connection::RoomConnection},
 };
 
 use crate::{render, viewport};
@@ -1045,11 +1045,27 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         Some(canvas::Action::request_redraw().and_capture())
                     }
                     Interaction::Idle => {
-                        let room_key = self.room_key_at(map_position);
-                        if room_key == self.hovered_room {
+                        let top = self.entity_at(map_position);
+                        let room = match (top, self.area_id) {
+                            (Some(EntityId::Room(room_number)), Some(area_id)) => Some(RoomKey {
+                                area_id,
+                                room_number,
+                            }),
+                            _ => None,
+                        };
+                        let connection = match top {
+                            Some(EntityId::Connection(id)) if self.tool == Tool::Select => {
+                                Some(id)
+                            }
+                            _ => None,
+                        };
+                        if room == self.hovered_room && connection == self.hovered_connection {
                             Some(canvas::Action::request_redraw())
                         } else {
-                            Some(canvas::Action::publish(Message::SetHoveredRoom(room_key)))
+                            Some(canvas::Action::publish(Message::SetHovered {
+                                room,
+                                connection,
+                            }))
                         }
                     }
                 },
@@ -1210,6 +1226,24 @@ impl canvas::Program<Message, Theme> for MapEditor {
                 // Selection: dragged entities render offset; otherwise
                 // outline them in place.
                 let accent = theme.styles.general.accent;
+
+                // Hovered Connection: a muted accent glow that makes the
+                // otherwise invisible hit band discoverable. Selected
+                // connections already get the full outline below.
+                if let Some(hovered) = self.hovered_connection
+                    && matches!(state.interaction, Interaction::Idle)
+                    && !self.selection.contains(EntityId::Connection(hovered))
+                    && let Some(connection) = area.get_room_connections().iter().find(|item| {
+                        item.connection_id == hovered && item.from_level == self.level
+                    })
+                {
+                    Self::stroke_resolved_connection_outline(
+                        frame,
+                        connection,
+                        render::apply_opacity(accent, 0.35),
+                    );
+                }
+
                 if let Some(offset) = drag_offset {
                     frame.with_save(|frame| {
                         frame.translate(offset);
@@ -1367,7 +1401,8 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         frame.fill(&path, accent);
                         frame.stroke(
                             &path,
-                            render::solid_stroke(Color::WHITE, 1.0 / self.scaling),
+                            // Stroke widths are pixel-space: a crisp 1-px ring.
+                            render::solid_stroke(Color::WHITE, 1.0),
                         );
                     }
                 }
@@ -1555,12 +1590,7 @@ impl MapEditor {
                     if let Some(preview) = connection_preview.filter(|preview| {
                         preview.connection_id == id && preview.from_level == self.level
                     }) {
-                        Self::stroke_resolved_connection_outline(
-                            frame,
-                            preview,
-                            accent,
-                            self.scaling,
-                        );
+                        Self::stroke_resolved_connection_outline(frame, preview, accent);
                     } else {
                         self.stroke_connection_outline(frame, area, id, accent);
                     }
@@ -1624,20 +1654,43 @@ impl MapEditor {
         }) else {
             return;
         };
-        Self::stroke_resolved_connection_outline(frame, connection, accent, self.scaling);
+        Self::stroke_resolved_connection_outline(frame, connection, accent);
     }
 
+    /// Accent-strokes the *visible* form of one Connection half: the stroked
+    /// primitives (plus any corner level markers) for planar halves, or the
+    /// level-change treatment glyph for cross-level halves — never the
+    /// undrawn wall stubs behind a treatment. Stroke widths are pixel-space,
+    /// so the highlight stays legible at any zoom.
     fn stroke_resolved_connection_outline(
         frame: &mut canvas::Frame,
         connection: &RoomConnection,
         accent: Color,
-        scaling: f32,
     ) {
-        let width = connection.thickness + 4.0 / scaling;
+        let width = connection.thickness + 4.0;
+        if let Some(treatment) = render::level_treatment(connection, false) {
+            match treatment {
+                render::LevelTreatment::Triangle { center, up } => {
+                    render::draw_level_triangle_outline(
+                        frame, center.x, center.y, up, accent, width,
+                    );
+                }
+                render::LevelTreatment::FadingStub { edge, tip } => {
+                    frame.stroke(
+                        &canvas::Path::line(edge, tip),
+                        render::solid_stroke(accent, width),
+                    );
+                }
+            }
+            return;
+        }
         frame.stroke(
             &render::path_from_primitives(&connection.geometry.primitives),
             render::solid_stroke(accent, width),
         );
+        for &(center, up) in &connection.geometry.level_markers {
+            render::draw_level_triangle_outline(frame, center.x, center.y, up, accent, width);
+        }
     }
 }
 

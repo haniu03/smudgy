@@ -335,7 +335,13 @@ pub enum Message {
         rect: Rectangle,
         additive: bool,
     },
-    SetHoveredRoom(Option<RoomKey>),
+    /// The topmost hover targets under an idle cursor: the hovered room (any
+    /// tool) and, in Select mode, the hovered Connection — published
+    /// together so one mouse move can never leave one of them stale.
+    SetHovered {
+        room: Option<RoomKey>,
+        connection: Option<ConnectionId>,
+    },
     MoveCommitted {
         offset: Vector,
     },
@@ -406,6 +412,10 @@ pub struct MapEditor {
     last_viewport_size: Cell<Option<Size>>,
     player_location: Option<RoomKey>,
     hovered_room: Option<RoomKey>,
+    /// The Connection under an idle Select-tool cursor, drawn with a muted
+    /// accent glow so the invisible hit band and click cycling are
+    /// discoverable.
+    hovered_connection: Option<ConnectionId>,
     selected_connection_handle: Option<(ConnectionId, SelectedConnectionHandle)>,
     /// Accepted solver output awaiting user confirmation. This is view-only:
     /// the cache and stored Connection remain untouched until the host emits
@@ -435,6 +445,7 @@ impl MapEditor {
             last_viewport_size: Cell::new(None),
             player_location: None,
             hovered_room: None,
+            hovered_connection: None,
             selected_connection_handle: None,
             automatic_route_preview: None,
             activity: EditorActivity::Idle,
@@ -449,6 +460,7 @@ impl MapEditor {
         self.area_id = area_id;
         self.selection.clear();
         self.hovered_room = None;
+        self.hovered_connection = None;
         self.selected_connection_handle = None;
         self.automatic_route_preview = None;
         self.activity = EditorActivity::Idle;
@@ -524,6 +536,7 @@ impl MapEditor {
             self.level = level;
             self.selection.clear();
             self.hovered_room = None;
+            self.hovered_connection = None;
             self.selected_connection_handle = None;
             self.automatic_route_preview = None;
             self.activity = EditorActivity::Idle;
@@ -535,6 +548,7 @@ impl MapEditor {
     pub fn set_level_keeping_selection(&mut self, level: i32) {
         self.level = level;
         self.hovered_room = None;
+        self.hovered_connection = None;
     }
 
     #[must_use]
@@ -687,9 +701,13 @@ impl MapEditor {
                 }
                 Update::with_event(Event::SelectionChanged)
             }
-            Message::SetHoveredRoom(room_key) => {
-                self.hovered_room = room_key.clone();
-                Update::with_event(Event::HoveredRoomChanged(room_key))
+            Message::SetHovered { room, connection } => {
+                self.hovered_connection = connection;
+                if self.hovered_room == room {
+                    return Update::none();
+                }
+                self.hovered_room = room.clone();
+                Update::with_event(Event::HoveredRoomChanged(room))
             }
             Message::MoveCommitted { offset } => {
                 Update::with_event(Event::RequestMutation(MutationRequest::MoveSelection {
@@ -991,8 +1009,9 @@ impl MapEditor {
         hits
     }
 
-    /// Visible Connection strokes within a stable six-pixel target, nearest
-    /// first and UUID-stable for crossing click-cycling.
+    /// Visible Connection strokes and level-change glyphs within a stable
+    /// six-pixel target, nearest first and UUID-stable for crossing
+    /// click-cycling.
     fn connection_hits(
         &self,
         area: &smudgy_cloud::mapper::area_cache::AreaCache,
@@ -1000,24 +1019,36 @@ impl MapEditor {
     ) -> Vec<ConnectionId> {
         let tolerance = 6.0 / self.scaling;
         let map_point = MapPoint::new(point.x, point.y);
+        // Level treatments (corner triangles, fading directional stubs) can
+        // reach outside a cross-level Connection's stroke bounds; pad the
+        // spatial query so their halves stay candidates.
+        let reach = tolerance + render::LEVEL_TREATMENT_REACH;
         let mut hits = Vec::new();
         let mut seen = HashSet::new();
         area.with_room_connections_in(
-            point.x - tolerance,
-            point.y - tolerance,
-            point.x + tolerance,
-            point.y + tolerance,
+            point.x - reach,
+            point.y - reach,
+            point.x + reach,
+            point.y + reach,
             |connection| {
-                if connection.from_level != self.level
-                    || !seen.insert(connection.connection_id)
-                    || !connection.geometry.hit_test(map_point, tolerance)
-                {
+                if connection.from_level != self.level || !seen.insert(connection.connection_id) {
                     return;
                 }
-                hits.push((
-                    connection.connection_id,
-                    connection.geometry.distance_to(map_point),
-                ));
+                let mut distance = if connection.geometry.hit_test(map_point, tolerance) {
+                    connection.geometry.distance_to(map_point)
+                } else {
+                    f32::INFINITY
+                };
+                // The rendered level glyph is clickable exactly as drawn.
+                if let Some(treatment) = render::level_treatment(connection, false) {
+                    let glyph = treatment.distance_to(map_point);
+                    if glyph <= tolerance {
+                        distance = distance.min(glyph);
+                    }
+                }
+                if distance.is_finite() {
+                    hits.push((connection.connection_id, distance));
+                }
             },
         );
         hits.sort_by(|(id_a, distance_a), (id_b, distance_b)| {
@@ -1026,17 +1057,6 @@ impl MapEditor {
                 .then_with(|| id_a.cmp(id_b))
         });
         hits.into_iter().map(|(id, _)| id).collect()
-    }
-
-    #[must_use]
-    fn room_key_at(&self, point: Point) -> Option<RoomKey> {
-        match self.entity_at(point) {
-            Some(EntityId::Room(number)) => Some(RoomKey {
-                area_id: self.area_id?,
-                room_number: number,
-            }),
-            _ => None,
-        }
     }
 
     /// The bounds of the single selected label/shape on the current level

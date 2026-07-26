@@ -53,6 +53,18 @@ pub const DANGLING_TAIL_LENGTH: f32 = 0.25;
 /// unrelated quantities that merely start equal.
 pub const MARKER_RESERVE: f32 = 0.25;
 
+/// Distance from a room center to the center of its up/down level triangle,
+/// along both axes (▲ at the top-right corner, ▼ at the bottom-left). The
+/// renderer's corner glyphs and the hit/bounds footprint share this value.
+pub const LEVEL_MARKER_OFFSET: f32 = ROOM_SIZE / 2.0 + 0.09;
+
+/// Half the edge span of the level triangle glyph.
+pub const LEVEL_MARKER_HALF_SIZE: f32 = 0.08;
+
+/// Disc radius approximating the level triangle's footprint for hit-testing
+/// (the triangle's circumradius).
+pub const LEVEL_MARKER_RADIUS: f32 = LEVEL_MARKER_HALF_SIZE * std::f32::consts::SQRT_2;
+
 /// Map-space stroke width of one thickness unit. `thickness: 1.0` matches
 /// the familiar 1-px stroke at the default zoom (40 px per map unit);
 /// strokes scale with the map while selection tolerance stays screen-space.
@@ -134,11 +146,19 @@ pub enum StubAxis {
     /// Diagonal exits: a stub along the exit's unit diagonal, leaving the
     /// corner-inset port toward the room corner it names.
     Diagonal(MapPoint),
-    /// Vertical/portal exits (up/down/in/out/special): no stub of their own —
-    /// a drawn line meets the room directly at the port. Contexts that must
-    /// stay visible without a line (explicit `Stub` routing, marker kinds,
-    /// dangling tails) and the routed-mode anchor tips fall back to the wall
-    /// normal.
+    /// Up/Down exits: no stub — where an unrouted look would need one
+    /// (explicit `Stub` routing, dangling tails), the endpoint draws its
+    /// level triangle at the fixed room corner instead (▲ top-right,
+    /// ▼ bottom-left). Drawn lines and routed anchor tips behave exactly as
+    /// [`StubAxis::None`]. The marker kinds (External/CrossLevel) own their
+    /// glyph treatments and keep the wall-normal fallback.
+    Level {
+        up: bool,
+    },
+    /// Portal exits (in/out/special): no stub of their own — a drawn line
+    /// meets the room directly at the port. Contexts that must stay visible
+    /// without a line (explicit `Stub` routing, marker kinds, dangling
+    /// tails) and the routed-mode anchor tips fall back to the wall normal.
     None,
 }
 
@@ -156,13 +176,30 @@ impl StubAxis {
             ExitDirection::Southeast => Self::Diagonal(MapPoint::new(DIAG, DIAG)),
             ExitDirection::Southwest => Self::Diagonal(MapPoint::new(-DIAG, DIAG)),
             ExitDirection::Northwest => Self::Diagonal(MapPoint::new(-DIAG, -DIAG)),
-            ExitDirection::Up
-            | ExitDirection::Down
-            | ExitDirection::In
+            ExitDirection::Up => Self::Level { up: true },
+            ExitDirection::Down => Self::Level { up: false },
+            ExitDirection::In
             | ExitDirection::Out
             | ExitDirection::Special
             | ExitDirection::Other => Self::None,
         }
+    }
+}
+
+/// The center of a room's up/down level triangle: ▲ at the top-right corner,
+/// ▼ at the bottom-left, [`LEVEL_MARKER_OFFSET`] out along both axes.
+#[must_use]
+pub fn level_marker_center(room_center: MapPoint, up: bool) -> MapPoint {
+    if up {
+        MapPoint::new(
+            room_center.x + LEVEL_MARKER_OFFSET,
+            room_center.y - LEVEL_MARKER_OFFSET,
+        )
+    } else {
+        MapPoint::new(
+            room_center.x - LEVEL_MARKER_OFFSET,
+            room_center.y + LEVEL_MARKER_OFFSET,
+        )
     }
 }
 
@@ -304,6 +341,11 @@ pub struct ConnectionGeometry {
     /// Stroked circles (the self-loop arc), hit-tested and bounded
     /// analytically rather than via a polygon approximation.
     pub circles: Vec<(MapPoint, f32)>,
+    /// Up/down level triangles standing in for wall stubs on `Level`-axis
+    /// endpoints in the stub looks (`Stub` routing, dangling): `(center,
+    /// up)`. Renderers draw the ▲/▼ glyph; hit-testing treats each as a
+    /// filled disc of [`LEVEL_MARKER_RADIUS`].
+    pub level_markers: Vec<(MapPoint, bool)>,
     /// Unit tangent leaving port A along the path (A→B sense).
     pub start_tangent: MapPoint,
     /// Unit tangent arriving at the far end along the path (A→B sense). For
@@ -331,6 +373,10 @@ impl ConnectionGeometry {
         }
         for &(center, radius) in &self.circles {
             best = best.min((point.distance(center) - radius).abs());
+        }
+        for &(center, _) in &self.level_markers {
+            // A filled glyph: anywhere inside the footprint is distance 0.
+            best = best.min((point.distance(center) - LEVEL_MARKER_RADIUS).max(0.0));
         }
         best
     }
@@ -393,7 +439,7 @@ pub fn stub_tip(port: MapPoint, side: RoomSide) -> MapPoint {
 pub fn stub_direction(side: RoomSide, stub: StubAxis) -> MapPoint {
     match stub {
         StubAxis::Diagonal(direction) => direction,
-        StubAxis::Normal | StubAxis::None => side.outward(),
+        StubAxis::Normal | StubAxis::Level { .. } | StubAxis::None => side.outward(),
     }
 }
 
@@ -403,7 +449,7 @@ pub fn stub_direction(side: RoomSide, stub: StubAxis) -> MapPoint {
 #[must_use]
 pub fn visible_stub_tip(port: MapPoint, side: RoomSide, stub: StubAxis) -> MapPoint {
     match stub {
-        StubAxis::None => port,
+        StubAxis::None | StubAxis::Level { .. } => port,
         axis => port + stub_direction(side, axis).scale(STUB_LENGTH),
     }
 }
@@ -451,6 +497,7 @@ pub fn resolve(input: &GeometryInput<'_>) -> ConnectionGeometry {
         primitives: Vec::new(),
         flattened: Vec::new(),
         circles: Vec::new(),
+        level_markers: Vec::new(),
         start_tangent: stub_direction(a.side, a.stub),
         end_tangent: input.endpoint_b.map_or(stub_direction(a.side, a.stub), |b| {
             stub_direction(b.side, b.stub).scale(-1.0)
@@ -697,30 +744,52 @@ fn resolve_stroke(
         // Bare wall stubs, middle hidden — Stub mode for every kind, and the
         // stub half of the marker kinds whose middle glyph the renderer owns
         // (markers anchor on the exposed stub tips; nothing re-derives them).
-        // These always draw a stub, so stub-less endpoints degrade to their
-        // wall normal.
+        // These always stay visible: stub-less endpoints degrade to their
+        // wall normal, except up/down endpoints outside the marker kinds,
+        // whose stub is the corner level triangle itself.
         (_, ConnectionRouting::Stub)
         | (ConnectionKind::External | ConnectionKind::CrossLevel, _) => {
-            let tip_a = forced_stub_tip(port_a, input.endpoint_a.side, input.endpoint_a.stub);
-            geometry.stub_tip_a = tip_a;
-            push_polyline(geometry, &[port_a, tip_a]);
+            // External/CrossLevel glyphs (area dots, cross-level triangles)
+            // anchor on the exposed stub tips, so those kinds keep the wall
+            // stub whatever the axis.
+            let marker_kind = matches!(
+                input.kind,
+                ConnectionKind::External | ConnectionKind::CrossLevel
+            );
+            if let (false, StubAxis::Level { up }) = (marker_kind, input.endpoint_a.stub) {
+                push_level_marker(geometry, input.endpoint_a.room_center, up);
+            } else {
+                let tip_a = forced_stub_tip(port_a, input.endpoint_a.side, input.endpoint_a.stub);
+                geometry.stub_tip_a = tip_a;
+                push_polyline(geometry, &[port_a, tip_a]);
+            }
             if let (Some(port), Some(b)) = (port_b, input.endpoint_b) {
-                let tip = forced_stub_tip(port, b.side, b.stub);
-                geometry.stub_tip_b = Some(tip);
-                push_polyline(geometry, &[port, tip]);
+                if let (false, StubAxis::Level { up }) = (marker_kind, b.stub) {
+                    push_level_marker(geometry, b.room_center, up);
+                } else {
+                    let tip = forced_stub_tip(port, b.side, b.stub);
+                    geometry.stub_tip_b = Some(tip);
+                    push_polyline(geometry, &[port, tip]);
+                }
             }
         }
         (ConnectionKind::SelfLoop, _) => {
             resolve_self_loop(geometry, input, port_a, port_b);
         }
         (ConnectionKind::Dangling, _) => {
-            let direction = stub_direction(input.endpoint_a.side, input.endpoint_a.stub);
-            let tip = forced_stub_tip(port_a, input.endpoint_a.side, input.endpoint_a.stub);
-            geometry.stub_tip_a = tip;
-            let tail = tip + direction.scale(DANGLING_TAIL_LENGTH);
-            let line = dedup(&[port_a, tip, tail]);
-            push_polyline(geometry, &line);
-            geometry.centerline = line;
+            if let StubAxis::Level { up } = input.endpoint_a.stub {
+                // A dangling up/down exit is its corner triangle; no tail
+                // line and no centerline, so nothing grows an arrowhead.
+                push_level_marker(geometry, input.endpoint_a.room_center, up);
+            } else {
+                let direction = stub_direction(input.endpoint_a.side, input.endpoint_a.stub);
+                let tip = forced_stub_tip(port_a, input.endpoint_a.side, input.endpoint_a.stub);
+                geometry.stub_tip_a = tip;
+                let tail = tip + direction.scale(DANGLING_TAIL_LENGTH);
+                let line = dedup(&[port_a, tip, tail]);
+                push_polyline(geometry, &line);
+                geometry.centerline = line;
+            }
         }
         (ConnectionKind::Internal, ConnectionRouting::Simple) => {
             if let (Some(port), Some(tip)) = (port_b, tip_b) {
@@ -798,6 +867,16 @@ fn finalize_bounds(geometry: &mut ConnectionGeometry, input: &GeometryInput<'_>,
             .bounds
             .include(MapPoint::new(center.x + radius, center.y + radius));
     }
+    for &(center, _) in &geometry.level_markers {
+        geometry.bounds.include(MapPoint::new(
+            center.x - LEVEL_MARKER_RADIUS,
+            center.y - LEVEL_MARKER_RADIUS,
+        ));
+        geometry.bounds.include(MapPoint::new(
+            center.x + LEVEL_MARKER_RADIUS,
+            center.y + LEVEL_MARKER_RADIUS,
+        ));
+    }
     if matches!(
         input.kind,
         ConnectionKind::External | ConnectionKind::CrossLevel
@@ -822,6 +901,13 @@ fn finalize_bounds(geometry: &mut ConnectionGeometry, input: &GeometryInput<'_>,
     geometry
         .bounds
         .expand(input.thickness.max(0.0) * BASE_STROKE_WIDTH / 2.0 + ARROW_SIZE + BOUNDS_PAD);
+}
+
+/// Records an up/down level-triangle marker at its fixed room corner.
+fn push_level_marker(geometry: &mut ConnectionGeometry, room_center: MapPoint, up: bool) {
+    geometry
+        .level_markers
+        .push((level_marker_center(room_center, up), up));
 }
 
 /// Appends a sharp polyline as primitives + one flattened subpath.
@@ -1231,8 +1317,14 @@ mod tests {
             kind: ConnectionKind::Internal,
             routing: ConnectionRouting::Simple,
             corner: CornerStyle::Sharp,
-            endpoint_a: stubless(0.0, 0.0, RoomSide::East, 0.2),
-            endpoint_b: Some(stubless(1.0, -1.0, RoomSide::West, 0.8)),
+            endpoint_a: EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Up),
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: Some(EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Down),
+                ..endpoint(1.0, -1.0, RoomSide::West, 0.8)
+            }),
             route_points: &[],
             thickness: 1.0,
         };
@@ -1359,6 +1451,78 @@ mod tests {
             "tail continues along the diagonal, got {:?}",
             line[line.len() - 1]
         );
+    }
+
+    #[test]
+    fn stub_routed_up_endpoint_swaps_its_stub_for_the_corner_triangle() {
+        let input = GeometryInput {
+            kind: ConnectionKind::Internal,
+            routing: ConnectionRouting::Stub,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Up),
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: Some(endpoint(4.0, 0.0, RoomSide::West, 0.5)),
+            route_points: &[],
+            thickness: 1.0,
+        };
+        let g = resolve(&input);
+        assert_eq!(g.flattened.len(), 1, "only the cardinal endpoint keeps a stub");
+        assert_eq!(g.level_markers.len(), 1);
+        let (center, up) = g.level_markers[0];
+        assert!(up);
+        assert!(center.nearly_equals(MapPoint::new(LEVEL_MARKER_OFFSET, -LEVEL_MARKER_OFFSET)));
+        assert!(g.hit_test(center, 0.01), "triangle footprint is clickable");
+        assert!(g.bounds.contains(center), "bounds cover the marker");
+    }
+
+    #[test]
+    fn dangling_down_exit_is_a_corner_triangle_with_no_tail() {
+        let input = GeometryInput {
+            kind: ConnectionKind::Dangling,
+            routing: ConnectionRouting::Simple,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Down),
+                ..endpoint(0.0, 0.0, RoomSide::West, 0.8)
+            },
+            endpoint_b: None,
+            route_points: &[],
+            thickness: 1.0,
+        };
+        let g = resolve(&input);
+        assert!(g.flattened.is_empty(), "no stub or tail line");
+        assert!(g.centerline.is_empty(), "no centerline, so no arrowhead");
+        assert_eq!(g.level_markers.len(), 1);
+        let (center, up) = g.level_markers[0];
+        assert!(!up);
+        assert!(center.nearly_equals(MapPoint::new(-LEVEL_MARKER_OFFSET, LEVEL_MARKER_OFFSET)));
+        assert!(g.hit_test(center, 0.01));
+    }
+
+    #[test]
+    fn marker_kinds_keep_wall_stubs_on_level_endpoints() {
+        // CrossLevel glyphs anchor on the stub tips, so an up member still
+        // strokes its wall stub rather than emitting a duplicate triangle.
+        let input = GeometryInput {
+            kind: ConnectionKind::CrossLevel,
+            routing: ConnectionRouting::Simple,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Up),
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: Some(EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Down),
+                ..endpoint(0.0, -4.0, RoomSide::West, 0.8)
+            }),
+            route_points: &[],
+            thickness: 1.0,
+        };
+        let g = resolve(&input);
+        assert_eq!(g.flattened.len(), 2, "both wall stubs survive");
+        assert!(g.level_markers.is_empty());
     }
 
     #[test]
