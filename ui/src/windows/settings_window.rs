@@ -1266,17 +1266,9 @@ impl SettingsWindow {
             .spacing(2),
         );
         col = col.push(
-            column![
-                checkbox(self.settings.terminal_font_ligatures)
-                    .label("Font ligatures")
-                    .on_toggle(Message::PrefFontLigaturesToggled),
-                dim_text(
-                    "Let the terminal font merge character pairs like => or fi into \
-                     single glyphs. Off keeps every character in its own column, \
-                     which most MUD text assumes.",
-                ),
-            ]
-            .spacing(2),
+            checkbox(self.settings.terminal_font_ligatures)
+                .label("Enable font ligature support")
+                .on_toggle(Message::PrefFontLigaturesToggled),
         );
         col = col.push(pref_input(
             "Font size",
