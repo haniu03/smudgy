@@ -15,8 +15,8 @@ use iced::{Color, Point, Rectangle, Size, Vector, mouse};
 use iced::event::Event as IcedEvent;
 
 use smudgy_cloud::{
-    ConnectionEndpoint, ConnectionId, ConnectionRouting, ConnectionUpdates, MapPoint, PortMode,
-    RoomNumber, RoomSide, SegmentShape,
+    CORNER_INSET, ConnectionEndpoint, ConnectionId, ConnectionRouting, ConnectionUpdates, MapPoint,
+    PortMode, RoomNumber, RoomSide, SegmentShape,
     connection_geometry::{
         EndpointGeometry, GeometryInput, Handle as ConnectionHandle, distance_to_segment,
         port_position, resolve, stub_tip,
@@ -366,6 +366,7 @@ impl MapEditor {
                     connection.endpoint_a.room_number,
                     Point::new(room.get_x(), room.get_y()),
                     current,
+                    !modifiers.alt(),
                 );
                 let mut route_points = None;
                 if connection.segment_shape == SegmentShape::Orthogonal
@@ -415,6 +416,7 @@ impl MapEditor {
                     endpoint_b.room_number,
                     Point::new(room.get_x(), room.get_y()),
                     current,
+                    !modifiers.alt(),
                 );
                 let mut route_points = None;
                 if connection.segment_shape == SegmentShape::Orthogonal
@@ -480,6 +482,13 @@ impl MapEditor {
         let room_b = updated
             .endpoint_b
             .and_then(|endpoint| area.get_room(&endpoint.room_number));
+        let mut preview = area
+            .get_room_connections()
+            .iter()
+            .find(|connection| {
+                connection.connection_id == *connection_id && connection.from_level == self.level
+            })?
+            .clone();
         let geometry = resolve(&GeometryInput {
             kind: updated.kind,
             routing: updated.routing,
@@ -488,6 +497,7 @@ impl MapEditor {
                 room_center: MapPoint::new(room_a.get_x(), room_a.get_y()),
                 side: updated.endpoint_a.side,
                 port_offset: updated.endpoint_a.port_offset,
+                stub: preview.stub_a,
             },
             endpoint_b: updated
                 .endpoint_b
@@ -496,17 +506,11 @@ impl MapEditor {
                     room_center: MapPoint::new(room.get_x(), room.get_y()),
                     side: endpoint.side,
                     port_offset: endpoint.port_offset,
+                    stub: preview.stub_b,
                 }),
             route_points: &updated.route_points,
             thickness: updated.thickness,
         });
-        let mut preview = area
-            .get_room_connections()
-            .iter()
-            .find(|connection| {
-                connection.connection_id == *connection_id && connection.from_level == self.level
-            })?
-            .clone();
         preview.geometry = Arc::new(geometry);
         preview.routing = updated.routing;
         preview.corner = updated.corner;
@@ -1482,10 +1486,15 @@ impl canvas::Program<Message, Theme> for MapEditor {
     }
 }
 
+/// The wall offsets a snapped port drag can land on: the wall midpoint and
+/// the two corner-inset slots every automatic anchor uses.
+const PORT_SNAP_OFFSETS: [f32; 3] = [CORNER_INSET, 0.5, 1.0 - CORNER_INSET];
+
 fn endpoint_at_pointer(
     room_number: RoomNumber,
     center: Point,
     pointer: Point,
+    snap: bool,
 ) -> ConnectionEndpoint {
     let half = render::MAP_ROOM_SIZE / 2.0;
     let left = center.x - half;
@@ -1502,11 +1511,21 @@ fn endpoint_at_pointer(
         .into_iter()
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map_or(RoomSide::East, |(side, _)| side);
-    let port_offset = match side {
+    let mut port_offset = match side {
         RoomSide::North | RoomSide::South => (pointer.x - left) / render::MAP_ROOM_SIZE,
         RoomSide::East | RoomSide::West => (pointer.y - top) / render::MAP_ROOM_SIZE,
     }
     .clamp(0.0, 1.0);
+    if snap {
+        port_offset = PORT_SNAP_OFFSETS
+            .into_iter()
+            .min_by(|a, b| {
+                (a - port_offset)
+                    .abs()
+                    .total_cmp(&(b - port_offset).abs())
+            })
+            .unwrap_or(port_offset);
+    }
     ConnectionEndpoint {
         room_number,
         side,
@@ -1703,5 +1722,28 @@ fn rect_from_corners(a: Point, b: Point) -> Rectangle {
         y: a.y.min(b.y),
         width: (a.x - b.x).abs(),
         height: (a.y - b.y).abs(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_drags_snap_to_midpoint_and_corner_slots() {
+        let center = Point::new(0.0, 0.0);
+        let room = RoomNumber(1);
+        // Near the east wall, slightly below the middle: the wall midpoint.
+        let snapped = endpoint_at_pointer(room, center, Point::new(0.25, 0.03), true);
+        assert_eq!(snapped.side, RoomSide::East);
+        assert!((snapped.port_offset - 0.5).abs() < f32::EPSILON);
+        // Toward the north end of the same wall: the corner-inset slot.
+        let corner = endpoint_at_pointer(room, center, Point::new(0.25, -0.1), true);
+        assert_eq!(corner.side, RoomSide::East);
+        assert!((corner.port_offset - CORNER_INSET).abs() < f32::EPSILON);
+        // Snapping disabled (Alt held): the exact pointer offset survives.
+        let free = endpoint_at_pointer(room, center, Point::new(0.25, 0.03), false);
+        assert!((free.port_offset - 0.56).abs() < 1e-4);
+        assert_eq!(free.port_mode, PortMode::Manual);
     }
 }

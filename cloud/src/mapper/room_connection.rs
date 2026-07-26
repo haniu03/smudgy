@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use crate::{
     AreaId, ConnectionDash, ConnectionId, ConnectionKind, ConnectionRouting, CornerStyle,
-    ExitDirection, connection_geometry::ConnectionGeometry, mapper::room_cache::RoomCache,
+    ExitDirection,
+    connection_geometry::{ConnectionGeometry, StubAxis},
+    mapper::room_cache::RoomCache,
 };
 
 /// A resolved render view over one stored [`crate::Connection`] half: the
@@ -26,6 +28,11 @@ pub struct RoomConnection {
     pub dash: ConnectionDash,
     pub corner: CornerStyle,
     pub thickness: f32,
+    /// The member-exit-derived stub axes the geometry was resolved with,
+    /// kept so editor previews re-resolving during a drag reproduce the
+    /// same stub treatment.
+    pub stub_a: StubAxis,
+    pub stub_b: StubAxis,
     /// The Connection's parsed color (renderer-gray fallback when the stored
     /// string does not parse).
     pub color: iced::Color,

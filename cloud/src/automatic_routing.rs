@@ -18,7 +18,7 @@ use crate::{
     ConnectionKind, ConnectionRouting, CornerStyle, MAX_COORDINATE, MAX_ROUTE_POINTS, MapPoint,
     RoomNumber, RoomSide,
     connection_geometry::{
-        ARROW_SIZE, BASE_STROKE_WIDTH, EndpointGeometry, GeometryInput, ROOM_SIZE,
+        ARROW_SIZE, BASE_STROKE_WIDTH, EndpointGeometry, GeometryInput, ROOM_SIZE, StubAxis,
         orthogonal_violation, port_position, resolve, stub_tip,
     },
 };
@@ -143,6 +143,9 @@ impl RouteEndpoint {
             room_center: self.room_center,
             side: self.side,
             port_offset: self.port_offset,
+            // Automatic routing anchors on the wall-normal contract tips, so
+            // the solver never needs the member exit's stub axis.
+            stub: StubAxis::Normal,
         }
     }
 }

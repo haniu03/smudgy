@@ -101,7 +101,11 @@ pub fn resolve_legend(
             return vec![
                 LegendItem {
                     key: "Drag",
-                    action: "move along the room edge",
+                    action: "snap to midpoint or corners",
+                },
+                LegendItem {
+                    key: "Alt",
+                    action: "move freely",
                 },
                 LegendItem {
                     key: "Esc",

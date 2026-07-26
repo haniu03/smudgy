@@ -403,14 +403,22 @@ pub fn default_anchor_for_bearing(bearing: MapPoint) -> (RoomSide, f32) {
 
 /// The wall and offset an endpoint is *initialized* to from an exit
 /// direction (never permanently derived — the inspector can move an endpoint
-/// to any side afterwards): compass directions anchor their named wall, with
-/// diagonals inset from the shared corner (NW = North wall at `0.2`, NE at `0.8`,
-/// and likewise on the South wall).
+/// to any side afterwards). Every named direction owns a fixed home slot, so
+/// an exit's port never depends on where its partner room sits or on what
+/// else shares the wall:
+///
+/// - compass directions anchor their named wall midpoint, with diagonals
+///   inset from the shared corner (NW = North wall at `0.2`, NE at `0.8`,
+///   and likewise on the South wall);
+/// - the vertical pair claims opposite corners of the vertical walls — Up
+///   the top-right (East wall at `0.2`), Down the bottom-left (West wall at
+///   `0.8`) — and In/Out mirror them across the other diagonal (In top-left,
+///   Out bottom-right), giving all twelve named directions distinct slots.
 ///
 /// `partner_bearing` is the unit-ish vector from this room toward the
-/// partner (other room center, or outbound direction), used only by the
-/// non-planar directions which have no wall of their own; without one they
-/// fall back to East at `0.5`.
+/// partner (other room center, or outbound direction), used only by
+/// `Special`/`Other` which have no direction semantics at all; without one
+/// they fall back to East at `0.5`.
 #[must_use]
 pub fn default_anchor_for_direction(
     direction: ExitDirection,
@@ -425,12 +433,11 @@ pub fn default_anchor_for_direction(
         ExitDirection::South => (RoomSide::South, 0.5),
         ExitDirection::Southeast => (RoomSide::South, 1.0 - CORNER_INSET),
         ExitDirection::West => (RoomSide::West, 0.5),
-        ExitDirection::Up
-        | ExitDirection::Down
-        | ExitDirection::In
-        | ExitDirection::Out
-        | ExitDirection::Special
-        | ExitDirection::Other => {
+        ExitDirection::Up => (RoomSide::East, CORNER_INSET),
+        ExitDirection::Down => (RoomSide::West, 1.0 - CORNER_INSET),
+        ExitDirection::In => (RoomSide::West, CORNER_INSET),
+        ExitDirection::Out => (RoomSide::East, 1.0 - CORNER_INSET),
+        ExitDirection::Special | ExitDirection::Other => {
             partner_bearing.map_or((RoomSide::East, 0.5), default_anchor_for_bearing)
         }
     }
@@ -497,17 +504,41 @@ mod tests {
     }
 
     #[test]
-    fn non_planar_directions_follow_partner_bearing() {
-        let east = default_anchor_for_direction(ExitDirection::Up, Some(MapPoint::new(2.0, 0.5)));
-        assert_eq!(east, (RoomSide::East, 0.5));
-        let north = default_anchor_for_direction(ExitDirection::In, Some(MapPoint::new(0.5, -2.0)));
-        assert_eq!(north, (RoomSide::North, 0.5));
-        let northeast =
-            default_anchor_for_direction(ExitDirection::Down, Some(MapPoint::new(2.0, -2.0)));
-        assert_eq!(northeast, (RoomSide::North, 1.0 - CORNER_INSET));
-        let cardinal_bias =
-            default_anchor_for_direction(ExitDirection::Up, Some(MapPoint::new(2.0, 1.0)));
-        assert_eq!(cardinal_bias, (RoomSide::East, 0.5));
+    fn vertical_and_portal_directions_pin_their_home_corners() {
+        // Up/Down/In/Out ignore the partner bearing entirely: the slot is
+        // the direction's, not the layout's.
+        for bearing in [
+            None,
+            Some(MapPoint::new(2.0, 0.5)),
+            Some(MapPoint::new(-2.0, 2.0)),
+        ] {
+            assert_eq!(
+                default_anchor_for_direction(ExitDirection::Up, bearing),
+                (RoomSide::East, CORNER_INSET),
+                "up owns the top-right corner"
+            );
+            assert_eq!(
+                default_anchor_for_direction(ExitDirection::Down, bearing),
+                (RoomSide::West, 1.0 - CORNER_INSET),
+                "down owns the bottom-left corner"
+            );
+            assert_eq!(
+                default_anchor_for_direction(ExitDirection::In, bearing),
+                (RoomSide::West, CORNER_INSET),
+                "in owns the top-left corner"
+            );
+            assert_eq!(
+                default_anchor_for_direction(ExitDirection::Out, bearing),
+                (RoomSide::East, 1.0 - CORNER_INSET),
+                "out owns the bottom-right corner"
+            );
+        }
+        // Special/Other have no direction semantics: they still follow the
+        // partner bearing, falling back to the East midpoint.
+        assert_eq!(
+            default_anchor_for_direction(ExitDirection::Special, Some(MapPoint::new(0.5, -2.0))),
+            (RoomSide::North, 0.5)
+        );
         assert_eq!(
             default_anchor_for_direction(ExitDirection::Other, None),
             (RoomSide::East, 0.5)

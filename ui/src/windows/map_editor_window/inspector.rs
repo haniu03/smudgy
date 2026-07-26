@@ -193,9 +193,12 @@ fn endpoint_bearing(
 }
 
 /// Computes the deterministic preview/commit payload for an explicit wall
-/// redistribution. Manual endpoints remain fixed. AutoPinned endpoints use
-/// their rank in the full bearing-ordered group, preserving stable UUID/role
-/// tie-breaks and the public/effective-secret layout split.
+/// redistribution — the author-invoked fan-out for walls where several
+/// pinned ports coincide, and deliberately the ONLY port redistribution
+/// anywhere: creation, migration, and retargeting all pin ports at their
+/// direction's semantic default. Manual endpoints remain fixed. AutoPinned
+/// endpoints use their rank in the full bearing-ordered group, preserving
+/// stable UUID/role tie-breaks and the public/effective-secret layout split.
 pub(super) fn redistribute_port_updates(
     area: &AreaCache,
     room_number: RoomNumber,

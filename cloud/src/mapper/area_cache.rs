@@ -320,6 +320,21 @@ impl AreaCache {
                 continue;
             };
 
+            let stub_a = connection_geometry::StubAxis::for_direction(Self::direction_at(
+                members,
+                connection.endpoint_a.room_number,
+                Some(connection.endpoint_a.side),
+            ));
+            let stub_b = connection
+                .endpoint_b
+                .as_ref()
+                .map_or(connection_geometry::StubAxis::Normal, |endpoint| {
+                    connection_geometry::StubAxis::for_direction(Self::direction_at(
+                        members,
+                        endpoint.room_number,
+                        Some(endpoint.side),
+                    ))
+                });
             let geometry = Arc::new(connection_geometry::resolve(
                 &connection_geometry::GeometryInput {
                     kind: connection.kind,
@@ -329,12 +344,14 @@ impl AreaCache {
                         room_center: MapPoint::new(room_a.get_x(), room_a.get_y()),
                         side: connection.endpoint_a.side,
                         port_offset: connection.endpoint_a.port_offset,
+                        stub: stub_a,
                     },
                     endpoint_b: connection.endpoint_b.as_ref().zip(room_b).map(
                         |(endpoint, room)| connection_geometry::EndpointGeometry {
                             room_center: MapPoint::new(room.get_x(), room.get_y()),
                             side: endpoint.side,
                             port_offset: endpoint.port_offset,
+                            stub: stub_b,
                         },
                     ),
                     route_points: &connection.route_points,
@@ -361,6 +378,8 @@ impl AreaCache {
                 dash: connection.dash,
                 corner: connection.corner,
                 thickness: connection.thickness,
+                stub_a,
+                stub_b,
                 color: parse_css_color(&connection.color).unwrap_or(DEFAULT_CONNECTION_ICED_COLOR),
                 is_bidirectional,
                 arrow_toward_b,
