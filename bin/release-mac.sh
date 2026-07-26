@@ -120,6 +120,17 @@ mkdir -p "$out_dir"
 
 # --- build ------------------------------------------------------------------
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
+    # Materialize the patch-crate-managed dependency patches (patches/*.patch ->
+    # target/patch/): [patch.crates-io] points there, so every cargo invocation
+    # below (cargo-about included) fails to resolve on a fresh checkout or
+    # after a `cargo clean` until they exist.
+    command -v cargo-patch-crate >/dev/null 2>&1 || {
+        echo "==> cargo install --locked patch-crate"
+        cargo install --locked patch-crate
+    }
+    echo "==> cargo patch-crate --force"
+    cargo patch-crate --force
+
     echo "==> cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md"
     cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md
 

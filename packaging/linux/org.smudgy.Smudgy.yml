@@ -55,6 +55,12 @@ modules:
       build-args:
         - --share=network
     build-commands:
+      # Materialize the patch-crate-managed dependency patches (patches/*.patch
+      # -> target/patch/): the dir source skips target/, so the patched crates
+      # must be recreated inside the sandbox before any cargo invocation.
+      # cargo finds the subcommand in $CARGO_HOME/bin without a PATH change.
+      - cargo install --locked patch-crate
+      - cargo patch-crate --force
       # LTO release build of just the app binary, default features (regex backend;
       # the optional hyperscan C++ backend stays off). `release-full` is the same
       # LTO'd profile the Windows/macOS releases use (root Cargo.toml); it outputs
