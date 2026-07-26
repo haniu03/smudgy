@@ -1396,17 +1396,29 @@ impl MapEditorWindow {
                         .ok()
                         .map(|n| Some(RoomNumber(n)))
                 };
+                // A room number with no area picked means the current area
+                // — the dropdown hints this with the area's name as its
+                // placeholder, and committing makes it explicit.
+                let implied_area = match (&parsed, self.inspector.exits.get(index)) {
+                    (Some(Some(_)), Some(row)) if row.to_area.is_none() => self.editor.area_id(),
+                    _ => None,
+                };
                 if let Some(row) = self.inspector.exits.get_mut(index) {
                     row.to_room = value;
                     if parsed == Some(None) {
                         row.to_area = None;
                         row.to_direction = None;
+                    } else if implied_area.is_some() {
+                        row.to_area = implied_area;
                     }
                 }
                 match parsed {
                     Some(to_room_number) => {
                         self.commit_exit_field(index, FieldId::Destination, move |updates| {
                             updates.to_room_number = to_room_number;
+                            if let Some(area_id) = implied_area {
+                                updates.to_area_id = Some(area_id);
+                            }
                             if to_room_number.is_none() {
                                 // The wire contract can only null a
                                 // destination as a whole (`clear_to`); an
@@ -2919,6 +2931,12 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
     // With a perspective anchor, the traversal leaving the anchor room
     // lists first — matching the endpoint editors' From/To order.
     let area = window.editor.area_id().and_then(|id| atlas.get_area(&id));
+    // An unpicked destination area defaults to the current one when a room
+    // number is entered; the dropdown hints that with the area's name as
+    // its dimmed placeholder.
+    let area_placeholder = area
+        .as_ref()
+        .map_or_else(|| "area".to_string(), |area| area.get_name().to_string());
     let mut order: Vec<usize> = (0..state.exits.len()).collect();
     if connection_selected && let Some(anchor) = window.editor.connection_anchor() {
         order.sort_by_key(|&index| state.exits[index].from_room != anchor);
@@ -2994,7 +3012,7 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
                     pick_list(area_choices.clone(), selected_area, move |choice| {
                         super::Message::Inspector(Message::ExitToAreaChanged(index, choice))
                     })
-                    .placeholder("area")
+                    .placeholder(area_placeholder.clone())
                     .text_size(12)
                     .width(Length::Fill),
                     trash_button(super::Message::Inspector(Message::ExitDeleted(index))),

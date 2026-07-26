@@ -94,6 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Connections light up under the cursor.** Hovering a link in the
   editor's Select mode glows it, so the click target (and click-cycling
   through crossings) is discoverable before you commit to a click.
+- **Destination room numbers assume the current map.** Typing a room
+  number into an exit's destination with no map picked selects the map
+  you're editing automatically — the dropdown shows its name dimmed as
+  the placeholder, so the default is visible before you type.
 
 ### Changed
 
