@@ -389,21 +389,57 @@ impl GameStream {
         }
     }
 
-    /// Write all of `bytes` to the stream and flush. The flush matters for TLS: rustls
-    /// buffers plaintext into the session record, so without it a lone interactive command
-    /// would sit unsent until the next write. On plain TCP `flush` is a no-op (`nodelay` is
-    /// already set), so flushing uniformly costs nothing there.
-    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+    /// Write all of `bytes` to the stream and flush, requiring forward
+    /// progress (see [`write_all_with_stall_guard`]): a peer that has stopped
+    /// reading entirely fails the write with `TimedOut` after `stall` instead
+    /// of parking it for the OS's own multi-minute TCP timeout.
+    async fn write_all_stall_guarded(&mut self, bytes: &[u8], stall: Duration) -> io::Result<()> {
         match self {
-            Self::Plain(stream) => {
-                stream.write_all(bytes).await?;
-                stream.flush().await
-            }
-            Self::Tls(stream) => {
-                stream.write_all(bytes).await?;
-                stream.flush().await
-            }
+            Self::Plain(stream) => write_all_with_stall_guard(stream, bytes, stall).await,
+            Self::Tls(stream) => write_all_with_stall_guard(stream, bytes, stall).await,
         }
+    }
+}
+
+/// Write all of `bytes` and flush, requiring forward progress: every accepted
+/// byte resets a `stall` clock, so a slowly draining peer is never cut off, but
+/// one that has stopped reading entirely (a zero TCP window) fails the write
+/// with `TimedOut` once the clock runs out.
+///
+/// The flush (same budget) matters for TLS: rustls buffers plaintext into the
+/// session record, so without it a lone interactive command would sit unsent
+/// until the next write. On plain TCP `flush` is a no-op (`nodelay` is already
+/// set), so flushing uniformly costs nothing there.
+///
+/// Kernel buffering bounds how quickly a dead peer trips this: Unix parks a
+/// write within a few hundred KB of buffered outbound; Windows dynamically
+/// absorbs far more before its first `Pending`, deferring (not defeating) the
+/// guard there.
+async fn write_all_with_stall_guard<S>(
+    stream: &mut S,
+    mut bytes: &[u8],
+    stall: Duration,
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    fn stalled(stall: Duration) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("no write progress within {stall:?}"),
+        )
+    }
+    while !bytes.is_empty() {
+        match tokio::time::timeout(stall, stream.write(bytes)).await {
+            Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(Ok(written)) => bytes = &bytes[written..],
+            Ok(Err(err)) => return Err(err),
+            Err(_elapsed) => return Err(stalled(stall)),
+        }
+    }
+    match tokio::time::timeout(stall, stream.flush()).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(stalled(stall)),
     }
 }
 
@@ -438,6 +474,15 @@ impl TlsMode {
 /// rare coop-budget-induced early batch end on the TLS drain path is possible but harmless
 /// (no data loss; the tail reads on the next wake) and does not affect the plain path.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The zero-progress budget for one outbound write. A slowly draining peer is never cut
+/// off — every accepted byte resets the clock — but a peer that has stopped reading
+/// entirely (a zero TCP window; the OS would otherwise park the write for its own
+/// multi-minute timeout) forfeits the connection. Tearing down closes the frame queue,
+/// which also unparks a runtime producer awaiting queue capacity — without this, a full
+/// queue against a wedged server leaves the whole session (including its `Disconnect`
+/// handling) frozen until the TCP stack gives up.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Connect the transport: TCP, then a TLS handshake if requested. `host` is the server name
 /// for certificate verification and SNI (a DNS name or IP literal).
@@ -674,6 +719,9 @@ pub struct Connection {
     /// reports the real size in its first NAWS answer; later changes ride
     /// [`OutboundFrame::WindowSize`].
     window_size: Arc<std::sync::atomic::AtomicU32>,
+    /// Zero-progress write budget handed to each connect task
+    /// ([`WRITE_STALL_TIMEOUT`]); a field so tests can shrink it.
+    write_stall_timeout: Duration,
 }
 
 fn clear_socket_sender(socket_tx: &RwLock<Option<WeakSender<OutboundFrame>>>) {
@@ -695,6 +743,7 @@ impl std::fmt::Debug for Connection {
             .field("on_connect", &self.on_connect.is_some())
             .field("raw_wanted", &self.raw_wanted)
             .field("window_size", &self.window_size)
+            .field("write_stall_timeout", &self.write_stall_timeout)
             .finish()
     }
 }
@@ -715,6 +764,7 @@ impl Connection {
             on_connect: None,
             raw_wanted,
             window_size,
+            write_stall_timeout: WRITE_STALL_TIMEOUT,
         }
     }
 
@@ -832,6 +882,7 @@ impl Connection {
         let on_connect = self.on_connect.take();
         let raw_wanted = self.raw_wanted.clone();
         let window_size = self.window_size.clone();
+        let write_stall_timeout = self.write_stall_timeout;
 
         spawn_io_task(async move {
             let mut vt_parser = VTParser::new();
@@ -980,8 +1031,12 @@ impl Connection {
                                                         log_raw(&mut raw_log, &slice[..consumed]);
                                                         fed = true;
                                                         if !telnet_replies.is_empty()
-                                                            && let Err(err) =
-                                                                stream.write_all(&telnet_replies).await
+                                                            && let Err(err) = stream
+                                                                .write_all_stall_guarded(
+                                                                    &telnet_replies,
+                                                                    write_stall_timeout,
+                                                                )
+                                                                .await
                                                         {
                                                             warn!(
                                                                 "Failed to write telnet reply to {addr}: {err}"
@@ -1062,7 +1117,10 @@ impl Connection {
                                                                         plain = &plain[fed_n..];
                                                                         if !telnet_replies.is_empty()
                                                                             && let Err(err) = stream
-                                                                                .write_all(&telnet_replies)
+                                                                                .write_all_stall_guarded(
+                                                                                    &telnet_replies,
+                                                                                    write_stall_timeout,
+                                                                                )
                                                                                 .await
                                                                         {
                                                                             warn!(
@@ -1132,7 +1190,13 @@ impl Connection {
                                                                     telnet::command::DONT,
                                                                     compression_option,
                                                                 ];
-                                                                stream.write_all(&dont).await.ok();
+                                                                stream
+                                                                    .write_all_stall_guarded(
+                                                                        &dont,
+                                                                        write_stall_timeout,
+                                                                    )
+                                                                    .await
+                                                                    .ok();
                                                                 runtime_tx
                                                                     .send(RuntimeAction::Echo(Arc::new(
                                                                         "Compression error — disconnecting.".to_string(),
@@ -1187,36 +1251,71 @@ impl Connection {
                                     }
                             }
                             Some(frame) = write_to_socket_rx.recv() => {
-                                let mut outcome = match &frame {
-                                    OutboundFrame::Text(text) => {
-                                        if transcode.is_passthrough() {
-                                            stream.write_all(text.as_bytes()).await
-                                        } else {
-                                            // Encode to the active charset and double any
-                                            // 0xFF the encoding produced (UTF-8 output can
-                                            // never contain one; legacy encodings can).
+                                // The frame write races the disconnect signal: a wedged
+                                // peer parks the write (until the stall guard fires), and
+                                // during that park a full frame queue can leave the session
+                                // runtime itself awaiting queue capacity — unable to run
+                                // its own `Disconnect` handling. A user's disconnect must
+                                // preempt the parked write, not wait it out.
+                                let write_frame = async {
+                                    let mut outcome = match &frame {
+                                        OutboundFrame::Text(text) => {
+                                            if transcode.is_passthrough() {
+                                                stream
+                                                    .write_all_stall_guarded(
+                                                        text.as_bytes(),
+                                                        write_stall_timeout,
+                                                    )
+                                                    .await
+                                            } else {
+                                                // Encode to the active charset and double any
+                                                // 0xFF the encoding produced (UTF-8 output can
+                                                // never contain one; legacy encodings can).
+                                                stream
+                                                    .write_all_stall_guarded(
+                                                        transcode.encode_outbound(text),
+                                                        write_stall_timeout,
+                                                    )
+                                                    .await
+                                            }
+                                        }
+                                        OutboundFrame::Raw(bytes) => {
                                             stream
-                                                .write_all(transcode.encode_outbound(text))
+                                                .write_all_stall_guarded(bytes, write_stall_timeout)
                                                 .await
                                         }
+                                        OutboundFrame::WindowSize => Ok(()),
+                                    };
+                                    // Emit a changed NAWS report after every queued frame. That
+                                    // makes a full queue safely coalesce a WindowSize wakeup:
+                                    // one of the already-pending frames will observe the shared
+                                    // size cell as soon as capacity starts draining.
+                                    telnet_replies.clear();
+                                    if outcome.is_ok()
+                                        && telnet.local_enabled(telnet::option::NAWS)
+                                        && protocol.send_naws_if_changed(&mut telnet_replies)
+                                    {
+                                        outcome = stream
+                                            .write_all_stall_guarded(
+                                                &telnet_replies,
+                                                write_stall_timeout,
+                                            )
+                                            .await;
                                     }
-                                    OutboundFrame::Raw(bytes) => stream.write_all(bytes).await,
-                                    OutboundFrame::WindowSize => Ok(()),
+                                    outcome
                                 };
-                                // Emit a changed NAWS report after every queued frame. That
-                                // makes a full queue safely coalesce a WindowSize wakeup:
-                                // one of the already-pending frames will observe the shared
-                                // size cell as soon as capacity starts draining.
-                                telnet_replies.clear();
-                                if outcome.is_ok()
-                                    && telnet.local_enabled(telnet::option::NAWS)
-                                    && protocol.send_naws_if_changed(&mut telnet_replies)
-                                {
-                                    outcome = stream.write_all(&telnet_replies).await;
-                                }
-                                if let Err(err) = outcome {
-                                    warn!("Socket write to {addr} failed: {err}");
-                                    break;
+                                tokio::pin!(write_frame);
+                                select! {
+                                    outcome = &mut write_frame => {
+                                        if let Err(err) = outcome {
+                                            warn!("Socket write to {addr} failed: {err}");
+                                            break;
+                                        }
+                                    }
+                                    _ = &mut disconnect_rx => {
+                                        graceful = true;
+                                        break;
+                                    }
                                 }
                             }
                             _ = &mut disconnect_rx => {
@@ -1603,6 +1702,231 @@ mod tests {
         })
         .await
         .expect("the full burst should drain without drops or deadlock");
+    }
+
+    /// Large enough to overwhelm Unix loopback kernel buffers, so a write
+    /// against a peer that never reads parks mid-write on a zero TCP window —
+    /// the wedged-server condition. Windows dynamically absorbs even this
+    /// (measured: 64 MiB accepted in ~5ms against a 4 KB receive buffer), so
+    /// TCP-level wedge tests only exercise a truly parked write on Unix; the
+    /// stall-guard unit tests above cover the parked path deterministically
+    /// everywhere.
+    fn wedge_frame() -> Arc<[u8]> {
+        Arc::from(vec![b'x'; 64 * 1024 * 1024])
+    }
+
+    /// Accepts one connection and never reads from it, holding the socket open
+    /// until released: the kernel buffers fill and the client's write parks
+    /// indefinitely, exactly like a wedged (zero-window) server. The receive
+    /// buffer is shrunk before listening (accepted sockets inherit it) because
+    /// loopback defaults can otherwise absorb tens of megabytes and let the
+    /// write complete instead of wedging.
+    fn never_reading_server() -> (u16, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .set_recv_buffer_size(4096)
+            .expect("shrink receive buffer");
+        socket
+            .bind("127.0.0.1:0".parse().expect("loopback address"))
+            .expect("bind");
+        let listener = socket.listen(8).expect("listen");
+        let port = listener.local_addr().expect("listener address").port();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept");
+            release_rx.await.ok();
+        });
+        (port, release_tx, server)
+    }
+
+    async fn expect_connected(runtime_rx: &mut tokio_mpsc::UnboundedReceiver<RuntimeAction>) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(runtime_rx.recv().await, Some(RuntimeAction::Connected)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("connection should become ready");
+    }
+
+    /// A scripted zero-window peer: accepts a fixed number of bytes, then
+    /// never accepts another.
+    struct WedgedWriter {
+        accept: usize,
+    }
+
+    impl tokio::io::AsyncWrite for WedgedWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if self.accept == 0 {
+                // No waker is registered: only the stall guard's timer can
+                // end the write, exactly like a peer that never reads again.
+                return std::task::Poll::Pending;
+            }
+            let written = self.accept.min(buf.len());
+            self.accept -= written;
+            std::task::Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A slow but healthy peer: accepts exactly one byte per write call.
+    struct TrickleWriter;
+
+    impl tokio::io::AsyncWrite for TrickleWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(usize::from(!buf.is_empty())))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stall_guard_times_out_a_peer_that_stopped_accepting_bytes() {
+        let mut wedged = WedgedWriter { accept: 10 };
+        let error =
+            write_all_with_stall_guard(&mut wedged, &[b'x'; 64], Duration::from_millis(50))
+                .await
+                .expect_err("a zero-window peer must time the write out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn stall_guard_lets_a_slowly_draining_peer_finish() {
+        write_all_with_stall_guard(&mut TrickleWriter, &[b'x'; 256], Duration::from_millis(50))
+            .await
+            .expect("byte-at-a-time progress is never a stall");
+    }
+
+    #[tokio::test]
+    async fn disconnect_preempts_a_write_wedged_on_a_peer_that_stopped_reading() {
+        let (port, release_tx, server) = never_reading_server();
+
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+        expect_connected(&mut runtime_rx).await;
+
+        connection
+            .write_raw(wedge_frame())
+            .await
+            .expect("the frame should be queued");
+        // Give the socket task time to pick the frame up and (on Unix) park
+        // inside the write before asking for the disconnect. On Windows the
+        // kernel absorbs the frame, so this degrades to a plain-disconnect
+        // smoke test there.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        connection.disconnect();
+
+        let mut disconnected = false;
+        let mut reported_disconnect = false;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let action = runtime_rx.recv().await.expect("runtime action");
+                match action {
+                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Echo(text) if text.as_str() == "Disconnected." => {
+                        reported_disconnect = true;
+                    }
+                    _ => {}
+                }
+                if disconnected && reported_disconnect {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("disconnect should preempt the wedged write, not wait out TCP");
+
+        release_tx.send(()).ok();
+        server.await.expect("server task");
+    }
+
+    /// Unix-only: Windows never parks the TCP write (see [`wedge_frame`]), so
+    /// without a wedge there is no stall, no teardown, and the producer loop
+    /// would spin successfully forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stalled_write_times_out_and_unparks_a_producer_awaiting_capacity() {
+        let (port, release_tx, server) = never_reading_server();
+
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.write_stall_timeout = Duration::from_millis(300);
+        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+        expect_connected(&mut runtime_rx).await;
+
+        connection
+            .write_raw(wedge_frame())
+            .await
+            .expect("the frame should be queued");
+
+        // Fill the queue behind the wedged frame until a write parks awaiting
+        // capacity, then keep writing: the stall timeout must tear the socket
+        // down and surface an error here instead of leaving the producer
+        // parked for the TCP stack's own timeout.
+        let producer = async {
+            while connection.write(Arc::new("n".to_string())).await.is_ok() {}
+        };
+        let watcher = async {
+            let mut disconnected = false;
+            let mut reported_loss = false;
+            loop {
+                let action = runtime_rx.recv().await.expect("runtime action");
+                match action {
+                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Echo(text) if text.as_str() == "Connection lost" => {
+                        reported_loss = true;
+                    }
+                    _ => {}
+                }
+                if disconnected && reported_loss {
+                    break;
+                }
+            }
+        };
+
+        timeout(Duration::from_secs(10), async {
+            tokio::join!(producer, watcher);
+        })
+        .await
+        .expect("the stall timeout should tear down the socket and unpark the producer");
+
+        release_tx.send(()).ok();
+        server.await.expect("server task");
     }
 
     #[tokio::test]
