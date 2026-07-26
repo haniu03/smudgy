@@ -975,6 +975,15 @@ async fn concurrent_edits_conflict_refetch_replay_and_converge() {
     // B still holds the pre-write revision, so its envelope 409s; the client
     // refetches, replays the pending edit over the fresh projection, and
     // resends under the same operation id.
+    //
+    // Deliberately NO `sync_now()` here: the enqueue itself wakes the
+    // mutation worker, and waking the sync engine too would race its row
+    // sweep (`note_rows_confirmed`) against the send — if the sweep wins, the
+    // envelope carries the fresh revision, is accepted without a conflict,
+    // and the area's content refetch stays deferred (B has an in-flight
+    // write), leaving room 2 out of B's atlas until a later tick. Only the
+    // stale-revision send pins the 409 → refetch → replay path this test is
+    // about.
     mapper_b.upsert_room(
         RoomKey::new(area, RoomNumber(3)),
         RoomUpdates {
@@ -982,7 +991,6 @@ async fn concurrent_edits_conflict_refetch_replay_and_converge() {
             ..RoomUpdates::default()
         },
     );
-    mapper_b.sync_now();
     assert!(
         mapper_b
             .wait_for_sync_completion(10)
