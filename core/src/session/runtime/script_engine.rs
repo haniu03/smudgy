@@ -301,11 +301,6 @@ pub struct ScriptEngine<'a> {
     /// refcount bumps only (the per-line `sys:receive` path allocates no key strings).
     platform_event_keys: RefCell<HashMap<String, PlatformEventKeys>>,
     current_line: Rc<RefCell<Weak<StyledLine>>>,
-    /// The current-line staleness scope (see [`ops::LineScope`]): `current` is bumped by
-    /// [`Self::set_current_line`] per installed line; `armed` is set/restored by the
-    /// user-JS entry points below around every synchronous entry, and checked by the
-    /// ambient `line` mutators. One cell shared into every isolate's ops.
-    line_scope: ops::LineScopeCell,
     #[allow(dead_code)]
     pending_line_operations: &'a Rc<RefCell<Vec<LineOperation>>>,
     #[allow(dead_code)]
@@ -940,7 +935,6 @@ impl<'a> ScriptEngine<'a> {
         let server_path = smudgy_dir.join(params.server_name.as_str());
 
         let current_line = Rc::new(RefCell::new(Weak::new()));
-        let line_scope: ops::LineScopeCell = Rc::new(Cell::new(ops::LineScope::default()));
 
         // Per-isolate waker demux state (`EVENT-LOOP-READINESS-DEMUX.md`): `ready` records which
         // isolates have a pending wakeup; `parent` holds the session task's waker so a per-isolate
@@ -980,7 +974,6 @@ impl<'a> ScriptEngine<'a> {
         let mapper = params.mapper.clone();
         let extra_extensions = params.extra_script_extensions.clone();
         let current_line_for_ext = current_line.clone();
-        let line_scope_for_ext = line_scope.clone();
         // The same introspection mirror the `Manager` writes; bound into every isolate's ops.
         let automation_registry = params.automation_registry.clone();
         // One session-global `singleton` reservation set, shared (the same `Rc`) into every
@@ -1079,9 +1072,6 @@ impl<'a> ScriptEngine<'a> {
                     spawned_actions.clone(),
                     pending_ops.clone(),
                     current_line_for_ext.clone(),
-                    // The current-line staleness scope the ambient `line` mutators check
-                    // (armed by the engine's user-JS entry points).
-                    line_scope_for_ext.clone(),
                     emitted_line_count.clone(),
                     // The read ops resolve `buffer.line(n)` against this ring.
                     recent_lines.clone(),
@@ -1917,7 +1907,6 @@ impl<'a> ScriptEngine<'a> {
             ui_tx: params.ui_tx,
             pending_line_operations: params.pending_line_operations,
             current_line,
-            line_scope,
             mapper: params.mapper,
             ready,
             parent,
@@ -2011,50 +2000,13 @@ impl<'a> ScriptEngine<'a> {
             .is_some_and(|subs| !subs.is_empty())
     }
 
+    /// Install (or clear) the line in flight. The ambient `line` mutators gate on
+    /// this shared cell directly (see `ops::ensure_current_line`): they are valid
+    /// from install until the line's completion action consumes it — for any code
+    /// that runs in that window, not just the trigger/`sys:receive` entry run for
+    /// the line.
     pub fn set_current_line(&mut self, line: Option<Weak<StyledLine>>) {
-        match line {
-            Some(line) => {
-                *self.current_line.borrow_mut() = line;
-                // Stamp the installed line with a fresh generation: the staleness
-                // nonce the entry points below capture and the ambient `line`
-                // mutators check (see `ops::LineScope`).
-                let mut scope = self.line_scope.get();
-                scope.current = scope.current.wrapping_add(1);
-                self.line_scope.set(scope);
-            }
-            None => {
-                *self.current_line.borrow_mut() = Weak::new();
-            }
-        }
-    }
-
-    /// Arm the current-line scope for one synchronous user-JS entry: capture the
-    /// in-flight line's generation (0 when no line is in flight — the line's `Arc`
-    /// is held by its queued completion action, so a dead `Weak` means the line
-    /// already finished). Returns the prior armed value for the paired
-    /// [`Self::restore_line_scope`] — save/restore exactly like `EventDepth` at the
-    /// same call sites. Async continuations resume in the event-loop pump, outside
-    /// any armed entry, which is what makes a stale `line.gag()` detectable.
-    fn arm_line_scope(
-        line_scope: &ops::LineScopeCell,
-        current_line: &Rc<RefCell<Weak<StyledLine>>>,
-    ) -> u64 {
-        let mut scope = line_scope.get();
-        let prior = scope.armed;
-        scope.armed = if current_line.borrow().strong_count() > 0 {
-            scope.current
-        } else {
-            0
-        };
-        line_scope.set(scope);
-        prior
-    }
-
-    /// The restore half of [`Self::arm_line_scope`].
-    fn restore_line_scope(line_scope: &ops::LineScopeCell, prior: u64) {
-        let mut scope = line_scope.get();
-        scope.armed = prior;
-        line_scope.set(scope);
+        *self.current_line.borrow_mut() = line.unwrap_or_default();
     }
 
     /// Slow safety-net interval for the session run loop's idle `select!`. Readiness driving
@@ -2183,10 +2135,6 @@ impl<'a> ScriptEngine<'a> {
         // integration test, which strands the continuation if this seed is removed).
         self.mark_isolate_ready(isolate);
 
-        // Cloned out before `isolate_mut` borrows `self`; armed below beside `EventDepth`.
-        let line_scope = self.line_scope.clone();
-        let current_line = self.current_line.clone();
-
         let bundle = self.isolate_mut(isolate)?;
         // Clone the `v8::Global` out and drop the registry `Ref` *before* the v8 call.
         // `script_functions` is the same `Rc<RefCell<…>>` this isolate's create ops
@@ -2219,10 +2167,6 @@ impl<'a> ScriptEngine<'a> {
             .try_borrow::<ops::EventDepth>()
             .map_or(0, |d| d.0);
         op_state.borrow_mut().put(ops::EventDepth(depth));
-        // Arm the current-line scope for this entry (save/restore like `EventDepth`):
-        // trigger and `sys:receive` handlers run for the line in flight, so its
-        // generation is captured here and the ambient `line` mutators compare it.
-        let prior_line_scope = Self::arm_line_scope(&line_scope, &current_line);
         // Make the owning isolate current for this call (it usually isn't — Model B leaves the
         // enter-stack empty between ops); released after the scope on the way out.
         let _entered = EnteredIsolate::enter(deno);
@@ -2281,7 +2225,6 @@ impl<'a> ScriptEngine<'a> {
 
         // Restore the enclosing depth (0 at the outermost dispatch) now the handler has returned.
         op_state.borrow_mut().put(ops::EventDepth(prior_depth));
-        Self::restore_line_scope(&line_scope, prior_line_scope);
 
         if let Some(started) = started {
             trace!(
@@ -2323,19 +2266,12 @@ impl<'a> ScriptEngine<'a> {
         // Demux: a widget/hotkey callback can schedule async work synchronously; seed the target
         // isolate so the next pump arms it.
         self.mark_isolate_ready(isolate_id);
-        // Cloned out before `isolate_mut` borrows `self`; armed below beside `EventDepth`.
-        let line_scope = self.line_scope.clone();
-        let current_line = self.current_line.clone();
         let deno = self.isolate_mut(isolate_id)?.runtime.deno_runtime();
         // A widget/hotkey callback is a top-level dispatch (depth 0); stamp it so a store `set`
         // inside the callback journals at depth 0 rather than inheriting a stale `EventDepth`
         // from an earlier handler on this isolate. No restore needed — 0 is the between-dispatch
         // baseline the save/restore in the other dispatch paths returns to.
         deno.op_state().borrow_mut().put(ops::EventDepth(0));
-        // Arm the current-line scope for this entry (paired restore below): a callback
-        // dispatched while a line is in flight may act on that line, one dispatched
-        // between lines may not.
-        let prior_line_scope = Self::arm_line_scope(&line_scope, &current_line);
         // Make the target isolate current for this callback (Model B), released after the scope.
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
@@ -2367,7 +2303,6 @@ impl<'a> ScriptEngine<'a> {
             }
         };
 
-        Self::restore_line_scope(&line_scope, prior_line_scope);
         result
     }
 
@@ -2405,9 +2340,6 @@ impl<'a> ScriptEngine<'a> {
         // Demux: a link callback can schedule async work synchronously; seed the
         // target isolate so the next pump arms it.
         self.mark_isolate_ready(isolate_id);
-        // Cloned out before `isolate_mut` borrows `self`; armed below beside `EventDepth`.
-        let line_scope = self.line_scope.clone();
-        let current_line = self.current_line.clone();
         let deno = self.isolate_mut(isolate_id)?.runtime.deno_runtime();
         let function = {
             let op_state = deno.op_state();
@@ -2421,9 +2353,6 @@ impl<'a> ScriptEngine<'a> {
         };
         // Top-level dispatch (depth 0), like a widget callback.
         deno.op_state().borrow_mut().put(ops::EventDepth(0));
-        // Arm the current-line scope for this entry (paired restore below), like the
-        // widget-callback path this mirrors.
-        let prior_line_scope = Self::arm_line_scope(&line_scope, &current_line);
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
         let isolate = deno.v8_isolate();
@@ -2451,7 +2380,6 @@ impl<'a> ScriptEngine<'a> {
             }
         };
 
-        Self::restore_line_scope(&line_scope, prior_line_scope);
         result
     }
 
@@ -2515,10 +2443,6 @@ impl<'a> ScriptEngine<'a> {
         // work synchronously, so seed this isolate for the next pump.
         self.mark_isolate_ready(isolate);
 
-        // Cloned out before `isolate_mut` borrows `self`; armed below beside `EventDepth`.
-        let line_scope = self.line_scope.clone();
-        let current_line = self.current_line.clone();
-
         let bundle = self.isolate_mut(isolate)?;
         // Get the script before creating the mutable scope to avoid borrowing conflicts
         let script = bundle
@@ -2540,10 +2464,6 @@ impl<'a> ScriptEngine<'a> {
             .try_borrow::<ops::EventDepth>()
             .map_or(0, |d| d.0);
         op_state.borrow_mut().put(ops::EventDepth(depth));
-        // Arm the current-line scope for this eval (save/restore like `EventDepth`):
-        // an inline trigger body runs for the line in flight; the ambient `line`
-        // mutators compare against the generation captured here.
-        let prior_line_scope = Self::arm_line_scope(&line_scope, &current_line);
         // Make the owning isolate current for this eval (Model B), released after the scope.
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
@@ -2600,7 +2520,6 @@ impl<'a> ScriptEngine<'a> {
 
         // Restore the enclosing depth now the eval has returned (see the save above).
         op_state.borrow_mut().put(ops::EventDepth(prior_depth));
-        Self::restore_line_scope(&line_scope, prior_line_scope);
 
         if let Some(started) = started {
             trace!(

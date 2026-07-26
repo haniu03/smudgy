@@ -147,10 +147,6 @@ deno_core::extension!(
     spawned_actions: ActionQueue,
     pending_line_operations: Rc<RefCell<Vec<LineOperation>>>,
     current_line: Rc<RefCell<Weak<StyledLine>>>,
-    // The current-line staleness scope (see [`LineScope`]): one cell shared engine-wide,
-    // armed by the engine's user-JS entry points and checked by the ambient `line`
-    // mutators, so a stale async continuation cannot edit/route a line it wasn't run for.
-    line_scope: LineScopeCell,
     emitted_line_count: std::rc::Weak<Cell<usize>>,
     // Ring of recently-emitted lines (UI line number + the same `Arc` the UI holds),
     // shared with the runtime. `op_smudgy_buffer_get_text`/`_styles` read it for `buffer.line(n)`.
@@ -254,7 +250,6 @@ deno_core::extension!(
     state.put::<ActionQueue>(options.spawned_actions);
     state.put::<Rc<RefCell<Vec<LineOperation>>>>(options.pending_line_operations);
     state.put::<Rc<RefCell<Weak<StyledLine>>>>(options.current_line);
-    state.put::<LineScopeCell>(options.line_scope);
     state.put::<std::rc::Weak<Cell<usize>>>(options.emitted_line_count);
     state.put::<crate::session::runtime::RecentLines>(options.recent_lines);
     state.put::<crate::session::runtime::CurrentLocation>(options.current_location);
@@ -2914,46 +2909,34 @@ pub enum StyledTextOpError {
     NotCurrent(#[from] LineNotCurrent),
 }
 
-/// The current-line staleness scope, one cell shared engine-wide (every
-/// isolate's `OpState` plus the engine's user-JS entry points). `current` is
-/// the generation stamped on the line in flight (`ScriptEngine::set_current_line`
-/// bumps it as dispatch installs each line); `armed` is the generation the
-/// running synchronous user-JS entry captured on its way in — 0 outside any
-/// entry, and 0 for entries made while no line was in flight. The ambient
-/// `line` mutators require `armed == current` (see [`ensure_current_line`]):
-/// an async continuation that outlives its line can only resume between
-/// entries (deno runs microtasks in the event-loop pump, never inside a
-/// synchronous call), where `armed` is 0, so it throws instead of editing
-/// whatever line is current by then. The submission ops solve the same
-/// staleness for `sys:input` with a script-side capture ([`with_submission`]);
-/// `line` is armed host-side because triggers and aliases enter user JS with
-/// no script-side wrapper to capture in.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LineScope {
-    pub current: u64,
-    pub armed: u64,
-}
-
-/// The shared cell form of [`LineScope`].
-pub type LineScopeCell = Rc<Cell<LineScope>>;
-
-/// The staleness refusal for the ambient `line`'s mutators: the write arrived
-/// outside the window in which its line was in flight — no line at all (a
-/// hotkey, a timer, a module top level), or an async continuation that
-/// outlived its line. Reads stay graceful (`""`/`undefined`); writes are
-/// refused loudly because a leaked write would land on whatever line the
-/// per-line routing/transform cells are consumed for NEXT.
+/// The refusal for the ambient `line`'s mutators: the write arrived while no
+/// line was in flight — a hotkey, a timer, a module top level, or an async
+/// continuation that resumed after every line's processing finished. Reads
+/// stay graceful (`""`/`undefined`); writes are refused loudly because a
+/// leaked write would land on whatever line the per-line routing/transform
+/// cells are consumed for NEXT.
 #[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
 #[class(generic)]
-#[error("smudgy: the current line is only mutable inside a trigger or sys:receive handler for it")]
+#[error("smudgy: the current line is only mutable while a line is being processed")]
 pub struct LineNotCurrent;
 
-/// The current-line staleness gate shared by the ambient `line` mutators
-/// (gag/redirect/copy and the current-line transforms): the armed entry scope
-/// must name the line in flight. See [`LineScope`].
+/// The current-line gate shared by the ambient `line` mutators (gag/redirect/
+/// copy and the current-line transforms): a line must be in flight — installed
+/// by dispatch and not yet consumed by its completion action, whose queued
+/// `Arc` is what keeps this `Weak` alive. A live line means the per-line
+/// routing/transform cells will still be applied to it, so mutation is valid
+/// from ANY code that runs before the line completes: trigger and
+/// `sys:receive` handlers, event recipients they emit to, and microtask
+/// continuations pumped during the line's cascade. The deliberate trade-off:
+/// a continuation that outlives its own line and resumes while a LATER line
+/// is in flight edits that later line — same-cascade event recipients and
+/// continuations are common enough that per-entry arming (which rejected
+/// them along with the stale case) cost more than the narrow wrong-line
+/// window it closed. The submission ops still solve staleness for
+/// `sys:input` with a script-side capture ([`with_submission`]).
 fn ensure_current_line(state: &OpState) -> Result<(), LineNotCurrent> {
-    let scope = state.borrow::<LineScopeCell>().get();
-    if scope.armed != 0 && scope.armed == scope.current {
+    let current_line = state.borrow::<Rc<RefCell<Weak<StyledLine>>>>();
+    if current_line.borrow().strong_count() > 0 {
         Ok(())
     } else {
         Err(LineNotCurrent)

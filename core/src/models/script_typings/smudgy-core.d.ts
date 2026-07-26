@@ -1757,13 +1757,18 @@ declare module "smudgy:core" {
    * already-printed line by number. The handle remembers which line it points
    * at; methods never take a line number.
    *
-   * The line being processed accepts changes only while a trigger or
-   * `receive` handler for it is running. Once that handler returns, or after
-   * an `await` inside it, the line has moved on: any edit, `gag()`,
-   * `redirect()`, or `copy()` then throws rather than landing on whatever
-   * line comes next. Reads stay safe anywhere (`text` is `""` and `styles`
-   * an empty array outside a handler). Already-printed lines reached through
-   * `buffer.line(n)` can be edited at any time.
+   * The line being processed accepts changes until its processing finishes
+   * and it is delivered. That window covers the whole cascade the line runs
+   * — its trigger and `receive` handlers, plus anything they set in motion
+   * that runs before delivery, such as handlers of events they emit. Once
+   * the line has been delivered there is no line to edit: any edit,
+   * `gag()`, `redirect()`, or `copy()` then throws rather than landing on
+   * whatever line comes next. One caution for `async` handlers: code that
+   * resumes after an `await` acts on whichever line is being processed when
+   * it resumes — during a burst of output that can be a later line. Reads
+   * stay safe anywhere (`text` is `""` and `styles` an empty array outside
+   * the window). Already-printed lines reached through `buffer.line(n)` can
+   * be edited at any time.
    *
    * The text-search methods (`replace`, `highlight`, `remove`) find their
    * target by string; the `*At` forms take byte offsets (e.g. from `styles`).
@@ -1823,9 +1828,10 @@ declare module "smudgy:core" {
     line(lineNumber: number): Line;
   }
 
-  /** The line a trigger is processing. Only meaningful inside a trigger (or
-   *  `receive` event) handler for it: elsewhere reads come back empty and
-   *  edits throw (see {@link Line}). */
+  /** The line being processed right now. Meaningful while a line is being
+   *  processed (its trigger and `receive` cascade and anything that runs
+   *  before it is delivered): elsewhere reads come back empty and edits
+   *  throw (see {@link Line}). */
   export const line: Line;
   /** This session's recent-lines buffer. */
   export const buffer: Buffer;
