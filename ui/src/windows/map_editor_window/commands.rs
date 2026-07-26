@@ -959,6 +959,14 @@ pub fn delete_selection(
                 continue;
             }
             for exit in host_room.get_exits() {
+                // Members of an explicitly deleted link don't survive the
+                // delete at all — their restore (with destination) rides the
+                // link's own CreateExit batch. A relink here would enqueue
+                // an UpdateExit for an exit that no longer exists, wedging
+                // the sync queue on ExitNotFound.
+                if restored_connections.contains(&exit.connection_id) {
+                    continue;
+                }
                 let (Some(to_area_id), Some(to_room_number)) =
                     (exit.to_area_id, exit.to_room_number)
                 else {
@@ -1355,6 +1363,23 @@ pub fn edit_connection(
         thickness: updates.thickness.map(|_| current.thickness),
     };
     let description = description.into();
+    // Coalescing keeps the first command's undo and the last redo, which
+    // only inverts correctly when every merged command touches the same
+    // fields. Endpoint edits carry exactly one endpoint, so edits to
+    // different endpoints must not merge — key them apart.
+    let key = match (updates.endpoint_a.is_some(), updates.endpoint_b.is_some()) {
+        (true, false) => CoalesceKey::with_detail(
+            EntityRef::Connection(area_id, connection_id),
+            field,
+            "endpoint-a",
+        ),
+        (false, true) => CoalesceKey::with_detail(
+            EntityRef::Connection(area_id, connection_id),
+            field,
+            "endpoint-b",
+        ),
+        _ => CoalesceKey::new(EntityRef::Connection(area_id, connection_id), field),
+    };
     Some(
         Command::new(
             vec![Mutation::AreaBatch {
@@ -1374,10 +1399,7 @@ pub fn edit_connection(
                 description: format!("Undo {description}"),
             }],
         )
-        .coalescing(CoalesceKey::new(
-            EntityRef::Connection(area_id, connection_id),
-            field,
-        )),
+        .coalescing(key),
     )
 }
 
@@ -2480,11 +2502,15 @@ pub fn snapshot_selection(
         .get_connections()
         .iter()
         .filter(|connection| {
-            connection.endpoint_b.is_some_and(|endpoint_b| {
-                (selected_rooms.contains(&connection.endpoint_a.room_number)
-                    && selected_rooms.contains(&endpoint_b.room_number))
-                    || explicitly_selected.contains(&connection.id)
-            })
+            // Explicitly selected links copy whatever their shape —
+            // dangling and external ones included (their paste degrades
+            // per-member); room-implied links still need both ends inside
+            // the selection.
+            explicitly_selected.contains(&connection.id)
+                || connection.endpoint_b.is_some_and(|endpoint_b| {
+                    selected_rooms.contains(&connection.endpoint_a.room_number)
+                        && selected_rooms.contains(&endpoint_b.room_number)
+                })
         })
         .map(|connection| connection.id)
         .collect();
@@ -2967,9 +2993,13 @@ pub fn paste_clipboard(
             },
             None => None,
         };
-        let remapped = mapping.contains_key(&source_a)
+        // Any endpoint attached to a pre-existing room means (a) the stored
+        // route belongs to the source layout and must be dropped, and (b)
+        // the room-delete cascade won't clean the link up on undo, so it
+        // needs its own DeleteLink.
+        let any_existing = !mapping.contains_key(&source_a)
             || endpoint_b_room
-                .is_some_and(|(source, _)| mapping.contains_key(&source));
+                .is_some_and(|(source, _)| !mapping.contains_key(&source));
 
         let mut members = Vec::new();
         let mut viable = true;
@@ -2989,12 +3019,27 @@ pub fn paste_clipboard(
                 break;
             }
             // Members of an internal link point at its other endpoint;
-            // resolve the destination through the same room resolution.
-            let (to_area_id, to_room_number, to_direction) =
-                match exit.to_room_number.and_then(resolve) {
+            // resolve those through the same room resolution. A genuinely
+            // cross-area destination (an explicit External clip) keeps its
+            // area when it's live in the atlas, and dangles otherwise —
+            // never silently rewritten into the target area.
+            let (to_area_id, to_room_number, to_direction) = match exit.to_area_id {
+                Some(destination_area) if destination_area != source_area_id => {
+                    if atlas.get_area(&destination_area).is_some() {
+                        (
+                            Some(destination_area),
+                            exit.to_room_number,
+                            exit.to_direction,
+                        )
+                    } else {
+                        (None, None, None)
+                    }
+                }
+                _ => match exit.to_room_number.and_then(resolve) {
                     Some(number) => (Some(target_area_id), Some(number), exit.to_direction),
                     None => (None, None, None),
-                };
+                },
+            };
             members.push((room_number, exit, to_area_id, to_room_number, to_direction));
         }
         if !viable {
@@ -3009,12 +3054,7 @@ pub fn paste_clipboard(
         if let (Some(endpoint), Some((_, number))) = (body.endpoint_b.as_mut(), endpoint_b_room) {
             endpoint.room_number = number;
         }
-        if remapped {
-            for point in &mut body.route_points {
-                point.x += origin.x + offset.x;
-                point.y += origin.y + offset.y;
-            }
-        } else {
+        if any_existing {
             body.route_points.clear();
             if matches!(
                 body.routing,
@@ -3026,6 +3066,11 @@ pub fn paste_clipboard(
             undo_links.push(AreaMutation::DeleteLink {
                 connection_id: new_connection_id,
             });
+        } else {
+            for point in &mut body.route_points {
+                point.x += origin.x + offset.x;
+                point.y += origin.y + offset.y;
+            }
         }
         compound.push(AreaMutation::CreateConnection { body });
         for (room_number, exit, to_area_id, to_room_number, to_direction) in members {
@@ -3970,6 +4015,65 @@ mod tests {
             .filter(|exit| exit.connection_id == connection_id)
             .collect();
         assert_eq!(exits.len(), 2, "both member exits restored exactly once");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_link_with_one_of_its_rooms_restores_cleanly() {
+        let mapper = test_mapper();
+        let area_id = area_with_rooms(&mapper, &[(1, 0.0, 0.0), (2, 4.0, 0.0)]).await;
+        let mut stack = CommandStack::default();
+        let connection_id = link_rooms(&mapper, &mut stack, area_id, 1, 2).await;
+
+        // One endpoint room plus the link: the surviving room's member exit
+        // is restored by the link path, so the undo must NOT also carry an
+        // inbound-exit relink for it — that UpdateExit would target an exit
+        // the DeleteLink removed and wedge the sync queue.
+        let selection: Selection = [
+            EntityId::Room(RoomNumber(1)),
+            EntityId::Connection(connection_id),
+        ]
+        .into_iter()
+        .collect();
+        let command = delete_selection(&mapper.get_current_atlas(), area_id, &selection)
+            .expect("command");
+        assert!(
+            !command
+                .undo
+                .iter()
+                .any(|mutation| matches!(mutation, Mutation::UpdateExit { .. })),
+            "no doomed relink for a link-restored exit"
+        );
+        let _ = stack.push_and_apply(&mapper, command);
+        {
+            let atlas = mapper.get_current_atlas();
+            let area = atlas.get_area(&area_id).expect("area");
+            assert!(area.get_room(&RoomNumber(1)).is_none());
+            assert!(area.get_connection(connection_id).is_none());
+            assert!(
+                area.get_room(&RoomNumber(2))
+                    .is_some_and(|room| room.get_exits().is_empty()),
+                "surviving room's member exit deleted with the link"
+            );
+        }
+
+        let _ = stack.undo(&mapper);
+        let atlas = mapper.get_current_atlas();
+        let area = atlas.get_area(&area_id).expect("area");
+        assert!(area.get_room(&RoomNumber(1)).is_some(), "room restored");
+        assert!(area.get_connection(connection_id).is_some(), "link restored");
+        let exits: Vec<_> = area
+            .get_rooms()
+            .iter()
+            .flat_map(|room| room.get_exits())
+            .filter(|exit| exit.connection_id == connection_id)
+            .collect();
+        assert_eq!(exits.len(), 2, "both member exits restored exactly once");
+        assert!(
+            exits
+                .iter()
+                .all(|exit| exit.to_room_number.is_some()),
+            "restored exits keep their destinations"
+        );
     }
 
     #[tokio::test]

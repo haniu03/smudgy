@@ -1737,6 +1737,14 @@ impl MapEditorWindow {
             ));
         }
         let Some(command) = command else {
+            if skipped_connections == 0 {
+                // Not a skip: the paste itself couldn't be built (too many
+                // operations for one envelope). Say so instead of nothing.
+                self.editor_notice = Some((
+                    Instant::now(),
+                    "The clipboard is too large to paste in one step.".to_string(),
+                ));
+            }
             return Update::none();
         };
         let update = self.push_command(Some(command));

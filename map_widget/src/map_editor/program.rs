@@ -872,12 +872,25 @@ impl canvas::Program<Message, Theme> for MapEditor {
             IcedEvent::Mouse(mouse_event) => match mouse_event {
                 mouse::Event::ButtonPressed(button) => match button {
                     mouse::Button::Right => {
+                        // A right press abandons an in-flight connection
+                        // drag; tell the host so the drag legend clears.
+                        let was_connection_drag = matches!(
+                            state.interaction,
+                            Interaction::DraggingConnectionHandle { .. }
+                        );
                         state.interaction = Interaction::Panning {
                             translation: self.translation,
                             start: cursor_position,
                         };
 
-                        Some(canvas::Action::request_redraw().and_capture())
+                        Some(if was_connection_drag {
+                            canvas::Action::publish(Message::ActivityChanged(
+                                super::EditorActivity::Idle,
+                            ))
+                            .and_capture()
+                        } else {
+                            canvas::Action::request_redraw().and_capture()
+                        })
                     }
                     mouse::Button::Left => match self.tool {
                         Tool::Select => {
