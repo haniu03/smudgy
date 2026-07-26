@@ -1,0 +1,67 @@
+diff --git a/src/text.rs b/src/text.rs
+index 35ff24f..d531f18 100644
+--- a/src/text.rs
++++ b/src/text.rs
+@@ -255,13 +255,60 @@ pub fn align(
+     min_bounds
+ }
+ 
++/// Families opted out of ligature substitutions via
++/// [`set_ligatures_enabled`].
++fn no_ligature_families() -> &'static RwLock<HashSet<String>> {
++    static NO_LIGATURE_FAMILIES: OnceLock<RwLock<HashSet<String>>> =
++        OnceLock::new();
++
++    NO_LIGATURE_FAMILIES.get_or_init(|| RwLock::new(HashSet::new()))
++}
++
++/// Enables or disables ligature substitutions (`liga`, `clig`, `calt`, and
++/// `dlig`) for every run shaped with the given font family. Ligatures are
++/// enabled by default; disabling them suits monospace grids, where
++/// contextual substitutions break column alignment.
++///
++/// Takes effect the next time affected text is shaped; callers are
++/// responsible for invalidating any cached paragraphs.
++pub fn set_ligatures_enabled(family: &str, enabled: bool) {
++    let mut families = no_ligature_families()
++        .write()
++        .expect("Write no-ligature families");
++
++    if enabled {
++        let _ = families.remove(family);
++    } else {
++        let _ = families.insert(family.to_owned());
++    }
++}
++
+ /// Returns the attributes of the given [`Font`].
+ pub fn to_attributes(font: Font) -> cosmic_text::Attrs<'static> {
+-    cosmic_text::Attrs::new()
++    let attrs = cosmic_text::Attrs::new()
+         .family(to_family(font.family))
+         .weight(to_weight(font.weight))
+         .stretch(to_stretch(font.stretch))
+-        .style(to_style(font.style))
++        .style(to_style(font.style));
++
++    match font.family {
++        font::Family::Name(name)
++            if no_ligature_families()
++                .read()
++                .expect("Read no-ligature families")
++                .contains(name) =>
++        {
++            let mut features = cosmic_text::FontFeatures::new();
++            let _ = features
++                .disable(cosmic_text::FeatureTag::STANDARD_LIGATURES)
++                .disable(cosmic_text::FeatureTag::CONTEXTUAL_LIGATURES)
++                .disable(cosmic_text::FeatureTag::CONTEXTUAL_ALTERNATES)
++                .disable(cosmic_text::FeatureTag::DISCRETIONARY_LIGATURES);
++
++            attrs.font_features(features)
++        }
++        _ => attrs,
++    }
+ }
+ 
+ fn to_family(family: font::Family) -> cosmic_text::Family<'static> {

@@ -186,6 +186,11 @@ pub struct Settings {
     /// (`size * 1.25`).
     #[serde(default = "default_terminal_font_size")]
     pub terminal_font_size: f32,
+    /// Allow the terminal font's ligatures and contextual alternates. Off by
+    /// default: MUD output assumes a fixed character grid, and substitutions
+    /// merging `=>` or `fi` into one glyph break column alignment.
+    #[serde(default)]
+    pub terminal_font_ligatures: bool,
     /// Maximum terminal line length in columns; `None` wraps to the pane
     /// width. This is client-side wrapping only (no NAWS negotiation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -506,6 +511,7 @@ impl Default for Settings {
             dismissed_signin_banner_version: None,
             terminal_font_family: default_terminal_font_family(),
             terminal_font_size: default_terminal_font_size(),
+            terminal_font_ligatures: false,
             terminal_line_length: None,
             theme: default_theme(),
             theme_tweaks: std::collections::HashMap::new(),

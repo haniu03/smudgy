@@ -18,10 +18,15 @@ the scripting reference.
 ## Building from source
 
 ```sh
+cargo install patch-crate
+cargo patch-crate
 cargo run
 ```
 
-builds and runs the client with a stable Rust toolchain. See
+builds and runs the client with a stable Rust toolchain. The first two
+commands are a one-time setup: they materialize the workspace's dependency
+source patches (see [patches/](patches/)) under `target/patch/` before the
+first build, and again after a `cargo clean`. See
 [CHANGELOG.md](CHANGELOG.md) for what's new.
 
 ## License

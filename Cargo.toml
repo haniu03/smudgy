@@ -104,6 +104,28 @@ deno_error = "=0.7.1"
 winapi = { version = "0.3.9", features = ["sysinfoapi", "std"] }
 build-time = "0.1.3"
 
+# Source patches managed by patch-crate (https://crates.io/crates/patch-crate).
+# After a fresh clone (or a `cargo clean`), run `cargo install patch-crate &&
+# cargo patch-crate` once to materialize target/patch/ before building.
+#
+# - `iced_graphics` (patches/iced_graphics+0.14.0.patch): runtime per-family
+#   OpenType feature control that upstream iced lacks — the terminal opts its
+#   font family out of ligatures (liga/clig/calt/dlig), which break monospace
+#   column alignment, while UI text keeps them.
+# - `cosmic-text` (patches/cosmic-text+0.15.0.patch): upstream's
+#   `monospace_fallback` machinery only engages for the generic
+#   `Family::Monospace` request, which iced never issues (it always names a
+#   concrete family). The patch appends Monospace as a second default family
+#   whenever the named primary resolves to a monospace face, so missing
+#   glyphs fall back to coverage-ranked monospace candidates instead of the
+#   proportional script/common lists.
+[workspace.metadata.patch]
+crates = ["iced_graphics", "cosmic-text"]
+
+[patch.crates-io]
+iced_graphics = { path = "./target/patch/iced_graphics-0.14.0" }
+cosmic-text = { path = "./target/patch/cosmic-text-0.15.0" }
+
 # Define workspace-wide lints
 [workspace.lints.clippy]
 pedantic = "warn"
