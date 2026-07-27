@@ -185,7 +185,9 @@ async fn auto_mapper_maps_follows_and_promotes() {
     );
     let area = atlas.get_area(&key100.area_id).expect("zone area");
     assert_eq!(area.get_name(), "midgaard");
-    assert_eq!(area.room_count(), 3, "revisiting room 100 must not duplicate it");
+    // 100, 101, 103 visited + the unvisited placeholder for 102 (every room the server
+    // names is on the map); revisiting room 100 must not duplicate anything.
+    assert_eq!(area.room_count(), 4, "three visited rooms + the 102 placeholder");
     assert_eq!(room100.get_title(), "Temple Square");
     assert_eq!(room101.get_title(), "Market Street");
     // No two rooms may stack: catches both trusting the zone-granular Aardwolf
@@ -226,21 +228,49 @@ async fn auto_mapper_maps_follows_and_promotes() {
         1,
         "one east edge 101→103, not a stub-upgrade duplicate"
     );
-    assert!(
-        room101
-            .get_exits()
-            .iter()
-            .any(|e| e.to_room_number == Some(key100.room_number)),
-        "101 links back west to 100"
+    let exits_101 = room101.get_exits();
+    let west_back = exits_101
+        .iter()
+        .find(|e| e.to_room_number == Some(key100.room_number))
+        .unwrap_or_else(|| panic!("101 links back west to 100.\n{transcript}"));
+    // Reconciliation: the two reciprocal traversals share ONE Connection (the
+    // stub-upgrade recreates the exit so the host's auto-pair folds it onto the
+    // arrival exit's Connection) — the map draws a single two-way link, not two
+    // parallel one-way lines.
+    assert_eq!(
+        east.connection_id, west_back.connection_id,
+        "100<->101 reciprocal exits pair onto one Connection.\n{transcript}"
     );
-    // Unexplored exits stay destination-less (dangling stubs on the map):
-    // n:102 from room 100, e:103 from room 101.
+    let east_103 = exits_101
+        .iter()
+        .find(|e| e.to_room_number == Some(key103.room_number))
+        .expect("101 links east to 103");
+    let exits_103 = room103.get_exits();
+    let west_101 = exits_103
+        .iter()
+        .find(|e| e.to_room_number == Some(key101.room_number))
+        .unwrap_or_else(|| panic!("103 links back west to 101.\n{transcript}"));
+    assert_eq!(
+        east_103.connection_id, west_101.connection_id,
+        "101<->103 reciprocal exits pair onto one Connection.\n{transcript}"
+    );
+    // Unexplored-but-named neighbors exist as unvisited placeholders: 100's north exit
+    // links to a real room bound to id 102 and marked unvisited (the Mudlet pattern).
+    let (key102, room102) = atlas
+        .find_room_by_external_id("102")
+        .unwrap_or_else(|| panic!("neighbor 102 exists as a placeholder.\n{transcript}"));
+    assert_eq!(key102.area_id, key100.area_id, "the placeholder joins the zone area");
+    assert_eq!(
+        room102.get_property("unvisited"),
+        Some("true"),
+        "the 102 placeholder is marked unvisited.\n{transcript}"
+    );
     assert!(
         room100
             .get_exits()
             .iter()
-            .any(|e| e.to_room_number.is_none()),
-        "room 100's unexplored north exit is a dangling stub"
+            .any(|e| e.to_room_number == Some(key102.room_number)),
+        "100's north exit links to the 102 placeholder.\n{transcript}"
     );
 
     // ---- savemap: promote to the local tier, drop the session original. ----
@@ -291,6 +321,148 @@ async fn auto_mapper_maps_follows_and_promotes() {
     assert_eq!(
         key102.area_id, promoted_key.area_id,
         "post-promotion rooms land in the promoted area"
+    );
+    // The north stub minted before savemap survived promotion as a pending waiter
+    // (re-keyed onto the imported copy's exit): discovering 102 upgrades it to a real
+    // link, and the reciprocal exits pair onto one Connection.
+    let (_, promoted_100) = atlas
+        .find_room_by_external_id("100")
+        .expect("room 100 resolves in the promoted area");
+    let exits_100 = promoted_100.get_exits();
+    let north = exits_100
+        .iter()
+        .find(|e| e.to_room_number == Some(key102.room_number))
+        .unwrap_or_else(|| {
+            panic!("promoted 100's north stub upgraded to link 102.\n{transcript}")
+        });
+    let (_, room102) = atlas.find_room_by_external_id("102").expect("room 102");
+    let exits_102 = room102.get_exits();
+    let south = exits_102
+        .iter()
+        .find(|e| e.to_room_number == Some(promoted_key.room_number))
+        .unwrap_or_else(|| panic!("102 links south back to 100.\n{transcript}"));
+    assert_eq!(
+        north.connection_id, south.connection_id,
+        "100<->102 reciprocal exits pair onto one Connection across promotion.\n{transcript}"
+    );
+    // The placeholder (exported unvisited, imported by savemap) materialized on its
+    // first real visit.
+    assert_ne!(
+        room102.get_property("unvisited"),
+        Some("true"),
+        "visiting 102 cleared its unvisited marker.\n{transcript}"
+    );
+
+    tx.send(RuntimeAction::Shutdown).ok();
+    drop(events);
+    drop(mapper);
+
+    // ---- A NEW RUN: fresh Mapper over the same on-disk local tier, fresh session.
+    // The saved "midgaard" map must be ADOPTED, not redrawn: a known room follows into
+    // it, a new room is created inside it, and no session (ephemeral) area appears.
+    let local = Arc::new(LocalBackend::new(map_root.join("local")));
+    let cloud = Arc::new(CloudMapper::new(
+        "http://127.0.0.1:0".to_string(),
+        "test-key".to_string(),
+    ));
+    let backend: Arc<dyn MapperBackend + Send + Sync> =
+        Arc::new(CompositeBackend::new(local, cloud));
+    let mapper = Mapper::new(backend, map_root.join("cache2"));
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(9338_u32),
+        server_name: Arc::new(SERVER.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: Some(mapper.clone()),
+        package_client: Some(PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        )),
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady (second run)")
+            .expect("event stream ended before RuntimeReady (second run)");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+
+    tx.send(RuntimeAction::GmcpEnabled).unwrap();
+    // Revisit a known room, then step somewhere new in the same zone.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 102, "name": "North Road", "zone": "midgaard", "terrain": "road",
+             "exits": { "s": 100, "n": 105 } }"#,
+    ))
+    .unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 105, "name": "North Gate", "zone": "midgaard", "terrain": "city",
+             "exits": { "s": 102 } }"#,
+    ))
+    .unwrap();
+
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+
+    let atlas = mapper.get_current_atlas();
+    let (key102b, _) = atlas
+        .find_room_by_external_id("102")
+        .unwrap_or_else(|| panic!("saved room 102 resolves in the new run.\n{transcript}"));
+    let (key105, _) = atlas
+        .find_room_by_external_id("105")
+        .unwrap_or_else(|| panic!("room 105 was auto-created in the new run.\n{transcript}"));
+    assert_eq!(
+        key105.area_id, key102b.area_id,
+        "the new room joins the SAVED midgaard map (adopted by name).\n{transcript}"
+    );
+    assert!(
+        !mapper.is_ephemeral(&key105.area_id),
+        "the adopted area is the saved local map, not a session copy.\n{transcript}"
+    );
+    assert_eq!(
+        mapper.ephemeral_area_ids().len(),
+        0,
+        "no duplicate session area is minted for a saved zone.\n{transcript}"
+    );
+    assert_eq!(
+        atlas.get_area(&key105.area_id).expect("midgaard").get_name(),
+        "midgaard"
+    );
+    // Revisit reconciliation: run 1 saved room 102 with only its south exit; run 2's
+    // fix advertises n:105, so the revisit adds the stub, 105's discovery upgrades it,
+    // and the reciprocal traversals pair onto one Connection.
+    let (_, room102b) = atlas.find_room_by_external_id("102").expect("room 102");
+    let (_, room105b) = atlas.find_room_by_external_id("105").expect("room 105");
+    let exits_102b = room102b.get_exits();
+    let north_105 = exits_102b
+        .iter()
+        .find(|e| e.to_room_number == Some(key105.room_number))
+        .unwrap_or_else(|| {
+            panic!("revisit reconciliation adds 102's newly advertised north exit.\n{transcript}")
+        });
+    let exits_105b = room105b.get_exits();
+    let south_102 = exits_105b
+        .iter()
+        .find(|e| e.to_room_number == Some(key102b.room_number))
+        .unwrap_or_else(|| panic!("105 links south back to 102.\n{transcript}"));
+    assert_eq!(
+        north_105.connection_id, south_102.connection_id,
+        "the revisit-added exit pairs onto one Connection.\n{transcript}"
     );
 
     tx.send(RuntimeAction::Shutdown).ok();
@@ -570,7 +742,7 @@ async fn auto_mapper_maps_ire_dialect_with_server_coords() {
         "Room.Info",
         r#"{ "num": 4711, "name": "Centre of the crossroads",
              "area": "the village of Tasur'ke", "environment": "road",
-             "coords": "77,5,7", "exits": { "n": 4712 } }"#,
+             "coords": "77,5,7,2", "exits": { "n": 4712 } }"#,
     ))
     .unwrap();
 
@@ -591,18 +763,79 @@ async fn auto_mapper_maps_ire_dialect_with_server_coords() {
         "the village of Tasur'ke",
         "IRE's `area` field names the zone"
     );
-    // "area,x,y" server coords place the room on the grid (GRID spacing = 2.0).
-    assert!((room.get_x() - 10.0).abs() < f32::EPSILON, "x = 5 * GRID");
-    assert!((room.get_y() - 14.0).abs() < f32::EPSILON, "y = 7 * GRID");
+    // "area,x,y[,level]" server coords place the room on the grid (GRID spacing = 1.0,
+    // matching the map's one-unit-per-room pitch); the 4th slot is the floor, so
+    // multi-level IRE areas separate by z instead of stacking on one plane.
+    assert!((room.get_x() - 5.0).abs() < f32::EPSILON, "x = 5 * GRID");
+    assert!((room.get_y() - 7.0).abs() < f32::EPSILON, "y = 7 * GRID");
+    assert_eq!(room.get_level(), 2, "the coords 4th slot is the level");
     // `environment` is the IRE spelling of terrain: property + color wash.
     assert_eq!(room.get_property("terrain"), Some("road"));
     assert_eq!(room.get_color(), "#b09a6a", "road wash");
-    // The unexplored north exit is a dangling stub awaiting 4712.
+    // The named neighbor 4712 exists as an unvisited placeholder, linked from 4711.
+    let (key4712, room4712) = atlas
+        .find_room_by_external_id("4712")
+        .unwrap_or_else(|| panic!("neighbor 4712 exists as a placeholder.\n{transcript}"));
+    assert_eq!(
+        room4712.get_property("unvisited"),
+        Some("true"),
+        "the 4712 placeholder is marked unvisited.\n{transcript}"
+    );
     assert!(
         room.get_exits()
             .iter()
-            .any(|e| e.to_room_number.is_none()),
-        "unexplored north exit is a dangling stub.\n{transcript}"
+            .any(|e| e.to_room_number == Some(key4712.room_number)),
+        "4711's north exit links to the placeholder.\n{transcript}"
+    );
+
+    // ---- Visiting the placeholder materializes it: server coords re-place it (they
+    // beat the direction-offset guess), the marker clears, and the reciprocal exits
+    // pair onto one Connection.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 4712, "name": "North of the crossroads",
+             "area": "the village of Tasur'ke", "environment": "road",
+             "coords": "77,5,8,2", "exits": { "s": 4711 } }"#,
+    ))
+    .unwrap();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+    let atlas = mapper.get_current_atlas();
+    let (key4712b, room4712b) = atlas
+        .find_room_by_external_id("4712")
+        .unwrap_or_else(|| panic!("4712 still resolves after materialization.\n{transcript}"));
+    assert_ne!(
+        room4712b.get_property("unvisited"),
+        Some("true"),
+        "visiting 4712 cleared its unvisited marker.\n{transcript}"
+    );
+    assert!(
+        (room4712b.get_x() - 5.0).abs() < f32::EPSILON
+            && (room4712b.get_y() - 8.0).abs() < f32::EPSILON,
+        "materialization re-placed 4712 by its server coords (got {},{}).\n{transcript}",
+        room4712b.get_x(),
+        room4712b.get_y()
+    );
+    assert_eq!(room4712b.get_level(), 2);
+    assert_eq!(room4712b.get_title(), "North of the crossroads");
+    let (_, room4711b) = atlas.find_room_by_external_id("4711").expect("room 4711");
+    let exits_4711 = room4711b.get_exits();
+    let north_4712 = exits_4711
+        .iter()
+        .find(|e| e.to_room_number == Some(key4712b.room_number))
+        .unwrap_or_else(|| panic!("4711 still links north to 4712.\n{transcript}"));
+    let exits_4712 = room4712b.get_exits();
+    let south_4711 = exits_4712
+        .iter()
+        .find(|e| e.to_room_number == Some(key.room_number))
+        .unwrap_or_else(|| panic!("4712 links south back to 4711.\n{transcript}"));
+    assert_eq!(
+        north_4712.connection_id, south_4711.connection_id,
+        "materialized reciprocal exits pair onto one Connection.\n{transcript}"
     );
 
     tx.send(RuntimeAction::Shutdown).ok();
@@ -737,15 +970,367 @@ async fn auto_mapper_maps_msdp_composite_room() {
     let area = atlas.get_area(&key.area_id).expect("zone area");
     assert_eq!(area.get_name(), "Training Halls");
     assert_eq!(room.get_title(), "A Small Island Beach");
-    // Server coords place the room on the grid (GRID spacing = 2.0 in the package).
-    assert!((room.get_x() - 8.0).abs() < f32::EPSILON, "x = 4 * GRID");
-    assert!((room.get_y() - 14.0).abs() < f32::EPSILON, "y = 7 * GRID");
-    // The unexplored east exit is a dangling stub awaiting 14101.
+    // Server coords place the room on the grid (GRID spacing = 1.0 in the package).
+    assert!((room.get_x() - 4.0).abs() < f32::EPSILON, "x = 4 * GRID");
+    assert!((room.get_y() - 7.0).abs() < f32::EPSILON, "y = 7 * GRID");
+    // The named neighbor 14101 exists as an unvisited placeholder, linked from 14100.
+    let (key14101, room14101) = atlas
+        .find_room_by_external_id("14101")
+        .unwrap_or_else(|| panic!("neighbor 14101 exists as a placeholder.\n{transcript}"));
+    assert_eq!(
+        room14101.get_property("unvisited"),
+        Some("true"),
+        "the 14101 placeholder is marked unvisited.\n{transcript}"
+    );
     assert!(
         room.get_exits()
             .iter()
-            .any(|e| e.to_room_number.is_none()),
-        "unexplored east exit is a dangling stub.\n{transcript}"
+            .any(|e| e.to_room_number == Some(key14101.room_number)),
+        "14100's east exit links to the placeholder.\n{transcript}"
+    );
+
+    tx.send(RuntimeAction::Shutdown).ok();
+}
+
+/// The id-less dialect (LP-family GMCP: room ids present, exit destinations withheld):
+/// the observed movement command is the only evidence connecting consecutive rooms.
+/// The package watches `sys:send` for direction tokens; a walk east must place the new
+/// room east of the previous one AND link both traversals onto one Connection —
+/// generic_mapper's consume-the-stub rule. Also covers the adapter hardening bounds
+/// (giant ids withheld, absurd coords ignored) and the opt-in `mapprune` sweep.
+#[tokio::test]
+async fn auto_mapper_maps_idless_exits_by_movement() {
+    const MOVE_SERVER: &str = "AutoMapperMoves";
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    std::fs::create_dir_all(smudgy_home.join(MOVE_SERVER).join("modules")).unwrap();
+    std::fs::create_dir_all(smudgy_home.join(MOVE_SERVER).join("logs")).unwrap();
+    copy_package_source(MOVE_SERVER);
+    shared_packages::install_package(
+        MOVE_SERVER,
+        "smudgy://local/auto-mapper",
+        UpdateMode::Auto,
+        true,
+    )
+    .unwrap();
+
+    let map_root = smudgy_home.join("map-test-moves");
+    let local = Arc::new(LocalBackend::new(map_root.join("local")));
+    let cloud = Arc::new(CloudMapper::new(
+        "http://127.0.0.1:0".to_string(),
+        "test-key".to_string(),
+    ));
+    let backend: Arc<dyn MapperBackend + Send + Sync> =
+        Arc::new(CompositeBackend::new(local, cloud));
+    let mapper = Mapper::new(backend, map_root.join("cache"));
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(9339_u32),
+        server_name: Arc::new(MOVE_SERVER.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: Some(mapper.clone()),
+        package_client: Some(PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        )),
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+
+    tx.send(RuntimeAction::GmcpEnabled).unwrap();
+    // Let the session settle first (package load, sys:send subscription registration,
+    // the maps-loaded barrier) — a real login spends seconds here before anyone moves.
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    // Login room: exits advertised without destination ids. Each step drains until
+    // quiet before the next command goes out: commands and room reports interleave at
+    // human/network timescales, and a same-instant blast would deliver the observed
+    // command before the PRIOR fix's watch even flushed — an ordering no real walk
+    // produces.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 900, "name": "Trail Head", "zone": "trailfields", "exits": { "e": "" } }"#,
+    ))
+    .unwrap();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    // Walk east — the sent command is observed via sys:send and attributed to the next fix.
+    tx.send(RuntimeAction::Send(Arc::new("e".to_string()))).unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 901, "name": "Open Trail", "zone": "trailfields", "exits": { "w": "", "e": "" } }"#,
+    ))
+    .unwrap();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    // Walk back west into known terrain: follow only, nothing new minted.
+    tx.send(RuntimeAction::Send(Arc::new("w".to_string()))).unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 900, "name": "Trail Head", "zone": "trailfields", "exits": { "e": "" } }"#,
+    ))
+    .unwrap();
+
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+
+    let atlas = mapper.get_current_atlas();
+    let (key900, room900) = atlas
+        .find_room_by_external_id("900")
+        .unwrap_or_else(|| panic!("room 900 was auto-created.\n{transcript}"));
+    let (key901, room901) = atlas
+        .find_room_by_external_id("901")
+        .unwrap_or_else(|| panic!("room 901 was auto-created.\n{transcript}"));
+    assert_eq!(key900.area_id, key901.area_id, "one area for the zone");
+    // Placement followed the walked direction: 901 sits one unit east of 900.
+    assert!(
+        (room901.get_x() - (room900.get_x() + 1.0)).abs() < 0.01
+            && (room901.get_y() - room900.get_y()).abs() < 0.01,
+        "901 placed east of 900 by the observed command (got {},{} from {},{}).\n{transcript}",
+        room901.get_x(),
+        room901.get_y(),
+        room900.get_x(),
+        room900.get_y()
+    );
+    // Both traversals exist and share ONE Connection: the walk proved 900-e->901, and
+    // 901's advertised (destination-less) west stub was consumed for the reverse.
+    let exits_900 = room900.get_exits();
+    let east = exits_900
+        .iter()
+        .find(|e| e.to_room_number == Some(key901.room_number))
+        .unwrap_or_else(|| panic!("900 links east to 901 by movement evidence.\n{transcript}"));
+    let exits_901 = room901.get_exits();
+    let west = exits_901
+        .iter()
+        .find(|e| e.to_room_number == Some(key900.room_number))
+        .unwrap_or_else(|| panic!("901's west stub was consumed to link back.\n{transcript}"));
+    assert_eq!(
+        east.connection_id, west.connection_id,
+        "movement-linked traversals pair onto one Connection.\n{transcript}"
+    );
+    // The unexplored east exit of 901 stays a dangling stub; walking back minted nothing.
+    assert!(exits_901.iter().any(|e| e.to_room_number.is_none()));
+    assert_eq!(
+        atlas.get_area(&key900.area_id).expect("zone area").room_count(),
+        2,
+        "the return walk re-used the mapped rooms.\n{transcript}"
+    );
+    assert_eq!(
+        exits_900.len(),
+        1,
+        "no duplicate east exit from the re-walk.\n{transcript}"
+    );
+
+    // ---- Adapter hardening: a giant id is withheld identity; absurd coords are
+    // ignored in favor of walk inference.
+    let giant = "x".repeat(5000);
+    tx.send(gmcp(
+        "Room.Info",
+        &format!(r#"{{ "num": "{giant}", "name": "Bogus", "zone": "trailfields", "exits": {{}} }}"#),
+    ))
+    .unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 902, "name": "Far Field", "zone": "trailfields", "coords": "1,999999999,5", "exits": {} }"#,
+    ))
+    .unwrap();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+    let atlas = mapper.get_current_atlas();
+    assert!(
+        atlas.find_room_by_external_id(&giant).is_none(),
+        "an over-length id must not be minted.\n{transcript}"
+    );
+    let (_, room902) = atlas
+        .find_room_by_external_id("902")
+        .unwrap_or_else(|| panic!("room 902 was auto-created.\n{transcript}"));
+    assert!(
+        room902.get_x().abs() < 100.0 && room902.get_y().abs() < 100.0,
+        "out-of-bounds server coords fall back to walk inference (got {},{}).\n{transcript}",
+        room902.get_x(),
+        room902.get_y()
+    );
+
+    // ---- mapprune (opt-in): 900 stops advertising its east exit; the revisit prunes it.
+    tx.send(RuntimeAction::Send(Arc::new("mapprune on".to_string()))).unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 900, "name": "Trail Head", "zone": "trailfields", "exits": {} }"#,
+    ))
+    .unwrap();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+    let atlas = mapper.get_current_atlas();
+    let (_, room900_pruned) = atlas.find_room_by_external_id("900").expect("room 900");
+    assert!(
+        room900_pruned.get_exits().is_empty(),
+        "mapprune removes the compass exit the server stopped reporting.\n{transcript}"
+    );
+
+    tx.send(RuntimeAction::Shutdown).ok();
+}
+
+/// Continent rooms (Aardwolf `coord.cont == 1`) are follow-only: a KNOWN room from an
+/// imported overland map still moves the current-location marker, while unknown
+/// continent rooms are never drawn (creating rooms across a 1000x1000 grid belongs to a
+/// future grid regime, docs/gmcp-mapping.md §4).
+#[tokio::test]
+async fn auto_mapper_follows_continent_rooms_without_drawing() {
+    const CONT_SERVER: &str = "AutoMapperCont";
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    std::fs::create_dir_all(smudgy_home.join(CONT_SERVER).join("modules")).unwrap();
+    std::fs::create_dir_all(smudgy_home.join(CONT_SERVER).join("logs")).unwrap();
+    copy_package_source(CONT_SERVER);
+    shared_packages::install_package(
+        CONT_SERVER,
+        "smudgy://local/auto-mapper",
+        UpdateMode::Auto,
+        true,
+    )
+    .unwrap();
+
+    let map_root = smudgy_home.join("map-test-cont");
+    let local = Arc::new(LocalBackend::new(map_root.join("local")));
+    let cloud = Arc::new(CloudMapper::new(
+        "http://127.0.0.1:0".to_string(),
+        "test-key".to_string(),
+    ));
+    let backend: Arc<dyn MapperBackend + Send + Sync> =
+        Arc::new(CompositeBackend::new(local, cloud));
+    let mapper = Mapper::new(backend, map_root.join("cache"));
+
+    // Stand in for an imported overland map: one continent room bound to its id.
+    let mesolar = mapper
+        .create_area_ephemeral("Mesolar".to_string())
+        .await
+        .expect("create the overland area");
+    mapper.upsert_room(
+        RoomKey::new(mesolar, RoomNumber(1)),
+        RoomUpdates {
+            title: Some("On a dusty road".to_string()),
+            external_id: Some(Some("35200".to_string())),
+            ..RoomUpdates::default()
+        },
+    );
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(9340_u32),
+        server_name: Arc::new(CONT_SERVER.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: Some(mapper.clone()),
+        package_client: Some(PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        )),
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+
+    tx.send(RuntimeAction::GmcpEnabled).unwrap();
+    // The known continent room: followed.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 35200, "name": "On a dusty road", "zone": "mesolar", "terrain": "field",
+             "exits": { "e": 35201 },
+             "coord": { "id": 0, "x": 500, "y": 300, "cont": 1 } }"#,
+    ))
+    .unwrap();
+    // An unknown continent room: never drawn.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 35201, "name": "On a dusty road", "zone": "mesolar", "terrain": "field",
+             "exits": { "w": 35200 },
+             "coord": { "id": 0, "x": 501, "y": 300, "cont": 1 } }"#,
+    ))
+    .unwrap();
+
+    let mut located = None;
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        match event.event {
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            SessionEvent::SetCurrentLocation(area, room) => located = Some((area, room)),
+            _ => {}
+        }
+    }
+    let transcript = lines.join("\n");
+
+    assert_eq!(
+        located,
+        Some((mesolar, Some(1))),
+        "a known continent room is FOLLOWED (follow-only, not follow-never).\n{transcript}"
+    );
+    let atlas = mapper.get_current_atlas();
+    assert!(
+        atlas.find_room_by_external_id("35201").is_none(),
+        "unknown continent rooms are never drawn.\n{transcript}"
+    );
+    assert_eq!(
+        atlas.get_area(&mesolar).expect("mesolar").room_count(),
+        1,
+        "the overland map gained no rooms.\n{transcript}"
+    );
+    assert_eq!(
+        mapper.ephemeral_area_ids().len(),
+        1,
+        "no zone area was opened for continent fixes.\n{transcript}"
     );
 
     tx.send(RuntimeAction::Shutdown).ok();

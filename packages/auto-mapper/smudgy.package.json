@@ -1,6 +1,6 @@
 {
     "name": "auto-mapper",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "Follows your position from GMCP or MSDP room data and auto-draws a session map as you explore. Type `savemap` to keep what you've mapped.",
     "permissions": {
         "smudgy": {
