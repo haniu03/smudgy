@@ -150,6 +150,13 @@ pub(crate) type SettingsSnapshot = Rc<RefCell<crate::models::settings::ScriptSet
 /// [`RecentLines`], which is what makes "panes survive script reloads" true.
 pub(crate) type SharedPaneRegistry = Rc<RefCell<PaneRegistry>>;
 
+/// The pane-size mirror (`docs/panes.md` placement read-back), shared into
+/// every isolate's ops like the input mirror: read synchronously by
+/// `pane.size`, written by the `PaneDisplayChanged` dispatch arm, interest
+/// flagged by the first read or a `pane:resize` subscription. Session-scoped
+/// (survives reload) like the registry itself.
+pub(crate) type SharedPaneSizeMirror = Rc<RefCell<pane::PaneSizeMirror>>;
+
 /// Per-line suppression/routing state, cleared per line event. Transforms
 /// (insert/replace/highlight/remove) stay in `pending_line_operations`;
 /// gag/redirect/copy live here so transforms always apply to every sink —
@@ -352,6 +359,13 @@ impl Runtime {
             // scoped (survives reload) like the pane registry — interest is a session fact.
             let input_mirror: SharedInputMirror = Rc::new(RefCell::new(InputMirror::default()));
 
+            // The pane-size mirror (panes.md placement read-back): read synchronously by
+            // every isolate's `pane.size` op, written by the `PaneDisplayChanged` dispatch
+            // arm. Session-scoped (survives reload) like the input mirror — interest is a
+            // session fact.
+            let pane_size_mirror: SharedPaneSizeMirror =
+                Rc::new(RefCell::new(pane::PaneSizeMirror::default()));
+
             // The in-flight typed submission `sys:input` handlers act on: installed by the
             // `SubmitInput` dispatch arm, mutated by the submission ops, consumed by the
             // completion arm. Shared into every isolate's ops beside `line_routing`. The
@@ -446,6 +460,7 @@ impl Runtime {
                 pane_registry: pane_registry.clone(),
                 line_routing: line_routing.clone(),
                 input_mirror: input_mirror.clone(),
+                pane_size_mirror: pane_size_mirror.clone(),
                 input_submission: input_submission.clone(),
                 input_word_sets: input_word_sets.clone(),
                 pane_input_callbacks: pane_input_callbacks.clone(),
@@ -510,6 +525,7 @@ impl Runtime {
                 pane_registry: pane_registry.clone(),
                 line_routing: line_routing.clone(),
                 input_mirror: input_mirror.clone(),
+                pane_size_mirror: pane_size_mirror.clone(),
                 input_submission: input_submission.clone(),
                 input_word_sets: input_word_sets.clone(),
                 pane_input_callbacks: pane_input_callbacks.clone(),
@@ -687,6 +703,7 @@ impl Runtime {
                     pane_registry: pane_registry.clone(),
                     line_routing: line_routing.clone(),
                     input_mirror: input_mirror.clone(),
+                    pane_size_mirror: pane_size_mirror.clone(),
                     input_submission: input_submission.clone(),
                     input_word_sets: input_word_sets.clone(),
                     pane_input_callbacks: pane_input_callbacks.clone(),
@@ -769,6 +786,7 @@ impl Runtime {
                     pane_registry: pane_registry.clone(), // Panes survive script reloads
                     line_routing: line_routing.clone(),
                     input_mirror: input_mirror.clone(), // Mirror + interest survive reload
+                    pane_size_mirror: pane_size_mirror.clone(),
                     input_submission: input_submission.clone(), // Cleared above; the cell itself is session-scoped
                     input_word_sets: input_word_sets.clone(), // Contributions reset above; the cell itself is session-scoped
                     pane_input_callbacks: pane_input_callbacks.clone(), // Handlers reset above; the cell itself is session-scoped
@@ -922,6 +940,10 @@ struct Inner<'a> {
     /// The input mirror, shared (the same `Rc`) into every isolate's input read ops.
     /// Written by the `InputStateChanged` dispatch arm; preserved across reload.
     input_mirror: SharedInputMirror,
+    /// The pane-size mirror, shared (the same `Rc`) into every isolate's pane read
+    /// ops. Written by the `PaneDisplayChanged` dispatch arm; preserved across
+    /// reload like the pane registry itself.
+    pane_size_mirror: SharedPaneSizeMirror,
     /// The in-flight typed submission slot, shared into every isolate's submission ops.
     /// Its live cell is `Some` only between the `SubmitInput` dispatch arm's `sys:input`
     /// handler splice and the `CompleteInputSubmission` that consumes it.

@@ -1897,12 +1897,12 @@ pub(crate) struct KindSchemeRef {
 }
 
 /// Single-segment kind-scheme paths reserved for the platform (interop.md §4). `sys`/`map`/
-/// `input` are the host event catalogs; `gmcp` is the host GMCP producer (state + readiness
-/// events, `docs/gmcp.md`); `user` is reserved unpublished (main-isolate code shares user
-/// handles by ordinary import). Reservation is unconditional, so a package owner who happens
-/// to take one of these nicknames stays unaddressable through the schemes rather than
-/// shadowing the platform.
-const PLATFORM_PRODUCERS: [&str; 6] = ["sys", "map", "gmcp", "msdp", "user", "input"];
+/// `input`/`pane` are the host event catalogs; `gmcp` is the host GMCP producer (state +
+/// readiness events, `docs/gmcp.md`); `user` is reserved unpublished (main-isolate code
+/// shares user handles by ordinary import). Reservation is unconditional, so a package owner
+/// who happens to take one of these nicknames stays unaddressable through the schemes rather
+/// than shadowing the platform.
+const PLATFORM_PRODUCERS: [&str; 7] = ["sys", "map", "gmcp", "msdp", "user", "input", "pane"];
 
 /// The host event catalog of a platform producer: `(export name, event name)`, where the
 /// event name is the canonical kind's suffix (`("receive", "receive")` ⇒ `sys:receive`).
@@ -1929,6 +1929,10 @@ pub fn platform_event_catalog(producer: &str) -> &'static [(&'static str, &'stat
         // The observe-only command-input notifications (`docs/input.md`
         // §3.5): subscribing requires the `input` capability, enforced at `on()`.
         "input" => &[("change", "change"), ("focus", "focus")],
+        // The observe-only pane display notifications (`docs/panes.md`):
+        // subscribing requires the `panes` capability, enforced at `on()`
+        // (`pane:resize` additionally flags size-mirror interest there).
+        "pane" => &[("visibility", "visibility"), ("resize", "resize")],
         _ => &[],
     }
 }

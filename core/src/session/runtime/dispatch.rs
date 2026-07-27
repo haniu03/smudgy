@@ -67,6 +67,17 @@ impl Inner<'_> {
         }
     }
 
+    /// The `pane:visibility` host event for one actual eyeball-state change —
+    /// fired on every toggle whatever the spelling (spec restatement,
+    /// `hide()`/`show()`, cross-session, the user's eyeball click). Like
+    /// `input:change`'s `pane` field, the payload carries the display-cased
+    /// name; subscribers resolve it in their own namespace.
+    fn pane_visibility_emit(&self, def: &super::pane::PaneDef) -> Vec<RuntimeAction> {
+        self.gated_host_emit("pane:visibility", || {
+            serde_json::json!({ "pane": def.name.as_ref(), "hidden": def.hidden }).to_string()
+        })
+    }
+
     /// Send `text` to the wire verbatim — '\n' splits, nothing else does, and no
     /// alias matching — then flush the buffered display updates (the echoed copy)
     /// to the UI. The shared tail of every raw-send arm: the raw-prefix branch of
@@ -1120,6 +1131,8 @@ impl Inner<'_> {
             RuntimeAction::PaneClosed { key } => {
                 // Flush first: buffered updates may hold `AppendTo`s for this key, and the
                 // dangling-sink rule promises the UI that `PaneClosed` arrives behind them.
+                // The closed pane's mirrored size dies with it (keys are never reused).
+                self.pane_size_mirror.borrow_mut().remove(key);
                 if let Some(fut) = self.flush_buffer_updates()? {
                     fut.await?;
                 }
@@ -1131,16 +1144,31 @@ impl Inner<'_> {
                     .await?;
                 Ok(ActionResult::None)
             }
-            RuntimeAction::PaneUpdated { def } => {
+            RuntimeAction::PaneUpdated {
+                def,
+                announce_visibility,
+            } => {
                 // The registry mutation already happened synchronously in the op; this is a
-                // pure display-state refresh (title-bar policy), so no flush is needed.
+                // pure display-state refresh (title bar, hidden, font size), so no flush is
+                // needed. `announce_visibility` marks that the change included the hidden
+                // toggle — that is the queuing op's edge detection, carried here because
+                // the def alone can't say what changed.
                 self.ui_tx
                     .send(TaggedSessionEvent {
                         session_id: self.session_id,
-                        event: SessionEvent::PaneUpdated(def),
+                        event: SessionEvent::PaneUpdated(def.clone()),
                     })
                     .await?;
-                Ok(ActionResult::None)
+                let actions = if announce_visibility {
+                    self.pane_visibility_emit(&def)
+                } else {
+                    Vec::new()
+                };
+                if actions.is_empty() {
+                    Ok(ActionResult::None)
+                } else {
+                    Ok(ActionResult::Run(actions))
+                }
             }
             RuntimeAction::PaneReloadSweep => {
                 // Reload garbage collection: close every pane no script re-claimed
@@ -1162,6 +1190,7 @@ impl Inner<'_> {
                             &self.pane_input_callbacks,
                             key,
                         );
+                        self.pane_size_mirror.borrow_mut().remove(key);
                         self.ui_tx
                             .send(TaggedSessionEvent {
                                 session_id: self.session_id,
@@ -1176,7 +1205,7 @@ impl Inner<'_> {
                 namespace,
                 name,
                 kind,
-                title_bar,
+                def_state,
                 reference,
                 direction,
                 size_px,
@@ -1186,10 +1215,10 @@ impl Inner<'_> {
                 // caller (who has already moved on).
                 // Cross-session splits never carry an input (the op refuses
                 // the spec), so the registry sees `None` here by construction.
-                let outcome = self
-                    .pane_registry
-                    .borrow_mut()
-                    .split(&namespace, &name, kind, title_bar, None);
+                let outcome =
+                    self.pane_registry
+                        .borrow_mut()
+                        .split(&namespace, &name, kind, def_state, None);
                 match outcome {
                     Ok(outcome) if outcome.created => {
                         let reference = reference
@@ -1216,14 +1245,20 @@ impl Inner<'_> {
                             .await?;
                     }
                     // Get-or-create hit: the pane already exists, but an explicit
-                    // titleBar may still have re-policied it.
-                    Ok(outcome) if outcome.title_bar_changed => {
+                    // def-state field may still have updated it.
+                    Ok(outcome) if outcome.def_changed => {
                         self.ui_tx
                             .send(TaggedSessionEvent {
                                 session_id: self.session_id,
-                                event: SessionEvent::PaneUpdated(outcome.def),
+                                event: SessionEvent::PaneUpdated(outcome.def.clone()),
                             })
                             .await?;
+                        if outcome.hidden_changed {
+                            let actions = self.pane_visibility_emit(&outcome.def);
+                            if !actions.is_empty() {
+                                return Ok(ActionResult::Run(actions));
+                            }
+                        }
                     }
                     Ok(_) => {}
                     Err(err) => warn!("Cross-session pane split '{name}' refused: {err}"),
@@ -1242,6 +1277,7 @@ impl Inner<'_> {
                             &self.pane_input_callbacks,
                             key,
                         );
+                        self.pane_size_mirror.borrow_mut().remove(key);
                         if let Some(fut) = self.flush_buffer_updates()? {
                             fut.await?;
                         }
@@ -1256,6 +1292,125 @@ impl Inner<'_> {
                     Err(PaneError::NoSuchPane(_)) => {}
                     Err(err) => warn!("Cross-session pane close '{name}' refused: {err}"),
                 }
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneSetHiddenRemote {
+                namespace,
+                name,
+                hidden,
+            } => {
+                // Cross-session hide/show, resolved on this (owning) runtime;
+                // last-writer-wins in queue order, silent no-op on an unknown
+                // name (the `PaneCloseRemote` rule).
+                let updated = self
+                    .pane_registry
+                    .borrow_mut()
+                    .set_hidden(&namespace, &name, hidden);
+                match updated {
+                    Ok(Some(def)) => {
+                        self.ui_tx
+                            .send(TaggedSessionEvent {
+                                session_id: self.session_id,
+                                event: SessionEvent::PaneUpdated(def.clone()),
+                            })
+                            .await?;
+                        let actions = self.pane_visibility_emit(&def);
+                        if !actions.is_empty() {
+                            return Ok(ActionResult::Run(actions));
+                        }
+                    }
+                    Ok(None) | Err(PaneError::NoSuchPane(_)) => {}
+                    Err(err) => warn!("Cross-session pane hide/show '{name}' refused: {err}"),
+                }
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneSetFontSizeRemote {
+                namespace,
+                name,
+                font_size,
+            } => {
+                let updated = self
+                    .pane_registry
+                    .borrow_mut()
+                    .set_font_size(&namespace, &name, font_size);
+                match updated {
+                    Ok(Some(def)) => {
+                        self.ui_tx
+                            .send(TaggedSessionEvent {
+                                session_id: self.session_id,
+                                event: SessionEvent::PaneUpdated(def),
+                            })
+                            .await?;
+                    }
+                    Ok(None) | Err(PaneError::NoSuchPane(_)) => {}
+                    Err(err) => warn!("Cross-session pane font size '{name}' refused: {err}"),
+                }
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneUserHidden { key, hidden } => {
+                // The UI's report of a user eyeball click. The toggling window
+                // already flipped optimistically; writing the def and echoing
+                // `PaneUpdated` makes every consumer converge on it (idempotent
+                // for the reporter). No main guard — the user may hide any
+                // pane, including main (the all-hidden fallback keeps a window
+                // usable). A retired key or an already-matching state drops
+                // the report whole, like a stale `InputStateChanged`.
+                let updated = self.pane_registry.borrow_mut().set_hidden_by_key(key, hidden);
+                match updated {
+                    Some(def) => {
+                        self.ui_tx
+                            .send(TaggedSessionEvent {
+                                session_id: self.session_id,
+                                event: SessionEvent::PaneUpdated(def.clone()),
+                            })
+                            .await?;
+                        let actions = self.pane_visibility_emit(&def);
+                        if actions.is_empty() {
+                            Ok(ActionResult::None)
+                        } else {
+                            Ok(ActionResult::Run(actions))
+                        }
+                    }
+                    None => Ok(ActionResult::None),
+                }
+            }
+            RuntimeAction::PaneResize { key, width, height } => {
+                // Placement command: no core state, no ordering constraints —
+                // the daemon applies it to the hosting window's cluster model.
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneResize { key, width, height },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneRelocate {
+                key,
+                reference,
+                direction,
+                size_px,
+            } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneRelocate {
+                            key,
+                            reference,
+                            direction,
+                            size_px,
+                        },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneTearOut { key, width, height } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneTearOut { key, width, height },
+                    })
+                    .await?;
                 Ok(ActionResult::None)
             }
             RuntimeAction::PaneEcho {
@@ -1386,6 +1541,55 @@ impl Inner<'_> {
                     })
                     .await?;
                 Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneMirrorInterest => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneMirrorInterest,
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneDisplayChanged { key, width, height } => {
+                // The UI's coalesced pane-size update: write the mirror the
+                // `pane.size` read op consults; the `pane:resize` host event
+                // derives from the same feed's edges. A non-main key with no
+                // live registry entry drops whole (the update was in flight
+                // when the close purge ran), like a stale `InputStateChanged`.
+                let pane_name = {
+                    let registry = self.pane_registry.borrow();
+                    match registry.get(key) {
+                        Some(def) => def.name.to_string(),
+                        None => return Ok(ActionResult::None),
+                    }
+                };
+                let size = super::pane::PaneSize { width, height };
+                let prior = self.pane_size_mirror.borrow_mut().apply(key, size);
+                // A pane's first-ever report is a BASELINE, not an edge: the
+                // UI pushes current sizes unconditionally when interest is
+                // flagged (and when a pane opens under standing interest), so
+                // state that merely predates the subscription seeds the
+                // mirror without replaying as a resize event.
+                let Some(prior) = prior else {
+                    return Ok(ActionResult::None);
+                };
+                if prior == size {
+                    return Ok(ActionResult::None);
+                }
+                let actions = self.gated_host_emit("pane:resize", || {
+                    serde_json::json!({
+                        "pane": pane_name,
+                        "width": width,
+                        "height": height,
+                    })
+                    .to_string()
+                });
+                if actions.is_empty() {
+                    Ok(ActionResult::None)
+                } else {
+                    Ok(ActionResult::Run(actions))
+                }
             }
             RuntimeAction::InputStateChanged {
                 key,

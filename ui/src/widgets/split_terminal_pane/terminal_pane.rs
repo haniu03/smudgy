@@ -38,6 +38,23 @@ struct ParagraphCache<P: text::Paragraph> {
     /// The prefs generation this paragraph was shaped with; a mismatch is a
     /// cache miss (font/size/palette changes rebuild paragraphs).
     generation: u64,
+    /// The effective font size this paragraph was shaped at — the per-pane
+    /// override composes with the generation (an override change re-shapes
+    /// without a prefs bump).
+    font_size: f32,
+}
+
+/// The effective text metrics for a pane: its font override (line height by
+/// the same ×1.25 rule the global preference derives with, `prefs.rs`) or
+/// the preference values.
+pub(super) fn effective_metrics(
+    prefs: &crate::prefs::TerminalPrefs,
+    font_override: Option<f32>,
+) -> (f32, f32) {
+    match font_override {
+        Some(px) => (px, (px * 1.25).round()),
+        None => (prefs.font_size, prefs.line_height),
+    }
 }
 
 /// State specific to the TerminalPane widget instance.
@@ -46,8 +63,10 @@ pub(super) struct State<P: text::Paragraph> {
     pub last_line_number: usize,
     cache: Vec<ParagraphCache<P>>,
     pub is_focused: bool,
-    /// Measured `(prefs generation, monospace cell advance)`.
-    pub advance: Option<(u64, f32)>,
+    /// Measured `(prefs generation, effective font size, monospace cell
+    /// advance)` — the font size composes because a per-pane override changes
+    /// the cell without a prefs bump.
+    pub advance: Option<(u64, f32, f32)>,
     /// Keyboard modifiers as of the last change event, reported with link clicks.
     pub modifiers: keyboard::Modifiers,
     /// The buffer cell the press landed on, kept while the pointer stays on it. A
@@ -139,6 +158,9 @@ pub struct TerminalPane<'a> {
     /// shell message so the pane stays `Message`-agnostic (it is instantiated under
     /// several message types); the handler sends the resulting runtime action itself.
     on_link: Option<Rc<dyn Fn(LinkClickEvent)>>,
+    /// Per-pane terminal font override (`docs/panes.md`); `None` follows the
+    /// global preference.
+    font_size: Option<f32>,
 }
 
 impl<'a> TerminalPane<'a> {
@@ -149,6 +171,7 @@ impl<'a> TerminalPane<'a> {
             selection,
             last_line_number: None,
             on_link: None,
+            font_size: None,
         }
     }
 
@@ -159,6 +182,11 @@ impl<'a> TerminalPane<'a> {
 
     pub fn on_link(mut self, on_link: Option<Rc<dyn Fn(LinkClickEvent)>>) -> Self {
         self.on_link = on_link;
+        self
+    }
+
+    pub fn font_size(mut self, font_size: Option<f32>) -> Self {
+        self.font_size = font_size;
         self
     }
 }
@@ -195,27 +223,32 @@ where
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
         let selection = self.selection.borrow();
         let prefs = crate::prefs::current();
+        let (font_size, line_height) = effective_metrics(&prefs, self.font_size);
 
         // The measured width of one monospace cell at the current font/size,
-        // measured once per prefs generation. It clamps the wrap width when a
-        // maximum line length is configured, and the parent split pane reads
-        // it to derive the character grid NAWS reports.
+        // measured once per (prefs generation, effective font size). It clamps
+        // the wrap width when a maximum line length is configured, and the
+        // parent split pane reads it to derive the character grid NAWS reports.
         let advance = match state.advance {
-            Some((generation, advance)) if generation == prefs.generation => advance,
+            Some((generation, probe_size, advance))
+                if generation == prefs.generation && probe_size == font_size =>
+            {
+                advance
+            }
             _ => {
                 let probe = Renderer::Paragraph::with_text(iced::advanced::text::Text {
                     content: ADVANCE_PROBE,
                     bounds: iced::Size::new(f32::INFINITY, f32::INFINITY),
-                    size: Pixels(prefs.font_size),
+                    size: Pixels(font_size),
                     font: prefs.font,
-                    line_height: LineHeight::Absolute(Pixels(prefs.line_height)),
+                    line_height: LineHeight::Absolute(Pixels(line_height)),
                     align_x: text::Alignment::Left,
                     align_y: alignment::Vertical::Top,
                     shaping: text::Shaping::Advanced,
                     wrapping: text::Wrapping::None,
                 });
                 let advance = probe.min_width() / ADVANCE_PROBE.len() as f32;
-                state.advance = Some((prefs.generation, advance));
+                state.advance = Some((prefs.generation, font_size, advance));
                 advance
             }
         };
@@ -250,9 +283,11 @@ where
 
             // look for a matching cached Paragraph in state.paragraphs[i] or state.paragraphs[i + 1],
             // advancing i by 1 if a match is found; entries shaped under an
-            // older prefs generation are always misses
+            // older prefs generation — or a different effective font size —
+            // are always misses
             if let Some(cache) = state.cache.get_mut(i)
                 && cache.generation == prefs.generation
+                && cache.font_size == font_size
             {
                 let line_selection = selection.for_line(line_number);
 
@@ -293,9 +328,9 @@ where
             let text = iced::advanced::text::Text {
                 content: Vec::as_ref(&spans_vec),
                 bounds: text_bounds,
-                size: Pixels(prefs.font_size),
+                size: Pixels(font_size),
                 font: prefs.font,
-                line_height: LineHeight::Absolute(Pixels(prefs.line_height)),
+                line_height: LineHeight::Absolute(Pixels(line_height)),
                 align_x: text::Alignment::Left,
                 align_y: alignment::Vertical::Top,
                 shaping: text::Shaping::Advanced,
@@ -312,6 +347,7 @@ where
                 max_valid_width: text_bounds.width,
                 selection: line_selection,
                 generation: prefs.generation,
+                font_size,
             });
         }
 
@@ -373,9 +409,9 @@ where
                         // Baseline placement per iced's rich_text: the underline
                         // sits at font size plus half the leading, nudged up by
                         // 8% of the font size.
-                        let underline_y = prefs.font_size
-                            + (prefs.line_height - prefs.font_size) / 2.0
-                            - prefs.font_size * 0.08;
+                        let (font_size, line_height) = effective_metrics(&prefs, self.font_size);
+                        let underline_y =
+                            font_size + (line_height - font_size) / 2.0 - font_size * 0.08;
                         for region in &regions {
                             let rect = Rectangle {
                                 x: layout.bounds().x + region.x,

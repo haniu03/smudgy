@@ -197,6 +197,11 @@ enum Message {
     /// A window-geometry observation (moved/resized/rescaled/focused/cursor)
     /// for the tracker feeding the cross-window drag layer.
     WindowTracking(window::Id, pane_drag::TrackEvent),
+    /// The trailing debounce flush of one session's pane-size feed: send the
+    /// settled pending sizes to the runtime (`docs/panes.md` placement
+    /// read-back). Scheduled by [`report_pane_sizes`], at most one in flight
+    /// per session.
+    FlushPaneSizes(SessionId),
 }
 
 /// The application id, matching the Linux desktop-entry / Flatpak app id
@@ -624,7 +629,7 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 .task
                 .map(move |message| Message::SmudgyWindowMessage(id, message));
 
-            match update.event {
+            let handled = match update.event {
                 Some(SmudgyWindowEvent::CreateNewScriptEditorWindow {
                     server_name,
                     session_id,
@@ -711,8 +716,28 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     smudgy.account.dismiss_upgrade_for_version();
                     task
                 }
+                Some(SmudgyWindowEvent::PaneVisibilityToggled { slot, hidden }) => {
+                    // The window flipped optimistically; the def lives on the
+                    // pane's session runtime, which echoes `PaneUpdated` to
+                    // converge every consumer (and fires `pane:visibility`).
+                    if let Some(session) = smudgy.sessions.get(slot.session_id) {
+                        session.report_user_hidden(slot.key, hidden);
+                    }
+                    task
+                }
                 None => task,
+            };
+            // Any window update may have moved pane geometry (divider drags,
+            // window resizes, toolbar toggles): feed the pane-size mirror.
+            // Cheap, and a no-op for sessions without mirror interest.
+            let report = report_pane_sizes(smudgy);
+            Task::batch([handled, report])
+        }
+        Message::FlushPaneSizes(session_id) => {
+            if let Some(session) = smudgy.sessions.get_mut(session_id) {
+                session.flush_pane_sizes();
             }
+            Task::none()
         }
         Message::SessionEvent(TaggedSessionEvent { session_id, event }) => {
             // Per-server map-scope reactions live on the daemon (it owns the
@@ -728,24 +753,99 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 }
                 _ => Task::none(),
             };
-            // Pane lifecycle touches both the store (display state, handled
-            // by the session's own update below) and the windows' grids
-            // (handled here at the daemon, which owns the window map).
-            let pane_lifecycle = match &event {
-                SessionEvent::PaneOpened { def, placement } => Some((def.key, Some(*placement))),
-                SessionEvent::PaneClosed(key) => Some((*key, None)),
+            // Pane lifecycle, def-state, and placement events touch both the
+            // store (display state, handled by the session's own update
+            // below) and the windows' grids (handled here at the daemon,
+            // which owns the window map).
+            let pane_follow_up = match &event {
+                SessionEvent::PaneOpened { def, placement } => Some(PaneFollowUp::Opened {
+                    key: def.key,
+                    placement: *placement,
+                    hidden: def.hidden,
+                }),
+                SessionEvent::PaneClosed(key) => Some(PaneFollowUp::Closed(*key)),
+                SessionEvent::PaneUpdated(def) => Some(PaneFollowUp::DefSync {
+                    key: def.key,
+                    hidden: def.hidden,
+                }),
+                SessionEvent::PaneResize { key, width, height } => Some(PaneFollowUp::Resize {
+                    key: *key,
+                    width: *width,
+                    height: *height,
+                }),
+                SessionEvent::PaneRelocate {
+                    key,
+                    reference,
+                    direction,
+                    size_px,
+                } => Some(PaneFollowUp::Relocate {
+                    key: *key,
+                    reference: *reference,
+                    direction: *direction,
+                    size_px: *size_px,
+                }),
+                SessionEvent::PaneTearOut { key, width, height } => Some(PaneFollowUp::TearOut {
+                    key: *key,
+                    width: *width,
+                    height: *height,
+                }),
+                SessionEvent::PaneMirrorInterest => Some(PaneFollowUp::MirrorInterest),
                 _ => None,
             };
             if let Some(session) = smudgy.sessions.get_mut(session_id) {
                 let task = session
                     .update(session_store::Message::SessionEvent(event))
                     .map(move |msg| Message::SessionAction(session_id, msg));
-                let pane_task = match pane_lifecycle {
-                    Some((key, Some(placement))) => {
+                let pane_task = match pane_follow_up {
+                    Some(PaneFollowUp::Opened {
+                        key,
+                        placement,
+                        hidden,
+                    }) => {
                         place_pane_in_windows(smudgy, session_id, key, placement);
-                        Task::none()
+                        // A pre-hidden spec (`hidden: true` at split) seeds
+                        // the hosting window's toggle before first paint —
+                        // reveal-on-event panes never flash at load.
+                        if hidden {
+                            sync_pane_hidden(smudgy, PaneRef { session_id, key }, true);
+                        }
+                        report_pane_sizes(smudgy)
                     }
-                    Some((key, None)) => remove_pane_from_windows(smudgy, session_id, key),
+                    Some(PaneFollowUp::Closed(key)) => {
+                        remove_pane_from_windows(smudgy, session_id, key)
+                    }
+                    Some(PaneFollowUp::DefSync { key, hidden }) => {
+                        sync_pane_hidden(smudgy, PaneRef { session_id, key }, hidden);
+                        report_pane_sizes(smudgy)
+                    }
+                    Some(PaneFollowUp::Resize { key, width, height }) => {
+                        let slot = PaneRef { session_id, key };
+                        for window in smudgy.smudgy_windows.values_mut() {
+                            if window.hosts_pane(session_id, key) {
+                                window.resize_pane_slot(slot, width, height);
+                            }
+                        }
+                        report_pane_sizes(smudgy)
+                    }
+                    Some(PaneFollowUp::Relocate {
+                        key,
+                        reference,
+                        direction,
+                        size_px,
+                    }) => relocate_script_pane(smudgy, session_id, key, reference, direction, size_px),
+                    Some(PaneFollowUp::TearOut { key, width, height }) => {
+                        tear_out_script_pane(smudgy, session_id, key, width, height)
+                    }
+                    Some(PaneFollowUp::MirrorInterest) => {
+                        // Warm-up: measure everything now and flush without
+                        // the debounce, so the first `pane.size` reads see
+                        // reality (the store arm above armed the feed).
+                        let report = report_pane_sizes(smudgy);
+                        if let Some(session) = smudgy.sessions.get_mut(session_id) {
+                            session.flush_pane_sizes();
+                        }
+                        report
+                    }
                     None => Task::none(),
                 };
                 Task::batch([task, pane_task, scope_task])
@@ -1239,6 +1339,213 @@ fn close_emptied_windows(smudgy: &mut Smudgy, emptied: Vec<window::Id>) -> Task<
 /// pane — falling back to the window hosting the session's main pane, then
 /// any window. (A script splitting against a pane whose window vanished
 /// mid-flight lands next to the main pane.)
+/// The daemon's half of a pane session event — captured by value before the
+/// event is forwarded into the session store, then applied to the windows.
+enum PaneFollowUp {
+    Opened {
+        key: PaneKey,
+        placement: PanePlacement,
+        hidden: bool,
+    },
+    Closed(PaneKey),
+    DefSync {
+        key: PaneKey,
+        hidden: bool,
+    },
+    Resize {
+        key: PaneKey,
+        width: Option<f32>,
+        height: Option<f32>,
+    },
+    Relocate {
+        key: PaneKey,
+        reference: PaneKey,
+        direction: smudgy_core::session::runtime::pane::SplitDirection,
+        size_px: Option<f32>,
+    },
+    TearOut {
+        key: PaneKey,
+        width: Option<f32>,
+        height: Option<f32>,
+    },
+    MirrorInterest,
+}
+
+/// Sync one pane's def-owned hidden state into whichever window hosts it —
+/// idempotent for the window whose own eyeball click originated the change.
+fn sync_pane_hidden(smudgy: &mut Smudgy, slot: PaneRef, hidden: bool) {
+    for window in smudgy.smudgy_windows.values_mut() {
+        if window.hosts_pane(slot.session_id, slot.key) {
+            window.set_pane_hidden(slot, hidden);
+        }
+    }
+}
+
+/// Feed the pane-size mirror: measure every rendered slot in every smudgy
+/// window and report it to its session's feed (change-gated; a no-op for
+/// sessions without mirror interest). Sessions that gained pending entries
+/// get one trailing flush scheduled — the debounce that turns divider-drag
+/// streams into settled reports.
+fn report_pane_sizes(smudgy: &mut Smudgy) -> Task<Message> {
+    let measured: Vec<(PaneRef, Size)> = smudgy
+        .smudgy_windows
+        .values()
+        .flat_map(windows::smudgy_window::SmudgyWindow::pane_sizes)
+        .collect();
+    let mut flushes = Vec::new();
+    for (slot, size) in measured {
+        let Some(session) = smudgy.sessions.get_mut(slot.session_id) else {
+            continue;
+        };
+        if !session.pane_size_interest() {
+            continue;
+        }
+        if session.report_pane_size(slot.key, size.width, size.height) {
+            let session_id = slot.session_id;
+            flushes.push(Task::perform(
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                },
+                move |()| Message::FlushPaneSizes(session_id),
+            ));
+        }
+    }
+    Task::batch(flushes)
+}
+
+/// Apply a script `pane.relocate` (panes.md placement commands): detach the
+/// pane's slot from whichever window holds it and re-attach it beside the
+/// reference — the synthetic manual drop, riding the transplant machinery
+/// when the reference lives in another window. The hidden toggle travels
+/// with the slot; unlike a user drop, focus does not.
+fn relocate_script_pane(
+    smudgy: &mut Smudgy,
+    session_id: SessionId,
+    key: PaneKey,
+    reference: PaneKey,
+    direction: smudgy_core::session::runtime::pane::SplitDirection,
+    size_px: Option<f32>,
+) -> Task<Message> {
+    let slot = PaneRef { session_id, key };
+    let ref_slot = PaneRef {
+        session_id,
+        key: reference,
+    };
+    let source_id = smudgy
+        .smudgy_windows
+        .iter()
+        .find_map(|(id, window)| window.hosts_pane(session_id, key).then_some(*id));
+    let target_id = smudgy
+        .smudgy_windows
+        .iter()
+        .find_map(|(id, window)| window.hosts_pane(session_id, reference).then_some(*id))
+        .or(source_id);
+    let (Some(source_id), Some(target_id)) = (source_id, target_id) else {
+        log::warn!("No window hosts {key} for session {session_id}; dropping relocate");
+        return Task::none();
+    };
+    if source_id == target_id {
+        if let Some(window) = smudgy.smudgy_windows.get_mut(&source_id) {
+            let hidden = window.pane_hidden(slot);
+            // The reference stays behind, so the removal can never empty the
+            // window; the re-insert follows in this same update.
+            window.remove_pane_slot(session_id, key);
+            window.insert_pane_beside(slot, ref_slot, direction, size_px);
+            window.set_pane_hidden(slot, hidden);
+        }
+        return report_pane_sizes(smudgy);
+    }
+    let Some(source) = smudgy.smudgy_windows.get_mut(&source_id) else {
+        return Task::none();
+    };
+    let hidden = source.pane_hidden(slot);
+    let emptied = source.remove_pane_slot(session_id, key);
+    let repair = source
+        .repair_active_session(&smudgy.sessions)
+        .map(move |msg| Message::SmudgyWindowMessage(source_id, msg));
+    if let Some(target) = smudgy.smudgy_windows.get_mut(&target_id) {
+        target.insert_pane_beside(slot, ref_slot, direction, size_px);
+        target.set_pane_hidden(slot, hidden);
+    }
+    let close = if emptied {
+        close_emptied_windows(smudgy, vec![source_id])
+    } else {
+        Task::none()
+    };
+    let report = report_pane_sizes(smudgy);
+    Task::batch([repair, close, report])
+}
+
+/// Apply a script `pane.tearOut`: the drag tear-out flow minus the drag —
+/// move the slot into a fresh dedicated window, sized by the request (or
+/// like the pane it carries), positioned by the OS. Windows stay emergent:
+/// no script-facing window identity is minted, and the empty-window rule
+/// closes the window when its last pane leaves.
+fn tear_out_script_pane(
+    smudgy: &mut Smudgy,
+    session_id: SessionId,
+    key: PaneKey,
+    width: Option<f32>,
+    height: Option<f32>,
+) -> Task<Message> {
+    let slot = PaneRef { session_id, key };
+    let Some(source_id) = smudgy
+        .smudgy_windows
+        .iter()
+        .find_map(|(id, window)| window.hosts_pane(session_id, key).then_some(*id))
+    else {
+        log::warn!("No window hosts {key} for session {session_id}; dropping tearOut");
+        return Task::none();
+    };
+    let Some(source) = smudgy.smudgy_windows.get_mut(&source_id) else {
+        return Task::none();
+    };
+    let hidden = source.pane_hidden(slot);
+    let measured = source.pane_size(slot);
+    let emptied = source.remove_pane_slot(session_id, key);
+    let repair = source
+        .repair_active_session(&smudgy.sessions)
+        .map(move |msg| Message::SmudgyWindowMessage(source_id, msg));
+
+    let mut settings = smudgy_window_settings();
+    // Size the window by the request, falling back per dimension to the
+    // pane's measured rect (plus the toolbar band), floored by the window
+    // minimum — the drag tear-out's sizing rule.
+    let fallback = measured.map(|size| (size.width, size.height + TORN_OUT_CHROME_HEIGHT));
+    let width = width.or(fallback.map(|(w, _)| w));
+    let height = height.or(fallback.map(|(_, h)| h));
+    if width.is_some() || height.is_some() {
+        settings.size = Size::new(
+            width.unwrap_or(settings.size.width).max(640.0),
+            height.unwrap_or(settings.size.height).max(400.0),
+        );
+    }
+
+    let (id, open_task) = window::open(settings);
+    let mut torn_out = windows::smudgy_window::SmudgyWindow::new(id, smudgy.account.handles());
+    torn_out.adopt_torn_out_pane(slot);
+    torn_out.set_pane_hidden(slot, hidden);
+    smudgy.smudgy_windows.insert(id, torn_out);
+
+    let activate = Task::done(Message::SmudgyWindowMessage(
+        id,
+        windows::smudgy_window::Message::SetActiveSession(session_id),
+    ));
+    let close = if emptied {
+        close_emptied_windows(smudgy, vec![source_id])
+    } else {
+        Task::none()
+    };
+    let report = report_pane_sizes(smudgy);
+    Task::batch([
+        open_task.map(Message::NewSmudgyWindow),
+        activate,
+        close,
+        repair,
+        report,
+    ])
+}
+
 fn place_pane_in_windows(
     smudgy: &mut Smudgy,
     session_id: SessionId,

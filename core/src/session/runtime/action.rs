@@ -21,7 +21,7 @@ use super::input::{InputOp, InputSnapshot, InputSource};
 use super::line_operation::LineOperation;
 use super::origin::{IsolateId, Origin};
 use super::pane::{
-    PaneDef, PaneKey, PaneKind, PaneNamespace, PanePlacement, SplitDirection, TitleBarPolicy,
+    DefStateSpec, PaneDef, PaneKey, PaneKind, PaneNamespace, PanePlacement, SplitDirection,
 };
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
@@ -282,12 +282,16 @@ pub enum RuntimeAction {
     PaneClosed {
         key: PaneKey,
     },
-    /// Emit `SessionEvent::PaneUpdated` for a def the split op already
-    /// mutated in place (an explicit `titleBar` on an existing pane). A pure
-    /// display refresh — no placement, so no ordering constraints beyond the
-    /// channel itself.
+    /// Emit `SessionEvent::PaneUpdated` for a def the queuing op already
+    /// mutated in place (an explicit def-state field — `titleBar`, `hidden`,
+    /// `fontSize` — on an existing pane, or the `hide`/`show`/`setFontSize`
+    /// ops). A pure display refresh — no placement, so no ordering
+    /// constraints beyond the channel itself. `announce_visibility` is the
+    /// op's edge detection: the change included the hidden toggle, so the
+    /// dispatch arm also fires the `pane:visibility` host event.
     PaneUpdated {
         def: PaneDef,
+        announce_visibility: bool,
     },
     /// Close every pane no script re-claimed during a reload. The reload loop
     /// queues this *behind* the freshly loaded modules' own spawned actions,
@@ -301,7 +305,7 @@ pub enum RuntimeAction {
         namespace: PaneNamespace,
         name: Arc<str>,
         kind: PaneKind,
-        title_bar: Option<TitleBarPolicy>,
+        def_state: DefStateSpec,
         reference: Option<Arc<str>>,
         direction: SplitDirection,
         size_px: Option<f32>,
@@ -311,6 +315,54 @@ pub enum RuntimeAction {
     PaneCloseRemote {
         namespace: PaneNamespace,
         name: Arc<str>,
+    },
+    /// Cross-session `hide()`/`show()`, by name (see
+    /// [`RuntimeAction::PaneSplitRemote`] for the resolution rules). Own-session
+    /// calls never ride an action for the mutation itself — the op writes the
+    /// registry synchronously and queues [`RuntimeAction::PaneUpdated`] to
+    /// mirror it.
+    PaneSetHiddenRemote {
+        namespace: PaneNamespace,
+        name: Arc<str>,
+        hidden: bool,
+    },
+    /// Cross-session `setFontSize()`, by name; `None` clears the override
+    /// back to the global setting.
+    PaneSetFontSizeRemote {
+        namespace: PaneNamespace,
+        name: Arc<str>,
+        font_size: Option<f32>,
+    },
+    /// The UI's report of a user eyeball click on a pane's title bar. The
+    /// dispatch arm writes the def (no main guard — the user may hide any
+    /// pane), echoes `SessionEvent::PaneUpdated`, and fires `pane:visibility`.
+    /// A retired key or an already-matching state drops the report whole.
+    PaneUserHidden {
+        key: PaneKey,
+        hidden: bool,
+    },
+    /// Forward `pane.resize` to the UI as `SessionEvent::PaneResize`
+    /// (panes.md placement commands). Own-session only; the op resolved
+    /// `key` synchronously against the live registry. Placement carries no
+    /// core state — the daemon applies it to the cluster model.
+    PaneResize {
+        key: PaneKey,
+        width: Option<f32>,
+        height: Option<f32>,
+    },
+    /// Forward `pane.relocate` to the UI as `SessionEvent::PaneRelocate`.
+    /// Both keys were resolved synchronously by the op (same session).
+    PaneRelocate {
+        key: PaneKey,
+        reference: PaneKey,
+        direction: SplitDirection,
+        size_px: Option<f32>,
+    },
+    /// Forward `pane.tearOut` to the UI as `SessionEvent::PaneTearOut`.
+    PaneTearOut {
+        key: PaneKey,
+        width: Option<f32>,
+        height: Option<f32>,
     },
     /// Echo `text` into the named pane as whole lines (split on `\n`).
     /// Name-carrying so it is routable cross-session; resolved at dispatch.
@@ -377,6 +429,20 @@ pub enum RuntimeAction {
     /// feeding the input mirror (`SessionEvent::InputMirrorInterest`). Sent
     /// once per session — interest never clears.
     InputMirrorInterest,
+    /// The session thread's first pane-size read (or `pane:resize`
+    /// subscription): tell the UI to start feeding the pane-size mirror
+    /// (`SessionEvent::PaneMirrorInterest`). Sent once per session.
+    PaneMirrorInterest,
+    /// One coalesced pane-size update from the UI (sent only while the
+    /// session has flagged interest; change-gated per pane on settled
+    /// layouts, never per drag frame). The dispatch arm writes it into the
+    /// session-thread pane-size mirror the `pane.size` read op consults and
+    /// derives the `pane:resize` host event from the edge.
+    PaneDisplayChanged {
+        key: PaneKey,
+        width: f32,
+        height: f32,
+    },
     /// One coalesced input-state update from the UI (sent only while the
     /// session has flagged interest). The dispatch arm writes it into the
     /// session-thread [`super::input::InputMirror`] the read ops consult.

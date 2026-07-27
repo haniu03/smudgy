@@ -10,7 +10,7 @@ use crate::{
     models::hotkeys::HotkeyDefinition,
     session::runtime::input::InputOp,
     session::runtime::line_operation::LineOperation,
-    session::runtime::pane::{PaneDef, PaneKey, PanePlacement},
+    session::runtime::pane::{PaneDef, PaneKey, PanePlacement, SplitDirection},
 };
 
 pub mod config;
@@ -67,11 +67,45 @@ pub enum SessionEvent {
     /// it arrives behind every `AppendTo` that preceded it — a UI-side
     /// `AppendTo` miss is therefore a bug (warn and drop), never a race.
     PaneClosed(PaneKey),
-    /// An existing pane's def changed in place — today only its `title_bar`
-    /// policy, via a `split()` naming an existing pane with an explicit
-    /// `titleBar` (the only way to set the main pane's). Pure display-state
-    /// refresh: no placement, no buffer implications.
+    /// An existing pane's def changed in place — a def-state field
+    /// (`title_bar`, `hidden`, `font_size`) via a `split()` naming an
+    /// existing pane with an explicit field, the `hide`/`show`/`setFontSize`
+    /// ops, or the echo of a user eyeball toggle. Pure display-state
+    /// refresh: no placement, no buffer implications. The UI applies the
+    /// whole def (idempotent for the window whose eyeball click originated
+    /// it).
     PaneUpdated(PaneDef),
+    /// A script asked to resize a pane (`pane.resize`, panes.md placement
+    /// commands): adjust the nearest ancestor divider on each given axis to
+    /// make the pane `width`/`height` px, writing the edge back to a
+    /// script-owned px sizing (a later user drag re-owns it). Best-effort: a
+    /// pane spanning the full extent of an axis no-ops on that axis; a
+    /// retired key drops the event whole (warn, like a missed `AppendTo`).
+    PaneResize {
+        key: PaneKey,
+        width: Option<f32>,
+        height: Option<f32>,
+    },
+    /// A script asked to move a pane next to `reference` (`pane.relocate`):
+    /// the synthetic version of a manual drop — re-parent the pane's leaf on
+    /// the `direction` side of the reference in whichever window hosts it,
+    /// with an optional initial extent like a split's. Cross-window moves
+    /// (including re-dock from a torn-out window) ride the same path.
+    PaneRelocate {
+        key: PaneKey,
+        reference: PaneKey,
+        direction: SplitDirection,
+        size_px: Option<f32>,
+    },
+    /// A script asked to move a pane into a fresh dedicated window
+    /// (`pane.tearOut`): the drag tear-out flow minus the drag. `width`/
+    /// `height` size the new window (floored by the window minimum); omitted
+    /// dimensions default to ~the pane's current rect plus the toolbar band.
+    PaneTearOut {
+        key: PaneKey,
+        width: Option<f32>,
+        height: Option<f32>,
+    },
     /// A session-store flush updated widget-binding cells
     /// (`docs/interop.md` §7). Pure repaint wake: the cells already
     /// hold the new values and the widget render closures read them lock-free,
@@ -85,6 +119,11 @@ pub enum SessionEvent {
     /// `RuntimeAction::InputStateChanged` on input changes, and push the
     /// current state immediately so the mirror warms up.
     InputMirrorInterest,
+    /// The session thread has flagged pane-size-mirror interest (a `pane.size`
+    /// read or a `pane:resize` subscription): start sending
+    /// `RuntimeAction::PaneDisplayChanged` on settled pane layout changes, and
+    /// push every pane's current size immediately so the mirror warms up.
+    PaneMirrorInterest,
     /// The merged completion word sets for the input of pane `key`
     /// (`docs/input.md` §3.8): every creator's registered
     /// suggestions in merge order (creators in first-contribution order,
