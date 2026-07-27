@@ -465,6 +465,42 @@ impl<T: Copy + PartialEq> WindowLayout<T> {
         Some(acc)
     }
 
+    /// Apply a script `pane.resize` for one axis: re-size the nearest
+    /// in-cluster ancestor split on `axis` above `slot`'s leaf to a
+    /// script-owned px sizing — re-resolved against the region at every
+    /// rebuild until a user drag re-owns the edge (last writer wins, both
+    /// directions). Between the leaf and that ancestor lie only splits of the
+    /// other axis, so the sized branch's extent along `axis` *is* the pane's.
+    /// Returns `false` (no-op) when the leaf has no such ancestor: the pane
+    /// spans its cluster on that axis, and the top-level cluster fold is the
+    /// sessions' share of the window, not a pane edge.
+    pub fn set_leaf_px(&mut self, slot: T, axis: Axis, px: f32) -> bool {
+        let Some((cluster, path)) = self.find_path(slot) else {
+            return false;
+        };
+        let Some(root) = self.clusters.get_mut(cluster).map(|c| &mut c.root) else {
+            return false;
+        };
+        for depth in (0..path.len()).rev() {
+            let Some(LayoutNode::Split {
+                axis: split_axis,
+                sizing,
+                ..
+            }) = root.node_at_mut(&path[..depth])
+            else {
+                continue;
+            };
+            if *split_axis == axis {
+                *sizing = SplitSizing::Px {
+                    px,
+                    sized_first: path[depth] == Branch::A,
+                };
+                return true;
+            }
+        }
+        false
+    }
+
     /// Apply a user divider drag to the model. A top-level edge re-weights
     /// the clusters (preserving relative proportions within the remainder);
     /// an in-cluster edge becomes a user-owned `Ratio` (a px sizing is
@@ -778,6 +814,46 @@ mod tests {
         layout.set_split_ratio(&EdgeTarget::TopLevel(0), 0.25);
         let (ratios, _) = built(&layout);
         assert!((ratios[0] - 0.25).abs() < 1e-6, "{ratios:?}");
+    }
+
+    #[test]
+    fn set_leaf_px_targets_the_nearest_axis_ancestor() {
+        // main | (chat over notes): chat's width edge is the vertical split
+        // at the cluster root; its height edge is the horizontal split below.
+        let mut layout = WindowLayout::new();
+        layout.push_cluster(A_MAIN);
+        script_split(&mut layout, A_MAIN, A_NOTES); // vertical, notes 200px second
+        assert!(layout.split_leaf(
+            A_NOTES,
+            Axis::Horizontal,
+            true,
+            SplitSizing::Ratio(0.5),
+            3, // chat, above notes
+        ));
+
+        // Height: the nearest horizontal ancestor, chat on the A side.
+        assert!(layout.set_leaf_px(3, Axis::Horizontal, 120.0));
+        // Width: the nearest vertical ancestor is the cluster root; chat's
+        // subtree is the B side there, so the px sizes the second child.
+        assert!(layout.set_leaf_px(3, Axis::Vertical, 300.0));
+        let (conf, _) = layout.build(AREA, SPACING, MIN).unwrap();
+        let (mut ratios, mut leaves) = (Vec::new(), Vec::new());
+        flatten(&conf, &mut ratios, &mut leaves);
+        assert_eq!(leaves, vec![A_MAIN, 3, A_NOTES]);
+        // Root: 300px for the (chat|notes) side of a 1600px area.
+        assert!((ratios[0] - (1.0 - 302.0 / 1600.0)).abs() < 1e-4, "{ratios:?}");
+        // Inner: 120px for chat (the first child) of the 900px height.
+        assert!((ratios[1] - 122.0 / 900.0).abs() < 1e-4, "{ratios:?}");
+
+        // A pane spanning its cluster on an axis has no edge there: main is
+        // full-height, so a height resize is a no-op — and the top-level
+        // cluster fold is the sessions' share, not a pane edge, so a lone
+        // main has no width edge either.
+        assert!(!layout.set_leaf_px(A_MAIN, Axis::Horizontal, 100.0));
+        let mut solo = WindowLayout::new();
+        solo.push_cluster(B_MAIN);
+        assert!(!solo.set_leaf_px(B_MAIN, Axis::Vertical, 100.0));
+        assert!(!solo.set_leaf_px(99, Axis::Vertical, 100.0), "unknown slot");
     }
 
     #[test]

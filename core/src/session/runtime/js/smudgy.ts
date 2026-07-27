@@ -63,6 +63,13 @@ const {
     op_smudgy_pane_split,
     op_smudgy_pane_input_on_submit,
     op_smudgy_pane_close,
+    op_smudgy_pane_set_hidden,
+    op_smudgy_pane_set_font_size,
+    op_smudgy_pane_def_state,
+    op_smudgy_pane_resize,
+    op_smudgy_pane_relocate,
+    op_smudgy_pane_tear_out,
+    op_smudgy_pane_size,
     op_smudgy_pane_echo,
     op_smudgy_pane_echo_styled,
     op_smudgy_pane_clear,
@@ -869,8 +876,23 @@ interface PaneSpecBase {
     name: string;
     terminal?: boolean;
     titleBar?: TitleBarSpec;
+    /** Initial eyeball state -- `true` creates the pane pre-hidden (reveal-on-
+     *  event panes never flash at load). Explicit on an existing pane it
+     *  updates the toggle; omitted, a reload re-claim keeps the user's
+     *  eyeball state. Explicit on `main` throws. */
+    hidden?: boolean;
+    /** Terminal font override in px (8-40); omitted follows the global
+     *  setting. Explicit on an existing pane it updates the override;
+     *  reverting is `setFontSize(null)`, not a spec field. */
+    fontSize?: number;
     input?: PaneInputSpec;
 }
+
+/** The optional relocate extent, keyed to the split axis like `PaneSpec`'s
+ *  initial size (the off-axis dimension is a type error). */
+type RelocateSize<D extends SplitDirection> = D extends "left" | "right"
+    ? { width?: number; height?: never }
+    : { height?: number; width?: never };
 
 /** The spec for `pane.split()`. The initial pixel size is keyed to the split
  *  axis -- `width` on left/right splits, `height` on top/bottom -- and the
@@ -970,9 +992,129 @@ class Pane {
     }
 
     /** Split a new pane off this one. Get-or-create by (folded) name; an
-     *  explicit `titleBar` also re-policies an existing pane (incl. main). */
+     *  explicit def-state field (`titleBar`, `hidden`, `fontSize`) also
+     *  updates an existing pane (`titleBar`/`fontSize` incl. main). */
     split<D extends SplitDirection>(direction: D, spec: PaneSpec<D>): Pane {
         return __smudgy_pane_split(this._sessionId, this._name, direction, spec, this.#creatorId);
+    }
+
+    /** Hide this pane -- the title-bar eyeball's script spelling. A soft
+     *  display state: the pane keeps running, its widgets stay mounted, and
+     *  routed lines keep landing in its scrollback. Throws on main. */
+    hide(): void {
+        op_smudgy_pane_set_hidden(this._sessionId, this._name, true);
+    }
+
+    /** Show this pane (the eyeball's other half). Throws on main. */
+    show(): void {
+        op_smudgy_pane_set_hidden(this._sessionId, this._name, false);
+    }
+
+    /** The eyeball's toggle state -- never effective visibility (a hidden
+     *  pane still renders, veiled, while the toolbar is expanded, and an
+     *  all-hidden window ignores the toggles rather than go blank). Live per
+     *  access; own-session only. */
+    get isHidden(): boolean {
+        return op_smudgy_pane_def_state(this._sessionId, this._name).hidden;
+    }
+
+    /** Set (or with `null` clear) this pane's terminal font override in px
+     *  (8-40; out of range throws). Scrollback text only -- input lines stay
+     *  on the global preference. Allowed on main, where it is a per-session
+     *  override of the user's setting and additionally requires the
+     *  `change-display` capability. */
+    setFontSize(px: number | null): void {
+        if (px !== null && (typeof px !== "number" || !Number.isFinite(px) || px <= 0)) {
+            throw new TypeError("setFontSize expects a positive font size in px, or null to follow the global setting");
+        }
+        op_smudgy_pane_set_font_size(this._sessionId, this._name, px === null ? -1 : px);
+    }
+
+    /** This pane's font override in px, or undefined while following the
+     *  global setting. Live per access; own-session only. */
+    get fontSize(): number | undefined {
+        const fontSize = op_smudgy_pane_def_state(this._sessionId, this._name).fontSize;
+        return fontSize === null ? undefined : fontSize;
+    }
+
+    /** Resize this pane in px: each given dimension adjusts the nearest
+     *  divider on that axis, which becomes script-owned until the user drags
+     *  it again (last writer wins, both directions). Best-effort per axis --
+     *  a pane spanning its cluster's full extent on an axis no-ops there.
+     *  Throws on main (resize the sibling script pane instead). */
+    resize(size: { width?: number; height?: number }): void {
+        if (typeof size !== "object" || size === null) {
+            throw new TypeError("resize expects an object of the form { width?, height? }");
+        }
+        const width = typeof size.width === "number" && Number.isFinite(size.width) ? size.width : -1;
+        const height = typeof size.height === "number" && Number.isFinite(size.height) ? size.height : -1;
+        op_smudgy_pane_resize(this._sessionId, this._name, width, height);
+    }
+
+    /** The pane's last laid-out size in logical px, or undefined before the
+     *  first layout report reaches the mirror. Live per access; own-session
+     *  only. A hidden pane keeps its last laid-out size. */
+    get size(): { width: number; height: number } | undefined {
+        const size = op_smudgy_pane_size(this._sessionId, this._name);
+        return size === null ? undefined : { width: size[0], height: size[1] };
+    }
+
+    /** Move this pane next to `reference` (default: the session's main
+     *  pane): the direction reads exactly like `split`'s -- where this pane
+     *  lands relative to the reference -- and the move follows the reference
+     *  across windows (relocating onto a pane in a torn-out window re-docks
+     *  there). The optional extent is axis-keyed like a split's initial
+     *  size; omitted, the pane takes an even share. Throws on main, on a
+     *  foreign session's reference, and on self. */
+    relocate<D extends SplitDirection>(
+        direction: D,
+        reference?: Pane | string,
+        size?: RelocateSize<D>,
+    ): void {
+        if (direction !== "left" && direction !== "right" && direction !== "top" && direction !== "bottom") {
+            throw new TypeError('direction must be one of "left" | "right" | "top" | "bottom"');
+        }
+        let refName = "main";
+        if (reference !== undefined) {
+            if (reference instanceof Pane) {
+                if (reference._sessionId !== this._sessionId) {
+                    throw new TypeError("relocate reference must be a pane of the same session");
+                }
+                refName = reference._name;
+            } else {
+                refName = String(reference);
+            }
+        }
+        let sizePx = -1;
+        if (size !== undefined) {
+            if (typeof size !== "object" || size === null) {
+                throw new TypeError("relocate size must be an object of the form { width? } or { height? }");
+            }
+            const onAxis = direction === "left" || direction === "right" ? size.width : size.height;
+            if (typeof onAxis === "number" && Number.isFinite(onAxis)) {
+                sizePx = onAxis;
+            }
+        }
+        op_smudgy_pane_relocate(this._sessionId, this._name, direction, refName, sizePx);
+    }
+
+    /** Move this pane into a fresh dedicated window -- the drag tear-out
+     *  minus the drag. Windows stay anonymous: there is no window handle,
+     *  the window closes when its last pane leaves, and re-docking is a
+     *  `relocate` onto a pane elsewhere. `width`/`height` size the new
+     *  window (floored by the window minimum); omitted dimensions follow the
+     *  pane's current size. Throws on main. */
+    tearOut(opts?: { width?: number; height?: number }): void {
+        let width = -1;
+        let height = -1;
+        if (opts !== undefined) {
+            if (typeof opts !== "object" || opts === null) {
+                throw new TypeError("tearOut expects an object of the form { width?, height? }");
+            }
+            if (typeof opts.width === "number" && Number.isFinite(opts.width)) width = opts.width;
+            if (typeof opts.height === "number" && Number.isFinite(opts.height)) height = opts.height;
+        }
+        op_smudgy_pane_tear_out(this._sessionId, this._name, width, height);
     }
 }
 
@@ -1008,6 +1150,8 @@ function __smudgy_pane_split(
         height: typeof spec.height === "number" ? spec.height : null,
         terminal: spec.terminal !== undefined ? Boolean(spec.terminal) : null,
         titleBar: typeof spec.titleBar === "string" ? spec.titleBar : null,
+        hidden: typeof spec.hidden === "boolean" ? spec.hidden : null,
+        fontSize: typeof spec.fontSize === "number" ? spec.fontSize : null,
         input:
             spec.input !== undefined
                 ? {

@@ -116,6 +116,11 @@ pub enum Event {
     /// runtime shutdown, grid cleanup across all windows, the empty-window
     /// rule — is the daemon's job.
     CloseSession(SessionId),
+    /// The user clicked a pane's title-bar eyeball. The window already
+    /// flipped its local state optimistically; the daemon reports the toggle
+    /// to the pane's session runtime (`PaneUserHidden`), which owns the def —
+    /// the echoed `PaneUpdated` then converges every consumer.
+    PaneVisibilityToggled { slot: PaneRef, hidden: bool },
     /// A pane pick started in this window's grid. The daemon's DragController
     /// records it; every terminal outcome (drop, cancel, tear-out) resolves
     /// against this record.
@@ -561,6 +566,99 @@ impl SmudgyWindow {
         self.hidden_panes.remove(&slot);
         self.rebuild_grid();
         self.grid.is_none()
+    }
+
+    /// Sync one slot's hidden state from its pane's def (the daemon calls
+    /// this on `PaneUpdated`, on a pre-hidden `PaneOpened`, and after a
+    /// cross-window move re-homes the slot here). Idempotent for the window
+    /// whose own eyeball click originated the change.
+    pub fn set_pane_hidden(&mut self, slot: PaneRef, hidden: bool) {
+        let changed = if hidden {
+            self.hidden_panes.insert(slot)
+        } else {
+            self.hidden_panes.remove(&slot)
+        };
+        if changed && !self.toolbar_expanded {
+            self.rebuild_grid();
+        }
+    }
+
+    /// Whether this window's layout currently marks `slot` hidden.
+    pub fn pane_hidden(&self, slot: PaneRef) -> bool {
+        self.hidden_panes.contains(&slot)
+    }
+
+    /// Apply a script `pane.resize` (panes.md placement commands): write the
+    /// nearest in-cluster ancestor edge per given axis back to a script-owned
+    /// px sizing. Best-effort per axis (a full-extent axis no-ops); rebuilds
+    /// only when an edge actually changed.
+    pub fn resize_pane_slot(&mut self, slot: PaneRef, width: Option<f32>, height: Option<f32>) {
+        let mut changed = false;
+        if let Some(px) = width {
+            changed |= self
+                .layout
+                .set_leaf_px(slot, pane_grid::Axis::Vertical, px);
+        }
+        if let Some(px) = height {
+            changed |= self
+                .layout
+                .set_leaf_px(slot, pane_grid::Axis::Horizontal, px);
+        }
+        if changed {
+            self.rebuild_grid();
+        }
+    }
+
+    /// The re-attach half of a script `pane.relocate`: insert `slot` on the
+    /// requested side of `reference`, with a split-style optional px extent.
+    /// The caller already detached `slot` from whichever window held it. A
+    /// reference that vanished mid-flight falls back to the session's main
+    /// pane, then a fresh top-level cluster — the split placement chain.
+    pub fn insert_pane_beside(
+        &mut self,
+        slot: PaneRef,
+        reference: PaneRef,
+        direction: SplitDirection,
+        size_px: Option<f32>,
+    ) {
+        let (axis, new_first) = direction_axis(direction);
+        let sizing = size_px.map_or(SplitSizing::Ratio(0.5), |px| SplitSizing::Px {
+            px,
+            sized_first: new_first,
+        });
+        let main = PaneRef {
+            session_id: slot.session_id,
+            key: MAIN_PANE_KEY,
+        };
+        let placed = self
+            .layout
+            .split_leaf(reference, axis, new_first, sizing, slot)
+            || self.layout.split_leaf(main, axis, new_first, sizing, slot);
+        if !placed {
+            self.layout.push_cluster(slot);
+        }
+        self.rebuild_grid();
+    }
+
+    /// The measured sizes of every slot in this window's rendered grid, for
+    /// the pane-size mirror feed. Empty before the first layout pass. A
+    /// hidden pane dropped from the collapsed-toolbar grid simply doesn't
+    /// appear — its mirror keeps the last laid-out size.
+    pub fn pane_sizes(&self) -> Vec<(PaneRef, Size)> {
+        let Some(grid) = self.grid.as_ref() else {
+            return Vec::new();
+        };
+        let area = self.grid_area.get();
+        if area.width <= 0.0 || area.height <= 0.0 {
+            return Vec::new();
+        }
+        let regions = grid
+            .layout()
+            .pane_regions(GRID_SPACING, GRID_MIN_SIZE, area);
+        grid.panes
+            .iter()
+            .filter_map(|(pane, slot)| regions.get(pane).map(|region| (*slot, region.size())))
+            .collect()
     }
 
     /// The slot behind one of this grid's internal pane ids (pane ids are
@@ -1072,9 +1170,12 @@ impl SmudgyWindow {
                 Update::none()
             }
             Message::TogglePaneVisibility(slot) => {
-                if !self.hidden_panes.remove(&slot) {
+                let hidden = if self.hidden_panes.remove(&slot) {
+                    false
+                } else {
                     self.hidden_panes.insert(slot);
-                }
+                    true
+                };
                 // With the toolbar expanded the toggle only changes the veil
                 // (the grid renders everything); collapsed — reachable when
                 // the pane's header is pinned or the global hide setting is
@@ -1082,7 +1183,9 @@ impl SmudgyWindow {
                 if !self.toolbar_expanded {
                     self.rebuild_grid();
                 }
-                Update::none()
+                // The flip above is optimistic display state; the def lives
+                // on the pane's session runtime, so the daemon reports it.
+                Update::with_event(Event::PaneVisibilityToggled { slot, hidden })
             }
             Message::OpenSettingsPressed => Update::with_event(Event::OpenSettingsWindow),
             Message::OpenDownloadPage => Update::with_event(Event::OpenDownloadPage),

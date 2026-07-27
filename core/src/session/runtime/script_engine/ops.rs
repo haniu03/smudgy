@@ -71,6 +71,13 @@ deno_core::extension!(
     op_smudgy_pane_split,
     op_smudgy_pane_input_on_submit,
     op_smudgy_pane_close,
+    op_smudgy_pane_set_hidden,
+    op_smudgy_pane_set_font_size,
+    op_smudgy_pane_def_state,
+    op_smudgy_pane_resize,
+    op_smudgy_pane_relocate,
+    op_smudgy_pane_tear_out,
+    op_smudgy_pane_size,
     op_smudgy_pane_echo,
     op_smudgy_pane_echo_styled,
     op_smudgy_pane_clear,
@@ -173,6 +180,11 @@ deno_core::extension!(
     // `InputStateChanged` dispatch arm writes it). The input read op consults it
     // synchronously and flags interest on it; writes leave it untouched.
     input_mirror: crate::session::runtime::SharedInputMirror,
+    // The pane-size mirror (`docs/panes.md` placement read-back), shared with the
+    // runtime (whose `PaneDisplayChanged` dispatch arm writes it). The `pane.size`
+    // read op consults it synchronously and flags interest on it, as does a
+    // `pane:resize` subscription.
+    pane_size_mirror: crate::session::runtime::SharedPaneSizeMirror,
     // The in-flight typed submission (`docs/input.md` §3.5), shared with the
     // runtime (whose `SubmitInput`/`CompleteInputSubmission` dispatch arms install and
     // consume it). The ambient `submission` ops read and mutate it while a `sys:input`
@@ -258,6 +270,7 @@ deno_core::extension!(
     state.put::<crate::session::runtime::SharedPaneRegistry>(options.pane_registry);
     state.put::<crate::session::runtime::SharedLineRouting>(options.line_routing);
     state.put::<crate::session::runtime::SharedInputMirror>(options.input_mirror);
+    state.put::<crate::session::runtime::SharedPaneSizeMirror>(options.pane_size_mirror);
     state.put::<crate::session::runtime::SharedInputSubmission>(options.input_submission);
     state.put::<crate::session::runtime::SharedInputWordSets>(options.input_word_sets);
     state.put::<crate::session::runtime::SharedPaneInputCallbacks>(options.pane_input_callbacks);
@@ -1091,6 +1104,23 @@ fn op_smudgy_on<'s>(
             let flipped = mirror.borrow_mut().flag_interest();
             if flipped {
                 queue_own_action(state, RuntimeAction::InputMirrorInterest);
+            }
+        }
+        // The pane observe events require the pane surface capability, like
+        // the rest of the pane ops. `pane:resize` additionally flags
+        // size-mirror interest (exactly like a `pane.size` read): its emit
+        // site derives from the mirror feed, so without interest the UI
+        // would never send the layout changes the subscriber is waiting on.
+        // `pane:visibility` derives from def changes and needs no feed.
+        "pane:visibility" => ensure(grants(state).panes, "panes")?,
+        "pane:resize" => {
+            ensure(grants(state).panes, "panes")?;
+            let mirror = state
+                .borrow::<crate::session::runtime::SharedPaneSizeMirror>()
+                .clone();
+            let flipped = mirror.borrow_mut().flag_interest();
+            if flipped {
+                queue_own_action(state, RuntimeAction::PaneMirrorInterest);
             }
         }
         _ => {}
@@ -4708,9 +4738,50 @@ pub struct PaneSpecJs {
     /// `'normal' | 'always-show'`; omitted leaves an existing pane's policy
     /// alone and defaults a new pane to `'normal'`.
     title_bar: Option<String>,
+    /// Initial (and, when explicit on an existing pane, updated) eyeball
+    /// state — `true` creates the pane pre-hidden (reveal-on-event panes
+    /// never flash at load). Omitted leaves an existing pane's toggle alone:
+    /// a reload re-claim keeps the user's eyeball state. Explicit on `main`
+    /// throws.
+    hidden: Option<bool>,
+    /// Per-pane terminal font override in px (8–40); omitted leaves an
+    /// existing pane's override alone and lets a new pane follow the global
+    /// setting. Reverting an existing override is `setFontSize(null)`, not a
+    /// spec field.
+    font_size: Option<f64>,
     /// The pane's own input line. Own-session only: the `onSubmit` handler
     /// runs in the creating isolate, which a cross-session split cannot name.
     input: Option<PaneInputSpecJs>,
+}
+
+/// Parse the split spec's kind + def-state trio — the shape shared verbatim
+/// between the own-session and cross-session (`PaneSplitRemote`) paths.
+fn parse_split_def_state(
+    spec: &PaneSpecJs,
+) -> Result<(pane::PaneKind, pane::DefStateSpec), PaneCallError> {
+    let kind = if spec.terminal.unwrap_or(true) {
+        pane::PaneKind::Terminal
+    } else {
+        pane::PaneKind::Widgets
+    };
+    let title_bar = spec
+        .title_bar
+        .as_deref()
+        .map(|raw| {
+            pane::TitleBarPolicy::parse(raw)
+                .ok_or_else(|| PaneOpError(format!("invalid titleBar '{raw}'")))
+        })
+        .transpose()?;
+    #[allow(clippy::cast_possible_truncation)]
+    let font_size = spec.font_size.map(|px| px as f32);
+    Ok((
+        kind,
+        pane::DefStateSpec {
+            title_bar,
+            hidden: spec.hidden,
+            font_size,
+        },
+    ))
 }
 
 /// Get-or-create a pane and (on creation) place it by splitting off `ref_name`
@@ -4732,19 +4803,7 @@ fn op_smudgy_pane_split(
 
     let direction = pane::SplitDirection::parse(direction)
         .ok_or_else(|| PaneOpError(format!("invalid split direction '{direction}'")))?;
-    let kind = if spec.terminal.unwrap_or(true) {
-        pane::PaneKind::Terminal
-    } else {
-        pane::PaneKind::Widgets
-    };
-    let title_bar = spec
-        .title_bar
-        .as_deref()
-        .map(|raw| {
-            pane::TitleBarPolicy::parse(raw)
-                .ok_or_else(|| PaneOpError(format!("invalid titleBar '{raw}'")))
-        })
-        .transpose()?;
+    let (kind, def_state) = parse_split_def_state(&spec)?;
     // The initial size is measured along the split axis; the off-axis
     // dimension is ignored (documented).
     #[allow(clippy::cast_possible_truncation)]
@@ -4757,6 +4816,13 @@ fn op_smudgy_pane_split(
 
     let namespace = pane_namespace(state);
 
+    // A spec-borne font override on `main` is the one script mutation of the
+    // user's primary display this op can make — gate it like gag/redirect
+    // (the same class of "alters what the main display shows").
+    if def_state.font_size.is_some() && pane::is_main_pane_name(&spec.name) {
+        ensure(grants(state).change_display, "change-display")?;
+    }
+
     let input = spec.input.map(|input| pane::PaneInputDef {
         placeholder: input.placeholder.map(Arc::from),
     });
@@ -4765,7 +4831,7 @@ fn op_smudgy_pane_split(
         let registry = pane_registry(state);
         let outcome = registry
             .borrow_mut()
-            .split(&namespace, &spec.name, kind, title_bar, input)?;
+            .split(&namespace, &spec.name, kind, def_state, input)?;
         if outcome.created {
             let reference = registry
                 .borrow()
@@ -4782,11 +4848,12 @@ fn op_smudgy_pane_split(
                     },
                 },
             );
-        } else if outcome.title_bar_changed {
+        } else if outcome.def_changed {
             queue_own_action(
                 state,
                 RuntimeAction::PaneUpdated {
                     def: outcome.def.clone(),
+                    announce_visibility: outcome.hidden_changed,
                 },
             );
         }
@@ -4810,7 +4877,7 @@ fn op_smudgy_pane_split(
                 namespace,
                 name: Arc::from(spec.name.as_str()),
                 kind,
-                title_bar,
+                def_state,
                 reference: Some(Arc::from(ref_name)),
                 direction,
                 size_px,
@@ -4933,6 +5000,319 @@ fn op_smudgy_pane_close(
         );
         Ok(())
     }
+}
+
+/// `pane.hide()` / `pane.show()`: set the pane's eyeball toggle state.
+/// Own-session calls mutate the registry synchronously (an immediate
+/// `isHidden` read sees the new state) and mirror via `PaneUpdated`;
+/// cross-session calls queue a name-carrying action to the owning runtime
+/// (last-writer-wins, silent no-op on an unknown name). Main throws — the
+/// user's eyeball owns main's visibility.
+#[op2(fast)]
+fn op_smudgy_pane_set_hidden(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    hidden: bool,
+) -> Result<(), PaneCallError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    let namespace = pane_namespace(state);
+
+    if target == *state.borrow::<SessionId>() {
+        if let Some(def) = pane_registry(state)
+            .borrow_mut()
+            .set_hidden(&namespace, name, hidden)?
+        {
+            queue_own_action(
+                state,
+                RuntimeAction::PaneUpdated {
+                    def,
+                    announce_visibility: true,
+                },
+            );
+        }
+        Ok(())
+    } else {
+        // The main guard still applies at the source: hiding another
+        // session's main is as refused as hiding your own.
+        if pane::is_main_pane_name(name) {
+            return Err(pane::PaneError::HideMain.into());
+        }
+        route_session_action(
+            state,
+            target,
+            RuntimeAction::PaneSetHiddenRemote {
+                namespace,
+                name: Arc::from(name),
+                hidden,
+            },
+        );
+        Ok(())
+    }
+}
+
+/// `pane.setFontSize(px | null)`: set (or with `px <= 0`, the facade's `null`
+/// encoding, clear) the pane's terminal font override. Allowed on main — the
+/// one script mutator main accepts, a per-session override of the global
+/// preference — but gated by `change-display` there, since it alters the
+/// user's primary display (the gag/redirect class). Own-session mutates
+/// synchronously and mirrors via `PaneUpdated`; cross-session queues by name.
+#[op2(fast)]
+fn op_smudgy_pane_set_font_size(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    font_size: f64,
+) -> Result<(), PaneCallError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    if pane::is_main_pane_name(name) {
+        ensure(grants(state).change_display, "change-display")?;
+    }
+    let namespace = pane_namespace(state);
+    #[allow(clippy::cast_possible_truncation)]
+    let font_size = (font_size > 0.0).then_some(font_size as f32);
+
+    if target == *state.borrow::<SessionId>() {
+        if let Some(def) = pane_registry(state)
+            .borrow_mut()
+            .set_font_size(&namespace, name, font_size)?
+        {
+            queue_own_action(
+                state,
+                RuntimeAction::PaneUpdated {
+                    def,
+                    announce_visibility: false,
+                },
+            );
+        }
+        Ok(())
+    } else {
+        route_session_action(
+            state,
+            target,
+            RuntimeAction::PaneSetFontSizeRemote {
+                namespace,
+                name: Arc::from(name),
+                font_size,
+            },
+        );
+        Ok(())
+    }
+}
+
+/// The mutable def-state half of a pane read (`isHidden`/`fontSize` getters):
+/// live registry state, read per access so a handle never staleness-drifts.
+/// Own-session only, like [`op_smudgy_pane_list`] — mirroring another
+/// session's display state into every runtime is the imprudent half of
+/// cross-session panes. A closed pane throws, like the routing ops.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneDefState {
+    hidden: bool,
+    font_size: Option<f32>,
+}
+
+#[op2]
+#[serde]
+fn op_smudgy_pane_def_state(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+) -> Result<PaneDefState, PaneCallError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    if target != *state.borrow::<SessionId>() {
+        return Err(PaneOpError(
+            "cross-session pane introspection is not supported (isHidden/fontSize are own-session only)"
+                .to_string(),
+        )
+        .into());
+    }
+    let namespace = pane_namespace(state);
+    let registry = pane_registry(state);
+    let registry = registry.borrow();
+    let def = registry
+        .resolve(&namespace, name)
+        .ok_or_else(|| PaneOpError(format!("no pane named '{name}'")))?;
+    Ok(PaneDefState {
+        hidden: def.hidden,
+        font_size: def.font_size,
+    })
+}
+
+/// `pane.size`: the pane's last laid-out pixel size from the UI-fed mirror,
+/// or null before the first mirrored layout. Own-session only, like the
+/// def-state read. Reads — and only reads — flag mirror interest (plus a
+/// `pane:resize` subscription, whose emit site derives from the same feed);
+/// the one-time interest notification for the UI is queued on the flip.
+#[op2]
+#[serde]
+fn op_smudgy_pane_size(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+) -> Result<Option<(f32, f32)>, PaneCallError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    if target != *state.borrow::<SessionId>() {
+        return Err(PaneOpError(
+            "cross-session pane introspection is not supported (size is own-session only)"
+                .to_string(),
+        )
+        .into());
+    }
+    let namespace = pane_namespace(state);
+    let key = {
+        let registry = pane_registry(state);
+        let registry = registry.borrow();
+        registry
+            .resolve(&namespace, name)
+            .map(|def| def.key)
+            .ok_or_else(|| PaneOpError(format!("no pane named '{name}'")))?
+    };
+    let mirror = state
+        .borrow::<crate::session::runtime::SharedPaneSizeMirror>()
+        .clone();
+    let flipped = mirror.borrow_mut().flag_interest();
+    if flipped {
+        queue_own_action(state, RuntimeAction::PaneMirrorInterest);
+    }
+    Ok(mirror
+        .borrow()
+        .get(key)
+        .map(|size| (size.width, size.height)))
+}
+
+/// Resolve a placement-command target: the caller's own live pane, never
+/// main. Placement commands are own-session-only in v1 — they span daemon
+/// windows and carry keys, which a foreign registry could never validate —
+/// so a cross-session `session_id` throws rather than silently degrading.
+fn resolve_own_placement_pane(
+    state: &OpState,
+    target: SessionId,
+    name: &str,
+    main_error: pane::PaneError,
+) -> Result<pane::PaneKey, PaneCallError> {
+    if target != *state.borrow::<SessionId>() {
+        return Err(PaneOpError(
+            "pane placement commands (resize/relocate/tearOut) are own-session only".to_string(),
+        )
+        .into());
+    }
+    if pane::is_main_pane_name(name) {
+        return Err(main_error.into());
+    }
+    let namespace = pane_namespace(state);
+    let registry = pane_registry(state);
+    let registry = registry.borrow();
+    let def = registry
+        .resolve(&namespace, name)
+        .ok_or_else(|| PaneOpError(format!("no pane named '{name}'")))?;
+    Ok(def.key)
+}
+
+/// A placement dimension from the facade: `<= 0` encodes "not given" (the
+/// same convention as the split spec's filtered sizes), non-finite is
+/// dropped too.
+#[allow(clippy::cast_possible_truncation)]
+fn placement_px(raw: f64) -> Option<f32> {
+    let px = raw as f32;
+    (px.is_finite() && px > 0.0).then_some(px)
+}
+
+/// `pane.resize({ width?, height? })`: adjust the nearest ancestor divider on
+/// each given axis (panes.md placement commands). Best-effort per axis; the
+/// edge becomes script-owned px, re-resolving at every rebuild until a user
+/// drag re-owns it. Throws on main — resize the sibling script pane instead.
+#[op2(fast)]
+fn op_smudgy_pane_resize(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    width: f64,
+    height: f64,
+) -> Result<(), PaneCallError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    let key = resolve_own_placement_pane(state, target, name, pane::PaneError::ResizeMain)?;
+    let (width, height) = (placement_px(width), placement_px(height));
+    if width.is_none() && height.is_none() {
+        return Ok(());
+    }
+    queue_own_action(state, RuntimeAction::PaneResize { key, width, height });
+    Ok(())
+}
+
+/// `pane.relocate(direction, reference?)`: detach the pane and re-attach it
+/// on the `direction` side of `reference` — the exact dual of a split's
+/// placement, and internally the manual-drop model mutation. The reference
+/// defaults to main and must be the caller's own live pane (or main);
+/// relocating a pane relative to itself throws.
+#[op2(fast)]
+fn op_smudgy_pane_relocate(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    #[string] direction: &str,
+    #[string] ref_name: &str,
+    size_px: f64,
+) -> Result<(), PaneCallError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    let direction = pane::SplitDirection::parse(direction)
+        .ok_or_else(|| PaneOpError(format!("invalid relocate direction '{direction}'")))?;
+    let key = resolve_own_placement_pane(state, target, name, pane::PaneError::RelocateMain)?;
+    let reference = {
+        let namespace = pane_namespace(state);
+        let registry = pane_registry(state);
+        let registry = registry.borrow();
+        registry
+            .resolve(&namespace, ref_name)
+            .map(|def| def.key)
+            .ok_or_else(|| PaneOpError(format!("no pane named '{ref_name}'")))?
+    };
+    if reference == key {
+        return Err(PaneOpError("cannot relocate a pane relative to itself".to_string()).into());
+    }
+    queue_own_action(
+        state,
+        RuntimeAction::PaneRelocate {
+            key,
+            reference,
+            direction,
+            size_px: placement_px(size_px),
+        },
+    );
+    Ok(())
+}
+
+/// `pane.tearOut({ width?, height? })`: move the pane into a fresh dedicated
+/// window — the drag tear-out flow minus the drag. Windows stay emergent (no
+/// script-facing window identity): the empty-window rule closes the window
+/// when its last pane leaves, and re-docking is a `relocate` onto a
+/// reference elsewhere. Throws on main.
+#[op2(fast)]
+fn op_smudgy_pane_tear_out(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    width: f64,
+    height: f64,
+) -> Result<(), PaneCallError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    let key = resolve_own_placement_pane(state, target, name, pane::PaneError::TearOutMain)?;
+    queue_own_action(
+        state,
+        RuntimeAction::PaneTearOut {
+            key,
+            width: placement_px(width),
+            height: placement_px(height),
+        },
+    );
+    Ok(())
 }
 
 /// Echo whole lines into a terminal pane. Own-session calls validate the pane

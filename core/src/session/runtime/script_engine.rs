@@ -129,6 +129,7 @@ pub struct ScriptEngineParams<'a> {
     /// The input mirror (`docs/input.md` §3.3), shared into every isolate's input
     /// read ops. Written by the runtime's `InputStateChanged` dispatch arm; session-scoped.
     pub input_mirror: super::SharedInputMirror,
+    pub pane_size_mirror: super::SharedPaneSizeMirror,
     /// The in-flight typed submission (`docs/input.md` §3.5), shared into every
     /// isolate's submission ops. Installed/consumed by the runtime's `SubmitInput`/
     /// `CompleteInputSubmission` dispatch arms; the ambient `submission` acts on it.
@@ -965,6 +966,8 @@ impl<'a> ScriptEngine<'a> {
         let line_routing = params.line_routing.clone();
         // The same input mirror `Rc` is bound into every isolate's input read ops.
         let input_mirror = params.input_mirror.clone();
+        // The same pane-size mirror `Rc` is bound into every isolate's pane read ops.
+        let pane_size_mirror = params.pane_size_mirror.clone();
         // The same submission cell `Rc` is bound into every isolate's submission ops.
         let input_submission = params.input_submission.clone();
         // The same word-set cell `Rc` is bound into every isolate's registry ops.
@@ -1089,6 +1092,9 @@ impl<'a> ScriptEngine<'a> {
                     // The input read op resolves `input.value`/`cursor`/… against this
                     // mirror and flags interest on it; writes bypass it.
                     input_mirror.clone(),
+                    // The `pane.size` read op resolves against this mirror and flags
+                    // interest on it (as does a `pane:resize` subscription).
+                    pane_size_mirror.clone(),
                     // The ambient `submission` ops act on this shared cell while a
                     // `sys:input` handler splice is live.
                     input_submission.clone(),

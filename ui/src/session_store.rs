@@ -165,9 +165,14 @@ pub struct ManagedSession {
 
     /// The main pane's header-visibility policy. The main pane has no
     /// `PaneDisplay` entry (its buffer/input live directly on the session),
-    /// so the one mutable def field the UI reads is mirrored here — set via
+    /// so the mutable def fields the UI reads are mirrored here — set via
     /// `PaneUpdated` when a script re-policies `main`.
     main_title_bar: TitleBarPolicy,
+    /// The main pane's terminal font override, mirrored beside
+    /// `main_title_bar` (set via `setFontSize` on main, `change-display`
+    /// gated). Scrollback text only — the session input stays on the global
+    /// preference.
+    main_font_size: Option<f32>,
 
     widget_root: WidgetRoot<'static, crate::Theme, crate::Renderer>,
     map_store: MapStore,
@@ -178,6 +183,13 @@ pub struct ManagedSession {
     /// The gate and coalescing cache in front of `InputStateChanged` sends
     /// (see [`InputMirrorFeed`]).
     input_mirror_feed: InputMirrorFeed,
+
+    /// The gate, coalescing cache, and debounce state in front of
+    /// `PaneDisplayChanged` sends (see [`PaneSizeFeed`]). Windows report
+    /// measured pane sizes through the daemon; the feed change-gates them and
+    /// a short trailing flush turns divider-drag streams into settled
+    /// reports.
+    pane_size_feed: PaneSizeFeed,
 
     /// The change detector in front of `InputHistoryChanged` sends
     /// (see [`InputHistoryFeed`]).
@@ -406,6 +418,70 @@ impl InputMirrorFeed {
     /// the map from growing under split/close churn.
     fn forget(&mut self, key: PaneKey) {
         self.last_sent.remove(&key);
+    }
+}
+
+/// The UI-side feed of the session-thread pane-size mirror (`docs/panes.md`
+/// placement read-back): the interest gate (no messages until the session
+/// thread asks — a session that never reads pane sizes pays nothing per
+/// layout change) in front of a per-pane coalescing cache, plus the pending
+/// set a trailing debounce flush drains — a divider drag reports per frame,
+/// but only the settled geometry crosses the channel. Sizes are compared on
+/// whole logical pixels so sub-pixel layout jitter never queues a send.
+#[derive(Default)]
+struct PaneSizeFeed {
+    interest: bool,
+    last_sent: HashMap<PaneKey, (u32, u32)>,
+    pending: HashMap<PaneKey, (f32, f32)>,
+    /// Whether a trailing flush message is already scheduled (the daemon
+    /// schedules at most one at a time per session).
+    flush_scheduled: bool,
+}
+
+/// The whole-pixel comparison key for a reported size.
+fn size_key(width: f32, height: f32) -> (u32, u32) {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    (width.round().max(0.0) as u32, height.round().max(0.0) as u32)
+}
+
+impl PaneSizeFeed {
+    /// Flag interest (sticky) and forget the coalescing history, so the next
+    /// report per pane sends unconditionally — the warm-up push.
+    fn start(&mut self) {
+        self.interest = true;
+        self.last_sent.clear();
+    }
+
+    fn interest(&self) -> bool {
+        self.interest
+    }
+
+    /// Queue one measured size, change-gated. Returns whether anything is now
+    /// pending (the caller then makes sure a flush is scheduled).
+    fn report(&mut self, key: PaneKey, width: f32, height: f32) -> bool {
+        if !self.interest {
+            return false;
+        }
+        if self.last_sent.get(&key) != Some(&size_key(width, height)) {
+            self.pending.insert(key, (width, height));
+        }
+        !self.pending.is_empty()
+    }
+
+    /// Drain the pending set, recording each entry as sent.
+    fn take_pending(&mut self) -> Vec<(PaneKey, (f32, f32))> {
+        let drained: Vec<_> = self.pending.drain().collect();
+        for (key, (width, height)) in &drained {
+            self.last_sent.insert(*key, size_key(*width, *height));
+        }
+        drained
+    }
+
+    /// Drop `key`'s records — the pane closed (see
+    /// [`InputMirrorFeed::forget`]).
+    fn forget(&mut self, key: PaneKey) {
+        self.last_sent.remove(&key);
+        self.pending.remove(&key);
     }
 }
 
@@ -660,6 +736,8 @@ impl ManagedSession {
             terminal_pane_selection: Rc::new(RefCell::new(Selection::default())),
             panes: HashMap::new(),
             main_title_bar: TitleBarPolicy::Normal,
+            main_font_size: None,
+            pane_size_feed: PaneSizeFeed::default(),
             runtime_tx: None,
             input_mirror_feed: InputMirrorFeed::default(),
             input_history_feed: InputHistoryFeed::default(),
@@ -800,6 +878,7 @@ impl ManagedSession {
                             self.link_handler(),
                             // NAWS describes the main terminal; script panes don't report.
                             None,
+                            pane.def.font_size,
                         );
                         if pane.input.is_some() {
                             stack![
@@ -955,6 +1034,45 @@ impl ManagedSession {
     /// the runtime is gone or not yet ready. A session's runtime thread can die
     /// independently of the UI (its own panic, shutdown teardown), so a closed
     /// channel is a per-session condition to survive, never an app-wide abort.
+    /// Whether the session runtime has asked for pane sizes — measuring is
+    /// pointless before (the feed would drop the report anyway).
+    pub fn pane_size_interest(&self) -> bool {
+        self.pane_size_feed.interest()
+    }
+
+    /// Record one measured pane size (daemon-fed from the hosting window's
+    /// layout, change-gated on whole pixels). Returns `true` exactly when the
+    /// caller should schedule the trailing flush — at most one is in flight
+    /// per session.
+    pub fn report_pane_size(&mut self, key: PaneKey, width: f32, height: f32) -> bool {
+        if !self.pane_size_feed.report(key, width, height) {
+            return false;
+        }
+        if self.pane_size_feed.flush_scheduled {
+            return false;
+        }
+        self.pane_size_feed.flush_scheduled = true;
+        true
+    }
+
+    /// The trailing flush: send every settled pending size to the runtime.
+    /// Reports that arrived while the flush message was in flight ride this
+    /// same drain.
+    pub fn flush_pane_sizes(&mut self) {
+        self.pane_size_feed.flush_scheduled = false;
+        for (key, (width, height)) in self.pane_size_feed.take_pending() {
+            self.send_runtime_action(RuntimeAction::PaneDisplayChanged { key, width, height });
+        }
+    }
+
+    /// The user clicked a pane's title-bar eyeball: report the new toggle
+    /// state to the runtime, which owns the def (`PaneUserHidden`). The
+    /// toggling window already flipped optimistically; the echoed
+    /// `PaneUpdated` converges everyone.
+    pub fn report_user_hidden(&self, key: PaneKey, hidden: bool) {
+        self.send_runtime_action(RuntimeAction::PaneUserHidden { key, hidden });
+    }
+
     fn send_runtime_action(&self, action: RuntimeAction) {
         match &self.runtime_tx {
             Some(tx) => {
@@ -1332,14 +1450,19 @@ impl ManagedSession {
                         // on every close path too).
                         self.input_mirror_feed.forget(key);
                         self.input_history_feed.forget(key);
+                        self.pane_size_feed.forget(key);
                         Task::none()
                     }
                     SessionEvent::PaneUpdated(def) => {
-                        // An in-place def change (title-bar policy). Main has
-                        // no PaneDisplay entry; its policy mirrors into the
-                        // dedicated field the view reads.
+                        // An in-place def-state change (title bar, hidden,
+                        // font size). Main has no PaneDisplay entry; its
+                        // mutable fields mirror into the dedicated fields the
+                        // view reads. The hidden flag's window-side sync (the
+                        // grid filter) is the daemon's job — it intercepts
+                        // this event before delegating here.
                         if def.is_main {
                             self.main_title_bar = def.title_bar;
+                            self.main_font_size = def.font_size;
                         } else if let Some(pane) = self.panes.get_mut(&def.key) {
                             pane.def = def;
                         }
@@ -1385,6 +1508,12 @@ impl ManagedSession {
                     SessionEvent::MapperNavigated(_)
                     | SessionEvent::OfferMapRescue { .. }
                     | SessionEvent::MapAreaCreated(_) => Task::none(),
+                    // Placement commands — applied by the daemon (which owns
+                    // the windows and their cluster models) before this
+                    // forward; no session-store state is involved.
+                    SessionEvent::PaneResize { .. }
+                    | SessionEvent::PaneRelocate { .. }
+                    | SessionEvent::PaneTearOut { .. } => Task::none(),
                     SessionEvent::Connected => {
                         self.connected = true;
                         self.ever_connected = true;
@@ -1436,6 +1565,15 @@ impl ManagedSession {
                         for key in self.pane_input_keys() {
                             self.sync_input_mirror(key);
                         }
+                        Task::none()
+                    }
+                    SessionEvent::PaneMirrorInterest => {
+                        // The session thread wants pane sizes from now on.
+                        // Arm the feed here; the warm-up push itself is the
+                        // daemon's job (it owns the windows the sizes are
+                        // measured in) — it intercepts this same event after
+                        // delegating here.
+                        self.pane_size_feed.start();
                         Task::none()
                     }
                     SessionEvent::ServerEcho { enabled } => {
@@ -1689,6 +1827,7 @@ impl ManagedSession {
             self.terminal_pane_selection.clone(),
             self.link_handler(),
             self.grid_change_handler(),
+            self.main_font_size,
         ))
         .on_release(Message::TerminalClicked);
 

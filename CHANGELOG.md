@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Scripts can drive pane display state.** A pane handle now covers what
+  the eyeball and dividers already let you do by hand: `hide()`/`show()`
+  and `isHidden` (the same toggle as the title-bar eyeball, in both
+  directions — scripts hear user clicks too, via the new
+  `smudgy:events/pane` `visibility` event), `resize({ width, height })`
+  and a live `size` read (with a `resize` event that fires once per
+  settled layout change), and a per-pane terminal font override
+  (`setFontSize(px | null)`, also available in the split spec as
+  `fontSize`). A split spec can start a pane `hidden: true`, so
+  reveal-on-event panes never flash at load; a reload keeps your eyeball
+  toggles. The main pane accepts only the font override — a per-session
+  override of the Preferences font size.
+- **Scripts can rearrange panes.** `pane.relocate(direction, reference?)`
+  moves a pane next to another one — across windows too, so relocating
+  onto a pane in a torn-out window re-docks there — and
+  `pane.tearOut({ width?, height? })` moves it into a fresh window of its
+  own, exactly like dragging it out. Windows stay anonymous: when a
+  torn-out pane leaves or closes, its window closes with it.
 - **Scripts can work with the command input.** A new `input` object reads
   what's in the box, puts text there (`propose()` suggests a command
   fully selected, so typing anything discards it), moves the cursor,

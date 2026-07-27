@@ -926,6 +926,18 @@ declare module "smudgy:core" {
      *  naming an existing pane (including `'main'`) with an explicit
      *  `titleBar` updates its policy. */
     titleBar?: TitleBarSpec;
+    /** Start the pane hidden — the title-bar eyeball's toggle, pre-set — so
+     *  a reveal-on-event pane never flashes at load; `show()` (or the user's
+     *  eyeball) reveals it. Explicit on an existing pane it updates the
+     *  toggle; omitted, the current state — including the user's own toggle —
+     *  is kept across reloads. Not allowed on `main`. */
+    hidden?: boolean;
+    /** This pane's terminal font size in px (8–40; out of range throws).
+     *  Omitted, the pane follows the global setting. Explicit on an existing
+     *  pane it updates the override; reverting is {@link Pane.setFontSize}
+     *  with `null`. Scrollback text only — input lines stay on the global
+     *  setting. */
+    fontSize?: number;
     /** Give the pane its own input line (see {@link PaneInputSpec}). Part of
      *  what the pane is, like `terminal`: `split()` naming an existing pane
      *  that has no input while asking for one throws (close it first). Works
@@ -944,6 +956,12 @@ declare module "smudgy:core" {
     (D extends "left" | "right"
       ? { width?: number; height?: never }
       : { height?: number; width?: never });
+
+  /** The optional extent for {@link Pane.relocate}, keyed to the split axis
+   *  exactly like a split's initial size. */
+  export type RelocateSize<D extends SplitDirection> = D extends "left" | "right"
+    ? { width?: number; height?: never }
+    : { height?: number; width?: never };
 
   /**
    * A handle to one session pane. Panes are keyed by name: `split()` with an
@@ -990,8 +1008,59 @@ declare module "smudgy:core" {
      *  {@link Session.input}. */
     readonly input: InputHandle | undefined;
     /** Split a new pane off this one (get-or-create by name; an explicit
-     *  `titleBar` also updates an existing pane's policy, including main's). */
+     *  def-state field — `titleBar`, `hidden`, `fontSize` — also updates an
+     *  existing pane, `titleBar`/`fontSize` including main's). */
     split<D extends SplitDirection>(direction: D, spec: PaneSpec<D>): Pane;
+    /** Hide this pane — the title-bar eyeball, scripted. A soft display
+     *  state: the pane keeps running, widgets stay mounted, and routed lines
+     *  keep landing in its scrollback. Throws on main (the user's eyeball
+     *  owns main's visibility). */
+    hide(): void;
+    /** Show this pane (the eyeball's other half). Throws on main. */
+    show(): void;
+    /** The eyeball's toggle state — never effective visibility: a hidden
+     *  pane still renders, veiled, while the toolbar is expanded, and a
+     *  window whose every pane is hidden shows them all rather than go
+     *  blank. Reads are live; your own session only. */
+    readonly isHidden: boolean;
+    /** Set (or with `null` clear) this pane's terminal font override in px
+     *  (8–40; out of range throws). Scrollback text only — input lines stay
+     *  on the global setting. Allowed on main, as a per-session override of
+     *  the user's setting; that one additionally requires the
+     *  `change-display` capability. */
+    setFontSize(px: number | null): void;
+    /** This pane's font override in px, or `undefined` while following the
+     *  global setting. Your own session only. */
+    readonly fontSize: number | undefined;
+    /** Resize this pane in px. Each given dimension adjusts the nearest
+     *  divider on that axis, which becomes script-owned until the user drags
+     *  it again — last writer wins, in both directions. Best-effort per
+     *  axis: a pane already spanning its cluster on an axis is left alone
+     *  there. Throws on main (resize the sibling script pane instead). */
+    resize(size: { width?: number; height?: number }): void;
+    /** The pane's last laid-out size in logical px, or `undefined` before
+     *  the first layout report. A hidden pane keeps its last laid-out size.
+     *  Your own session only. */
+    readonly size: { width: number; height: number } | undefined;
+    /** Move this pane next to `reference` (default: the session's main
+     *  pane). The direction reads exactly like `split`'s — where this pane
+     *  lands relative to the reference: `chat.relocate('left')` is the
+     *  placement `mainPane.split('left', …)` would have produced. The move
+     *  follows the reference across windows, so relocating onto a pane in a
+     *  torn-out window re-docks there. Throws on main, on another session's
+     *  `Pane`, and on this pane itself. */
+    relocate<D extends SplitDirection>(
+      direction: D,
+      reference?: Pane | string,
+      size?: RelocateSize<D>,
+    ): void;
+    /** Move this pane into a fresh window of its own — the drag tear-out,
+     *  scripted. Windows stay anonymous: there is no window handle, the
+     *  window closes when its last pane leaves it, and re-docking is a
+     *  {@link relocate} onto a pane elsewhere. `width`/`height` size the new
+     *  window (floored by the window minimum); omitted dimensions follow the
+     *  pane's current size. Throws on main. */
+    tearOut(opts?: { width?: number; height?: number }): void;
   }
 
   /**
@@ -2053,6 +2122,34 @@ declare module "smudgy:events/input" {
     focused: boolean;
     masked?: true;
     pane?: string;
+  }>;
+}
+
+declare module "smudgy:events/pane" {
+  import type { EventConsumer } from "smudgy:core";
+
+  /**
+   * Fires on every actual visibility toggle of a pane — the user's title-bar
+   * eyeball and scripted `hide()`/`show()` alike (including the main pane,
+   * which only the user can toggle). `pane` is the pane's display-cased
+   * name, resolvable in your own namespace; `hidden` is the new toggle
+   * state. Subscribing requires the `panes` capability.
+   */
+  export const visibility: EventConsumer<{
+    pane: string;
+    hidden: boolean;
+  }>;
+
+  /**
+   * Fires when a pane's laid-out size settles on a new value — after a
+   * divider drag comes to rest, a window resize, or a scripted `resize()`;
+   * never per drag frame. `width`/`height` are logical px, the same values
+   * {@link Pane.size} reads. Subscribing requires the `panes` capability.
+   */
+  export const resize: EventConsumer<{
+    pane: string;
+    width: number;
+    height: number;
   }>;
 }
 

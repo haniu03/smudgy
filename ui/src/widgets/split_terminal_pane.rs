@@ -31,6 +31,9 @@ struct SplitTerminalPane<'a> {
     /// `Message`-agnostic, and the handler sends the runtime action itself (the
     /// session's NAWS report — wired only for the session's main terminal).
     pub on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
+    /// Per-pane terminal font override (`docs/panes.md`); `None` follows the
+    /// global preference. Scrollback text only — the input line stays global.
+    pub font_size: Option<f32>,
 }
 
 impl<'a> SplitTerminalPane<'a> {
@@ -40,12 +43,20 @@ impl<'a> SplitTerminalPane<'a> {
             buffer,
             on_link: None,
             on_grid_change: None,
+            font_size: None,
         }
     }
 
     fn terminal_pane(&self) -> TerminalPane<'a> {
         terminal_pane(Ref::clone(&self.buffer), self.selection.clone())
             .on_link(self.on_link.clone())
+            .font_size(self.font_size)
+    }
+
+    /// The pane's effective line height (see
+    /// [`terminal_pane::effective_metrics`]).
+    fn line_height(&self) -> f32 {
+        terminal_pane::effective_metrics(&crate::prefs::current(), self.font_size).1
     }
 
     fn scroll_bar_element<Message, Theme, Renderer: iced::advanced::Renderer>(
@@ -150,7 +161,7 @@ impl<'a> SplitTerminalPane<'a> {
                         .min(AUTOSCROLL_MAX_TICK_SECS);
                     state.autoscroll_tick = Some(*now);
 
-                    let line_height = crate::prefs::current().line_height;
+                    let line_height = self.line_height();
                     let speed = (AUTOSCROLL_BASE_LINES_PER_SEC
                         + (overshoot.abs() / line_height) * AUTOSCROLL_GAIN_PER_LINE)
                         .min(AUTOSCROLL_MAX_LINES_PER_SEC);
@@ -400,10 +411,11 @@ where
         };
 
         let prefs = crate::prefs::current();
+        let line_height = self.line_height();
 
         // Use the same line height the panes lay text out with, so the
         // scrollbar's visible-lines math matches what is on screen.
-        let visible_lines = terminal_pane_limits.max().height / prefs.line_height;
+        let visible_lines = terminal_pane_limits.max().height / line_height;
 
         let scrollbar_node = self
             .scroll_bar_element::<Message, Theme, Renderer>(
@@ -424,14 +436,14 @@ where
         // quantization means a pixel-level resize drag only fires on real grid
         // steps. The cell advance was measured by the child layout above.
         if let Some(on_grid_change) = &self.on_grid_change
-            && let Some((_, advance)) = main_pane_tree
+            && let Some((_, _, advance)) = main_pane_tree
                 .state
                 .downcast_ref::<terminal_pane::State<Renderer::Paragraph>>()
                 .advance
         {
             let full = terminal_pane_limits.max();
             let cols = whole_cells(full.width, advance).min(prefs.line_length.unwrap_or(u16::MAX));
-            let rows = whole_cells(full.height, prefs.line_height);
+            let rows = whole_cells(full.height, line_height);
             if state.reported_grid != Some((cols, rows)) {
                 state.reported_grid = Some((cols, rows));
                 on_grid_change(cols, rows);
@@ -620,6 +632,7 @@ pub fn split_terminal_pane<'a, Message, Theme, Renderer>(
     selection: Rc<RefCell<Selection>>,
     on_link: Option<Rc<dyn Fn(LinkClickEvent)>>,
     on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
+    font_size: Option<f32>,
 ) -> Element<'a, Message, Theme, Renderer>
 where
     Renderer: text::Renderer<Font = iced::Font> + 'a,
@@ -631,5 +644,6 @@ where
     let mut pane = SplitTerminalPane::new(buffer, selection);
     pane.on_link = on_link;
     pane.on_grid_change = on_grid_change;
+    pane.font_size = font_size;
     Element::new(pane)
 }
