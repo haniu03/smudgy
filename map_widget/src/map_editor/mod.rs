@@ -73,6 +73,8 @@ pub enum LegendContext {
     Connection {
         routing: smudgy_cloud::ConnectionRouting,
         waypoint_selected: bool,
+        /// A port handle is selected: arrow keys slide it along its wall.
+        port_selected: bool,
     },
 }
 
@@ -119,6 +121,7 @@ pub fn resolve_legend(
     let LegendContext::Connection {
         routing,
         waypoint_selected,
+        port_selected,
     } = context
     else {
         return Vec::new();
@@ -145,6 +148,22 @@ pub fn resolve_legend(
             },
         ];
     }
+    if port_selected {
+        return vec![
+            LegendItem {
+                key: "Drag",
+                action: "move port",
+            },
+            LegendItem {
+                key: "←→↑↓",
+                action: "slide along the wall (its axis only)",
+            },
+            LegendItem {
+                key: "Esc",
+                action: "stop editing",
+            },
+        ];
+    }
 
     match routing {
         smudgy_cloud::ConnectionRouting::Simple | smudgy_cloud::ConnectionRouting::Manual => {
@@ -153,11 +172,16 @@ pub fn resolve_legend(
                 action: "add a point",
             }]
         }
+        // Dragging the line body is deliberately inert; only Ctrl+click and
+        // handle drags convert an Automatic route.
         smudgy_cloud::ConnectionRouting::Automatic => vec![LegendItem {
-            key: "Ctrl+click or drag",
-            action: "convert to Manual",
+            key: "Ctrl+click",
+            action: "add a point (converts to Manual)",
         }],
-        smudgy_cloud::ConnectionRouting::Stub => Vec::new(),
+        smudgy_cloud::ConnectionRouting::Stub => vec![LegendItem {
+            key: "",
+            action: "Stub routing draws no route, so there is nothing to edit",
+        }],
     }
 }
 
@@ -335,7 +359,13 @@ pub enum Message {
         rect: Rectangle,
         additive: bool,
     },
-    SetHoveredRoom(Option<RoomKey>),
+    /// The topmost hover targets under an idle cursor: the hovered room (any
+    /// tool) and, in Select mode, the hovered Connection — published
+    /// together so one mouse move can never leave one of them stale.
+    SetHovered {
+        room: Option<RoomKey>,
+        connection: Option<ConnectionId>,
+    },
     MoveCommitted {
         offset: Vector,
     },
@@ -406,6 +436,15 @@ pub struct MapEditor {
     last_viewport_size: Cell<Option<Size>>,
     player_location: Option<RoomKey>,
     hovered_room: Option<RoomKey>,
+    /// The Connection under an idle Select-tool cursor, drawn with a muted
+    /// accent glow so the invisible hit band and click cycling are
+    /// discoverable.
+    hovered_connection: Option<ConnectionId>,
+    /// The room the user came *from* when the selection transitioned room →
+    /// one of its connections. Presentation-only: the inspector shows the
+    /// connection from this room's perspective (it is the "From" end),
+    /// whatever the stored endpoint order says.
+    connection_anchor: Option<RoomNumber>,
     selected_connection_handle: Option<(ConnectionId, SelectedConnectionHandle)>,
     /// Accepted solver output awaiting user confirmation. This is view-only:
     /// the cache and stored Connection remain untouched until the host emits
@@ -418,6 +457,10 @@ pub struct MapEditor {
 impl MapEditor {
     const MIN_SCALING: f32 = 2.0;
     const MAX_SCALING: f32 = 200.0;
+    /// Must stay comfortably above the worst-case overhang of a level
+    /// treatment glyph past its Connection's stroke bounds (~0.8 map units:
+    /// [`render::LEVEL_TREATMENT_REACH`] with the port dragged to the
+    /// opposite wall), or edge-of-viewport glyphs get culled.
     const SPATIAL_QUERY_PADDING: f32 = 1.0;
     /// Opacity of the ghosted adjacent levels.
     const GHOST_OPACITY: f32 = 0.15;
@@ -435,6 +478,8 @@ impl MapEditor {
             last_viewport_size: Cell::new(None),
             player_location: None,
             hovered_room: None,
+            hovered_connection: None,
+            connection_anchor: None,
             selected_connection_handle: None,
             automatic_route_preview: None,
             activity: EditorActivity::Idle,
@@ -449,6 +494,8 @@ impl MapEditor {
         self.area_id = area_id;
         self.selection.clear();
         self.hovered_room = None;
+        self.hovered_connection = None;
+        self.connection_anchor = None;
         self.selected_connection_handle = None;
         self.automatic_route_preview = None;
         self.activity = EditorActivity::Idle;
@@ -492,6 +539,12 @@ impl MapEditor {
 
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
+        // Connection hover is a Select-tool affordance; hover state is only
+        // republished on cursor movement, so clear it here rather than glow
+        // under the wrong tool.
+        if tool != Tool::Select {
+            self.hovered_connection = None;
+        }
         self.activity = EditorActivity::Idle;
     }
 
@@ -524,6 +577,8 @@ impl MapEditor {
             self.level = level;
             self.selection.clear();
             self.hovered_room = None;
+            self.hovered_connection = None;
+            self.connection_anchor = None;
             self.selected_connection_handle = None;
             self.automatic_route_preview = None;
             self.activity = EditorActivity::Idle;
@@ -535,6 +590,7 @@ impl MapEditor {
     pub fn set_level_keeping_selection(&mut self, level: i32) {
         self.level = level;
         self.hovered_room = None;
+        self.hovered_connection = None;
     }
 
     #[must_use]
@@ -544,6 +600,7 @@ impl MapEditor {
 
     pub fn clear_selection(&mut self) {
         self.selection.clear();
+        self.connection_anchor = None;
         self.selected_connection_handle = None;
         self.activity = EditorActivity::Idle;
     }
@@ -551,6 +608,7 @@ impl MapEditor {
     /// Replaces the selection with a single entity (e.g. one just created).
     pub fn select(&mut self, entity: EntityId) {
         self.selection.replace_with(entity);
+        self.connection_anchor = None;
         self.selected_connection_handle = None;
         self.activity = EditorActivity::Idle;
     }
@@ -613,6 +671,13 @@ impl MapEditor {
             self.selected_connection_handle,
             Some((selected, SelectedConnectionHandle::Waypoint(_))) if selected == connection_id
         );
+        let port_selected = matches!(
+            self.selected_connection_handle,
+            Some((
+                selected,
+                SelectedConnectionHandle::PortA | SelectedConnectionHandle::PortB,
+            )) if selected == connection_id
+        );
 
         let atlas = self.mapper.get_current_atlas();
         let Some(connection) = self
@@ -629,6 +694,7 @@ impl MapEditor {
             LegendContext::Connection {
                 routing: connection.routing,
                 waypoint_selected,
+                port_selected,
             },
         )
     }
@@ -636,6 +702,30 @@ impl MapEditor {
     #[must_use]
     pub fn hovered_room(&self) -> Option<&RoomKey> {
         self.hovered_room.as_ref()
+    }
+
+    /// The perspective anchor of the selected connection: the room the
+    /// selection transitioned from, when it was one of the connection's
+    /// endpoints. See the field docs.
+    #[must_use]
+    pub fn connection_anchor(&self) -> Option<RoomNumber> {
+        self.connection_anchor
+    }
+
+    fn connection_has_endpoint(&self, connection_id: ConnectionId, room: RoomNumber) -> bool {
+        let atlas = self.mapper.get_current_atlas();
+        self.area_id
+            .as_ref()
+            .and_then(|id| atlas.get_area(id))
+            .and_then(|area| {
+                area.get_connection(connection_id).map(|connection| {
+                    connection.endpoint_a.room_number == room
+                        || connection
+                            .endpoint_b
+                            .is_some_and(|endpoint| endpoint.room_number == room)
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// Updates the player marker, returning whether it actually moved. The
@@ -663,6 +753,21 @@ impl MapEditor {
                 Update::none()
             }
             Message::ClickSelect { entity, additive } => {
+                // A room → its-connection transition remembers the room as
+                // the perspective anchor; re-clicking the same connection
+                // (click cycling) keeps it. Everything else forgets it.
+                self.connection_anchor = match entity {
+                    EntityId::Connection(id) => match self.selection.single() {
+                        Some(EntityId::Room(room)) if self.connection_has_endpoint(id, room) => {
+                            Some(room)
+                        }
+                        Some(EntityId::Connection(previous)) if previous == id => {
+                            self.connection_anchor
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 if additive {
                     self.selection.toggle(entity);
                 } else {
@@ -679,6 +784,7 @@ impl MapEditor {
             }
             Message::RubberBandSelect { rect, additive } => {
                 let hits = self.entities_in_rect(rect);
+                self.connection_anchor = None;
                 if additive {
                     self.selection.extend(hits);
                 } else {
@@ -687,9 +793,13 @@ impl MapEditor {
                 }
                 Update::with_event(Event::SelectionChanged)
             }
-            Message::SetHoveredRoom(room_key) => {
-                self.hovered_room = room_key.clone();
-                Update::with_event(Event::HoveredRoomChanged(room_key))
+            Message::SetHovered { room, connection } => {
+                self.hovered_connection = connection;
+                if self.hovered_room == room {
+                    return Update::none();
+                }
+                self.hovered_room = room.clone();
+                Update::with_event(Event::HoveredRoomChanged(room))
             }
             Message::MoveCommitted { offset } => {
                 Update::with_event(Event::RequestMutation(MutationRequest::MoveSelection {
@@ -742,14 +852,10 @@ impl MapEditor {
                     .replace_with(EntityId::Connection(connection_id));
                 self.selected_connection_handle = Some((connection_id, handle));
                 self.automatic_route_preview = None;
-                self.activity = match handle {
-                    SelectedConnectionHandle::Waypoint(_) => {
-                        EditorActivity::DraggingConnectionWaypoint
-                    }
-                    SelectedConnectionHandle::PortA | SelectedConnectionHandle::PortB => {
-                        EditorActivity::DraggingConnectionPort
-                    }
-                };
+                // A press is selection only; the canvas reports the drag
+                // activity separately once the pointer crosses the drag
+                // threshold, so the legend doesn't flip on a bare click.
+                self.activity = EditorActivity::Idle;
                 Update::with_event(Event::SelectionChanged)
             }
             Message::ConnectionUpdated {
@@ -934,19 +1040,30 @@ impl MapEditor {
         let half_size = render::MAP_ROOM_SIZE / 2.0;
 
         let mut connection_ids = HashSet::new();
+        // Padded so a rubber band tight around a level treatment glyph
+        // (which can sit outside the stroke bounds) still finds its half.
+        let glyph_pad = render::LEVEL_TREATMENT_REACH + render::MAP_ROOM_SIZE;
         area.with_room_connections_in(
-            rect.x,
-            rect.y,
-            rect.x + rect.width,
-            rect.y + rect.height,
+            rect.x - glyph_pad,
+            rect.y - glyph_pad,
+            rect.x + rect.width + glyph_pad,
+            rect.y + rect.height + glyph_pad,
             |connection| {
-                if connection.from_level == self.level
-                    && connection.geometry.bounds.max_x >= rect.x
+                if connection.from_level != self.level {
+                    return;
+                }
+                let bounds_hit = connection.geometry.bounds.max_x >= rect.x
                     && connection.geometry.bounds.min_x <= rect.x + rect.width
                     && connection.geometry.bounds.max_y >= rect.y
-                    && connection.geometry.bounds.min_y <= rect.y + rect.height
-                    && connection_ids.insert(connection.connection_id)
-                {
+                    && connection.geometry.bounds.min_y <= rect.y + rect.height;
+                // The drawn level glyph is selectable exactly as drawn; both
+                // treatment forms are axis-aligned, so a box test is exact.
+                let glyph_hit = !bounds_hit
+                    && render::level_treatment(connection, false).is_some_and(|treatment| {
+                        let (min, max) = treatment.bounding_box();
+                        rects_intersect(rect, min.x, min.y, max.x - min.x, max.y - min.y)
+                    });
+                if (bounds_hit || glyph_hit) && connection_ids.insert(connection.connection_id) {
                     hits.push(EntityId::Connection(connection.connection_id));
                 }
             },
@@ -991,8 +1108,9 @@ impl MapEditor {
         hits
     }
 
-    /// Visible Connection strokes within a stable six-pixel target, nearest
-    /// first and UUID-stable for crossing click-cycling.
+    /// Visible Connection strokes and level-change glyphs within a stable
+    /// six-pixel target, nearest first and UUID-stable for crossing
+    /// click-cycling.
     fn connection_hits(
         &self,
         area: &smudgy_cloud::mapper::area_cache::AreaCache,
@@ -1000,24 +1118,39 @@ impl MapEditor {
     ) -> Vec<ConnectionId> {
         let tolerance = 6.0 / self.scaling;
         let map_point = MapPoint::new(point.x, point.y);
+        // Level treatments (corner triangles, fading directional stubs) can
+        // reach outside a cross-level Connection's stroke bounds; pad the
+        // spatial query so their halves stay candidates. The extra room
+        // width covers the worst case of a port dragged to the wall
+        // opposite the exit direction, where the stroke envelope starts on
+        // the far side of the room the glyph hangs off.
+        let reach = tolerance + render::LEVEL_TREATMENT_REACH + render::MAP_ROOM_SIZE;
         let mut hits = Vec::new();
         let mut seen = HashSet::new();
         area.with_room_connections_in(
-            point.x - tolerance,
-            point.y - tolerance,
-            point.x + tolerance,
-            point.y + tolerance,
+            point.x - reach,
+            point.y - reach,
+            point.x + reach,
+            point.y + reach,
             |connection| {
-                if connection.from_level != self.level
-                    || !seen.insert(connection.connection_id)
-                    || !connection.geometry.hit_test(map_point, tolerance)
-                {
+                if connection.from_level != self.level || !seen.insert(connection.connection_id) {
                     return;
                 }
-                hits.push((
-                    connection.connection_id,
-                    connection.geometry.distance_to(map_point),
-                ));
+                let mut distance = if connection.geometry.hit_test(map_point, tolerance) {
+                    connection.geometry.distance_to(map_point)
+                } else {
+                    f32::INFINITY
+                };
+                // The rendered level glyph is clickable exactly as drawn.
+                if let Some(treatment) = render::level_treatment(connection, false) {
+                    let glyph = treatment.distance_to(map_point);
+                    if glyph <= tolerance {
+                        distance = distance.min(glyph);
+                    }
+                }
+                if distance.is_finite() {
+                    hits.push((connection.connection_id, distance));
+                }
             },
         );
         hits.sort_by(|(id_a, distance_a), (id_b, distance_b)| {
@@ -1026,17 +1159,6 @@ impl MapEditor {
                 .then_with(|| id_a.cmp(id_b))
         });
         hits.into_iter().map(|(id, _)| id).collect()
-    }
-
-    #[must_use]
-    fn room_key_at(&self, point: Point) -> Option<RoomKey> {
-        match self.entity_at(point) {
-            Some(EntityId::Room(number)) => Some(RoomKey {
-                area_id: self.area_id?,
-                room_number: number,
-            }),
-            _ => None,
-        }
     }
 
     /// The bounds of the single selected label/shape on the current level
@@ -1200,6 +1322,7 @@ mod legend_tests {
                 LegendContext::Connection {
                     routing: ConnectionRouting::Automatic,
                     waypoint_selected: false,
+                    port_selected: false,
                 },
             ),
             vec![
@@ -1224,6 +1347,7 @@ mod legend_tests {
                 LegendContext::Connection {
                     routing: ConnectionRouting::Manual,
                     waypoint_selected: false,
+                    port_selected: false,
                 },
             ),
             vec![LegendItem {
@@ -1238,12 +1362,41 @@ mod legend_tests {
                 LegendContext::Connection {
                     routing: ConnectionRouting::Manual,
                     waypoint_selected: true,
+                    port_selected: false,
                 },
             )
             .len(),
             3
         );
         assert!(resolve_legend(EditorActivity::Idle, true, LegendContext::None).is_empty());
+        // A selected port advertises its wall-axis nudge; Stub routing
+        // explains itself instead of showing an empty footer.
+        assert_eq!(
+            resolve_legend(
+                EditorActivity::Idle,
+                true,
+                LegendContext::Connection {
+                    routing: ConnectionRouting::Simple,
+                    waypoint_selected: false,
+                    port_selected: true,
+                },
+            )
+            .len(),
+            3
+        );
+        assert_eq!(
+            resolve_legend(
+                EditorActivity::Idle,
+                true,
+                LegendContext::Connection {
+                    routing: ConnectionRouting::Stub,
+                    waypoint_selected: false,
+                    port_selected: false,
+                },
+            )
+            .len(),
+            1
+        );
     }
 }
 

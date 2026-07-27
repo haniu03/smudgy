@@ -30,6 +30,7 @@ use smudgy_map_widget::render::parse_color;
 
 use crate::assets::{bootstrap_icons, fonts};
 use crate::components::color_picker::{self, ColorPicker};
+use crate::components::stroke_sample::StrokeSample;
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::update::Update;
@@ -52,11 +53,14 @@ pub(super) fn endpoint_updates(
 ) -> Option<ConnectionUpdates> {
     let connection = area.get_connection(connection_id)?;
     let mut route_points = None;
+    // Without endpoint B there is no active tip-to-tip route to repair —
+    // dormant stored points stay untouched and the endpoint simply moves.
     if connection.segment_shape == SegmentShape::Orthogonal
         && matches!(
             connection.routing,
             ConnectionRouting::Manual | ConnectionRouting::Automatic
         )
+        && connection.endpoint_b.is_some()
     {
         let render = area.get_room_connections().iter().find(|item| {
             item.connection_id == connection_id && item.geometry.stub_tip_b.is_some()
@@ -70,38 +74,18 @@ pub(super) fn endpoint_updates(
             ),
             endpoint.side,
         );
-        let mut points = connection.route_points.clone();
-        if endpoint_b {
-            let old_tip = render.geometry.stub_tip_b?;
-            if let Some(last) = points.last_mut() {
-                if (last.y - old_tip.y).abs() <= (last.x - old_tip.x).abs() {
-                    last.y = new_tip.y;
-                } else {
-                    last.x = new_tip.x;
-                }
-            } else if (render.geometry.stub_tip_a.x - new_tip.x).abs() > f32::EPSILON
-                && (render.geometry.stub_tip_a.y - new_tip.y).abs() > f32::EPSILON
-            {
-                points.push(smudgy_cloud::MapPoint::new(
-                    render.geometry.stub_tip_a.x,
-                    new_tip.y,
-                ));
-            }
-        } else if let Some(first) = points.first_mut() {
-            if (first.y - render.geometry.stub_tip_a.y).abs()
-                <= (first.x - render.geometry.stub_tip_a.x).abs()
-            {
-                first.y = new_tip.y;
-            } else {
-                first.x = new_tip.x;
-            }
-        } else if let Some(other_tip) = render.geometry.stub_tip_b
-            && (new_tip.x - other_tip.x).abs() > f32::EPSILON
-            && (new_tip.y - other_tip.y).abs() > f32::EPSILON
-        {
-            points.push(smudgy_cloud::MapPoint::new(new_tip.x, other_tip.y));
-        }
-        route_points = Some(points);
+        let (old_tip, other_tip) = if endpoint_b {
+            (render.geometry.stub_tip_b?, Some(render.geometry.stub_tip_a))
+        } else {
+            (render.geometry.stub_tip_a, render.geometry.stub_tip_b)
+        };
+        route_points = Some(smudgy_cloud::connection_geometry::reroute_for_port_move(
+            &connection.route_points,
+            old_tip,
+            other_tip,
+            new_tip,
+            endpoint_b,
+        ));
     }
 
     Some(if endpoint_b {
@@ -117,6 +101,64 @@ pub(super) fn endpoint_updates(
             ..ConnectionUpdates::default()
         }
     })
+}
+
+/// The endpoint edit that keeps `connection`'s port at `room` agreeing with
+/// a changed exit direction: re-anchored to the direction's home slot in
+/// `AutoPinned` mode, with the orthogonal elbow repair folded in. `None`
+/// when the connection has no endpoint at `room`, the connection is a
+/// self-loop (whose arc ignores ports), or the endpoint already sits home.
+pub(super) fn endpoint_reanchor(
+    area: &AreaCache,
+    connection: &smudgy_cloud::Connection,
+    room: RoomNumber,
+    direction: ExitDirection,
+) -> Option<ConnectionUpdates> {
+    if connection.kind == smudgy_cloud::ConnectionKind::SelfLoop {
+        return None;
+    }
+    let endpoint_b = if connection.endpoint_a.room_number == room {
+        false
+    } else if connection
+        .endpoint_b
+        .is_some_and(|endpoint| endpoint.room_number == room)
+    {
+        true
+    } else {
+        return None;
+    };
+    let mut endpoint = if endpoint_b {
+        connection.endpoint_b?
+    } else {
+        connection.endpoint_a
+    };
+    // `Special`/`Other` have no compass semantics; give them the partner
+    // bearing so the anchor lands toward the destination, exactly as
+    // connection creation does.
+    let bearing = (|| {
+        let this = area.get_room(&room)?;
+        let other_number = if endpoint_b {
+            connection.endpoint_a.room_number
+        } else {
+            connection.endpoint_b?.room_number
+        };
+        let other = area.get_room(&other_number)?;
+        Some(smudgy_cloud::MapPoint::new(
+            other.get_x() - this.get_x(),
+            other.get_y() - this.get_y(),
+        ))
+    })();
+    let (side, offset) = smudgy_cloud::default_anchor_for_direction(direction, bearing);
+    if endpoint.side == side
+        && (endpoint.port_offset - offset).abs() < smudgy_cloud::connection_geometry::EPSILON
+        && endpoint.port_mode == smudgy_cloud::PortMode::AutoPinned
+    {
+        return None;
+    }
+    endpoint.side = side;
+    endpoint.port_offset = offset;
+    endpoint.port_mode = smudgy_cloud::PortMode::AutoPinned;
+    endpoint_updates(area, connection.id, endpoint, endpoint_b)
 }
 
 #[derive(Clone, Copy)]
@@ -303,7 +345,11 @@ pub enum Message {
     ConnectionCornerChanged(CornerStyle),
     ConnectionDashChanged(ConnectionDash),
     ConnectionColorChanged(String),
-    ConnectionThicknessChanged(String),
+    /// A width row in the visual stroke panel was clicked.
+    ConnectionThicknessPicked(f32),
+    ThicknessPanelToggled,
+    DashPanelToggled,
+    ConnectionAddReturn,
     ConnectionEndpointSideChanged(bool, RoomSide),
     ConnectionEndpointOffsetChanged(bool, String),
     ConnectionEndpointReset(bool),
@@ -363,6 +409,7 @@ pub enum ColorField {
     LabelBackground,
     ShapeFill,
     ShapeStroke,
+    Connection,
 }
 
 /// An area option in the exit-destination picker.
@@ -503,6 +550,10 @@ pub struct State {
     new_area_property_value: String,
     /// The open color picker, if any, and the field it edits.
     picker: Option<(ColorField, ColorPicker)>,
+    /// The visual stroke-width sample panel is open.
+    thickness_panel_open: bool,
+    /// The visual dash-style sample panel is open.
+    dash_panel_open: bool,
     /// Secrecy of the single selected room/label/shape.
     is_secret: bool,
     /// Error from the last secret-marks call (preserved across resyncs;
@@ -522,6 +573,7 @@ impl State {
             ColorField::LabelBackground => &self.label.background,
             ColorField::ShapeFill => &self.shape.background,
             ColorField::ShapeStroke => &self.shape.stroke_color,
+            ColorField::Connection => &self.connection.color,
         }
     }
 }
@@ -877,6 +929,110 @@ impl MapEditorWindow {
         self.push_command(command)
     }
 
+    /// Commits an exit direction change with the matching Connection
+    /// endpoint re-anchor in one undo unit: the port follows the new
+    /// direction to its home slot. `to_side` targets the destination
+    /// endpoint instead (only when no member exit originates there — a
+    /// reciprocal member's own direction governs its port).
+    fn commit_exit_direction_field(
+        &mut self,
+        index: usize,
+        field: FieldId,
+        direction: ExitDirection,
+        to_side: bool,
+    ) -> Update<super::Message, super::Event> {
+        let Some(row) = self.inspector.exits.get(index) else {
+            return Update::none();
+        };
+        let exit_id = row.id;
+        let from_room = row.from_room;
+        let room_key = self
+            .selected_room_key()
+            .or_else(|| Some(RoomKey::new(self.editor.area_id()?, from_room)));
+        let Some(room_key) = room_key else {
+            return Update::none();
+        };
+        let atlas = self.mapper.get_current_atlas();
+        let connection_edit = (|| {
+            let area = atlas.get_area(&room_key.area_id)?;
+            let room = area.get_room(&room_key.room_number)?;
+            let exit = room.get_exits().iter().find(|exit| exit.id == exit_id)?;
+            let connection = area.get_connection(exit.connection_id)?;
+            let target_room = if to_side {
+                let to_room = exit.to_room_number?;
+                if exit.to_area_id != Some(room_key.area_id) {
+                    return None;
+                }
+                if area
+                    .get_room(&to_room)?
+                    .get_exits()
+                    .iter()
+                    .any(|other| other.connection_id == connection.id)
+                {
+                    return None;
+                }
+                to_room
+            } else {
+                room_key.room_number
+            };
+            endpoint_reanchor(&area, connection, target_room, direction)
+                .map(|updates| (connection.id, updates))
+        })();
+        let change = |updates: &mut smudgy_cloud::ExitUpdates| {
+            if to_side {
+                updates.to_direction = Some(direction);
+            } else {
+                updates.from_direction = Some(direction);
+            }
+        };
+        let command = match &connection_edit {
+            // With an endpoint re-anchor, one atomic two-mutation batch —
+            // deliberately not coalescing (see edit_exit_with_endpoint).
+            Some((connection_id, updates)) => {
+                // Re-anchoring an Automatic route's endpoint leaves its
+                // stored route stale exactly like an inspector port edit.
+                if atlas.get_area(&room_key.area_id).is_some_and(|area| {
+                    area.get_connection(*connection_id).is_some_and(|connection| {
+                        connection.routing == ConnectionRouting::Automatic
+                    })
+                }) {
+                    self.automatic_routes_maybe_stale.insert(*connection_id);
+                }
+                // If the endpoint will now render as its level triangle,
+                // its port handle vanishes with this change; drop a
+                // selected one rather than let keyboard nudges edit an
+                // invisible port. (All other cases keep their handles —
+                // the enum is positionless, so the selection stays valid
+                // at the new anchor.)
+                let becomes_triangle = atlas.get_area(&room_key.area_id).is_some_and(|area| {
+                    area.get_connection(*connection_id).is_some_and(|connection| {
+                        smudgy_cloud::connection_geometry::renders_as_level_triangle(
+                            connection.kind,
+                            connection.routing,
+                            smudgy_cloud::connection_geometry::StubAxis::for_direction(direction),
+                        )
+                    })
+                });
+                if becomes_triangle {
+                    self.editor.clear_selected_connection_handle();
+                }
+                commands::edit_exit_with_endpoint(
+                    &atlas,
+                    room_key,
+                    exit_id,
+                    change,
+                    *connection_id,
+                    updates.clone(),
+                )
+            }
+            // No endpoint to move: the plain coalescing exit edit.
+            None => commands::edit_exit_field(&atlas, room_key, exit_id, field, change),
+        };
+        let update = self.push_command(command);
+        self.inspector.resync(&self.mapper, &self.editor);
+        update
+    }
+
     /// Sends one secret-marks POST and optimistically mirrors the flags into
     /// the local cache (reverted by [`Message::SecretMarksCompleted`] on
     /// failure). Secrecy edits deliberately bypass the undo stack, like area
@@ -1220,9 +1376,7 @@ impl MapEditorWindow {
                 if let Some(row) = self.inspector.exits.get_mut(index) {
                     row.from_direction = direction;
                 }
-                self.commit_exit_field(index, FieldId::FromDirection, |updates| {
-                    updates.from_direction = Some(direction);
-                })
+                self.commit_exit_direction_field(index, FieldId::FromDirection, direction, false)
             }
             Message::ExitToAreaChanged(index, choice) => {
                 if let Some(row) = self.inspector.exits.get_mut(index) {
@@ -1242,17 +1396,29 @@ impl MapEditorWindow {
                         .ok()
                         .map(|n| Some(RoomNumber(n)))
                 };
+                // A room number with no area picked means the current area
+                // — the dropdown hints this with the area's name as its
+                // placeholder, and committing makes it explicit.
+                let implied_area = match (&parsed, self.inspector.exits.get(index)) {
+                    (Some(Some(_)), Some(row)) if row.to_area.is_none() => self.editor.area_id(),
+                    _ => None,
+                };
                 if let Some(row) = self.inspector.exits.get_mut(index) {
                     row.to_room = value;
                     if parsed == Some(None) {
                         row.to_area = None;
                         row.to_direction = None;
+                    } else if implied_area.is_some() {
+                        row.to_area = implied_area;
                     }
                 }
                 match parsed {
                     Some(to_room_number) => {
                         self.commit_exit_field(index, FieldId::Destination, move |updates| {
                             updates.to_room_number = to_room_number;
+                            if let Some(area_id) = implied_area {
+                                updates.to_area_id = Some(area_id);
+                            }
                             if to_room_number.is_none() {
                                 // The wire contract can only null a
                                 // destination as a whole (`clear_to`); an
@@ -1272,9 +1438,7 @@ impl MapEditorWindow {
                 if let Some(row) = self.inspector.exits.get_mut(index) {
                     row.to_direction = Some(direction);
                 }
-                self.commit_exit_field(index, FieldId::Destination, move |updates| {
-                    updates.to_direction = Some(direction);
-                })
+                self.commit_exit_direction_field(index, FieldId::Destination, direction, true)
             }
             Message::ExitPathChanged(index, value) => {
                 if let Some(row) = self.inspector.exits.get_mut(index) {
@@ -1446,6 +1610,7 @@ impl MapEditorWindow {
             }
             Message::ConnectionDashChanged(dash) => {
                 self.inspector.connection.dash = dash;
+                self.inspector.dash_panel_open = false;
                 self.commit_connection_field(
                     FieldId::DashStyle,
                     ConnectionUpdates {
@@ -1457,7 +1622,10 @@ impl MapEditorWindow {
             }
             Message::ConnectionColorChanged(value) => {
                 self.inspector.connection.color = value.clone();
-                if !value.is_empty() && smudgy_cloud::canonicalize_css_color(&value).is_none() {
+                // An empty buffer stays uncommitted (the input shows it as
+                // invalid) rather than committing a value the mirror would
+                // silently rewrite to the default.
+                if smudgy_cloud::canonicalize_css_color(&value).is_none() {
                     return Update::none();
                 }
                 self.commit_connection_field(
@@ -1469,14 +1637,12 @@ impl MapEditorWindow {
                     "Change connection color",
                 )
             }
-            Message::ConnectionThicknessChanged(value) => {
-                self.inspector.connection.thickness = value.clone();
-                let Ok(thickness) = value.parse::<f32>() else {
-                    return Update::none();
-                };
+            Message::ConnectionThicknessPicked(thickness) => {
+                self.inspector.thickness_panel_open = false;
                 if !smudgy_cloud::THICKNESS_RANGE.contains(&thickness) {
                     return Update::none();
                 }
+                self.inspector.connection.thickness = thickness.to_string();
                 self.commit_connection_field(
                     FieldId::Thickness,
                     ConnectionUpdates {
@@ -1485,6 +1651,29 @@ impl MapEditorWindow {
                     },
                     "Change connection thickness",
                 )
+            }
+            Message::ThicknessPanelToggled => {
+                self.inspector.thickness_panel_open = !self.inspector.thickness_panel_open;
+                self.inspector.dash_panel_open = false;
+                Update::none()
+            }
+            Message::DashPanelToggled => {
+                self.inspector.dash_panel_open = !self.inspector.dash_panel_open;
+                self.inspector.thickness_panel_open = false;
+                Update::none()
+            }
+            Message::ConnectionAddReturn => {
+                let Some((area_id, connection_id)) = self.selected_connection_id() else {
+                    return Update::none();
+                };
+                let command = commands::add_return_exit(
+                    &self.mapper.get_current_atlas(),
+                    area_id,
+                    connection_id,
+                );
+                let update = self.push_command(command);
+                self.inspector.resync(&self.mapper, &self.editor);
+                update
             }
             Message::ConnectionEndpointSideChanged(endpoint_b, side) => {
                 let Some((area_id, connection_id)) = self.selected_connection_id() else {
@@ -1978,6 +2167,9 @@ impl MapEditorWindow {
                             }
                             ColorField::ShapeStroke => {
                                 self.update_inspector(Message::ShapeStrokeColorChanged(hex))
+                            }
+                            ColorField::Connection => {
+                                self.update_inspector(Message::ConnectionColorChanged(hex))
                             }
                         }
                     }
@@ -2736,13 +2928,34 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
         "Exits"
     }));
 
-    for (index, exit) in state.exits.iter().enumerate() {
-        if index > 0 {
+    // With a perspective anchor, the traversal leaving the anchor room
+    // lists first — matching the endpoint editors' From/To order.
+    let area = window.editor.area_id().and_then(|id| atlas.get_area(&id));
+    // An unpicked destination area defaults to the current one when a room
+    // number is entered; the dropdown hints that with the area's name as
+    // its dimmed placeholder.
+    let area_placeholder = area
+        .as_ref()
+        .map_or_else(|| "area".to_string(), |area| area.get_name().to_string());
+    let mut order: Vec<usize> = (0..state.exits.len()).collect();
+    if connection_selected && let Some(anchor) = window.editor.connection_anchor() {
+        order.sort_by_key(|&index| state.exits[index].from_room != anchor);
+    }
+
+    for (position, &index) in order.iter().enumerate() {
+        let exit = &state.exits[index];
+        if position > 0 {
             section = section.push(rule::horizontal(1));
         }
         if connection_selected {
+            let title = area
+                .as_ref()
+                .and_then(|area| area.get_room(&exit.from_room))
+                .map(|room| room.get_title())
+                .filter(|title| !title.is_empty())
+                .map_or_else(String::new, |title| format!(" · {title}"));
             section = section.push(
-                text(format!("From room {}", exit.from_room))
+                text(format!("From room {}{title}", exit.from_room))
                     .size(12)
                     .style(muted_text),
             );
@@ -2799,7 +3012,7 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
                     pick_list(area_choices.clone(), selected_area, move |choice| {
                         super::Message::Inspector(Message::ExitToAreaChanged(index, choice))
                     })
-                    .placeholder("area")
+                    .placeholder(area_placeholder.clone())
                     .text_size(12)
                     .width(Length::Fill),
                     trash_button(super::Message::Inspector(Message::ExitDeleted(index))),
@@ -2936,91 +3149,154 @@ fn connection_view(
     let Some(connection) = area.get_connection(connection_id) else {
         return content.push(text("Connection no longer exists"));
     };
-    let endpoints = connection.endpoint_b.map_or_else(
-        || format!("Room {} outward", connection.endpoint_a.room_number),
-        |endpoint| {
-            format!(
-                "Room {} {} to room {} {}",
-                connection.endpoint_a.room_number,
-                connection.endpoint_a.side,
-                endpoint.room_number,
-                endpoint.side
-            )
-        },
-    );
     content = content.push(secret_aware_heading(
         "Connection".to_string(),
         state.connection.is_secret,
     ));
 
-    // Link
-    content = content.push(field_label("Link"));
-    content = content.push(text(format!("{} · {endpoints}", connection.kind)).size(12));
-    content = content.push(
-        row![
-            pick_list(
-                &RoomSide::ALL[..],
-                Some(state.connection.endpoint_a_side),
-                |side| super::Message::Inspector(Message::ConnectionEndpointSideChanged(
-                    false, side
-                )),
+    // The perspective anchor: when the selection came from one of this
+    // connection's rooms, that room is the "From" end regardless of the
+    // stored endpoint order.
+    let anchor = window.editor.connection_anchor();
+    let flipped = anchor.is_some_and(|room| {
+        connection
+            .endpoint_b
+            .is_some_and(|endpoint| endpoint.room_number == room)
+            && connection.endpoint_a.room_number != room
+    });
+    let room_label = |number: RoomNumber| {
+        area.get_room(&number)
+            .map(|room| room.get_title())
+            .filter(|title| !title.is_empty())
+            .map_or_else(
+                || format!("room {number}"),
+                |title| format!("room {number} · {title}"),
             )
-            .text_size(12)
-            .width(Length::FillPortion(2)),
-            text_input("port 0–1", &state.connection.endpoint_a_offset)
-                .on_input(|value| super::Message::Inspector(
-                    Message::ConnectionEndpointOffsetChanged(false, value),
-                ))
-                .size(12)
-                .width(Length::FillPortion(1)),
-            button(text("Auto").size(11))
-                .style(builtins::button::secondary)
-                .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
-                    false,
-                ))),
-            button(text("Redistribute").size(11))
-                .style(builtins::button::secondary)
-                .on_press(super::Message::Inspector(
-                    Message::ConnectionRedistributePorts(false,)
-                )),
-        ]
-        .spacing(6),
+    };
+    let endpoints = connection.endpoint_b.map_or_else(
+        || format!("{} outward", room_label(connection.endpoint_a.room_number)),
+        |endpoint| {
+            let (from, to) = if flipped {
+                (endpoint, connection.endpoint_a)
+            } else {
+                (connection.endpoint_a, endpoint)
+            };
+            format!(
+                "{} {} to {} {}",
+                room_label(from.room_number),
+                from.side,
+                room_label(to.room_number),
+                to.side
+            )
+        },
     );
-    if state.connection.has_endpoint_b {
-        content = content.push(
+
+    // Endpoints rendered as their fixed level triangle have no port to
+    // place, so the wall/offset row gives way to a note. Same-level
+    // up/down lines and cross-area up/down stubs keep the port editor.
+    let render_item = area
+        .get_room_connections()
+        .iter()
+        .find(|item| item.connection_id == connection_id);
+    let level_endpoint = |endpoint_b: bool| {
+        render_item.is_some_and(|item| {
+            let stub = if endpoint_b { item.stub_b } else { item.stub_a };
+            smudgy_cloud::connection_geometry::renders_as_level_triangle(
+                item.kind,
+                item.routing,
+                stub,
+            )
+        })
+    };
+
+    // One labeled endpoint editor; `role` is the perspective label the
+    // anchor ordering assigns ("From"/"To").
+    let endpoint_editor = |endpoint_b: bool, role: &'static str| -> ThemedElement<'_, super::Message> {
+        let endpoint = if endpoint_b {
+            connection.endpoint_b.unwrap_or(connection.endpoint_a)
+        } else {
+            connection.endpoint_a
+        };
+        let mut col = Column::new().spacing(4);
+        col = col.push(
+            text(format!("{role} · {}", room_label(endpoint.room_number)))
+                .size(11)
+                .style(muted_text),
+        );
+        if level_endpoint(endpoint_b) {
+            col = col.push(
+                text("Anchored at its level triangle (up/down exit)")
+                    .size(12)
+                    .style(muted_text),
+            );
+            return col.into();
+        }
+        let (side, offset_buffer) = if endpoint_b {
+            (
+                state.connection.endpoint_b_side,
+                &state.connection.endpoint_b_offset,
+            )
+        } else {
+            (
+                state.connection.endpoint_a_side,
+                &state.connection.endpoint_a_offset,
+            )
+        };
+        col = col.push(
             row![
-                pick_list(
-                    &RoomSide::ALL[..],
-                    Some(state.connection.endpoint_b_side),
-                    |side| super::Message::Inspector(Message::ConnectionEndpointSideChanged(
-                        true, side
-                    ),),
-                )
+                pick_list(&RoomSide::ALL[..], Some(side), move |side| {
+                    super::Message::Inspector(Message::ConnectionEndpointSideChanged(
+                        endpoint_b, side,
+                    ))
+                })
                 .text_size(12)
                 .width(Length::FillPortion(2)),
-                text_input("port 0–1", &state.connection.endpoint_b_offset)
-                    .on_input(|value| super::Message::Inspector(
-                        Message::ConnectionEndpointOffsetChanged(true, value),
+                text_input("port 0–1", offset_buffer)
+                    .on_input(move |value| super::Message::Inspector(
+                        Message::ConnectionEndpointOffsetChanged(endpoint_b, value),
                     ))
                     .size(12)
                     .width(Length::FillPortion(1)),
                 button(text("Auto").size(11))
                     .style(builtins::button::secondary)
                     .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
-                        true,
+                        endpoint_b,
                     ))),
                 button(text("Redistribute").size(11))
                     .style(builtins::button::secondary)
                     .on_press(super::Message::Inspector(
-                        Message::ConnectionRedistributePorts(true,)
+                        Message::ConnectionRedistributePorts(endpoint_b)
                     )),
             ]
             .spacing(6),
         );
+        let offset_valid = offset_buffer
+            .parse::<f32>()
+            .is_ok_and(|offset| (0.0..=1.0).contains(&offset));
+        if !offset_valid {
+            col = col.push(
+                text("port offset must be between 0 and 1")
+                    .size(11)
+                    .style(builtins::text::danger),
+            );
+        }
+        col.into()
+    };
+
+    // Link
+    content = content.push(field_label("Link"));
+    content = content.push(text(format!("{} · {endpoints}", connection.kind)).size(12));
+    if state.connection.has_endpoint_b {
+        let (first, second) = if flipped { (true, false) } else { (false, true) };
+        content = content.push(endpoint_editor(first, "From"));
+        content = content.push(endpoint_editor(second, "To"));
+    } else {
+        content = content.push(endpoint_editor(false, "From"));
     }
 
     if state.exits.len() == 1 {
         let selected = &state.exits[0];
+        let mut has_reciprocal_candidate = false;
         for candidate in area.get_connections() {
             if candidate.id == connection_id {
                 continue;
@@ -3052,6 +3328,7 @@ fn connection_view(
                     .to_direction
                     .is_none_or(|direction| direction == selected.from_direction);
             if reciprocal {
+                has_reciprocal_candidate = true;
                 content = content.push(
                     button(text("Pair with reciprocal connection").size(12))
                         .style(builtins::button::secondary)
@@ -3060,6 +3337,39 @@ fn connection_view(
                         ))),
                 );
             }
+        }
+
+        // One-way → two-way when no reciprocal exists to Pair with:
+        // creates the return exit on the destination room, attached to
+        // this link. Only for same-area, non-redacted, non-loop
+        // destinations whose return direction is still free.
+        let return_free = || {
+            let to_room = selected.to_room.trim().parse::<i32>().ok().map(RoomNumber)?;
+            let destination = area.get_room(&to_room)?;
+            let return_direction = selected
+                .to_direction
+                .unwrap_or_else(|| selected.from_direction.opposite());
+            Some(!destination.get_exits().iter().any(|other| {
+                other.from_direction == return_direction
+                    || (other.to_area_id == Some(area_id)
+                        && other.to_room_number == Some(selected.from_room))
+            }))
+        };
+        if selected.to_area == Some(area_id)
+            && !selected.to_unknown
+            && !has_reciprocal_candidate
+            && connection.kind != smudgy_cloud::ConnectionKind::SelfLoop
+            && return_free() == Some(true)
+        {
+            content = content.push(
+                button(text("Add return direction").size(12))
+                    .style(builtins::button::secondary)
+                    .on_press_maybe(
+                        window
+                            .can_edit_active_area()
+                            .then_some(super::Message::Inspector(Message::ConnectionAddReturn)),
+                    ),
+            );
         }
     }
 
@@ -3173,31 +3483,118 @@ fn connection_view(
     // Appearance
     content = content.push(rule::horizontal(1));
     content = content.push(field_label("Appearance"));
-    content = content.push(
-        pick_list(
-            &ConnectionDash::ALL[..],
-            Some(state.connection.dash),
-            |dash| super::Message::Inspector(Message::ConnectionDashChanged(dash)),
-        )
-        .text_size(12),
-    );
+    content = content.push(color_input(
+        window,
+        ColorField::Connection,
+        "Color",
+        "CSS color",
+        &state.connection.color,
+        false,
+        Message::ConnectionColorChanged,
+    ));
+
+    // Width and dash are chosen visually: the buttons render the current
+    // stroke, and their panels render every choice as it would draw with
+    // the connection's current color/dash/width.
+    let sample_color =
+        parse_color(&state.connection.color).unwrap_or(iced::Color::from_rgb8(164, 164, 164));
+    let current_thickness = state
+        .connection
+        .thickness
+        .parse::<f32>()
+        .unwrap_or(DEFAULT_CONNECTION_THICKNESS);
+    let sample = |thickness: f32, dash: ConnectionDash| StrokeSample {
+        color: sample_color,
+        thickness,
+        dash,
+    };
     content = content.push(
         row![
-            text_input("CSS color", &state.connection.color)
-                .on_input(
-                    |value| super::Message::Inspector(Message::ConnectionColorChanged(value),)
-                )
-                .size(12)
-                .width(Length::FillPortion(2)),
-            text_input("width", &state.connection.thickness)
-                .on_input(
-                    |value| super::Message::Inspector(Message::ConnectionThicknessChanged(value),)
-                )
-                .size(12)
-                .width(Length::FillPortion(1)),
+            column![
+                field_label("Width"),
+                button(sample(current_thickness, state.connection.dash).view(Length::Fill, 18.0))
+                    .style(builtins::button::secondary)
+                    .padding(3)
+                    .width(Length::Fill)
+                    .on_press(super::Message::Inspector(Message::ThicknessPanelToggled)),
+            ]
+            .spacing(2)
+            .width(Length::FillPortion(1)),
+            column![
+                field_label("Style"),
+                button(sample(current_thickness, state.connection.dash).view(Length::Fill, 18.0))
+                    .style(builtins::button::secondary)
+                    .padding(3)
+                    .width(Length::Fill)
+                    .on_press(super::Message::Inspector(Message::DashPanelToggled)),
+            ]
+            .spacing(2)
+            .width(Length::FillPortion(1)),
         ]
         .spacing(6),
     );
+    if state.thickness_panel_open {
+        const WIDTH_CHOICES: [f32; 11] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut panel = Column::new().spacing(2);
+        let width_row = |thickness: f32, label: String| {
+            button(
+                row![
+                    text(label).size(11).width(44.0),
+                    sample(thickness, state.connection.dash).view(Length::Fill, 16.0),
+                ]
+                .spacing(6)
+                .align_y(Vertical::Center),
+            )
+            .style(if (thickness - current_thickness).abs() < 0.005 {
+                builtins::button::primary
+            } else {
+                builtins::button::toolbar
+            })
+            .padding(3)
+            .width(Length::Fill)
+            .on_press(super::Message::Inspector(Message::ConnectionThicknessPicked(
+                thickness,
+            )))
+        };
+        // A stored width outside the offered list stays visible and
+        // reselectable rather than silently vanishing.
+        if !WIDTH_CHOICES
+            .iter()
+            .any(|choice| (choice - current_thickness).abs() < 0.005)
+        {
+            panel = panel.push(width_row(current_thickness, format!("{current_thickness}")));
+        }
+        for choice in WIDTH_CHOICES {
+            panel = panel.push(width_row(choice, format!("{choice}")));
+        }
+        content = content.push(panel);
+    }
+    if state.dash_panel_open {
+        let mut panel = Column::new().spacing(2);
+        for dash in ConnectionDash::ALL {
+            panel = panel.push(
+                button(
+                    row![
+                        text(dash.to_string()).size(11).width(44.0),
+                        sample(current_thickness, dash).view(Length::Fill, 16.0),
+                    ]
+                    .spacing(6)
+                    .align_y(Vertical::Center),
+                )
+                .style(if dash == state.connection.dash {
+                    builtins::button::primary
+                } else {
+                    builtins::button::toolbar
+                })
+                .padding(3)
+                .width(Length::Fill)
+                .on_press(super::Message::Inspector(Message::ConnectionDashChanged(
+                    dash,
+                ))),
+            );
+        }
+        content = content.push(panel);
+    }
     content = content.push(
         button(text("Reset route and appearance").size(12))
             .style(builtins::button::secondary)

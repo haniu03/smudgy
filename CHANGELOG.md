@@ -99,6 +99,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deleting a server removes its cache with it. A new
   `image_cache_max_mb` setting (default 256) bounds the whole image
   cache — the oldest-fetched entries are trimmed at startup.
+- **Pick a connection's look by eye.** The connection inspector's color
+  field gains the same swatch and picker rooms and labels have, and
+  stroke width and dash style are chosen from panels that draw each
+  choice as it will look on the map — width, dash, and color together.
+  A width outside the offered list stays visible and reselectable.
+- **One-way links can grow their return direction.** An "Add return
+  direction" button creates the reciprocal traversal on the destination
+  room and attaches it to the same link, in one undoable step. It stands
+  aside when an existing reciprocal is available to Pair with, or when
+  the return direction is already taken.
+- **Connections light up under the cursor.** Hovering a link in the
+  editor's Select mode glows it, so the click target (and click-cycling
+  through crossings) is discoverable before you commit to a click.
+- **Destination room numbers assume the current map.** Typing a room
+  number into an exit's destination with no map picked selects the map
+  you're editing automatically — the dropdown shows its name dimmed as
+  the placeholder, so the default is visible before you type.
 
 ### Changed
 
@@ -143,6 +160,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not with everything loaded. With 100,000 rooms loaded, an auto-mapped
   step dropped from ~120 ms to ~2 ms, and stays single-digit
   milliseconds even at procedural-MUD scale.
+- **The link inspector reads from your room's perspective.** Select a
+  room, then one of its connections: the inspector lists that room as
+  the From end — endpoint editors and traversals reorder to match, with
+  From/To labels and room titles alongside the numbers.
+- **Up/down stub exits draw as their triangles.** An unlinked up or down
+  exit shows a hollow ▲/▼ at its fixed room corner — stroke only, so a
+  real cross-level link's filled triangle still reads as linked — and
+  the triangle is what you click, select, and see highlighted. Endpoints
+  whose representation *is* the triangle (cross-level links, up/down
+  stubs) no longer expose a draggable wall port; up/down links drawn as
+  lines on the same level, and up/down exits to other maps, keep their
+  placeable ports.
+- **Changing an exit's direction moves its port along.** Switching an
+  exit from north to east (or to up/down, or any direction) re-anchors
+  the connection's endpoint at the new direction's home slot in the same
+  undo step, instead of leaving the line attached to the old wall.
+- **Selected connections are visibly selected.** The selection highlight
+  is a real accent halo around the stroke (it was a fraction of a pixel
+  wide), with the line's own color and dash redrawn inside it; cross-
+  level links highlight their drawn triangle or fading stub — which are
+  now also clickable exactly as drawn.
 
 ### Fixed
 
@@ -166,6 +204,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The software renderer announces itself in the log at startup, so
   rendering reports can be triaged without guessing which renderer was
   active.
+- Clicking a connection's port or waypoint handle no longer records a
+  do-nothing undo step — and a bare click on an Automatic route's
+  waypoint no longer silently converts the route to Manual. Dragging
+  still does what it always did, starting once the pointer actually
+  moves.
+- Deleting or cutting a mixed selection now includes its explicitly
+  selected links (they were silently left behind); undo restores the
+  link and both traversals exactly once. Copying a link by itself now
+  works too: pasting attaches it to the same-numbered rooms in the
+  target map when they exist, and reports what couldn't attach instead
+  of creating ambiguous duplicate exits.
+- The editor's status-bar hints no longer claim dragging an Automatic
+  route's line converts it (only handle drags and Ctrl+click do), Stub
+  routing explains why there's nothing to edit, and a selected port
+  advertises its arrow-key wall slide.
 
 ## [0.4.1] - 2026-07-14
 

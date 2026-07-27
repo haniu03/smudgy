@@ -1507,11 +1507,34 @@ impl MapEditorWindow {
                 updates,
                 description,
             } => {
+                // Canvas port drags are endpoint edits: they coalesce with
+                // the inspector's endpoint field (not with waypoint edits)
+                // and leave an Automatic route stale exactly like the
+                // inspector path does.
+                let endpoint_edit = updates.endpoint_a.is_some() || updates.endpoint_b.is_some();
+                let field = if endpoint_edit {
+                    commands::FieldId::Endpoint
+                } else {
+                    commands::FieldId::RoutePoints
+                };
+                if endpoint_edit
+                    && self
+                        .mapper
+                        .get_current_atlas()
+                        .get_area(&area_id)
+                        .is_some_and(|area| {
+                            area.get_connection(connection_id).is_some_and(|connection| {
+                                connection.routing == smudgy_cloud::ConnectionRouting::Automatic
+                            })
+                        })
+                {
+                    self.automatic_routes_maybe_stale.insert(connection_id);
+                }
                 let update = self.push_command(commands::edit_connection(
                     &self.mapper.get_current_atlas(),
                     area_id,
                     connection_id,
-                    commands::FieldId::RoutePoints,
+                    field,
                     updates,
                     description,
                 ));
@@ -1697,13 +1720,31 @@ impl MapEditorWindow {
             Vector::new(0.0, 0.0)
         };
 
-        let Some((command, pasted_rooms)) = commands::paste_clipboard(
+        let (command, pasted_rooms, skipped_connections) = commands::paste_clipboard(
             &self.mapper.get_current_atlas(),
             area_id,
             &clipboard,
             self.editor.level(),
             offset,
-        ) else {
+        );
+        if skipped_connections > 0 {
+            self.editor_notice = Some((
+                Instant::now(),
+                format!(
+                    "{skipped_connections} copied link{} couldn't attach here (missing rooms or occupied directions).",
+                    if skipped_connections == 1 { "" } else { "s" }
+                ),
+            ));
+        }
+        let Some(command) = command else {
+            if skipped_connections == 0 {
+                // Not a skip: the paste itself couldn't be built (too many
+                // operations for one envelope). Say so instead of nothing.
+                self.editor_notice = Some((
+                    Instant::now(),
+                    "The clipboard is too large to paste in one step.".to_string(),
+                ));
+            }
             return Update::none();
         };
         let update = self.push_command(Some(command));
@@ -1743,12 +1784,11 @@ impl MapEditorWindow {
                             let Some(point) = connection.route_points.get(index).copied() else {
                                 return Update::none();
                             };
-                            let mut points = connection.route_points.clone();
-                            let mut target = smudgy_cloud::MapPoint::new(
+                            let target = smudgy_cloud::MapPoint::new(
                                 point.x + dx as f32 * step,
                                 point.y + dy as f32 * step,
                             );
-                            if connection.segment_shape == SegmentShape::Orthogonal {
+                            let points = if connection.segment_shape == SegmentShape::Orthogonal {
                                 let Some(render) =
                                     area.get_room_connections().iter().find(|item| {
                                         item.connection_id == connection_id
@@ -1757,47 +1797,23 @@ impl MapEditorWindow {
                                 else {
                                     return Update::none();
                                 };
-                                let previous = if index == 0 {
-                                    render.geometry.stub_tip_a
-                                } else {
-                                    points[index - 1]
+                                let Some(points) =
+                                    smudgy_cloud::connection_geometry::reroute_for_waypoint_move(
+                                        &connection.route_points,
+                                        index,
+                                        render.geometry.stub_tip_a,
+                                        render.geometry.stub_tip_b,
+                                        target,
+                                    )
+                                else {
+                                    return Update::none();
                                 };
-                                let next = if index + 1 == points.len() {
-                                    let Some(tip) = render.geometry.stub_tip_b else {
-                                        return Update::none();
-                                    };
-                                    tip
-                                } else {
-                                    points[index + 1]
-                                };
-                                let previous_horizontal =
-                                    (point.y - previous.y).abs() <= (point.x - previous.x).abs();
-                                let next_horizontal =
-                                    (point.y - next.y).abs() <= (point.x - next.x).abs();
-                                if index == 0 {
-                                    if previous_horizontal {
-                                        target.y = previous.y;
-                                    } else {
-                                        target.x = previous.x;
-                                    }
-                                } else if previous_horizontal {
-                                    points[index - 1].y = target.y;
-                                } else {
-                                    points[index - 1].x = target.x;
-                                }
-                                if index + 1 == points.len() {
-                                    if next_horizontal {
-                                        target.y = next.y;
-                                    } else {
-                                        target.x = next.x;
-                                    }
-                                } else if next_horizontal {
-                                    points[index + 1].y = target.y;
-                                } else {
-                                    points[index + 1].x = target.x;
-                                }
-                            }
-                            points[index] = target;
+                                points
+                            } else {
+                                let mut points = connection.route_points.clone();
+                                points[index] = target;
+                                points
+                            };
                             (
                                 ConnectionUpdates {
                                     routing: Some(ConnectionRouting::Manual),
@@ -1818,6 +1834,33 @@ impl MapEditorWindow {
                                 }
                                 SelectedConnectionHandle::Waypoint(_) => unreachable!(),
                             };
+                            // The stored selection can outlive the handle
+                            // (an up/down endpoint has no port); refuse to
+                            // nudge a port the geometry no longer offers.
+                            let port_exists = area
+                                .get_room_connections()
+                                .iter()
+                                .find(|item| {
+                                    item.connection_id == connection_id
+                                        && item.from_level == self.editor.level()
+                                })
+                                .is_some_and(|item| {
+                                    item.geometry.handles.iter().any(|offered| {
+                                        use smudgy_cloud::connection_geometry::Handle;
+                                        match handle {
+                                            SelectedConnectionHandle::PortA => {
+                                                matches!(offered, Handle::PortA(_))
+                                            }
+                                            SelectedConnectionHandle::PortB => {
+                                                matches!(offered, Handle::PortB(_))
+                                            }
+                                            SelectedConnectionHandle::Waypoint(_) => false,
+                                        }
+                                    })
+                                });
+                            if !port_exists {
+                                return Update::none();
+                            }
                             // Port offsets are normalized wall coordinates.
                             // Keep the same fine/default/coarse relationship
                             // as waypoint nudging without jumping an entire

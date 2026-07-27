@@ -33,6 +33,12 @@ pub struct RoomConnection {
     /// same stub treatment.
     pub stub_a: StubAxis,
     pub stub_b: StubAxis,
+    /// The member-exit directions the stub axes were derived from, in the
+    /// geometry's A/B sense. Up/Down endpoints render (and hit-test, and
+    /// edit) as level triangles rather than wall ports, and only the
+    /// direction — not the collapsed [`StubAxis`] — can say which is which.
+    pub direction_a: ExitDirection,
+    pub direction_b: Option<ExitDirection>,
     /// The Connection's parsed color (renderer-gray fallback when the stored
     /// string does not parse).
     pub color: iced::Color,

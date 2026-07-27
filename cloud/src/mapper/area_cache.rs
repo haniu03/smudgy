@@ -320,21 +320,19 @@ impl AreaCache {
                 continue;
             };
 
-            let stub_a = connection_geometry::StubAxis::for_direction(Self::direction_at(
+            let direction_a = Self::direction_at(
                 members,
                 connection.endpoint_a.room_number,
                 Some(connection.endpoint_a.side),
-            ));
-            let stub_b = connection
-                .endpoint_b
-                .as_ref()
-                .map_or(connection_geometry::StubAxis::Normal, |endpoint| {
-                    connection_geometry::StubAxis::for_direction(Self::direction_at(
-                        members,
-                        endpoint.room_number,
-                        Some(endpoint.side),
-                    ))
-                });
+            );
+            let stub_a = connection_geometry::StubAxis::for_direction(direction_a);
+            let direction_b = connection.endpoint_b.as_ref().map(|endpoint| {
+                Self::direction_at(members, endpoint.room_number, Some(endpoint.side))
+            });
+            let stub_b = direction_b.map_or(
+                connection_geometry::StubAxis::Normal,
+                connection_geometry::StubAxis::for_direction,
+            );
             let geometry = Arc::new(connection_geometry::resolve(
                 &connection_geometry::GeometryInput {
                     kind: connection.kind,
@@ -380,6 +378,8 @@ impl AreaCache {
                 thickness: connection.thickness,
                 stub_a,
                 stub_b,
+                direction_a,
+                direction_b,
                 color: parse_css_color(&connection.color).unwrap_or(DEFAULT_CONNECTION_ICED_COLOR),
                 is_bidirectional,
                 arrow_toward_b,
@@ -396,7 +396,7 @@ impl AreaCache {
                     });
                 }
                 ConnectionKind::Internal => {
-                    let (Some(room_b), Some(endpoint_b)) = (room_b, connection.endpoint_b) else {
+                    let (Some(room_b), Some(_)) = (room_b, connection.endpoint_b) else {
                         warn!(
                             "area {area_id}: internal connection {} without endpoint B; skipping",
                             connection.id
@@ -405,11 +405,7 @@ impl AreaCache {
                     };
                     room_connections.push(RoomConnection {
                         to: RoomConnectionEnd::Normal {
-                            direction: Self::direction_at(
-                                members,
-                                endpoint_b.room_number,
-                                Some(endpoint_b.side),
-                            ),
+                            direction: direction_b.unwrap_or(direction_a),
                             x: room_b.get_x(),
                             y: room_b.get_y(),
                             room: (*room_b).clone(),
@@ -418,7 +414,7 @@ impl AreaCache {
                     });
                 }
                 ConnectionKind::CrossLevel => {
-                    let (Some(room_b), Some(endpoint_b)) = (room_b, connection.endpoint_b) else {
+                    let (Some(room_b), Some(_)) = (room_b, connection.endpoint_b) else {
                         warn!(
                             "area {area_id}: cross-level connection {} without endpoint B; skipping",
                             connection.id
@@ -430,11 +426,7 @@ impl AreaCache {
                     room_connections.push(RoomConnection {
                         to: RoomConnectionEnd::ToLevel {
                             level: room_b.get_level(),
-                            direction: Self::direction_at(
-                                members,
-                                connection.endpoint_a.room_number,
-                                Some(connection.endpoint_a.side),
-                            ),
+                            direction: direction_a,
                             x: room_b.get_x(),
                             y: room_b.get_y(),
                             room: (*room_b).clone(),
@@ -446,11 +438,7 @@ impl AreaCache {
                         room: (*room_b).clone(),
                         to: RoomConnectionEnd::ToLevel {
                             level: room_a.get_level(),
-                            direction: Self::direction_at(
-                                members,
-                                endpoint_b.room_number,
-                                Some(endpoint_b.side),
-                            ),
+                            direction: direction_b.unwrap_or(direction_a),
                             x: room_a.get_x(),
                             y: room_a.get_y(),
                             room: (*room_a).clone(),

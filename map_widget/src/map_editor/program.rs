@@ -19,9 +19,9 @@ use smudgy_cloud::{
     PortMode, RoomNumber, RoomSide, SegmentShape,
     connection_geometry::{
         EndpointGeometry, GeometryInput, Handle as ConnectionHandle, distance_to_segment,
-        port_position, resolve, stub_tip,
+        port_position, resolve, reroute_for_port_move, reroute_for_waypoint_move, stub_tip,
     },
-    mapper::room_connection::RoomConnection,
+    mapper::{RoomKey, room_connection::RoomConnection},
 };
 
 use crate::{render, viewport};
@@ -172,6 +172,14 @@ pub enum Interaction {
         original: Rectangle,
         current_map: Point,
     },
+    /// A left press on a Connection port/vertex handle that hasn't crossed
+    /// the drag threshold: a bare click selects the handle and must emit no
+    /// mutation (and no Automatic→Manual conversion).
+    PendingConnectionHandle {
+        connection_id: ConnectionId,
+        handle: ConnectionHandle,
+        start_screen: Point,
+    },
     /// A Connection port or stored route vertex. The cache is untouched
     /// during the drag; release emits one coalesced semantic update.
     DraggingConnectionHandle {
@@ -306,54 +314,27 @@ impl MapEditor {
         let connection = area.get_connection(connection_id)?;
         match handle {
             ConnectionHandle::Waypoint(index, _) => {
-                let mut points = connection.route_points.clone();
-                if index >= points.len() {
+                if index >= connection.route_points.len() {
                     return None;
                 }
                 let target = Self::maybe_snap_connection(current, modifiers);
-                let mut target = MapPoint::new(target.x, target.y);
-                if connection.segment_shape == SegmentShape::Orthogonal {
+                let target = MapPoint::new(target.x, target.y);
+                let points = if connection.segment_shape == SegmentShape::Orthogonal {
                     let render = area.get_room_connections().iter().find(|render| {
                         render.connection_id == connection_id && render.from_level == self.level
                     })?;
-                    let previous = if index == 0 {
-                        render.geometry.stub_tip_a
-                    } else {
-                        points[index - 1]
-                    };
-                    let next = if index + 1 == points.len() {
-                        render.geometry.stub_tip_b?
-                    } else {
-                        points[index + 1]
-                    };
-                    let old = points[index];
-                    let previous_horizontal =
-                        (old.y - previous.y).abs() <= (old.x - previous.x).abs();
-                    let next_horizontal = (old.y - next.y).abs() <= (old.x - next.x).abs();
-                    if index == 0 {
-                        if previous_horizontal {
-                            target.y = previous.y;
-                        } else {
-                            target.x = previous.x;
-                        }
-                    } else if previous_horizontal {
-                        points[index - 1].y = target.y;
-                    } else {
-                        points[index - 1].x = target.x;
-                    }
-                    if index + 1 == points.len() {
-                        if next_horizontal {
-                            target.y = next.y;
-                        } else {
-                            target.x = next.x;
-                        }
-                    } else if next_horizontal {
-                        points[index + 1].y = target.y;
-                    } else {
-                        points[index + 1].x = target.x;
-                    }
-                }
-                points[index] = target;
+                    reroute_for_waypoint_move(
+                        &connection.route_points,
+                        index,
+                        render.geometry.stub_tip_a,
+                        render.geometry.stub_tip_b,
+                        target,
+                    )?
+                } else {
+                    let mut points = connection.route_points.clone();
+                    points[index] = target;
+                    points
+                };
                 Some(ConnectionUpdates {
                     routing: Some(ConnectionRouting::Manual),
                     route_points: Some(points),
@@ -386,22 +367,13 @@ impl MapEditor {
                         ),
                         endpoint.side,
                     );
-                    let mut points = connection.route_points.clone();
-                    if let Some(first) = points.first_mut() {
-                        if (first.y - render.geometry.stub_tip_a.y).abs()
-                            <= (first.x - render.geometry.stub_tip_a.x).abs()
-                        {
-                            first.y = new_tip.y;
-                        } else {
-                            first.x = new_tip.x;
-                        }
-                    } else if let Some(other_tip) = render.geometry.stub_tip_b
-                        && (new_tip.x - other_tip.x).abs() > f32::EPSILON
-                        && (new_tip.y - other_tip.y).abs() > f32::EPSILON
-                    {
-                        points.push(MapPoint::new(new_tip.x, other_tip.y));
-                    }
-                    route_points = Some(points);
+                    route_points = Some(reroute_for_port_move(
+                        &connection.route_points,
+                        render.geometry.stub_tip_a,
+                        render.geometry.stub_tip_b,
+                        new_tip,
+                        false,
+                    ));
                 }
                 Some(ConnectionUpdates {
                     endpoint_a: Some(endpoint),
@@ -437,19 +409,13 @@ impl MapEditor {
                         ),
                         endpoint.side,
                     );
-                    let mut points = connection.route_points.clone();
-                    if let Some(last) = points.last_mut() {
-                        if (last.y - old_tip.y).abs() <= (last.x - old_tip.x).abs() {
-                            last.y = new_tip.y;
-                        } else {
-                            last.x = new_tip.x;
-                        }
-                    } else if (render.geometry.stub_tip_a.x - new_tip.x).abs() > f32::EPSILON
-                        && (render.geometry.stub_tip_a.y - new_tip.y).abs() > f32::EPSILON
-                    {
-                        points.push(MapPoint::new(render.geometry.stub_tip_a.x, new_tip.y));
-                    }
-                    route_points = Some(points);
+                    route_points = Some(reroute_for_port_move(
+                        &connection.route_points,
+                        old_tip,
+                        Some(render.geometry.stub_tip_a),
+                        new_tip,
+                        true,
+                    ));
                 }
                 Some(ConnectionUpdates {
                     endpoint_b: Some(endpoint),
@@ -778,6 +744,12 @@ impl MapEditor {
                         .and_capture(),
                 )
             }
+            // A click that never crossed the drag threshold: the handle was
+            // selected on press; no mutation, no undo entry, no
+            // Automatic→Manual conversion.
+            Interaction::PendingConnectionHandle { .. } => {
+                Some(canvas::Action::request_redraw().and_capture())
+            }
             Interaction::DraggingConnectionHandle {
                 connection_id,
                 handle,
@@ -863,6 +835,18 @@ impl canvas::Program<Message, Theme> for MapEditor {
             return None;
         }
 
+        // Hover state is only republished on in-canvas cursor movement, so
+        // the cursor leaving the canvas must clear it explicitly or the
+        // hover glow outlives the pointer.
+        if matches!(event, IcedEvent::Mouse(mouse::Event::CursorLeft))
+            && (self.hovered_room.is_some() || self.hovered_connection.is_some())
+        {
+            return Some(canvas::Action::publish(Message::SetHovered {
+                room: None,
+                connection: None,
+            }));
+        }
+
         // Releases finish gestures even when the cursor has left the canvas.
         if let IcedEvent::Mouse(mouse::Event::ButtonReleased(button)) = event {
             match button {
@@ -888,12 +872,25 @@ impl canvas::Program<Message, Theme> for MapEditor {
             IcedEvent::Mouse(mouse_event) => match mouse_event {
                 mouse::Event::ButtonPressed(button) => match button {
                     mouse::Button::Right => {
+                        // A right press abandons an in-flight connection
+                        // drag; tell the host so the drag legend clears.
+                        let was_connection_drag = matches!(
+                            state.interaction,
+                            Interaction::DraggingConnectionHandle { .. }
+                        );
                         state.interaction = Interaction::Panning {
                             translation: self.translation,
                             start: cursor_position,
                         };
 
-                        Some(canvas::Action::request_redraw().and_capture())
+                        Some(if was_connection_drag {
+                            canvas::Action::publish(Message::ActivityChanged(
+                                super::EditorActivity::Idle,
+                            ))
+                            .and_capture()
+                        } else {
+                            canvas::Action::request_redraw().and_capture()
+                        })
                     }
                     mouse::Button::Left => match self.tool {
                         Tool::Select => {
@@ -902,10 +899,10 @@ impl canvas::Program<Message, Theme> for MapEditor {
                             if let Some((connection_id, handle)) =
                                 self.connection_handle_at(map_position)
                             {
-                                state.interaction = Interaction::DraggingConnectionHandle {
+                                state.interaction = Interaction::PendingConnectionHandle {
                                     connection_id,
                                     handle,
-                                    current_map: map_position,
+                                    start_screen: cursor_position,
                                 };
                                 return Some(
                                     canvas::Action::publish(Message::ConnectionHandleSelected {
@@ -1074,6 +1071,38 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         }
                         Some(canvas::Action::request_redraw().and_capture())
                     }
+                    Interaction::PendingConnectionHandle {
+                        connection_id,
+                        handle,
+                        start_screen,
+                    } => {
+                        if (cursor_position - *start_screen).x.abs() > DRAG_THRESHOLD
+                            || (cursor_position - *start_screen).y.abs() > DRAG_THRESHOLD
+                        {
+                            let (connection_id, handle) = (*connection_id, *handle);
+                            state.interaction = Interaction::DraggingConnectionHandle {
+                                connection_id,
+                                handle,
+                                current_map: map_position,
+                            };
+                            // The drag legend appears when a drag actually
+                            // starts — a bare click never was one.
+                            return Some(
+                                canvas::Action::publish(Message::ActivityChanged(
+                                    match handle {
+                                        ConnectionHandle::Waypoint(..) => {
+                                            super::EditorActivity::DraggingConnectionWaypoint
+                                        }
+                                        ConnectionHandle::PortA(_) | ConnectionHandle::PortB(_) => {
+                                            super::EditorActivity::DraggingConnectionPort
+                                        }
+                                    },
+                                ))
+                                .and_capture(),
+                            );
+                        }
+                        Some(canvas::Action::request_redraw().and_capture())
+                    }
                     Interaction::DraggingSelection { current_map, .. } => {
                         *current_map = map_position;
                         Some(canvas::Action::request_redraw().and_capture())
@@ -1087,11 +1116,27 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         Some(canvas::Action::request_redraw().and_capture())
                     }
                     Interaction::Idle => {
-                        let room_key = self.room_key_at(map_position);
-                        if room_key == self.hovered_room {
+                        let top = self.entity_at(map_position);
+                        let room = match (top, self.area_id) {
+                            (Some(EntityId::Room(room_number)), Some(area_id)) => Some(RoomKey {
+                                area_id,
+                                room_number,
+                            }),
+                            _ => None,
+                        };
+                        let connection = match top {
+                            Some(EntityId::Connection(id)) if self.tool == Tool::Select => {
+                                Some(id)
+                            }
+                            _ => None,
+                        };
+                        if room == self.hovered_room && connection == self.hovered_connection {
                             Some(canvas::Action::request_redraw())
                         } else {
-                            Some(canvas::Action::publish(Message::SetHoveredRoom(room_key)))
+                            Some(canvas::Action::publish(Message::SetHovered {
+                                room,
+                                connection,
+                            }))
                         }
                     }
                 },
@@ -1252,6 +1297,26 @@ impl canvas::Program<Message, Theme> for MapEditor {
                 // Selection: dragged entities render offset; otherwise
                 // outline them in place.
                 let accent = theme.styles.general.accent;
+
+                // Hovered Connection: a muted accent glow that makes the
+                // otherwise invisible hit band discoverable. Selected
+                // connections already get the full outline below.
+                if let Some(hovered) = self.hovered_connection
+                    && self.tool == Tool::Select
+                    && matches!(state.interaction, Interaction::Idle)
+                    && !self.selection.contains(EntityId::Connection(hovered))
+                    && let Some(connection) = area.get_room_connections().iter().find(|item| {
+                        item.connection_id == hovered && item.from_level == self.level
+                    })
+                {
+                    Self::stroke_resolved_connection_outline(
+                        frame,
+                        connection,
+                        render::apply_opacity(accent, 0.35),
+                        false,
+                    );
+                }
+
                 if let Some(offset) = drag_offset {
                     frame.with_save(|frame| {
                         frame.translate(offset);
@@ -1409,7 +1474,8 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         frame.fill(&path, accent);
                         frame.stroke(
                             &path,
-                            render::solid_stroke(Color::WHITE, 1.0 / self.scaling),
+                            // Stroke widths are pixel-space: a crisp 1-px ring.
+                            render::solid_stroke(Color::WHITE, 1.0),
                         );
                     }
                 }
@@ -1454,7 +1520,8 @@ impl canvas::Program<Message, Theme> for MapEditor {
             | Interaction::DraggingExit { .. }
             | Interaction::DrawingRect { .. } => mouse::Interaction::Crosshair,
             Interaction::DraggingHandle { handle, .. } => resize_cursor(handle),
-            Interaction::DraggingConnectionHandle { .. } => mouse::Interaction::Grabbing,
+            Interaction::DraggingConnectionHandle { .. }
+            | Interaction::PendingConnectionHandle { .. } => mouse::Interaction::Grabbing,
             _ => {
                 if let Some(cursor_position) = cursor.position_in(bounds) {
                     let map_position = self.viewport().project(cursor_position, bounds.size());
@@ -1597,12 +1664,10 @@ impl MapEditor {
                     if let Some(preview) = connection_preview.filter(|preview| {
                         preview.connection_id == id && preview.from_level == self.level
                     }) {
-                        Self::stroke_resolved_connection_outline(
-                            frame,
-                            preview,
-                            accent,
-                            self.scaling,
-                        );
+                        // Preview during a drag: also stroke the (normally
+                        // hidden) wall stubs so a cross-level port drag has
+                        // moving feedback beyond the handle dot.
+                        Self::stroke_resolved_connection_outline(frame, preview, accent, true);
                     } else {
                         self.stroke_connection_outline(frame, area, id, accent);
                     }
@@ -1666,20 +1731,71 @@ impl MapEditor {
         }) else {
             return;
         };
-        Self::stroke_resolved_connection_outline(frame, connection, accent, self.scaling);
+        Self::stroke_resolved_connection_outline(frame, connection, accent, false);
     }
 
+    /// Accent-halos the *visible* form of one Connection half — the stroked
+    /// primitives (plus any corner level markers) for planar halves, or the
+    /// level-change treatment glyph for cross-level halves — then redraws
+    /// the entity over its halo so color, dash (including the secret dash),
+    /// and the ▲/▼ glyph shape stay legible while highlighted. Stroke widths
+    /// are pixel-space, so the halo is visible at any zoom.
+    ///
+    /// `stroke_hidden_stubs` additionally halos the wall stubs behind a
+    /// level treatment: they are not normally drawn, but a cross-level port
+    /// drag needs moving feedback beyond the handle dot.
     fn stroke_resolved_connection_outline(
         frame: &mut canvas::Frame,
         connection: &RoomConnection,
         accent: Color,
-        scaling: f32,
+        stroke_hidden_stubs: bool,
     ) {
-        let width = connection.thickness + 4.0 / scaling;
+        let halo = connection.thickness + 4.0;
+        if let Some(treatment) = render::level_treatment(connection, false) {
+            if stroke_hidden_stubs {
+                frame.stroke(
+                    &render::path_from_primitives(&connection.geometry.primitives),
+                    render::solid_stroke(accent, halo),
+                );
+            }
+            match treatment {
+                render::LevelTreatment::Triangle { center, up } => {
+                    render::draw_level_triangle_outline(frame, center.x, center.y, up, accent, halo);
+                    render::draw_level_triangle(frame, center.x, center.y, up, connection.color);
+                }
+                render::LevelTreatment::FadingStub { edge, tip } => {
+                    let line = canvas::Path::line(edge, tip);
+                    frame.stroke(&line, render::solid_stroke(accent, halo));
+                    frame.stroke(
+                        &line,
+                        render::solid_stroke(connection.color, connection.thickness),
+                    );
+                }
+            }
+            return;
+        }
+        let path = render::path_from_primitives(&connection.geometry.primitives);
+        frame.stroke(&path, render::solid_stroke(accent, halo));
         frame.stroke(
-            &render::path_from_primitives(&connection.geometry.primitives),
-            render::solid_stroke(accent, width),
+            &path,
+            render::connection_stroke(
+                connection.color,
+                connection.thickness,
+                connection.dash,
+                connection.is_secret,
+            ),
         );
+        for &(center, up) in &connection.geometry.level_markers {
+            render::draw_level_triangle_outline(frame, center.x, center.y, up, accent, halo);
+            render::draw_level_triangle_outline(
+                frame,
+                center.x,
+                center.y,
+                up,
+                connection.color,
+                connection.thickness,
+            );
+        }
     }
 }
 

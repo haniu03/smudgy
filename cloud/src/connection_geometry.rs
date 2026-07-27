@@ -53,6 +53,18 @@ pub const DANGLING_TAIL_LENGTH: f32 = 0.25;
 /// unrelated quantities that merely start equal.
 pub const MARKER_RESERVE: f32 = 0.25;
 
+/// Distance from a room center to the center of its up/down level triangle,
+/// along both axes (▲ at the top-right corner, ▼ at the bottom-left). The
+/// renderer's corner glyphs and the hit/bounds footprint share this value.
+pub const LEVEL_MARKER_OFFSET: f32 = ROOM_SIZE / 2.0 + 0.09;
+
+/// Half the edge span of the level triangle glyph.
+pub const LEVEL_MARKER_HALF_SIZE: f32 = 0.08;
+
+/// Disc radius approximating the level triangle's footprint for hit-testing
+/// (the triangle's circumradius).
+pub const LEVEL_MARKER_RADIUS: f32 = LEVEL_MARKER_HALF_SIZE * std::f32::consts::SQRT_2;
+
 /// Map-space stroke width of one thickness unit. `thickness: 1.0` matches
 /// the familiar 1-px stroke at the default zoom (40 px per map unit);
 /// strokes scale with the map while selection tolerance stays screen-space.
@@ -134,11 +146,19 @@ pub enum StubAxis {
     /// Diagonal exits: a stub along the exit's unit diagonal, leaving the
     /// corner-inset port toward the room corner it names.
     Diagonal(MapPoint),
-    /// Vertical/portal exits (up/down/in/out/special): no stub of their own —
-    /// a drawn line meets the room directly at the port. Contexts that must
-    /// stay visible without a line (explicit `Stub` routing, marker kinds,
-    /// dangling tails) and the routed-mode anchor tips fall back to the wall
-    /// normal.
+    /// Up/Down exits: no stub — where an unrouted look would need one
+    /// (explicit `Stub` routing, dangling tails), the endpoint draws its
+    /// level triangle at the fixed room corner instead (▲ top-right,
+    /// ▼ bottom-left). Drawn lines and routed anchor tips behave exactly as
+    /// [`StubAxis::None`]. The marker kinds (External/CrossLevel) own their
+    /// glyph treatments and keep the wall-normal fallback.
+    Level {
+        up: bool,
+    },
+    /// Portal exits (in/out/special): no stub of their own — a drawn line
+    /// meets the room directly at the port. Contexts that must stay visible
+    /// without a line (explicit `Stub` routing, marker kinds, dangling
+    /// tails) and the routed-mode anchor tips fall back to the wall normal.
     None,
 }
 
@@ -156,13 +176,63 @@ impl StubAxis {
             ExitDirection::Southeast => Self::Diagonal(MapPoint::new(DIAG, DIAG)),
             ExitDirection::Southwest => Self::Diagonal(MapPoint::new(-DIAG, DIAG)),
             ExitDirection::Northwest => Self::Diagonal(MapPoint::new(-DIAG, -DIAG)),
-            ExitDirection::Up
-            | ExitDirection::Down
-            | ExitDirection::In
+            ExitDirection::Up => Self::Level { up: true },
+            ExitDirection::Down => Self::Level { up: false },
+            ExitDirection::In
             | ExitDirection::Out
             | ExitDirection::Special
             | ExitDirection::Other => Self::None,
         }
+    }
+}
+
+/// Whether an endpoint's *rendered* representation is the fixed corner
+/// level triangle rather than anything anchored at its wall port — the
+/// cases whose port placement is meaningless and whose editing handle is
+/// therefore withheld:
+///
+/// - cross-level halves (the `ToLevel` triangle/fading stub anchors on the
+///   room center and exit direction, never the port);
+/// - the level-marker stubs: `Stub` routing outside the marker kinds, and
+///   dangling up/down exits (the [`ConnectionGeometry::level_markers`]
+///   emission cases).
+///
+/// Same-level up/down *lines* meet the room at their port, and cross-area
+/// (`External`) up/down stubs anchor their area marker on the port-derived
+/// tip — both keep placeable ports.
+#[must_use]
+pub fn renders_as_level_triangle(
+    kind: ConnectionKind,
+    routing: ConnectionRouting,
+    stub: StubAxis,
+) -> bool {
+    if !matches!(stub, StubAxis::Level { .. }) {
+        return false;
+    }
+    match kind {
+        ConnectionKind::CrossLevel => true,
+        ConnectionKind::Dangling => true,
+        ConnectionKind::External => false,
+        ConnectionKind::Internal | ConnectionKind::SelfLoop => {
+            routing == ConnectionRouting::Stub
+        }
+    }
+}
+
+/// The center of a room's up/down level triangle: ▲ at the top-right corner,
+/// ▼ at the bottom-left, [`LEVEL_MARKER_OFFSET`] out along both axes.
+#[must_use]
+pub fn level_marker_center(room_center: MapPoint, up: bool) -> MapPoint {
+    if up {
+        MapPoint::new(
+            room_center.x + LEVEL_MARKER_OFFSET,
+            room_center.y - LEVEL_MARKER_OFFSET,
+        )
+    } else {
+        MapPoint::new(
+            room_center.x - LEVEL_MARKER_OFFSET,
+            room_center.y + LEVEL_MARKER_OFFSET,
+        )
     }
 }
 
@@ -304,6 +374,11 @@ pub struct ConnectionGeometry {
     /// Stroked circles (the self-loop arc), hit-tested and bounded
     /// analytically rather than via a polygon approximation.
     pub circles: Vec<(MapPoint, f32)>,
+    /// Up/down level triangles standing in for wall stubs on `Level`-axis
+    /// endpoints in the stub looks (`Stub` routing, dangling): `(center,
+    /// up)`. Renderers draw the ▲/▼ glyph; hit-testing treats each as a
+    /// filled disc of [`LEVEL_MARKER_RADIUS`].
+    pub level_markers: Vec<(MapPoint, bool)>,
     /// Unit tangent leaving port A along the path (A→B sense).
     pub start_tangent: MapPoint,
     /// Unit tangent arriving at the far end along the path (A→B sense). For
@@ -331,6 +406,10 @@ impl ConnectionGeometry {
         }
         for &(center, radius) in &self.circles {
             best = best.min((point.distance(center) - radius).abs());
+        }
+        for &(center, _) in &self.level_markers {
+            // A filled glyph: anywhere inside the footprint is distance 0.
+            best = best.min((point.distance(center) - LEVEL_MARKER_RADIUS).max(0.0));
         }
         best
     }
@@ -393,7 +472,7 @@ pub fn stub_tip(port: MapPoint, side: RoomSide) -> MapPoint {
 pub fn stub_direction(side: RoomSide, stub: StubAxis) -> MapPoint {
     match stub {
         StubAxis::Diagonal(direction) => direction,
-        StubAxis::Normal | StubAxis::None => side.outward(),
+        StubAxis::Normal | StubAxis::Level { .. } | StubAxis::None => side.outward(),
     }
 }
 
@@ -403,7 +482,7 @@ pub fn stub_direction(side: RoomSide, stub: StubAxis) -> MapPoint {
 #[must_use]
 pub fn visible_stub_tip(port: MapPoint, side: RoomSide, stub: StubAxis) -> MapPoint {
     match stub {
-        StubAxis::None => port,
+        StubAxis::None | StubAxis::Level { .. } => port,
         axis => port + stub_direction(side, axis).scale(STUB_LENGTH),
     }
 }
@@ -451,6 +530,7 @@ pub fn resolve(input: &GeometryInput<'_>) -> ConnectionGeometry {
         primitives: Vec::new(),
         flattened: Vec::new(),
         circles: Vec::new(),
+        level_markers: Vec::new(),
         start_tangent: stub_direction(a.side, a.stub),
         end_tangent: input.endpoint_b.map_or(stub_direction(a.side, a.stub), |b| {
             stub_direction(b.side, b.stub).scale(-1.0)
@@ -461,8 +541,16 @@ pub fn resolve(input: &GeometryInput<'_>) -> ConnectionGeometry {
 
     resolve_stroke(&mut geometry, input, port_a, tip_a, port_b, tip_b);
 
-    geometry.handles.push(Handle::PortA(port_a));
-    if let Some(port) = port_b {
+    // Endpoints whose rendered representation is the fixed level triangle
+    // have no draggable port — the triangle ignores port placement. Up/down
+    // endpoints that still render port-anchored strokes (same-level lines,
+    // cross-area stubs) keep theirs.
+    if !renders_as_level_triangle(input.kind, input.routing, input.endpoint_a.stub) {
+        geometry.handles.push(Handle::PortA(port_a));
+    }
+    if let (Some(port), Some(b)) = (port_b, input.endpoint_b)
+        && !renders_as_level_triangle(input.kind, input.routing, b.stub)
+    {
         geometry.handles.push(Handle::PortB(port));
     }
     // Waypoint handles exist exactly for the vertices the centerline
@@ -576,6 +664,103 @@ pub fn orthogonalize_route(
     (path.len() <= crate::MAX_ROUTE_POINTS).then_some(path)
 }
 
+/// Adjusts an active orthogonal route for one endpoint's port move. The
+/// endpoint-adjacent stored elbow follows the moved anchor tip along the
+/// leg's off-axis; when the route has no stored vertices and the straight
+/// tip-to-tip leg would turn diagonal, the single elbow that keeps the route
+/// orthogonal is inserted instead (vertical leg at A's tip, horizontal at
+/// B's). Canvas dragging, inspector entry, and keyboard nudging all route
+/// through here; the renderer never repairs a diagonal leg.
+///
+/// `old_tip` is the moved endpoint's anchor tip before the move, `other_tip`
+/// the far endpoint's (absent for dangling routes, which never need the
+/// inserted elbow). Off-axis drift below [`EPSILON`] needs no elbow —
+/// [`orthogonal_violation`] tolerates it by the same threshold.
+#[must_use]
+pub fn reroute_for_port_move(
+    route_points: &[MapPoint],
+    old_tip: MapPoint,
+    other_tip: Option<MapPoint>,
+    new_tip: MapPoint,
+    endpoint_b: bool,
+) -> Vec<MapPoint> {
+    let mut points = route_points.to_vec();
+    let adjacent = if endpoint_b {
+        points.last_mut()
+    } else {
+        points.first_mut()
+    };
+    if let Some(elbow) = adjacent {
+        if (elbow.y - old_tip.y).abs() <= (elbow.x - old_tip.x).abs() {
+            elbow.y = new_tip.y;
+        } else {
+            elbow.x = new_tip.x;
+        }
+    } else if let Some(other) = other_tip
+        && (new_tip.x - other.x).abs() >= EPSILON
+        && (new_tip.y - other.y).abs() >= EPSILON
+    {
+        points.push(if endpoint_b {
+            MapPoint::new(other.x, new_tip.y)
+        } else {
+            MapPoint::new(new_tip.x, other.y)
+        });
+    }
+    points
+}
+
+/// Moves one stored orthogonal-route vertex to `target`, dragging each
+/// neighboring elbow along the shared leg's axis. At the route's ends the
+/// anchor tips cannot move, so the target clamps onto the tip-adjacent leg's
+/// axis instead. Returns the updated interior points, or `None` when `index`
+/// is out of range — or when the *last* vertex is moved on a route with no
+/// far tip (`tip_b` is only required for that vertex, so interior points of
+/// a route whose endpoint B is gone remain editable).
+#[must_use]
+pub fn reroute_for_waypoint_move(
+    route_points: &[MapPoint],
+    index: usize,
+    tip_a: MapPoint,
+    tip_b: Option<MapPoint>,
+    target: MapPoint,
+) -> Option<Vec<MapPoint>> {
+    let mut points = route_points.to_vec();
+    let old = *points.get(index)?;
+    let mut target = target;
+    let previous = if index == 0 { tip_a } else { points[index - 1] };
+    let next = if index + 1 == points.len() {
+        tip_b?
+    } else {
+        points[index + 1]
+    };
+    let previous_horizontal = (old.y - previous.y).abs() <= (old.x - previous.x).abs();
+    let next_horizontal = (old.y - next.y).abs() <= (old.x - next.x).abs();
+    if index == 0 {
+        if previous_horizontal {
+            target.y = previous.y;
+        } else {
+            target.x = previous.x;
+        }
+    } else if previous_horizontal {
+        points[index - 1].y = target.y;
+    } else {
+        points[index - 1].x = target.x;
+    }
+    if index + 1 == points.len() {
+        if next_horizontal {
+            target.y = next.y;
+        } else {
+            target.x = next.x;
+        }
+    } else if next_horizontal {
+        points[index + 1].y = target.y;
+    } else {
+        points[index + 1].x = target.x;
+    }
+    points[index] = target;
+    Some(points)
+}
+
 /// Distance from `point` to the segment `a..b`.
 #[must_use]
 pub fn distance_to_segment(point: MapPoint, a: MapPoint, b: MapPoint) -> f32 {
@@ -602,30 +787,56 @@ fn resolve_stroke(
         // Bare wall stubs, middle hidden — Stub mode for every kind, and the
         // stub half of the marker kinds whose middle glyph the renderer owns
         // (markers anchor on the exposed stub tips; nothing re-derives them).
-        // These always draw a stub, so stub-less endpoints degrade to their
-        // wall normal.
+        // These always stay visible: stub-less endpoints degrade to their
+        // wall normal, except up/down endpoints outside the marker kinds,
+        // whose stub is the corner level triangle itself.
         (_, ConnectionRouting::Stub)
         | (ConnectionKind::External | ConnectionKind::CrossLevel, _) => {
-            let tip_a = forced_stub_tip(port_a, input.endpoint_a.side, input.endpoint_a.stub);
-            geometry.stub_tip_a = tip_a;
-            push_polyline(geometry, &[port_a, tip_a]);
+            // External/CrossLevel glyphs (area dots, cross-level triangles)
+            // anchor on the exposed stub tips, so those kinds keep the wall
+            // stub whatever the axis.
+            let marker_kind = matches!(
+                input.kind,
+                ConnectionKind::External | ConnectionKind::CrossLevel
+            );
+            if let (false, StubAxis::Level { up }) = (marker_kind, input.endpoint_a.stub) {
+                push_level_marker(geometry, input.endpoint_a.room_center, up);
+            } else {
+                let tip_a = forced_stub_tip(port_a, input.endpoint_a.side, input.endpoint_a.stub);
+                geometry.stub_tip_a = tip_a;
+                push_polyline(geometry, &[port_a, tip_a]);
+            }
             if let (Some(port), Some(b)) = (port_b, input.endpoint_b) {
-                let tip = forced_stub_tip(port, b.side, b.stub);
-                geometry.stub_tip_b = Some(tip);
-                push_polyline(geometry, &[port, tip]);
+                if let (false, StubAxis::Level { up }) = (marker_kind, b.stub) {
+                    push_level_marker(geometry, b.room_center, up);
+                } else {
+                    let tip = forced_stub_tip(port, b.side, b.stub);
+                    geometry.stub_tip_b = Some(tip);
+                    push_polyline(geometry, &[port, tip]);
+                }
             }
         }
         (ConnectionKind::SelfLoop, _) => {
             resolve_self_loop(geometry, input, port_a, port_b);
         }
         (ConnectionKind::Dangling, _) => {
-            let direction = stub_direction(input.endpoint_a.side, input.endpoint_a.stub);
-            let tip = forced_stub_tip(port_a, input.endpoint_a.side, input.endpoint_a.stub);
-            geometry.stub_tip_a = tip;
-            let tail = tip + direction.scale(DANGLING_TAIL_LENGTH);
-            let line = dedup(&[port_a, tip, tail]);
-            push_polyline(geometry, &line);
-            geometry.centerline = line;
+            if let StubAxis::Level { up } = input.endpoint_a.stub {
+                // A dangling up/down exit is its corner triangle; no tail
+                // line and no centerline, so nothing grows an arrowhead.
+                // The triangle center doubles as the exposed "tip" so the
+                // marker anchors (the redacted-destination "?" and label)
+                // hang off the glyph instead of the bare wall port.
+                push_level_marker(geometry, input.endpoint_a.room_center, up);
+                geometry.stub_tip_a = level_marker_center(input.endpoint_a.room_center, up);
+            } else {
+                let direction = stub_direction(input.endpoint_a.side, input.endpoint_a.stub);
+                let tip = forced_stub_tip(port_a, input.endpoint_a.side, input.endpoint_a.stub);
+                geometry.stub_tip_a = tip;
+                let tail = tip + direction.scale(DANGLING_TAIL_LENGTH);
+                let line = dedup(&[port_a, tip, tail]);
+                push_polyline(geometry, &line);
+                geometry.centerline = line;
+            }
         }
         (ConnectionKind::Internal, ConnectionRouting::Simple) => {
             if let (Some(port), Some(tip)) = (port_b, tip_b) {
@@ -703,6 +914,16 @@ fn finalize_bounds(geometry: &mut ConnectionGeometry, input: &GeometryInput<'_>,
             .bounds
             .include(MapPoint::new(center.x + radius, center.y + radius));
     }
+    for &(center, _) in &geometry.level_markers {
+        geometry.bounds.include(MapPoint::new(
+            center.x - LEVEL_MARKER_RADIUS,
+            center.y - LEVEL_MARKER_RADIUS,
+        ));
+        geometry.bounds.include(MapPoint::new(
+            center.x + LEVEL_MARKER_RADIUS,
+            center.y + LEVEL_MARKER_RADIUS,
+        ));
+    }
     if matches!(
         input.kind,
         ConnectionKind::External | ConnectionKind::CrossLevel
@@ -727,6 +948,16 @@ fn finalize_bounds(geometry: &mut ConnectionGeometry, input: &GeometryInput<'_>,
     geometry
         .bounds
         .expand(input.thickness.max(0.0) * BASE_STROKE_WIDTH / 2.0 + ARROW_SIZE + BOUNDS_PAD);
+}
+
+/// Records an up/down level-triangle marker at its fixed room corner. A
+/// Stub-routed self-loop puts both endpoints on one room; the duplicate
+/// marker is dropped rather than double-stroked.
+fn push_level_marker(geometry: &mut ConnectionGeometry, room_center: MapPoint, up: bool) {
+    let marker = (level_marker_center(room_center, up), up);
+    if !geometry.level_markers.contains(&marker) {
+        geometry.level_markers.push(marker);
+    }
 }
 
 /// Appends a sharp polyline as primitives + one flattened subpath.
@@ -1136,8 +1367,14 @@ mod tests {
             kind: ConnectionKind::Internal,
             routing: ConnectionRouting::Simple,
             corner: CornerStyle::Sharp,
-            endpoint_a: stubless(0.0, 0.0, RoomSide::East, 0.2),
-            endpoint_b: Some(stubless(1.0, -1.0, RoomSide::West, 0.8)),
+            endpoint_a: EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Up),
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: Some(EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Down),
+                ..endpoint(1.0, -1.0, RoomSide::West, 0.8)
+            }),
             route_points: &[],
             thickness: 1.0,
         };
@@ -1264,6 +1501,246 @@ mod tests {
             "tail continues along the diagonal, got {:?}",
             line[line.len() - 1]
         );
+    }
+
+    #[test]
+    fn stub_routed_up_endpoint_swaps_its_stub_for_the_corner_triangle() {
+        let input = GeometryInput {
+            kind: ConnectionKind::Internal,
+            routing: ConnectionRouting::Stub,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Up),
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: Some(endpoint(4.0, 0.0, RoomSide::West, 0.5)),
+            route_points: &[],
+            thickness: 1.0,
+        };
+        let g = resolve(&input);
+        assert_eq!(g.flattened.len(), 1, "only the cardinal endpoint keeps a stub");
+        assert_eq!(g.level_markers.len(), 1);
+        let (center, up) = g.level_markers[0];
+        assert!(up);
+        assert!(center.nearly_equals(MapPoint::new(LEVEL_MARKER_OFFSET, -LEVEL_MARKER_OFFSET)));
+        assert!(g.hit_test(center, 0.01), "triangle footprint is clickable");
+        assert!(g.bounds.contains(center), "bounds cover the marker");
+        // The up endpoint's representation is the fixed triangle: no port
+        // handle; the cardinal endpoint keeps its own.
+        assert!(
+            g.handles.iter().all(|h| !matches!(h, Handle::PortA(_))),
+            "level endpoint must not grow a port handle"
+        );
+        assert!(g.handles.iter().any(|h| matches!(h, Handle::PortB(_))));
+    }
+
+    #[test]
+    fn ports_hide_only_where_the_triangle_is_the_representation() {
+        let up = StubAxis::for_direction(ExitDirection::Up);
+        let down = StubAxis::for_direction(ExitDirection::Down);
+        let port_handles = |g: &ConnectionGeometry| {
+            g.handles
+                .iter()
+                .filter(|h| matches!(h, Handle::PortA(_) | Handle::PortB(_)))
+                .count()
+        };
+
+        // Same-level (same z) up/down link: a Simple line meets each port,
+        // so both ports stay placeable.
+        let same_level = GeometryInput {
+            kind: ConnectionKind::Internal,
+            routing: ConnectionRouting::Simple,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: up,
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: Some(EndpointGeometry {
+                stub: down,
+                ..endpoint(1.0, -1.0, RoomSide::West, 0.8)
+            }),
+            route_points: &[],
+            thickness: 1.0,
+        };
+        assert_eq!(port_handles(&resolve(&same_level)), 2);
+
+        // Cross-area up exit: the wall stub and area marker anchor on the
+        // port, which stays placeable.
+        let external = GeometryInput {
+            kind: ConnectionKind::External,
+            routing: ConnectionRouting::Simple,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: up,
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: None,
+            route_points: &[],
+            thickness: 1.0,
+        };
+        assert_eq!(port_handles(&resolve(&external)), 1);
+
+        // Cross-level link: both representations are triangles; no ports.
+        let cross_level = GeometryInput {
+            kind: ConnectionKind::CrossLevel,
+            routing: ConnectionRouting::Simple,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: up,
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: Some(EndpointGeometry {
+                stub: down,
+                ..endpoint(0.0, -4.0, RoomSide::West, 0.8)
+            }),
+            route_points: &[],
+            thickness: 1.0,
+        };
+        assert_eq!(port_handles(&resolve(&cross_level)), 0);
+    }
+
+    #[test]
+    fn dangling_down_exit_is_a_corner_triangle_with_no_tail() {
+        let input = GeometryInput {
+            kind: ConnectionKind::Dangling,
+            routing: ConnectionRouting::Simple,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Down),
+                ..endpoint(0.0, 0.0, RoomSide::West, 0.8)
+            },
+            endpoint_b: None,
+            route_points: &[],
+            thickness: 1.0,
+        };
+        let g = resolve(&input);
+        assert!(g.flattened.is_empty(), "no stub or tail line");
+        assert!(g.centerline.is_empty(), "no centerline, so no arrowhead");
+        assert_eq!(g.level_markers.len(), 1);
+        let (center, up) = g.level_markers[0];
+        assert!(!up);
+        assert!(center.nearly_equals(MapPoint::new(-LEVEL_MARKER_OFFSET, LEVEL_MARKER_OFFSET)));
+        assert!(g.hit_test(center, 0.01));
+    }
+
+    #[test]
+    fn marker_kinds_keep_wall_stubs_on_level_endpoints() {
+        // CrossLevel glyphs anchor on the stub tips, so an up member still
+        // strokes its wall stub rather than emitting a duplicate triangle.
+        let input = GeometryInput {
+            kind: ConnectionKind::CrossLevel,
+            routing: ConnectionRouting::Simple,
+            corner: CornerStyle::Sharp,
+            endpoint_a: EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Up),
+                ..endpoint(0.0, 0.0, RoomSide::East, 0.2)
+            },
+            endpoint_b: Some(EndpointGeometry {
+                stub: StubAxis::for_direction(ExitDirection::Down),
+                ..endpoint(0.0, -4.0, RoomSide::West, 0.8)
+            }),
+            route_points: &[],
+            thickness: 1.0,
+        };
+        let g = resolve(&input);
+        assert_eq!(g.flattened.len(), 2, "both wall stubs survive");
+        assert!(g.level_markers.is_empty());
+    }
+
+    #[test]
+    fn port_move_drags_the_adjacent_elbow_along_its_leg_axis() {
+        // tip_a (0.4, 0) → elbow (2.0, 0): a horizontal leg, so a port move
+        // to y = 1 pulls the elbow's y along and leaves x alone.
+        let points = [MapPoint::new(2.0, 0.0), MapPoint::new(2.0, 3.0)];
+        let moved = reroute_for_port_move(
+            &points,
+            MapPoint::new(0.4, 0.0),
+            Some(MapPoint::new(3.6, 3.0)),
+            MapPoint::new(0.4, 1.0),
+            false,
+        );
+        assert!(moved[0].nearly_equals(MapPoint::new(2.0, 1.0)));
+        assert!(moved[1].nearly_equals(points[1]), "far elbow untouched");
+
+        // The same move on endpoint B adjusts the *last* elbow instead.
+        let moved = reroute_for_port_move(
+            &points,
+            MapPoint::new(3.6, 3.0),
+            Some(MapPoint::new(0.4, 0.0)),
+            MapPoint::new(3.6, 2.0),
+            true,
+        );
+        assert!(moved[0].nearly_equals(points[0]), "near elbow untouched");
+        // tip_b→last elbow leg is horizontal ((3,-0.6) style comparisons):
+        // |last.y - old.y| = 0 <= |last.x - old.x| = 1.6, so y follows.
+        assert!(moved[1].nearly_equals(MapPoint::new(2.0, 2.0)));
+    }
+
+    #[test]
+    fn empty_route_gains_one_elbow_only_when_the_leg_turns_diagonal() {
+        let tip_a = MapPoint::new(0.4, 0.0);
+        let tip_b = MapPoint::new(3.6, 0.0);
+        // Straight leg stays empty.
+        let moved = reroute_for_port_move(&[], tip_a, Some(tip_b), MapPoint::new(0.4, 0.0), false);
+        assert!(moved.is_empty());
+        // A vertical port move breaks the axis: one elbow appears, vertical
+        // leg on A's side.
+        let new_tip = MapPoint::new(0.4, 1.0);
+        let moved = reroute_for_port_move(&[], tip_a, Some(tip_b), new_tip, false);
+        assert_eq!(moved.len(), 1);
+        assert!(moved[0].nearly_equals(MapPoint::new(0.4, 0.0)));
+        assert_eq!(orthogonal_violation(new_tip, &moved, tip_b), None);
+        // Moving B inserts the mirror elbow: vertical at A, horizontal at B.
+        let new_tip = MapPoint::new(3.6, 1.0);
+        let moved = reroute_for_port_move(&[], tip_b, Some(tip_a), new_tip, true);
+        assert_eq!(moved.len(), 1);
+        assert!(moved[0].nearly_equals(MapPoint::new(0.4, 1.0)));
+        assert_eq!(orthogonal_violation(tip_a, &moved, new_tip), None);
+        // No far tip (dangling): nothing to elbow toward.
+        assert!(reroute_for_port_move(&[], tip_a, None, new_tip, false).is_empty());
+    }
+
+    #[test]
+    fn waypoint_move_adjusts_both_neighbors_and_clamps_at_the_tips() {
+        let tip_a = MapPoint::new(0.4, 0.0);
+        let tip_b = MapPoint::new(3.6, 2.0);
+        let points = [
+            MapPoint::new(2.0, 0.0),
+            MapPoint::new(2.0, 2.0),
+        ];
+        // The interior-facing move: dragging index 1 pulls its stored
+        // neighbor's shared axis and clamps onto the tip-b leg.
+        let moved = reroute_for_waypoint_move(
+            &points,
+            1,
+            tip_a,
+            Some(tip_b),
+            MapPoint::new(2.5, 2.5),
+        )
+        .expect("in range");
+        // prev leg (2,0)→(2,2) is vertical → neighbor x follows target.
+        assert!(moved[0].nearly_equals(MapPoint::new(2.5, 0.0)));
+        // next leg (2,2)→tip_b is horizontal → target clamps to y = 2.
+        assert!(moved[1].nearly_equals(MapPoint::new(2.5, 2.0)));
+        assert_eq!(orthogonal_violation(tip_a, &moved, tip_b), None);
+        // First-vertex moves clamp onto the tip-a leg instead of moving it.
+        let moved = reroute_for_waypoint_move(
+            &points,
+            0,
+            tip_a,
+            Some(tip_b),
+            MapPoint::new(2.5, 0.5),
+        )
+        .expect("in range");
+        // tip_a leg is horizontal → y clamps to tip_a's; vertical leg to the
+        // stored neighbor drags its x.
+        assert!(moved[0].nearly_equals(MapPoint::new(2.5, 0.0)));
+        assert!(moved[1].nearly_equals(MapPoint::new(2.5, 2.0)));
+        assert!(reroute_for_waypoint_move(&points, 2, tip_a, Some(tip_b), tip_a).is_none());
+        // Interior vertices stay editable without a far tip; the last one
+        // needs it.
+        assert!(reroute_for_waypoint_move(&points, 0, tip_a, None, tip_a).is_some());
+        assert!(reroute_for_waypoint_move(&points, 1, tip_a, None, tip_a).is_none());
     }
 
     #[test]
