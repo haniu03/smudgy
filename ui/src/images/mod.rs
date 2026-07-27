@@ -128,7 +128,13 @@ impl UiImageFetcher {
     fn new() -> Self {
         // Dedicated client: no default headers, no cookies, explicit timeouts, and NO
         // automatic redirects — hops are followed (and policy-checked) manually.
+        // One exception to "no default headers": a bare product token as User-Agent.
+        // reqwest sends no UA at all by default, and UA-less requests trip WAF/CDN
+        // bot rules (observed: CloudFront 403s on ropmud.com). Version-less on
+        // purpose — package-chosen hosts must not learn the client version (the
+        // same reason this client doesn't share the cloud client's headers).
         let client = reqwest::Client::builder()
+            .user_agent("smudgy")
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(60))
