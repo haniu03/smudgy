@@ -1792,11 +1792,20 @@ impl ManagedSession {
         // The connection control: Disconnect when live, otherwise Reconnect
         // (was connected before) or Connect (opened offline, never connected).
         let (conn_label, conn_message) = if self.connected {
-            ("Disconnect", Message::Disconnect)
+            (
+                crate::i18n::t!("session-action-disconnect"),
+                Message::Disconnect,
+            )
         } else if self.ever_connected {
-            ("Reconnect", Message::Reconnect)
+            (
+                crate::i18n::t!("session-action-reconnect"),
+                Message::Reconnect,
+            )
         } else {
-            ("Connect", Message::Reconnect)
+            (
+                crate::i18n::t!("session-action-connect"),
+                Message::Reconnect,
+            )
         };
 
         let connection_button = button(text(conn_label).size(12))
@@ -1873,8 +1882,14 @@ impl ManagedSession {
     /// server. Clicking the dimmed backdrop cancels.
     fn link_confirm_dialog(&self, pending: &PendingLinkConfirm) -> Element<'static, Message> {
         let (title, verb) = match &pending.action {
-            LinkAction::OpenUrl(_) => ("The server wants to open a link in your browser", "Open"),
-            _ => ("The server wants to send a command as you", "Send"),
+            LinkAction::OpenUrl(_) => (
+                crate::i18n::t!("link-confirm-open-title"),
+                crate::i18n::t!("action-open"),
+            ),
+            _ => (
+                crate::i18n::t!("link-confirm-send-title"),
+                crate::i18n::t!("action-send"),
+            ),
         };
 
         // A server can make the URL/command up to the OSC 8 URI cap (8 KiB);
@@ -1902,7 +1917,7 @@ impl ManagedSession {
         if let Some(host) = &pending.host {
             body = body.push(
                 checkbox(pending.grant_host)
-                    .label(format!("Always allow links to {host}"))
+                    .label(crate::i18n::t!("link-confirm-allow-host", "host" => host))
                     .on_toggle(Message::LinkConfirmGrantHost)
                     .size(15)
                     .text_size(13),
@@ -1910,7 +1925,7 @@ impl ManagedSession {
         }
         body = body.push(
             checkbox(pending.grant_server)
-                .label("Always trust links from this server")
+                .label(crate::i18n::t!("link-confirm-trust-server"))
                 .on_toggle(Message::LinkConfirmGrantServer)
                 .size(15)
                 .text_size(13),
@@ -1918,7 +1933,7 @@ impl ManagedSession {
         body = body.push(
             row![
                 space::horizontal(),
-                button(text("Cancel").size(13))
+                button(text(crate::i18n::t!("action-cancel")).size(13))
                     .style(smudgy_theme::builtins::button::subtle)
                     .padding([4, 14])
                     .on_press(Message::LinkConfirmCancel),
