@@ -41,8 +41,9 @@ impl fmt::Display for EncodingChoice {
 
 /// The curated encoding choices: [`DEFAULT_ENCODING_CHOICE`] plus the
 /// MUD-relevant Encoding Standard labels (each resolves via
-/// `encoding_rs::Encoding::for_label`; the connection falls back to UTF-8 on
-/// anything unresolvable, so a hand-edited `server.json` can hold any label).
+/// `encoding_rs::Encoding::for_label_no_replacement`; the connection falls
+/// back to UTF-8 — loudly, in the session view — on anything unresolvable,
+/// so a hand-edited `server.json` can hold any label).
 const ENCODING_CHOICES: [EncodingChoice; 15] = [
     EncodingChoice(DEFAULT_ENCODING_CHOICE),
     EncodingChoice("windows-1252"), // Latin-1 / Western European superset
