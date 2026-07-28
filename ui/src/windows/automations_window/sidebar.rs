@@ -1150,7 +1150,7 @@ fn creator_toggle_row<'a>(
 /// The "show N more…" row revealing a creator's remaining automations beyond the cap.
 fn show_more_row<'a>(indent: usize, remaining: usize, creator_id: String) -> Elem<'a> {
     button(
-        text(format!("Show {remaining} more…"))
+        text(crate::i18n::t!("automations-show-more", "count" => remaining as i64))
             .size(12.0)
             .style(common::faint),
     )

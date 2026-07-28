@@ -4906,7 +4906,7 @@ impl AutomationsWindow {
             });
         let Some(entry) = entry else {
             return pane_scroll(column![
-                text(format!("{name} is no longer available."))
+                text(crate::i18n::t!("package-automation-unavailable", "name" => name))
                     .size(13.0)
                     .style(common::muted)
             ]);

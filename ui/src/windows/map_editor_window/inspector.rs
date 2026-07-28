@@ -4418,25 +4418,36 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
         match entity {
             EntityId::Connection(connection_id) => {
                 if let Some(connection) = area.get_connection(connection_id) {
-                    content = content.push(heading("Connection".to_string()));
+                    content = content.push(heading(crate::i18n::t!("inspector-connection-heading")));
+                    let span = connection.endpoint_b.map_or_else(
+                        || {
+                            crate::i18n::t!(
+                                "inspector-connection-span",
+                                "room" => connection.endpoint_a.room_number.to_string()
+                            )
+                        },
+                        |endpoint| {
+                            crate::i18n::t!(
+                                "inspector-connection-span-to",
+                                "room_a" => connection.endpoint_a.room_number.to_string(),
+                                "room_b" => endpoint.room_number.to_string()
+                            )
+                        },
+                    );
+                    let direction = if area
+                        .get_room_connections()
+                        .iter()
+                        .find(|render| render.connection_id == connection_id)
+                        .is_some_and(|render| render.is_bidirectional)
+                    {
+                        crate::i18n::ts!("inspector-connection-bidirectional")
+                    } else {
+                        crate::i18n::ts!("inspector-connection-one-way")
+                    };
                     content = content.push(
                         text(format!(
-                            "{} · room {}{} · {}",
-                            connection.kind,
-                            connection.endpoint_a.room_number,
-                            connection.endpoint_b.map_or_else(String::new, |endpoint| {
-                                format!(" to room {}", endpoint.room_number)
-                            }),
-                            if area
-                                .get_room_connections()
-                                .iter()
-                                .find(|render| render.connection_id == connection_id)
-                                .is_some_and(|render| render.is_bidirectional)
-                            {
-                                "bidirectional"
-                            } else {
-                                "one-way"
-                            }
+                            "{} · {span} · {direction}",
+                            kind_name(connection.kind)
                         ))
                         .size(12),
                     );

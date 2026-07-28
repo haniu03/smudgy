@@ -299,7 +299,7 @@ fn entry_block(entry: &CatalogueEntryView) -> Elem<'_> {
     let mut block = column![head].spacing(4.0);
     if let Some(shape) = &entry.inferred_shape {
         block = block.push(
-            text(format!("shape: {shape}"))
+            text(crate::i18n::t!("store-shape", "shape" => shape.to_string()))
                 .size(11.0)
                 .font(MONO)
                 .style(common::muted),
