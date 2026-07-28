@@ -3174,6 +3174,46 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
     section.into()
 }
 
+/// Localized names for the language-independent cloud enums the connection
+/// editor displays. The cloud crate deliberately keeps Debug-style `Display`
+/// impls; translation happens here at the UI boundary.
+fn side_name(side: RoomSide) -> &'static str {
+    match side {
+        RoomSide::North => crate::i18n::ts!("side-north"),
+        RoomSide::East => crate::i18n::ts!("side-east"),
+        RoomSide::South => crate::i18n::ts!("side-south"),
+        RoomSide::West => crate::i18n::ts!("side-west"),
+    }
+}
+
+fn kind_name(kind: smudgy_cloud::ConnectionKind) -> &'static str {
+    match kind {
+        smudgy_cloud::ConnectionKind::Internal => crate::i18n::ts!("connection-kind-internal"),
+        smudgy_cloud::ConnectionKind::SelfLoop => crate::i18n::ts!("connection-kind-self-loop"),
+        smudgy_cloud::ConnectionKind::CrossLevel => crate::i18n::ts!("connection-kind-cross-level"),
+        smudgy_cloud::ConnectionKind::Dangling => crate::i18n::ts!("connection-kind-dangling"),
+        smudgy_cloud::ConnectionKind::External => crate::i18n::ts!("connection-kind-external"),
+    }
+}
+
+/// Wraps [`RoomSide`] so the endpoint pick_list renders translated wall names
+/// while messages keep carrying the plain enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SideChoice(RoomSide);
+
+impl fmt::Display for SideChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(side_name(self.0))
+    }
+}
+
+const SIDE_CHOICES: [SideChoice; 4] = [
+    SideChoice(RoomSide::North),
+    SideChoice(RoomSide::East),
+    SideChoice(RoomSide::South),
+    SideChoice(RoomSide::West),
+];
+
 fn connection_view(
     window: &MapEditorWindow,
     connection_id: ConnectionId,
@@ -3236,9 +3276,9 @@ fn connection_view(
             crate::i18n::t!(
                 "inspector-connection-between",
                 "room_a" => room_label(from.room_number),
-                "side_a" => from.side.to_string(),
+                "side_a" => side_name(from.side),
                 "room_b" => room_label(to.room_number),
-                "side_b" => to.side.to_string()
+                "side_b" => side_name(to.side)
             )
         },
     );
@@ -3296,9 +3336,9 @@ fn connection_view(
         };
         col = col.push(
             row![
-                pick_list(&RoomSide::ALL[..], Some(side), move |side| {
+                pick_list(&SIDE_CHOICES[..], Some(SideChoice(side)), move |choice| {
                     super::Message::Inspector(Message::ConnectionEndpointSideChanged(
-                        endpoint_b, side,
+                        endpoint_b, choice.0,
                     ))
                 })
                 .text_size(12)
@@ -3340,7 +3380,7 @@ fn connection_view(
 
     // Link
     content = content.push(field_label(crate::i18n::t!("inspector-link")));
-    content = content.push(text(format!("{} · {endpoints}", connection.kind)).size(12));
+    content = content.push(text(format!("{} · {endpoints}", kind_name(connection.kind))).size(12));
     if state.connection.has_endpoint_b {
         let (first, second) = if flipped { (true, false) } else { (false, true) };
         content = content.push(endpoint_editor(
