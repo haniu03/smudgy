@@ -2962,9 +2962,10 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
     // An unpicked destination area defaults to the current one when a room
     // number is entered; the dropdown hints that with the area's name as
     // its dimmed placeholder.
-    let area_placeholder = area
-        .as_ref()
-        .map_or_else(|| "area".to_string(), |area| area.get_name().to_string());
+    let area_placeholder = area.as_ref().map_or_else(
+        || crate::i18n::t!("inspector-area-placeholder"),
+        |area| area.get_name().to_string(),
+    );
     let mut order: Vec<usize> = (0..state.exits.len()).collect();
     if connection_selected && let Some(anchor) = window.editor.connection_anchor() {
         order.sort_by_key(|&index| state.exits[index].from_room != anchor);
@@ -2980,13 +2981,23 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
                 .as_ref()
                 .and_then(|area| area.get_room(&exit.from_room))
                 .map(|room| room.get_title())
-                .filter(|title| !title.is_empty())
-                .map_or_else(String::new, |title| format!(" · {title}"));
-            section = section.push(
-                text(format!("From room {}{title}", exit.from_room))
-                    .size(12)
-                    .style(muted_text),
+                .filter(|title| !title.is_empty());
+            let from_room = title.map_or_else(
+                || {
+                    crate::i18n::t!(
+                        "inspector-exit-from-room",
+                        "number" => exit.from_room.to_string()
+                    )
+                },
+                |title| {
+                    crate::i18n::t!(
+                        "inspector-exit-from-room-titled",
+                        "number" => exit.from_room.to_string(),
+                        "title" => title
+                    )
+                },
             );
+            section = section.push(text(from_room).size(12).style(muted_text));
         }
 
         let selected_area = exit
@@ -3180,7 +3191,7 @@ fn connection_view(
         return content.push(text(crate::i18n::t!("inspector-connection-missing")));
     };
     content = content.push(secret_aware_heading(
-        "Connection".to_string(),
+        crate::i18n::t!("inspector-connection-heading"),
         state.connection.is_secret,
     ));
 
@@ -3199,24 +3210,35 @@ fn connection_view(
             .map(|room| room.get_title())
             .filter(|title| !title.is_empty())
             .map_or_else(
-                || format!("room {number}"),
-                |title| format!("room {number} · {title}"),
+                || crate::i18n::t!("inspector-room-label", "number" => number.to_string()),
+                |title| {
+                    crate::i18n::t!(
+                        "inspector-room-label-titled",
+                        "number" => number.to_string(),
+                        "title" => title
+                    )
+                },
             )
     };
     let endpoints = connection.endpoint_b.map_or_else(
-        || format!("{} outward", room_label(connection.endpoint_a.room_number)),
+        || {
+            crate::i18n::t!(
+                "inspector-connection-outward",
+                "room" => room_label(connection.endpoint_a.room_number)
+            )
+        },
         |endpoint| {
             let (from, to) = if flipped {
                 (endpoint, connection.endpoint_a)
             } else {
                 (connection.endpoint_a, endpoint)
             };
-            format!(
-                "{} {} to {} {}",
-                room_label(from.room_number),
-                from.side,
-                room_label(to.room_number),
-                to.side
+            crate::i18n::t!(
+                "inspector-connection-between",
+                "room_a" => room_label(from.room_number),
+                "side_a" => from.side.to_string(),
+                "room_b" => room_label(to.room_number),
+                "side_b" => to.side.to_string()
             )
         },
     );
@@ -3255,7 +3277,7 @@ fn connection_view(
         );
         if level_endpoint(endpoint_b) {
             col = col.push(
-                text("Anchored at its level triangle (up/down exit)")
+                text(crate::i18n::t!("inspector-connection-level-anchored"))
                     .size(12)
                     .style(muted_text),
             );
@@ -3281,7 +3303,10 @@ fn connection_view(
                 })
                 .text_size(12)
                 .width(Length::FillPortion(2)),
-                text_input("port 0–1", offset_buffer)
+                text_input(
+                    crate::i18n::ts!("inspector-connection-port-placeholder"),
+                    offset_buffer
+                )
                     .on_input(move |value| super::Message::Inspector(
                         Message::ConnectionEndpointOffsetChanged(endpoint_b, value),
                     ))
@@ -3305,7 +3330,7 @@ fn connection_view(
             .is_ok_and(|offset| (0.0..=1.0).contains(&offset));
         if !offset_valid {
             col = col.push(
-                text("port offset must be between 0 and 1")
+                text(crate::i18n::t!("inspector-connection-port-invalid"))
                     .size(11)
                     .style(builtins::text::danger),
             );
@@ -3314,14 +3339,23 @@ fn connection_view(
     };
 
     // Link
-    content = content.push(field_label("Link"));
+    content = content.push(field_label(crate::i18n::t!("inspector-link")));
     content = content.push(text(format!("{} · {endpoints}", connection.kind)).size(12));
     if state.connection.has_endpoint_b {
         let (first, second) = if flipped { (true, false) } else { (false, true) };
-        content = content.push(endpoint_editor(first, "From"));
-        content = content.push(endpoint_editor(second, "To"));
+        content = content.push(endpoint_editor(
+            first,
+            crate::i18n::ts!("inspector-endpoint-from"),
+        ));
+        content = content.push(endpoint_editor(
+            second,
+            crate::i18n::ts!("inspector-endpoint-to"),
+        ));
     } else {
-        content = content.push(endpoint_editor(false, "From"));
+        content = content.push(endpoint_editor(
+            false,
+            crate::i18n::ts!("inspector-endpoint-from"),
+        ));
     }
 
     if state.exits.len() == 1 {
@@ -3394,7 +3428,7 @@ fn connection_view(
             && return_free() == Some(true)
         {
             content = content.push(
-                button(text("Add return direction").size(12))
+                button(text(crate::i18n::t!("inspector-add-return")).size(12))
                     .style(builtins::button::secondary)
                     .on_press_maybe(
                         window
@@ -3516,7 +3550,7 @@ fn connection_view(
 
     // Appearance
     content = content.push(rule::horizontal(1));
-    content = content.push(field_label("Appearance"));
+    content = content.push(field_label(crate::i18n::t!("inspector-appearance")));
     content = content.push(color_input(
         window,
         ColorField::Connection,
@@ -3545,7 +3579,7 @@ fn connection_view(
     content = content.push(
         row![
             column![
-                field_label("Width"),
+                field_label(crate::i18n::t!("inspector-width")),
                 button(sample(current_thickness, state.connection.dash).view(Length::Fill, 18.0))
                     .style(builtins::button::secondary)
                     .padding(3)
@@ -3555,7 +3589,7 @@ fn connection_view(
             .spacing(2)
             .width(Length::FillPortion(1)),
             column![
-                field_label("Style"),
+                field_label(crate::i18n::t!("inspector-style")),
                 button(sample(current_thickness, state.connection.dash).view(Length::Fill, 18.0))
                     .style(builtins::button::secondary)
                     .padding(3)

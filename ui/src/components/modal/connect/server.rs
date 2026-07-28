@@ -407,12 +407,12 @@ pub(super) fn view_server_form<'a>(
 
             // Per-server image cache management (beside the other whole-server action).
             let cache_usage = text(match state.image_cache_usage {
-                Some(bytes) => format!("Cached images: {}", format_bytes(bytes)),
-                None => "Cached images: …".to_string(),
+                Some(bytes) => t!("server-cached-images", "size" => format_bytes(bytes)),
+                None => t!("server-cached-images-pending"),
             })
             .size(13)
             .style(builtins::text::muted);
-            let clear_cache_button = button(text("Clear image cache"))
+            let clear_cache_button = button(text(t!("server-clear-image-cache")))
                 .style(builtins::button::link)
                 .on_press(Message::RequestClearImageCache(name.clone()));
 

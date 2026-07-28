@@ -1268,7 +1268,7 @@ impl SettingsWindow {
         );
         col = col.push(
             checkbox(self.settings.terminal_font_ligatures)
-                .label("Enable font ligature support")
+                .label(t!("preferences-font-ligatures"))
                 .on_toggle(Message::PrefFontLigaturesToggled),
         );
         col = col.push(pref_input(
