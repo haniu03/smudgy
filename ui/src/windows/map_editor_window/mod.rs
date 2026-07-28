@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 
 use crate::cloud_account::CloudHandles;
+use crate::components::cloud_errors::display_error;
 use crate::theme::{self, Element as ThemedElement};
 use crate::update::Update;
 use iced::alignment::Vertical;
@@ -1007,13 +1008,13 @@ impl MapEditorWindow {
     pub(super) fn sharer_attribution(&self, area_id: AreaId) -> String {
         let atlas = self.mapper.get_current_atlas();
         let Some(area) = atlas.get_area(&area_id) else {
-            return "Shared by a friend".to_string();
+            return crate::i18n::t!("mapper-shared-by-friend");
         };
         let meta = area.meta();
         let owner_label = meta
             .owner_nickname
             .clone()
-            .unwrap_or_else(|| "a friend".to_string());
+            .unwrap_or_else(|| crate::i18n::t!("mapper-a-friend"));
 
         let resolved = self
             .sharers
@@ -1025,7 +1026,7 @@ impl MapEditorWindow {
                 let sharer_label = sharer
                     .nickname
                     .clone()
-                    .unwrap_or_else(|| "a friend".to_string());
+                    .unwrap_or_else(|| crate::i18n::t!("mapper-a-friend"));
                 // Re-share: name both the sharer and the underlying owner.
                 if meta
                     .owner_id
@@ -1037,15 +1038,19 @@ impl MapEditorWindow {
                         .owner_nickname
                         .clone()
                         .or_else(|| sharer.owner_nickname.clone())
-                        .unwrap_or_else(|| "a friend".to_string());
-                    format!("Shared by {sharer_label} \u{00b7} owned by {owner_label}")
+                        .unwrap_or_else(|| crate::i18n::t!("mapper-a-friend"));
+                    crate::i18n::t!(
+                        "mapper-shared-by-owner-pair",
+                        "sharer" => sharer_label,
+                        "owner" => owner_label
+                    )
                 } else {
-                    format!("Shared by {sharer_label}")
+                    crate::i18n::t!("mapper-shared-by-person", "person" => sharer_label)
                 }
             }
             // Index not loaded / scope not covered: keep today's owner-handle
             // attribution as the fallback.
-            None => format!("Shared by {owner_label}"),
+            None => crate::i18n::t!("mapper-shared-by-person", "person" => owner_label),
         }
     }
 
@@ -1070,8 +1075,11 @@ impl MapEditorWindow {
             .area_id()
             .and_then(|id| atlas.get_area(&id))
             .map_or_else(
-                || "smudgy map editor".to_string(),
-                |area| format!("smudgy map editor - {}", area.get_name()),
+                || crate::i18n::t!("mapper-window-title"),
+                |area| crate::i18n::t!(
+                    "mapper-window-area-title",
+                    "area" => area.get_name()
+                ),
             )
     }
 
@@ -2400,7 +2408,7 @@ impl MapEditorWindow {
                 let mapper = self.mapper.clone();
                 Update::with_task(Task::perform(
                     async move { mapper.create_area_in(name, atlas_id).await },
-                    |result| Message::AreaCreated(result.map_err(|error| error.to_string())),
+                    |result| Message::AreaCreated(result.map_err(|error| display_error(&error))),
                 ))
             }
             Message::AreaCreated(result) => {
@@ -2940,10 +2948,10 @@ impl MapEditorWindow {
                     dialog.busy = false;
                     match result {
                         Ok(report) => {
-                            dialog.atlas_report = Some(format!(
-                                "Copied {} areas; skipped {} (not copyable).",
-                                report.copied.len(),
-                                report.skipped.len()
+                            dialog.atlas_report = Some(crate::i18n::t!(
+                                "mapper-copy-report",
+                                "copied" => report.copied.len(),
+                                "skipped" => report.skipped.len()
                             ));
                             // Select the first clone when sync lands it.
                             self.pending_copied_area = report.copied.first().copied();
@@ -3003,7 +3011,7 @@ impl MapEditorWindow {
                     move |result| Message::SecretsAuditUnmarked {
                         area_id,
                         request: echo.clone(),
-                        result: result.map_err(|error| error.to_string()),
+                        result: result.map_err(|error| display_error(&error)),
                     },
                 ))
             }
@@ -3122,7 +3130,7 @@ impl MapEditorWindow {
                     async move { mapper.create_atlas_in(name, local).await },
                     |result| {
                         Message::AtlasCreated(
-                            result.map(|atlas| atlas.id).map_err(|e| e.to_string()),
+                            result.map(|atlas| atlas.id).map_err(|e| display_error(&e)),
                         )
                     },
                 ))
@@ -3180,7 +3188,9 @@ impl MapEditorWindow {
                 let mapper = self.mapper.clone();
                 Update::with_task(Task::perform(
                     async move { mapper.rename_atlas(atlas_id, name).await },
-                    |result| Message::AtlasRenamed(result.map(|_| ()).map_err(|e| e.to_string())),
+                    |result| {
+                        Message::AtlasRenamed(result.map(|_| ()).map_err(|e| display_error(&e)))
+                    },
                 ))
             }
             Message::AtlasRenamed(result) => {
@@ -3214,7 +3224,7 @@ impl MapEditorWindow {
                 let mapper = self.mapper.clone();
                 Update::with_task(Task::perform(
                     async move { mapper.delete_atlas(atlas_id).await },
-                    |result| Message::AtlasDeleted(result.map_err(|e| e.to_string())),
+                    |result| Message::AtlasDeleted(result.map_err(|e| display_error(&e))),
                 ))
             }
             Message::AtlasDeleted(result) => {
@@ -3421,10 +3431,12 @@ impl MapEditorWindow {
                             canvas,
                             center(
                                 column![
-                                    button(text("Create first room").size(14))
+                                    button(
+                                        text(crate::i18n::t!("mapper-create-first-room")).size(14)
+                                    )
                                         .style(theme::builtins::button::primary)
                                         .on_press(Message::ToolSelected(Tool::AddRoom)),
-                                    text("Then choose its position on the grid.").size(12),
+                                    text(crate::i18n::t!("mapper-create-first-room-help")).size(12),
                                 ]
                                 .spacing(6)
                                 .align_x(iced::Alignment::Center),
@@ -3450,7 +3462,7 @@ impl MapEditorWindow {
         // the periodic tick expires it.
         if self.room_copy_notice.is_some() {
             layout = layout.push(
-                container(text("This map's owner hasn't allowed copying rooms.").size(13))
+                container(text(crate::i18n::t!("mapper-copy-rooms-denied")).size(13))
                     .width(Length::Fill)
                     .padding([6, 12])
                     .style(theme::builtins::container::modal_title_bar),
@@ -3476,12 +3488,9 @@ impl MapEditorWindow {
             layout = layout.push(
                 container(
                     row![
-                        text(
-                            "Local maps are saved on this device. Sign in to also use \
-                             cloud maps that sync across devices and can be shared.",
-                        )
+                        text(crate::i18n::t!("mapper-local-maps-signin"))
                         .size(13),
-                        button(text("Sign in or create account").size(12))
+                        button(text(crate::i18n::t!("mapper-sign-in-create")).size(12))
                             .style(theme::builtins::button::primary)
                             .padding([2, 8])
                             .on_press(Message::OpenSettingsRequested),
@@ -3663,8 +3672,8 @@ fn family_members_in(
 /// (source invisible, no `can_copy`, atlas not owned) — never distinguish.
 fn copy_error_message(error: &CloudError) -> String {
     match error {
-        CloudError::NotFoundOrNoAccess => "Copying isn't available for this map.".to_string(),
-        other => other.to_string(),
+        CloudError::NotFoundOrNoAccess => crate::i18n::t!("mapper-copy-unavailable"),
+        other => display_error(other),
     }
 }
 
