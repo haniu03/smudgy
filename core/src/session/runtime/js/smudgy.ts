@@ -2494,6 +2494,25 @@ function __utf8ByteLength(s: string): number {
     return bytes;
 }
 
+/** Byte ranges of every non-overlapping occurrence of `needle` in `text`, left to
+ *  right. An empty needle matches once, zero-width, at the start of the line. */
+function __occurrenceByteRanges(text: string, needle: string): { begin: number; end: number }[] {
+    if (needle === "") {
+        return [{ begin: 0, end: 0 }];
+    }
+    const needleBytes = __utf8ByteLength(needle);
+    const ranges: { begin: number; end: number }[] = [];
+    let from = 0;
+    let base = 0;
+    for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, from)) {
+        const begin = base + __utf8ByteLength(text.slice(from, at));
+        ranges.push({ begin, end: begin + needleBytes });
+        from = at + needle.length;
+        base = begin + needleBytes;
+    }
+    return ranges;
+}
+
 /**
  * A line you can read and edit. ONE `Line` type for both targets:
  *   - `line` is bound to the CURRENT in-flight incoming line.
@@ -2575,41 +2594,34 @@ class Line {
         }
     }
 
-    /** Replaces the first occurrence of `oldStr` with `newStr` (plain or styled).
-     *  The search side is always plain text. Returns whether it matched. */
+    /** Replaces every occurrence of `oldStr` with `newStr` (plain or styled).
+     *  The search side is always plain text. Returns whether anything matched. */
     replace(oldStr: string, newStr: string | StyledTextLike): boolean {
-        const currentText = this.text;
-        const index = currentText.indexOf(oldStr);
-        if (index === -1) {
-            return false;
+        const ranges = __occurrenceByteRanges(this.text, oldStr);
+        // Right to left: each edit reflows the line, but ranges before the edit
+        // point keep their offsets.
+        for (let i = ranges.length - 1; i >= 0; i--) {
+            this.replaceAt(newStr, ranges[i].begin, ranges[i].end);
         }
-        const begin = __utf8ByteLength(currentText.slice(0, index));
-        this.replaceAt(newStr, begin, begin + __utf8ByteLength(oldStr));
-        return true;
+        return ranges.length > 0;
     }
 
-    /** Highlights the first occurrence of `str`. Returns whether it matched. */
+    /** Highlights every occurrence of `str`. Returns whether anything matched. */
     highlight(str: string, options: ColorOptions = {}): boolean {
-        const currentText = this.text;
-        const index = currentText.indexOf(str);
-        if (index === -1) {
-            return false;
+        const ranges = __occurrenceByteRanges(this.text, str);
+        for (const range of ranges) {
+            this.highlightAt(range.begin, range.end, options);
         }
-        const begin = __utf8ByteLength(currentText.slice(0, index));
-        this.highlightAt(begin, begin + __utf8ByteLength(str), options);
-        return true;
+        return ranges.length > 0;
     }
 
-    /** Removes the first occurrence of `str`. Returns whether it matched. */
+    /** Removes every occurrence of `str`. Returns whether anything matched. */
     remove(str: string): boolean {
-        const currentText = this.text;
-        const index = currentText.indexOf(str);
-        if (index === -1) {
-            return false;
+        const ranges = __occurrenceByteRanges(this.text, str);
+        for (let i = ranges.length - 1; i >= 0; i--) {
+            this.removeAt(ranges[i].begin, ranges[i].end);
         }
-        const begin = __utf8ByteLength(currentText.slice(0, index));
-        this.removeAt(begin, begin + __utf8ByteLength(str));
-        return true;
+        return ranges.length > 0;
     }
 
     /** Prevents the current line from being displayed (gags it). No-op on a buffer line. */
@@ -3411,7 +3423,7 @@ function __smudgy_note_handle(creatorId: number, spec: string, kind: string, nam
     // Runtime-confirm the handle in the host catalogue (plan 10 tier 1) -- also how
     // dynamically-created handles surface there. Informational: presence grants nothing.
     op_smudgy_interop_declare(creatorId, kind, name);
-    const key = `${spec} ${kind} ${__smudgy_fold_name(name)}`;
+    const key = `${spec}\u0000${kind}\u0000${__smudgy_fold_name(name)}`;
     if (__smudgy_declared_handles.has(key)) {
         echo(
             `smudgy: duplicate interop ${kind} handle name ${JSON.stringify(name)} in ${spec} -- the name string is the handle's identity, so both handles address the same ${kind}`,

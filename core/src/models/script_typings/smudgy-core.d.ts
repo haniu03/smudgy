@@ -1841,8 +1841,9 @@ declare module "smudgy:core" {
    * outside the window). Already-printed lines reached through
    * `buffer.line(n)` can be edited at any time.
    *
-   * The text-search methods (`replace`, `highlight`, `remove`) find their
-   * target by string; the `*At` forms take byte offsets (e.g. from `styles`).
+   * The text-search methods (`replace`, `highlight`, `remove`) act on every
+   * occurrence of their target string; the `*At` forms take byte offsets
+   * (e.g. from `styles`).
    */
   export interface Line {
     /** Insert `text` at byte offset `begin` (replacing up to `end` if given),
@@ -1861,12 +1862,12 @@ declare module "smudgy:core" {
     highlightAt(begin: number, end: number, options?: LineColorOptions): void;
     /** Remove the byte range `[begin, end)`. */
     removeAt(begin: number, end: number): void;
-    /** Replace the first occurrence of `oldStr` with `newStr` (plain or styled;
-     *  the search side is always plain text). Returns `true` if it was found. */
+    /** Replace every occurrence of `oldStr` with `newStr` (plain or styled;
+     *  the search side is always plain text). Returns `true` if any was found. */
     replace(oldStr: string, newStr: string | StyledText): boolean;
-    /** Recolor the first occurrence of `str`. Returns `true` if it was found. */
+    /** Recolor every occurrence of `str`. Returns `true` if any was found. */
     highlight(str: string, options?: LineColorOptions): boolean;
-    /** Remove the first occurrence of `str`. Returns `true` if it was found. */
+    /** Remove every occurrence of `str`. Returns `true` if any was found. */
     remove(str: string): boolean;
     /** Hide this line: it never reaches the screen. Current-line only (a
      *  no-op on a buffer line). */
