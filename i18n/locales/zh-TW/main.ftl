@@ -1,6 +1,7 @@
 # 語言名稱
 locale-system = 使用系統語言
 locale-english = 英文（美國）
+locale-polish = 拋光
 locale-traditional-chinese = 繁體中文（臺灣）
 
 # 共用操作與狀態
@@ -920,6 +921,8 @@ editor-source = 原始碼
 pattern-kind-match = 必須相符
 pattern-kind-anti = 必須不相符
 pattern-kind-raw = 原始正規表示式
+widget-hotkey-click-to-record = 點擊以錄製按鍵
+widget-hotkey-listening = 正在偵測按鍵...
 
 # 套件資訊清單編輯器
 manifest-kind-text = 文字

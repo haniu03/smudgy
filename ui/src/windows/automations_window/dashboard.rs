@@ -53,7 +53,7 @@ impl AutomationsWindow {
         // Stat cards.
         let cards = row![
             stat_card(
-                "Active",
+                crate::i18n::ts!("automations-active"),
                 stats.active,
                 NodeStatus::Ok,
                 Message::ShowDashboard
@@ -72,13 +72,13 @@ impl AutomationsWindow {
                     .map_or(Message::ShowDashboard, Message::SelectScript),
             ),
             stat_card(
-                "Disabled",
+                crate::i18n::ts!("automations-disabled"),
                 stats.disabled,
                 NodeStatus::Disabled,
                 Message::ShowDashboard
             ),
             stat_card(
-                "Packages",
+                crate::i18n::ts!("automations-packages"),
                 stats.packages,
                 NodeStatus::Ok,
                 Message::SelectChip(Chip::Packages)
@@ -91,14 +91,14 @@ impl AutomationsWindow {
         let create = column![
             common::section_label(crate::i18n::ts!("automations-create")),
             wrap_row(vec![
-                create_tile(bootstrap_icons::AT, "Alias", Message::NewAlias),
-                create_tile(bootstrap_icons::LIGHTNING, "Trigger", Message::NewTrigger),
-                create_tile(bootstrap_icons::DPAD, "Hotkey", Message::NewHotkey),
-                create_tile(bootstrap_icons::FOLDER_PLUS, "Folder", Message::NewFolder),
-                create_tile(bootstrap_icons::FONTS, "Module", Message::NewModule),
+                create_tile(bootstrap_icons::AT, crate::i18n::ts!("automation-alias"), Message::NewAlias),
+                create_tile(bootstrap_icons::LIGHTNING, crate::i18n::ts!("automation-trigger"), Message::NewTrigger),
+                create_tile(bootstrap_icons::DPAD, crate::i18n::ts!("automation-hotkey"), Message::NewHotkey),
+                create_tile(bootstrap_icons::FOLDER_PLUS, crate::i18n::ts!("automation-folder"), Message::NewFolder),
+                create_tile(bootstrap_icons::FONTS, crate::i18n::ts!("automation-module"), Message::NewModule),
                 create_tile(
                     bootstrap_icons::BOUNDING_BOX,
-                    "Package",
+                    crate::i18n::ts!("automation-package"),
                     Message::NewPackage
                 ),
                 palette_tile(),

@@ -1180,7 +1180,7 @@ impl AutomationsWindow {
                 .size(14.0)
                 .into(),
         ));
-        body = body.push(self.tester_box("Test against a command", &alias.pattern, true));
+        body = body.push(self.tester_box(crate::i18n::ts!("editor-test-command"), &alias.pattern, true));
         body = body.push(self.matching_options(alias.priority, alias.fallthrough));
         body = body.push(field_row("Behavior", self.behavior_radios(alias.language)));
         body = body.push(self.code_editor(alias.language));
@@ -1365,7 +1365,7 @@ impl AutomationsWindow {
         );
         body = body.push(field_row(crate::i18n::ts!("editor-patterns"), patterns.into()));
 
-        body = body.push(self.tester_box("Test against a line", "", false));
+        body = body.push(self.tester_box(crate::i18n::ts!("editor-test-line"), "", false));
         body = body.push(self.matching_options(priority, fallthrough));
         body = body.push(field_row("Behavior", self.behavior_radios(language)));
         body = body.push(self.code_editor(language));
