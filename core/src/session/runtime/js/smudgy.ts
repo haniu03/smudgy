@@ -3423,7 +3423,7 @@ function __smudgy_note_handle(creatorId: number, spec: string, kind: string, nam
     // Runtime-confirm the handle in the host catalogue (plan 10 tier 1) -- also how
     // dynamically-created handles surface there. Informational: presence grants nothing.
     op_smudgy_interop_declare(creatorId, kind, name);
-    const key = `${spec} ${kind} ${__smudgy_fold_name(name)}`;
+    const key = `${spec}\u0000${kind}\u0000${__smudgy_fold_name(name)}`;
     if (__smudgy_declared_handles.has(key)) {
         echo(
             `smudgy: duplicate interop ${kind} handle name ${JSON.stringify(name)} in ${spec} -- the name string is the handle's identity, so both handles address the same ${kind}`,
