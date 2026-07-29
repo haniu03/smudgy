@@ -23,6 +23,7 @@ use windows::smudgy_window::SmudgyWindow;
 
 mod assets;
 mod cloud_account;
+mod discord_presence;
 mod i18n;
 mod images;
 mod pane_drag;
@@ -72,6 +73,7 @@ fn main_window_title() -> String {
 }
 
 use crate::cloud_account::CloudAccount;
+use crate::discord_presence::DiscordPresence;
 use crate::session_store::SessionStore;
 use crate::windows::map_editor_window::{self, MapEditorWindow, SharedClipboard};
 
@@ -87,6 +89,11 @@ pub(crate) const DOWNLOAD_URL: &str = "https://www.smudgy.org/download";
 // Main application state
 struct Smudgy {
     account: CloudAccount,
+    /// Discord Rich Presence ("Playing smudgy — on <server>"), mirrored from
+    /// `settings.discord_rich_presence`. Re-derived from the session store on
+    /// every connect/disconnect/close; the controller change-gates, so the
+    /// frequent recomputes are free.
+    discord: DiscordPresence,
     /// All live sessions, window-independent: windows' grids hold pane
     /// references into this store, and session events route here directly.
     sessions: SessionStore,
@@ -316,10 +323,12 @@ fn init() -> (Smudgy, Task<Message>) {
     };
 
     let sessions = SessionStore::new(account.handles());
+    let discord = DiscordPresence::new(settings.discord_rich_presence);
 
     (
         Smudgy {
             account,
+            discord,
             sessions,
             smudgy_windows: BTreeMap::new(),
             automations_windows: BTreeMap::new(),
@@ -753,6 +762,10 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::SessionEvent(TaggedSessionEvent { session_id, event }) => {
+            // Connection edges re-derive the Discord activity — after the
+            // session's own update below has adopted the new connected state.
+            let presence_edge =
+                matches!(event, SessionEvent::Connected | SessionEvent::Disconnected);
             // Per-server map-scope reactions live on the daemon (it owns the
             // authoritative `map_scopes`, which the session store doesn't), so
             // handle them here before the event is forwarded to the session.
@@ -861,6 +874,9 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     }
                     None => Task::none(),
                 };
+                if presence_edge {
+                    refresh_discord_presence(smudgy);
+                }
                 Task::batch([task, pane_task, scope_task])
             } else {
                 // The session was torn down (its store entry goes first) with
@@ -1176,6 +1192,13 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         smudgy
                             .account
                             .set_auto_check_for_updates(settings.auto_check_for_updates);
+                        // Same for the Discord toggle: enabling mid-session
+                        // publishes the current game at once, disabling clears
+                        // the activity from the user's profile.
+                        smudgy
+                            .discord
+                            .set_enabled(settings.discord_rich_presence);
+                        refresh_discord_presence(smudgy);
                         // Swap the hot prefs snapshot (fonts/palette/line
                         // length take effect next frame) and fan the change
                         // out to every live session (scrollback, span
@@ -1286,7 +1309,34 @@ fn close_session(smudgy: &mut Smudgy, session_id: SessionId) -> Task<Message> {
         return Task::none();
     }
     log::info!("Closed session {session_id}");
+    // A session closed while still connected never sees a Disconnected event.
+    refresh_discord_presence(smudgy);
     purge_sessions_from_windows(smudgy, &[session_id])
+}
+
+/// Re-derives the Discord presence from the session store and hands it to
+/// the controller, which change-gates (and no-ops while the setting is
+/// off). The longest-connected session provides the label; an empty store
+/// publishes `Idle`, keeping the activity up for the app's whole run.
+fn refresh_discord_presence(smudgy: &mut Smudgy) {
+    let primary = smudgy
+        .sessions
+        .iter()
+        .filter_map(|(_, session)| {
+            session.connected_at_unix_ms().map(|at| {
+                let label =
+                    discord_presence::server_label(&session.server_host(), &session.server_name);
+                (label, at)
+            })
+        })
+        .min_by_key(|(_, at)| *at);
+    let presence = primary.map_or(discord_presence::Presence::Idle, |(server_label, at)| {
+        discord_presence::Presence::Playing {
+            server_label,
+            connected_at_ms: at,
+        }
+    });
+    smudgy.discord.publish(presence);
 }
 
 /// Remove the dead sessions' panes from every window's grid, repairing each

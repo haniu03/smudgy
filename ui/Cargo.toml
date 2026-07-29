@@ -78,6 +78,7 @@ url = "2"
 base64 = "0.22"
 # HTTP date parsing (Expires/Last-Modified/Date) for the RFC-9111-subset freshness math.
 httpdate = "1"
+discord-rich-presence = "1.1.0"
 
 # Restart Manager cooperation so the installer can upgrade over a running smudgy:
 # a window-proc subclass catches the session-end message and exits. See win_rm.rs.
