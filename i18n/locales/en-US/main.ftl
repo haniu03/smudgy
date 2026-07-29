@@ -922,6 +922,8 @@ editor-source = Source
 pattern-kind-match = Match
 pattern-kind-anti = Anti-match
 pattern-kind-raw = Raw regex
+widget-hotkey-click-to-record = click to record
+widget-hotkey-listening = listening...
 
 # Package manifest editor
 manifest-kind-text = Text

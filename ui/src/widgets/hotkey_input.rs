@@ -61,9 +61,9 @@ where
     fn create_text(&self, listening: bool) -> Text<'a, Theme, Renderer> {
         let content = if self.keys.is_empty() {
             if listening {
-                "listening...".to_string()
+                crate::i18n::ts!("widget-hotkey-listening").to_string()
             } else {
-                "click to record".to_string()
+                crate::i18n::ts!("widget-hotkey-click-to-record").to_string()
             }
         } else {
             self.keys

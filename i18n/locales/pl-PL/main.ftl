@@ -940,6 +940,8 @@ editor-source = Źródło
 pattern-kind-match = Dopasowanie
 pattern-kind-anti = Anty-dopasowanie
 pattern-kind-raw = Surowe wyrażenie regularne
+widget-hotkey-click-to-record = kliknij, aby zarejestrować
+widget-hotkey-listening = nasłuchiwanie...
 
 # Package manifest editor
 manifest-kind-text = Tekst

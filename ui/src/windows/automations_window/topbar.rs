@@ -49,25 +49,25 @@ impl AutomationsWindow {
         let mut actions = row![
             action_button(
                 bootstrap_icons::CLOUD_CHECK,
-                "Discover",
+                crate::i18n::ts!("automations-discover"),
                 Message::OpenDiscover,
                 discover_active
             ),
             action_button(
                 bootstrap_icons::PEOPLE,
-                "Private & Shared",
+                crate::i18n::ts!("automations-private-shared"),
                 Message::OpenShared,
                 shared_active
             ),
             action_button(
                 bootstrap_icons::DATABASE,
-                "Store",
+                crate::i18n::ts!("automations-store"),
                 Message::OpenStoreInspector,
                 store_active
             ),
             action_button(
                 bootstrap_icons::ARROW_REPEAT,
-                "Reload",
+                crate::i18n::ts!("automations-reload"),
                 Message::Reload,
                 false
             ),

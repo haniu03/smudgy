@@ -5548,7 +5548,7 @@ impl AutomationsWindow {
                 .size(13.0)
                 .style(common::muted),
             radio(
-                "Relevant",
+                crate::i18n::t!("package-scope-relevant"),
                 DiscoverScope::Relevant,
                 Some(self.discover_scope),
                 Message::DiscoverScopeChanged
@@ -5566,13 +5566,13 @@ impl AutomationsWindow {
         }
         scope = scope
             .push(radio(
-                "Universal packages only",
+                crate::i18n::t!("package-scope-universal"),
                 DiscoverScope::Universal,
                 Some(self.discover_scope),
                 Message::DiscoverScopeChanged,
             ))
             .push(radio(
-                "All packages",
+                crate::i18n::t!("package-scope-all"),
                 DiscoverScope::All,
                 Some(self.discover_scope),
                 Message::DiscoverScopeChanged,
@@ -6579,10 +6579,9 @@ impl AutomationsWindow {
             column![
                 self.scene_header(
                     None,
-                    "Private & Shared",
+                    crate::i18n::ts!("package-private-shared"),
                     Some(
-                        "Private packages you own and packages friends have shared with you."
-                            .to_string()
+                        crate::i18n::t!("package-private-shared-subtitle")
                     ),
                     None,
                 )
