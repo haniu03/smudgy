@@ -14,6 +14,12 @@ pub(super) const CATALOGS: &[CatalogSource] = &[
         display_name: "English (United States)",
         source: include_str!("../locales/en-US/main.ftl"),
     },
+      CatalogSource {
+        tag: "pl-PL",
+        aliases: &["pl"],
+        display_name: "Polski",
+        source: include_str!("../locales/pl-PL/main.ftl"),
+      },    
     CatalogSource {
         tag: "zh-TW",
         aliases: &["zh-Hant-TW"],

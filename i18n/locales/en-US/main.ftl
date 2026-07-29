@@ -1,6 +1,7 @@
 # Locale names
 locale-system = Use system language
 locale-english = English (United States)
+locale-polish = Polish
 locale-traditional-chinese = Traditional Chinese (Taiwan)
 
 # Shared actions and states
