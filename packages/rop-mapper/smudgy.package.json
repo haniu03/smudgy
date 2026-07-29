@@ -1,0 +1,20 @@
+{
+    "name": "rop-mapper",
+    "version": "0.1.0",
+    "description": "Rites of Passage mapper using authoritative Room.Info exits and Room.Map neighborhoods.",
+    "dependencies": [
+        "smudgy://official/auto-mapper@^0.3.0"
+    ],
+    "hosts": [
+        "play.ropmud.com"
+    ],
+    "permissions": {
+        "smudgy": {
+            "interop": ["read"],
+            "mapper": ["write"],
+            "automations": ["aliases"],
+            "session": ["echo"],
+            "gmcp": ["send"]
+        }
+    }
+}
