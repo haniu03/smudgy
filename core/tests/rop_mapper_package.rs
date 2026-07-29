@@ -1,0 +1,229 @@
+//! End-to-end coverage of the first-party `rop-mapper` composition package.
+//! The test installs only `RoP`'s root package; its local `auto-mapper` dependency is
+//! code-imported into that sandbox, proving the side-effect-free engine/subpath design.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::StreamExt;
+use smudgy_cloud::{
+    CloudMapper, CompositeBackend, Credential, CredentialSource, ExitDirection, LocalBackend,
+    Mapper, MapperBackend, PackageApiClient,
+};
+use smudgy_core::models::local_packages::packages_dir;
+use smudgy_core::models::shared_packages::{self, UpdateMode};
+use smudgy_core::session::runtime::RuntimeAction;
+use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
+
+const QUIET_PERIOD: Duration = Duration::from_millis(900);
+const SERVER: &str = "RopMapperTest";
+
+fn copy_package(server: &str, name: &str) {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("packages")
+        .join(name);
+    let dest = packages_dir(server).expect("packages dir").join(name);
+    std::fs::create_dir_all(&dest).unwrap();
+    for entry in std::fs::read_dir(&source).unwrap_or_else(|_| panic!("read package {name}")) {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), dest.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+fn localize_rop_dependency(server: &str) {
+    let dir = packages_dir(server)
+        .expect("packages dir")
+        .join("rop-mapper");
+    for name in ["index.ts", "smudgy.package.json"] {
+        let path = dir.join(name);
+        let source = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            path,
+            source.replace(
+                "smudgy://official/auto-mapper",
+                "smudgy://local/auto-mapper",
+            ),
+        )
+        .unwrap();
+    }
+}
+
+fn gmcp(name: &str, data: &str) -> RuntimeAction {
+    RuntimeAction::GmcpMessage {
+        name: Arc::from(name),
+        data: Some(Arc::from(data)),
+    }
+}
+
+fn collect(updates: &[BufferUpdate], lines: &mut Vec<String>) {
+    for update in updates {
+        if let BufferUpdate::Append(line) = update {
+            lines.push(line.text.clone());
+        }
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    std::fs::create_dir_all(smudgy_home.join(SERVER).join("modules")).unwrap();
+    std::fs::create_dir_all(smudgy_home.join(SERVER).join("logs")).unwrap();
+    copy_package(SERVER, "auto-mapper");
+    copy_package(SERVER, "rop-mapper");
+    localize_rop_dependency(SERVER);
+    shared_packages::install_package(SERVER, "smudgy://local/rop-mapper", UpdateMode::Auto, true)
+        .unwrap();
+
+    let map_root = smudgy_home.join("map-test");
+    let local = Arc::new(LocalBackend::new(map_root.join("local")));
+    let cloud = Arc::new(CloudMapper::new(
+        "http://127.0.0.1:0".to_string(),
+        "test-key".to_string(),
+    ));
+    let backend: Arc<dyn MapperBackend + Send + Sync> =
+        Arc::new(CompositeBackend::new(local, cloud));
+    let mapper = Mapper::new(backend, map_root.join("cache"));
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(9350_u32),
+        server_name: Arc::new(SERVER.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: Some(mapper.clone()),
+        package_client: Some(PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        )),
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+    let mut lines = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+    tx.send(RuntimeAction::GmcpEnabled).unwrap();
+
+    // Room.Info uses RoP's structured exit values. The north room is first inferred at
+    // (0,-1); Room.Map then authoritatively places it northwest and provisions two more
+    // rooms that Room.Info did not mention.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 5539, "name": "The Bishop's Private Room",
+             "zone": "Rites of Passage", "terrain": "inside",
+             "exits": {
+                 "n": { "v": 5540, "door": 0 },
+                 "e": { "v": 5541, "door": 2 }
+             } }"#,
+    ))
+    .unwrap();
+    tx.send(gmcp(
+        "Room.Map",
+        r#"{ "px": 10, "py": 10, "rooms": [
+              { "x": 10, "y": 10, "v": 5539, "e": "ne", "s": 0, "i": 1, "d": 0 },
+              { "x": 9,  "y": 9,  "v": 5540, "e": "s",  "s": 1, "i": 0, "d": 0 },
+              { "x": 11, "y": 10, "v": 5541, "e": "w",  "s": 1, "i": 0, "d": 0 },
+              { "x": 10, "y": 11, "v": 5542, "e": "n",  "s": 2, "i": 0, "d": 0 },
+              { "x": 12, "y": 11, "v": 5550, "e": "",   "s": 3, "i": 0, "d": 0 }
+            ] }"#,
+    ))
+    .unwrap();
+
+    // The north command is refused without a Room.Info acknowledgement. The following
+    // east move must still resolve east from server ids, never as a north traversal.
+    tx.send(RuntimeAction::Send(Arc::new("n".to_string())))
+        .unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("e".to_string())))
+        .unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 5541, "name": "The Training Grounds",
+             "zone": "Rites of Passage", "terrain": "city",
+             "exits": { "w": { "v": 5539, "door": 0 } } }"#,
+    ))
+    .unwrap();
+
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("[auto-mapper] active"))
+            .count(),
+        1,
+        "the imported engine starts exactly once; transcript:\n{transcript}"
+    );
+
+    let atlas = mapper.get_current_atlas();
+    let (key5539, room5539) = atlas
+        .find_room_by_external_id("5539")
+        .unwrap_or_else(|| panic!("center room mapped; transcript:\n{transcript}"));
+    let (_, room5540) = atlas
+        .find_room_by_external_id("5540")
+        .unwrap_or_else(|| panic!("north room provisioned; transcript:\n{transcript}"));
+    let (key5541, room5541) = atlas
+        .find_room_by_external_id("5541")
+        .unwrap_or_else(|| panic!("east room provisioned; transcript:\n{transcript}"));
+    let (_, room5550) = atlas.find_room_by_external_id("5550").unwrap_or_else(|| {
+        panic!("unconnected Room.Map room provisioned; transcript:\n{transcript}")
+    });
+    let area = atlas.get_area(&key5539.area_id).expect("RoP area");
+    assert_eq!(
+        area.room_count(),
+        5,
+        "Room.Map provisions every reported room, not only Room.Info exits"
+    );
+    assert!(
+        (room5540.get_x() - (room5539.get_x() - 1.0)).abs() < 0.01
+            && (room5540.get_y() - (room5539.get_y() - 1.0)).abs() < 0.01,
+        "Room.Map coordinates replace the earlier north-only inference"
+    );
+    assert!(
+        (room5541.get_x() - (room5539.get_x() + 1.0)).abs() < 0.01
+            && (room5541.get_y() - room5539.get_y()).abs() < 0.01,
+        "the successful room remains east of the center"
+    );
+    assert_eq!(
+        room5550.get_property("unvisited"),
+        Some("true"),
+        "provisioned rooms remain unvisited"
+    );
+
+    let east = room5539
+        .get_exits()
+        .iter()
+        .find(|exit| exit.from_direction == ExitDirection::East)
+        .unwrap_or_else(|| panic!("structured east exit parsed; transcript:\n{transcript}"));
+    assert_eq!(east.to_room_number, Some(key5541.room_number));
+    assert!(east.is_closed, "RoP door state is preserved");
+    assert!(
+        !room5539.get_exits().iter().any(|exit| {
+            exit.from_direction == ExitDirection::North
+                && exit.to_room_number == Some(key5541.room_number)
+        }),
+        "the failed north command cannot be attributed to the east room"
+    );
+
+    tx.send(RuntimeAction::Shutdown).ok();
+}

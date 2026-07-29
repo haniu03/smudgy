@@ -1152,6 +1152,35 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
         "no duplicate east exit from the re-walk.\n{transcript}"
     );
 
+    // A refused north move produces no room report, then east reaches a new room. With
+    // two unresolved commands and no destination ids, attribution is ambiguous: the
+    // mapper may create/follow room 903, but must not invent 900 --north--> 903.
+    tx.send(RuntimeAction::Send(Arc::new("n".to_string()))).unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("e".to_string()))).unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 903, "name": "Ambiguous Trail", "zone": "trailfields", "exits": {} }"#,
+    ))
+    .unwrap();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+    let atlas = mapper.get_current_atlas();
+    let (key903, _) = atlas
+        .find_room_by_external_id("903")
+        .unwrap_or_else(|| panic!("ambiguous arrival is still mapped.\n{transcript}"));
+    let (_, room900_after_failure) = atlas.find_room_by_external_id("900").expect("room 900");
+    assert!(
+        !room900_after_failure
+            .get_exits()
+            .iter()
+            .any(|exit| exit.to_room_number == Some(key903.room_number)),
+        "ambiguous movement must not turn the failed north command into an exit.\n{transcript}"
+    );
+
     // ---- Adapter hardening: a giant id is withheld identity; absurd coords are
     // ignored in favor of walk inference.
     let giant = "x".repeat(5000);
