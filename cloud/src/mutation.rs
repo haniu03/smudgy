@@ -3,7 +3,7 @@
 //! `mapping::contract` and `mapping::ops`.
 //!
 //! Every mapper content write compiles down to a [`MutationEnvelope`] of
-//! ordered [`AreaMutation`]s conditioned on the caller's projected revision
+//! ordered [`AreaMutation`]s conditioned on the area's shared revision
 //! of the area. The cloud backend submits envelopes to
 //! `POST /areas/{id}/mutations`; local and ephemeral backends apply the same
 //! operations under their own compare-and-set, so behavior cannot drift
@@ -38,7 +38,8 @@ pub struct MutationEnvelope {
 }
 
 /// An aggregate this mutation is conditioned on, at the revision of the
-/// caller's own projection (the server decides which counter that names).
+/// shared area revision. The access fingerprint separately names the caller's
+/// redacted projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Precondition {
     pub resource: ResourceKind,
@@ -87,6 +88,13 @@ pub enum AreaMutation {
     },
     DeleteRoom {
         room_number: RoomNumber,
+    },
+    /// Server-side guard for the following same-area merge plan. It verifies
+    /// full secret visibility and rejects foreign inbound/outbound links
+    /// atomically with the rewrites and final room deletion.
+    AssertMergeSafe {
+        keep_room_number: RoomNumber,
+        remove_room_number: RoomNumber,
     },
     UpsertRoomProperty {
         room_number: RoomNumber,
@@ -195,6 +203,10 @@ impl AreaMutation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "entity", rename_all = "snake_case")]
 pub enum OpResult {
+    MergeSafetyChecked {
+        keep_room_number: RoomNumber,
+        remove_room_number: RoomNumber,
+    },
     Room {
         room: RoomWithDetails,
     },

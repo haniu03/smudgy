@@ -32,6 +32,8 @@ type RoomNumber = number;
 type ExitId = readonly [number, number];
 /** A Connection's identifier, opaque like {@link ExitId}. */
 type ConnectionId = readonly [number, number];
+/** A queued mapper mutation's identifier, opaque like {@link ExitId}. */
+type OperationId = readonly [number, number];
 
 /** A compass/special exit direction (the canonical PascalCase names). */
 type ExitDirection =
@@ -361,7 +363,7 @@ interface Room {
     /** Whether this room carries `tag` (case-insensitive). */
     hasTag(tag: string): boolean;
     /** Update multiple fields of this room in one cache update; only present fields change. */
-    update(fields: UpdateRoomParams): void;
+    update(fields: UpdateRoomParams): Promise<OperationId | null>;
     toString(): string;
 }
 
@@ -438,25 +440,26 @@ interface Mapper {
         description: string,
         visibleExitDirections: string[],
     ): (Room | undefined)[];
-    renameArea(area: Area | AreaId, name: string): void;
+    /** Rename an area after the backend acknowledges the change. */
+    renameArea(area: Area | AreaId, name: string): Promise<void>;
     /** Delete an area and everything in it. */
-    deleteArea(area: Area | AreaId): void;
-    setRoomTitle(area: Area | AreaId, room: Room | RoomNumber, title: string): void;
-    setRoomDescription(area: Area | AreaId, room: Room | RoomNumber, description: string): void;
+    deleteArea(area: Area | AreaId): Promise<void>;
+    setRoomTitle(area: Area | AreaId, room: Room | RoomNumber, title: string): Promise<OperationId | null>;
+    setRoomDescription(area: Area | AreaId, room: Room | RoomNumber, description: string): Promise<OperationId | null>;
     /** Set a room's color to a CSS color string. */
-    setRoomColor(area: Area | AreaId, room: Room | RoomNumber, color: string): void;
-    setRoomLevel(area: Area | AreaId, room: Room | RoomNumber, level: number): void;
-    setRoomX(area: Area | AreaId, room: Room | RoomNumber, x: number): void;
-    setRoomY(area: Area | AreaId, room: Room | RoomNumber, y: number): void;
+    setRoomColor(area: Area | AreaId, room: Room | RoomNumber, color: string): Promise<OperationId | null>;
+    setRoomLevel(area: Area | AreaId, room: Room | RoomNumber, level: number): Promise<OperationId | null>;
+    setRoomX(area: Area | AreaId, room: Room | RoomNumber, x: number): Promise<OperationId | null>;
+    setRoomY(area: Area | AreaId, room: Room | RoomNumber, y: number): Promise<OperationId | null>;
     /** Set a custom room property (string key/value). */
-    setRoomProperty(area: Area | AreaId, room: Room | RoomNumber, name: string, value: string): void;
+    setRoomProperty(area: Area | AreaId, room: Room | RoomNumber, name: string, value: string): Promise<OperationId | null>;
     /** Set a custom area property (string key/value); the write counterpart of `area.data(key)`.
      *  Pass an empty value to clear it. */
-    setAreaProperty(area: Area | AreaId, name: string, value: string): void;
+    setAreaProperty(area: Area | AreaId, name: string, value: string): Promise<OperationId | null>;
     /** Add a case-insensitive tag to a room (normalized to UPPERCASE; re-adding is a no-op). */
-    addRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): void;
+    addRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null>;
     /** Remove a tag from a room (case-insensitive). */
-    removeRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): void;
+    removeRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null>;
     /**
      * The nearest reachable room carrying `tag` (case-insensitive) from `from`, by the same
      * weighted search as `getPathBetweenRooms` (the start room counts if it carries the tag),
@@ -497,43 +500,52 @@ interface Mapper {
      */
     rescueRoomByExternalId(externalId: string): boolean;
     /** Bind (or, with an empty string, clear) a room's server-global room id. */
-    setRoomExternalId(area: Area | AreaId, room: Room | RoomNumber, externalId: string): void;
+    setRoomExternalId(area: Area | AreaId, room: Room | RoomNumber, externalId: string): Promise<OperationId | null>;
     /** Create a room and return its new room number. */
-    createRoom(area: Area | AreaId, params: CreateRoomParams): RoomNumber;
+    createRoom(area: Area | AreaId, params: CreateRoomParams): Promise<RoomNumber>;
     /** Update multiple fields of a room in one cache update; only present fields change. */
-    updateRoom(area: Area | AreaId, room: Room | RoomNumber, fields: UpdateRoomParams): void;
+    updateRoom(area: Area | AreaId, room: Room | RoomNumber, fields: UpdateRoomParams): Promise<OperationId | null>;
     /** Batch-update many rooms of one area in a single cache update. */
-    updateRooms(area: Area | AreaId, updates: [RoomNumber, UpdateRoomParams][]): void;
+    updateRooms(area: Area | AreaId, updates: [RoomNumber, UpdateRoomParams][]): Promise<OperationId[]>;
     /** Create an exit on a room and return its new id. */
     createRoomExit(area: Area | AreaId, room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId>;
-    /** Update an existing exit. Returns nothing. */
-    setRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId, exit: ExitUpdates): void;
+    /**
+     * Update an existing exit. Resolves after backend acknowledgement; equal
+     * updates resolve to `null` without sending a mutation.
+     */
+    setRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId, exit: ExitUpdates): Promise<OperationId | null>;
+    /**
+     * Merge `remove` into `keep` in one durable mutation. The kept room's
+     * metadata wins; traversal is deduplicated and rewired. Resolves after
+     * backend acknowledgement.
+     */
+    mergeRooms(area: Area | AreaId, keep: Room | RoomNumber, remove: Room | RoomNumber): Promise<OperationId | null>;
     /** Delete a room. */
-    deleteRoom(area: Area | AreaId, room: Room | RoomNumber): void;
+    deleteRoom(area: Area | AreaId, room: Room | RoomNumber): Promise<OperationId | null>;
     /** Delete an exit from a room. */
-    deleteRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId): void;
+    deleteRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId): Promise<OperationId | null>;
     /** Atomically create one Connection and its one or two traversals. */
-    createLink(area: Area | AreaId, link: LinkCreateArgs): ConnectionId;
+    createLink(area: Area | AreaId, link: LinkCreateArgs): Promise<ConnectionId>;
     /** Update shared Connection geometry or appearance. */
-    setConnection(area: Area | AreaId, connectionId: ConnectionId, updates: ConnectionUpdates): void;
+    setConnection(area: Area | AreaId, connectionId: ConnectionId, updates: ConnectionUpdates): Promise<OperationId | null>;
     /** Split one traversal out of a bidirectional Connection. */
-    unlinkRoomExit(area: Area | AreaId, exitId: ExitId): ConnectionId;
+    unlinkRoomExit(area: Area | AreaId, exitId: ExitId): Promise<ConnectionId>;
     /** Merge reciprocal one-way Connections, preserving the first one's route. */
-    pairConnections(area: Area | AreaId, keepConnectionId: ConnectionId, mergeConnectionId: ConnectionId): void;
+    pairConnections(area: Area | AreaId, keepConnectionId: ConnectionId, mergeConnectionId: ConnectionId): Promise<OperationId | null>;
     /** Delete a Connection and every member traversal. */
-    deleteLink(area: Area | AreaId, connectionId: ConnectionId): void;
+    deleteLink(area: Area | AreaId, connectionId: ConnectionId): Promise<OperationId | null>;
     /** Add a text label to an area and return its new id. */
     createLabel(area: Area | AreaId, label: LabelArgs): Promise<LabelId>;
     /** Add a graphical shape to an area and return its new id. */
     createShape(area: Area | AreaId, shape: ShapeArgs): Promise<ShapeId>;
     /** Delete a label from an area. */
-    deleteLabel(area: Area | AreaId, labelId: LabelId): void;
+    deleteLabel(area: Area | AreaId, labelId: LabelId): Promise<OperationId | null>;
     /** Delete a shape from an area. */
-    deleteShape(area: Area | AreaId, shapeId: ShapeId): void;
+    deleteShape(area: Area | AreaId, shapeId: ShapeId): Promise<OperationId | null>;
     /** Update an existing label; only present fields change. */
-    setLabel(area: Area | AreaId, labelId: LabelId, updates: LabelUpdates): void;
+    setLabel(area: Area | AreaId, labelId: LabelId, updates: LabelUpdates): Promise<OperationId | null>;
     /** Update an existing shape; only present fields change. */
-    setShape(area: Area | AreaId, shapeId: ShapeId, updates: ShapeUpdates): void;
+    setShape(area: Area | AreaId, shapeId: ShapeId, updates: ShapeUpdates): Promise<OperationId | null>;
     /** Export an area as a portable {@link AreaJson}. Requires copy rights on
      *  the area. */
     exportArea(area: Area | AreaId): Promise<AreaJson>;

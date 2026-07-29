@@ -823,6 +823,13 @@ pub(crate) fn apply_mutation(
 ) -> CloudResult<OpResult> {
     let area_id = details.area.id;
     match op {
+        AreaMutation::AssertMergeSafe {
+            keep_room_number,
+            remove_room_number,
+        } => Ok(OpResult::MergeSafetyChecked {
+            keep_room_number: *keep_room_number,
+            remove_room_number: *remove_room_number,
+        }),
         AreaMutation::UpsertRoom { room_number, body } => {
             let room = upsert_room_details(details, *room_number, body);
             Ok(OpResult::Room { room: room.clone() })

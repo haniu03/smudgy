@@ -1256,7 +1256,7 @@ impl CloudApiClient {
         .await
     }
 
-    /// `GET /sync` — one row per viewable area: projected rev plus access
+    /// `GET /sync` — one row per viewable area: shared revision plus access
     /// fingerprint.
     ///
     /// # Errors

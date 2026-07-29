@@ -115,6 +115,11 @@ pub enum CloudError {
     /// Carries the stable reason code (`too_many_members`, `wrong_area`,
     /// `invalid_endpoint`, `non_orthogonal`, `invalid_point`, …).
     InvalidConnection(String),
+
+    /// Internal dispatch guard: the authenticated credential changed after
+    /// this cloud operation was queued. The viewer-scoped journal retains it
+    /// until identity is resolved again.
+    CredentialChanged,
 }
 
 impl fmt::Display for CloudError {
@@ -191,6 +196,9 @@ impl fmt::Display for CloudError {
             }
             CloudError::InvalidConnection(reason) => {
                 write!(f, "Invalid connection: {reason}")
+            }
+            CloudError::CredentialChanged => {
+                write!(f, "Map credential changed before the edit was sent")
             }
         }
     }

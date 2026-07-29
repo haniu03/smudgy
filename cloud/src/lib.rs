@@ -268,7 +268,7 @@ impl AreaAccess {
     }
 }
 
-/// One row of `GET /sync`: the projected rev and access fingerprint for an
+/// One row of `GET /sync`: the shared area revision and access fingerprint for an
 /// area the caller can view. `rev` is opaque — compare for inequality only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRow {
@@ -382,8 +382,8 @@ const fn default_true() -> bool {
 
 /// Area model
 ///
-/// `rev` is **opaque**: it is the projected revision for the viewer and can
-/// move *down* when capabilities change — compare for inequality, never order.
+/// `rev` is shared by every viewer who can read the area. A database restore
+/// can still rewind it, so cache invalidation compares for inequality.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Area {
     pub id: AreaId,

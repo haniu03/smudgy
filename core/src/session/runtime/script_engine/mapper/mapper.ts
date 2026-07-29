@@ -54,6 +54,7 @@ import {
     op_smudgy_mapper_update_rooms,
     op_smudgy_mapper_create_room_exit,
     op_smudgy_mapper_set_room_exit,
+    op_smudgy_mapper_merge_rooms,
     op_smudgy_mapper_delete_room,
     op_smudgy_mapper_delete_room_exit,
     op_smudgy_mapper_get_area_labels,
@@ -89,6 +90,7 @@ type AreaId = readonly [number, number];
 type RoomNumber = number;
 type ExitId = readonly [number, number];
 type ConnectionId = readonly [number, number];
+type OperationId = readonly [number, number];
 
 /** A compass/special exit direction (the canonical PascalCase names). */
 type ExitDirection =
@@ -173,78 +175,78 @@ const mapper = {
         );
     },
 
-    renameArea(area: Area | AreaId, name: string) {
+    renameArea(area: Area | AreaId, name: string): Promise<void> {
         const areaId = area instanceof Area ? area.id : area;
-        op_smudgy_mapper_rename_area(areaId, name);
+        return op_smudgy_mapper_rename_area(areaId, name);
     },
 
-    deleteArea(area: Area | AreaId) {
+    deleteArea(area: Area | AreaId): Promise<void> {
         const areaId = area instanceof Area ? area.id : area;
-        op_smudgy_mapper_delete_area(areaId);
+        return op_smudgy_mapper_delete_area(areaId);
     },
 
-    setRoomTitle(area: Area | AreaId, room: Room | RoomNumber, title: string) {
+    setRoomTitle(area: Area | AreaId, room: Room | RoomNumber, title: string): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_set_room_title(areaId, roomNumber, title);
+        return op_smudgy_mapper_set_room_title(areaId, roomNumber, title);
     },
 
-    setRoomDescription(area: Area | AreaId, room: Room | RoomNumber, description: string) {
+    setRoomDescription(area: Area | AreaId, room: Room | RoomNumber, description: string): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_set_room_description(areaId, roomNumber, description);
+        return op_smudgy_mapper_set_room_description(areaId, roomNumber, description);
     },
 
-    setRoomColor(area: Area | AreaId, room: Room | RoomNumber, color: string) {
+    setRoomColor(area: Area | AreaId, room: Room | RoomNumber, color: string): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_set_room_color(areaId, roomNumber, color);
+        return op_smudgy_mapper_set_room_color(areaId, roomNumber, color);
     },
 
-    setRoomLevel(area: Area | AreaId, room: Room | RoomNumber, level: number) {
+    setRoomLevel(area: Area | AreaId, room: Room | RoomNumber, level: number): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_set_room_level(areaId, roomNumber, level);
+        return op_smudgy_mapper_set_room_level(areaId, roomNumber, level);
     },
 
-    setRoomX(area: Area | AreaId, room: Room | RoomNumber, x: number) {
+    setRoomX(area: Area | AreaId, room: Room | RoomNumber, x: number): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_set_room_x(areaId, roomNumber, x);
+        return op_smudgy_mapper_set_room_x(areaId, roomNumber, x);
     },
 
-    setRoomY(area: Area | AreaId, room: Room | RoomNumber, y: number) {
+    setRoomY(area: Area | AreaId, room: Room | RoomNumber, y: number): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_set_room_y(areaId, roomNumber, y);
+        return op_smudgy_mapper_set_room_y(areaId, roomNumber, y);
     },
 
-    setRoomProperty(area: Area | AreaId, room: Room | RoomNumber, name: string, value: string) {
+    setRoomProperty(area: Area | AreaId, room: Room | RoomNumber, name: string, value: string): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_set_room_property(areaId, roomNumber, name, value);
+        return op_smudgy_mapper_set_room_property(areaId, roomNumber, name, value);
     },
 
     /** Set a custom data property on an area (the write counterpart of `area.data(key)`). Pass an
      * empty value to clear it. Requires the `mapper:write` capability. */
-    setAreaProperty(area: Area | AreaId, name: string, value: string) {
+    setAreaProperty(area: Area | AreaId, name: string, value: string): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
-        op_smudgy_mapper_set_area_property(areaId, name, value);
+        return op_smudgy_mapper_set_area_property(areaId, name, value);
     },
 
     /** Add a case-insensitive tag to a room. The tag is normalized to UPPERCASE;
      * re-adding an existing tag is a no-op. Requires the `mapper:write` capability. */
-    addRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string) {
+    addRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_add_room_tag(areaId, roomNumber, tag);
+        return op_smudgy_mapper_add_room_tag(areaId, roomNumber, tag);
     },
 
     /** Remove a tag from a room (case-insensitive). Requires `mapper:write`. */
-    removeRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string) {
+    removeRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_remove_room_tag(areaId, roomNumber, tag);
+        return op_smudgy_mapper_remove_room_tag(areaId, roomNumber, tag);
     },
 
     /** The nearest reachable room carrying `tag` (case-insensitive) from `from`,
@@ -314,30 +316,30 @@ const mapper = {
 
     /** Bind (or, with an empty string, clear) a room's server-global room id.
      * Requires `mapper:write`. */
-    setRoomExternalId(area: Area | AreaId, room: Room | RoomNumber, externalId: string) {
+    setRoomExternalId(area: Area | AreaId, room: Room | RoomNumber, externalId: string): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_set_room_external_id(areaId, roomNumber, externalId);
+        return op_smudgy_mapper_set_room_external_id(areaId, roomNumber, externalId);
     },
 
-    createRoom(area: Area | AreaId, params: CreateRoomParams): RoomNumber {
+    createRoom(area: Area | AreaId, params: CreateRoomParams): Promise<RoomNumber> {
         const areaId = area instanceof Area ? area.id : area;
         return op_smudgy_mapper_create_room(areaId, params);
     },
 
     /** Update multiple fields of an existing room in ONE cache update (one index rebuild)
      * instead of one per field. Only the fields present in `fields` change. */
-    updateRoom(area: Area | AreaId, room: Room | RoomNumber, fields: UpdateRoomParams) {
+    updateRoom(area: Area | AreaId, room: Room | RoomNumber, fields: UpdateRoomParams): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_update_room(areaId, roomNumber, fields);
+        return op_smudgy_mapper_update_room(areaId, roomNumber, fields);
     },
 
     /** Batch-update many rooms of one area in a single cache update. Each entry is a
      * `[roomNumber, fields]` pair; only the present fields of each change. */
-    updateRooms(area: Area | AreaId, updates: [RoomNumber, UpdateRoomParams][]) {
+    updateRooms(area: Area | AreaId, updates: [RoomNumber, UpdateRoomParams][]): Promise<OperationId[]> {
         const areaId = area instanceof Area ? area.id : area;
-        op_smudgy_mapper_update_rooms(areaId, updates);
+        return op_smudgy_mapper_update_rooms(areaId, updates);
     },
 
     createRoomExit(area: Area | AreaId, room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId> {
@@ -345,45 +347,57 @@ const mapper = {
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_create_room_exit(areaId, roomNumber, exit);
     },
-    setRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId, exit: ExitUpdates): void {
+    /** Update an existing exit and resolve only after the map backend
+     * acknowledges the exact mutation. Equal updates resolve to `null`
+     * without sending a revision-bumping no-op. */
+    setRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId, exit: ExitUpdates): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_set_room_exit(areaId, roomNumber, exitId, exit);
+        return op_smudgy_mapper_set_room_exit(areaId, roomNumber, exitId, exit);
     },
-    deleteRoom(area: Area | AreaId, room: Room | RoomNumber): void {
+    /** Merge `remove` into `keep` as one durable area mutation. The kept
+     * room's metadata wins; traversal is deduplicated and rewired. Resolves
+     * only after the backend acknowledges the exact operation. */
+    mergeRooms(area: Area | AreaId, keep: Room | RoomNumber, remove: Room | RoomNumber): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
-        const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_delete_room(areaId, roomNumber);
+        const keepRoomNumber = keep instanceof Room ? keep.room_number : keep;
+        const removeRoomNumber = remove instanceof Room ? remove.room_number : remove;
+        return op_smudgy_mapper_merge_rooms(areaId, keepRoomNumber, removeRoomNumber);
     },
-    deleteRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId): void {
+    deleteRoom(area: Area | AreaId, room: Room | RoomNumber): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
         const roomNumber = room instanceof Room ? room.room_number : room;
-        op_smudgy_mapper_delete_room_exit(areaId, roomNumber, exitId);
+        return op_smudgy_mapper_delete_room(areaId, roomNumber);
+    },
+    deleteRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId): Promise<OperationId | null> {
+        const areaId = area instanceof Area ? area.id : area;
+        const roomNumber = room instanceof Room ? room.room_number : room;
+        return op_smudgy_mapper_delete_room_exit(areaId, roomNumber, exitId);
     },
     /** Atomically create one Connection and its one or two member traversals. */
-    createLink(area: Area | AreaId, link: LinkCreateArgs): ConnectionId {
+    createLink(area: Area | AreaId, link: LinkCreateArgs): Promise<ConnectionId> {
         const areaId = area instanceof Area ? area.id : area;
         return op_smudgy_mapper_create_link(areaId, link);
     },
     /** Update shared Connection geometry or appearance. */
-    setConnection(area: Area | AreaId, connectionId: ConnectionId, updates: ConnectionUpdates): void {
+    setConnection(area: Area | AreaId, connectionId: ConnectionId, updates: ConnectionUpdates): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
-        op_smudgy_mapper_set_connection(areaId, connectionId, updates);
+        return op_smudgy_mapper_set_connection(areaId, connectionId, updates);
     },
     /** Split one traversal out of a bidirectional Connection. */
-    unlinkRoomExit(area: Area | AreaId, exitId: ExitId): ConnectionId {
+    unlinkRoomExit(area: Area | AreaId, exitId: ExitId): Promise<ConnectionId> {
         const areaId = area instanceof Area ? area.id : area;
         return op_smudgy_mapper_unlink_exit(areaId, exitId);
     },
     /** Merge reciprocal one-way Connections, preserving `keepConnectionId`'s route. */
-    pairConnections(area: Area | AreaId, keepConnectionId: ConnectionId, mergeConnectionId: ConnectionId): void {
+    pairConnections(area: Area | AreaId, keepConnectionId: ConnectionId, mergeConnectionId: ConnectionId): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
-        op_smudgy_mapper_pair_connections(areaId, keepConnectionId, mergeConnectionId);
+        return op_smudgy_mapper_pair_connections(areaId, keepConnectionId, mergeConnectionId);
     },
     /** Delete a Connection and all of its member traversals. */
-    deleteLink(area: Area | AreaId, connectionId: ConnectionId): void {
+    deleteLink(area: Area | AreaId, connectionId: ConnectionId): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
-        op_smudgy_mapper_delete_link(areaId, connectionId);
+        return op_smudgy_mapper_delete_link(areaId, connectionId);
     },
     /** Add a text label to an area; returns its new id. Requires `mapper:write`. */
     createLabel(area: Area | AreaId, label: LabelArgs): Promise<LabelId> {
@@ -396,24 +410,24 @@ const mapper = {
         return op_smudgy_mapper_create_shape(areaId, shape);
     },
     /** Delete a label from an area. Requires `mapper:write`. */
-    deleteLabel(area: Area | AreaId, labelId: LabelId): void {
+    deleteLabel(area: Area | AreaId, labelId: LabelId): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
-        op_smudgy_mapper_delete_label(areaId, labelId);
+        return op_smudgy_mapper_delete_label(areaId, labelId);
     },
     /** Delete a shape from an area. Requires `mapper:write`. */
-    deleteShape(area: Area | AreaId, shapeId: ShapeId): void {
+    deleteShape(area: Area | AreaId, shapeId: ShapeId): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
-        op_smudgy_mapper_delete_shape(areaId, shapeId);
+        return op_smudgy_mapper_delete_shape(areaId, shapeId);
     },
     /** Update an existing label; only present fields change. Requires `mapper:write`. */
-    setLabel(area: Area | AreaId, labelId: LabelId, updates: LabelUpdates): void {
+    setLabel(area: Area | AreaId, labelId: LabelId, updates: LabelUpdates): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
-        op_smudgy_mapper_set_label(areaId, labelId, updates);
+        return op_smudgy_mapper_set_label(areaId, labelId, updates);
     },
     /** Update an existing shape; only present fields change. Requires `mapper:write`. */
-    setShape(area: Area | AreaId, shapeId: ShapeId, updates: ShapeUpdates): void {
+    setShape(area: Area | AreaId, shapeId: ShapeId, updates: ShapeUpdates): Promise<OperationId | null> {
         const areaId = area instanceof Area ? area.id : area;
-        op_smudgy_mapper_set_shape(areaId, shapeId, updates);
+        return op_smudgy_mapper_set_shape(areaId, shapeId, updates);
     },
     /** Serialize an area to a portable JSON blob. Requires `mapper:read` and copy rights
      * (`can_copy`) on the area. */
@@ -767,8 +781,8 @@ class Room {
     /** Update multiple fields of this room in one cache update. Convenience over
      * `mapper.updateRoom(this.area_id, this.room_number, fields)`; only the present fields
      * change. */
-    update(fields: UpdateRoomParams) {
-        op_smudgy_mapper_update_room(this.area_id, this.room_number, fields);
+    update(fields: UpdateRoomParams): Promise<OperationId | null> {
+        return op_smudgy_mapper_update_room(this.area_id, this.room_number, fields);
     }
 
     toString() {

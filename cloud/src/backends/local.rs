@@ -47,7 +47,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use parking_lot::RwLock;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, OnceCell},
     task,
@@ -60,6 +60,59 @@ use crate::{
     CloudError, CloudResult, CreateAreaRequest,
     mutation::{MutationEnvelope, MutationResult},
 };
+
+const LOCAL_OPERATION_RECEIPT_LIMIT: usize = 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalMutationReceipt {
+    operation_id: Uuid,
+    result: MutationResult,
+}
+
+/// Local-only persistence wrapper. Flattening preserves the portable v2 area
+/// JSON shape while committing idempotency receipts in the same atomic file
+/// as the mutation result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalAreaDocument {
+    #[serde(flatten)]
+    details: AreaWithDetails,
+    #[serde(
+        default,
+        rename = "_smudgy_applied_operations",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    applied_operations: Vec<LocalMutationReceipt>,
+}
+
+impl LocalAreaDocument {
+    fn new(details: AreaWithDetails) -> Self {
+        Self {
+            details,
+            applied_operations: Vec::new(),
+        }
+    }
+
+    fn receipt(&self, operation_id: Uuid) -> Option<MutationResult> {
+        self.applied_operations
+            .iter()
+            .find(|receipt| receipt.operation_id == operation_id)
+            .map(|receipt| receipt.result.clone())
+    }
+
+    fn remember(&mut self, result: MutationResult) {
+        self.applied_operations.push(LocalMutationReceipt {
+            operation_id: result.operation_id,
+            result,
+        });
+        let overflow = self
+            .applied_operations
+            .len()
+            .saturating_sub(LOCAL_OPERATION_RECEIPT_LIMIT);
+        if overflow > 0 {
+            self.applied_operations.drain(..overflow);
+        }
+    }
+}
 
 /// On-disk authoritative map store. Cheaply shareable behind an `Arc`.
 pub struct LocalBackend {
@@ -169,11 +222,11 @@ impl LocalBackend {
 
     /// Reads one area's full record from disk: the v2 namespace first, and
     /// only when it has no copy, the v1 namespace via on-demand migration.
-    async fn load_area(&self, id: AreaId) -> CloudResult<AreaWithDetails> {
+    async fn load_area_document(&self, id: AreaId) -> CloudResult<LocalAreaDocument> {
         let v2_path = self.area_path(id);
         let legacy_path = self.legacy_area_path(id);
         let backup_dir = self.backup_dir();
-        task::spawn_blocking(move || -> CloudResult<AreaWithDetails> {
+        task::spawn_blocking(move || -> CloudResult<LocalAreaDocument> {
             match fs::read(&v2_path) {
                 Ok(bytes) => parse_v2_document(&bytes, &v2_path),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -182,6 +235,7 @@ impl LocalBackend {
                         _ => CloudError::from(err),
                     })?;
                     migrate_legacy_file(&legacy_bytes, &legacy_path, &v2_path, &backup_dir)
+                        .map(LocalAreaDocument::new)
                 }
                 Err(err) => Err(CloudError::from(err)),
             }
@@ -190,13 +244,23 @@ impl LocalBackend {
         .map_err(|err| CloudError::InternalError(err.to_string()))?
     }
 
+    async fn load_area(&self, id: AreaId) -> CloudResult<AreaWithDetails> {
+        self.load_area_document(id)
+            .await
+            .map(|document| document.details)
+    }
+
     /// Writes one area's full record to disk (creating the directory if
     /// needed) and refreshes its index entry. The write is atomic
     /// (temp file + rename) so a concurrent reader never sees a torn file.
     async fn store_area(&self, area: AreaWithDetails) -> CloudResult<()> {
+        self.store_area_document(LocalAreaDocument::new(area)).await
+    }
+
+    async fn store_area_document(&self, document: LocalAreaDocument) -> CloudResult<()> {
         let dir = self.areas_dir();
-        let path = self.area_path(area.area.id);
-        let to_write = area.clone();
+        let path = self.area_path(document.details.area.id);
+        let to_write = document.clone();
         task::spawn_blocking(move || -> CloudResult<()> {
             fs::create_dir_all(&dir)?;
             write_atomic(&path, &serde_json::to_vec_pretty(&to_write)?)?;
@@ -204,7 +268,9 @@ impl LocalBackend {
         })
         .await
         .map_err(|err| CloudError::InternalError(err.to_string()))??;
-        self.areas.write().insert(area.area.id, area.area);
+        self.areas
+            .write()
+            .insert(document.details.area.id, document.details.area);
         Ok(())
     }
 
@@ -219,10 +285,10 @@ impl LocalBackend {
     {
         self.ensure_loaded().await;
         let _guard = self.write_lock.lock().await;
-        let mut area = self.load_area(area_id).await?;
-        let result = f(&mut area)?;
-        area.area.rev += 1;
-        self.store_area(area).await?;
+        let mut document = self.load_area_document(area_id).await?;
+        let result = f(&mut document.details)?;
+        document.details.area.rev += 1;
+        self.store_area_document(document).await?;
         Ok(result)
     }
 
@@ -288,7 +354,7 @@ fn document_version(bytes: &[u8]) -> CloudResult<u32> {
 /// current format: a *newer* document is a hard read-only error naming the
 /// file (opening it read-write would corrupt data this build cannot
 /// represent), and an older one does not belong in `areas-v2/` at all.
-fn parse_v2_document(bytes: &[u8], path: &Path) -> CloudResult<AreaWithDetails> {
+fn parse_v2_document(bytes: &[u8], path: &Path) -> CloudResult<LocalAreaDocument> {
     let version = document_version(bytes)?;
     if version > crate::AREA_FORMAT_VERSION {
         return Err(CloudError::InvalidInput(format!(
@@ -402,7 +468,7 @@ fn scan_areas(dir: &Path, legacy_dir: &Path, backup_dir: &Path) -> HashMap<AreaI
     let mut out: HashMap<AreaId, Area> = HashMap::new();
     let mut migrated: HashSet<AreaId> = HashSet::new();
     let scanned = read_json_dir(dir, |bytes, path| match parse_v2_document(bytes, path) {
-        Ok(details) => Some((details.area.id, details.area)),
+        Ok(document) => Some((document.details.area.id, document.details.area)),
         Err(err) => {
             log::warn!("skipping local map file: {err}");
             None
@@ -588,6 +654,10 @@ impl MapperBackend for LocalBackend {
 
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
         self.ensure_loaded().await;
+        // Serialize deletion with versioned mutation persistence. Without
+        // this lock, a worker can load the area, deletion can unlink it, and
+        // the worker can then store its stale working copy back to disk.
+        let _guard = self.write_lock.lock().await;
         let path = self.area_path(*area_id);
         // The v1-namespace file goes too: deleting only the v2 copy would
         // resurrect the area through the straggler migration on the next
@@ -624,12 +694,19 @@ impl MapperBackend for LocalBackend {
         // envelope changes nothing.
         self.ensure_loaded().await;
         let _guard = self.write_lock.lock().await;
-        let mut area = self.load_area(*area_id).await.map_err(|err| match err {
-            CloudError::NotFoundOrNoAccess => CloudError::AreaNotFound(*area_id),
-            other => other,
-        })?;
-        let result = area_edits::apply_envelope(&mut area, *area_id, envelope)?;
-        self.store_area(area).await?;
+        let mut document = self
+            .load_area_document(*area_id)
+            .await
+            .map_err(|err| match err {
+                CloudError::NotFoundOrNoAccess => CloudError::AreaNotFound(*area_id),
+                other => other,
+            })?;
+        if let Some(result) = document.receipt(envelope.operation_id) {
+            return Ok(result);
+        }
+        let result = area_edits::apply_envelope(&mut document.details, *area_id, envelope)?;
+        document.remember(result.clone());
+        self.store_area_document(document).await?;
         Ok(result)
     }
 
@@ -732,6 +809,7 @@ mod tests {
         ShapeId,
         mutation::{AreaMutation, OpResult, Precondition, ResourceKind},
     };
+    use std::sync::Arc;
 
     fn temp_root() -> PathBuf {
         std::env::temp_dir().join(format!("smudgy-local-test-{}", Uuid::new_v4()))
@@ -1514,6 +1592,86 @@ mod tests {
             backend.get_area(&area_id).await.is_err(),
             "the area is gone for good"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn execute_mutation_replays_persisted_receipt_exactly_once() {
+        let root = temp_root();
+        let area_id;
+        let mutation;
+        let first_result;
+        {
+            let backend = LocalBackend::new(&root);
+            let area = backend
+                .create_area(new_area_request("A", None))
+                .await
+                .expect("area");
+            area_id = area.id;
+            mutation = envelope(
+                area.id,
+                1,
+                vec![AreaMutation::UpsertRoom {
+                    room_number: RoomNumber(1),
+                    body: RoomUpdates {
+                        title: Some("Applied once".to_string()),
+                        ..RoomUpdates::default()
+                    },
+                }],
+            );
+            first_result = backend
+                .execute_mutation(&area.id, &mutation)
+                .await
+                .expect("first application");
+            assert_eq!(backend.get_area(&area.id).await.unwrap().area.rev, 2);
+        }
+
+        // Simulate restart after the area-file commit but before pending-WAL
+        // retirement. The stale expected revision would conflict if the
+        // operation were applied again.
+        let reopened = LocalBackend::new(&root);
+        let replayed = reopened
+            .execute_mutation(&area_id, &mutation)
+            .await
+            .expect("receipt replay");
+        assert_eq!(replayed.operation_id, first_result.operation_id);
+        assert_eq!(replayed.versions, first_result.versions);
+        assert_eq!(reopened.get_area(&area_id).await.unwrap().area.rev, 2);
+
+        let bytes = fs::read(reopened.area_path(area_id)).expect("read local document");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse document");
+        assert_eq!(
+            json["_smudgy_applied_operations"].as_array().map(Vec::len),
+            Some(1)
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_area_uses_the_mutation_write_lock() {
+        let root = temp_root();
+        let backend = Arc::new(LocalBackend::new(&root));
+        let area = backend
+            .create_area(new_area_request("Serialized", None))
+            .await
+            .expect("create");
+
+        let write_guard = backend.write_lock.lock().await;
+        let delete = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.delete_area(&area.id).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !delete.is_finished(),
+            "delete must wait for an in-flight whole-file mutation"
+        );
+
+        drop(write_guard);
+        delete.await.expect("delete task").expect("delete");
+        assert!(backend.get_area(&area.id).await.is_err());
 
         fs::remove_dir_all(&root).ok();
     }

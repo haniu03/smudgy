@@ -6,12 +6,11 @@
 //! applying. Undo/redo replay the appropriate list through the [`Mapper`]
 //! (instant cache write, background cloud sync).
 //!
-//! Entity creation is asynchronous (the backend assigns ids), so mutations
-//! reference created entities through [`IdRef::Slot`]: an index into the
-//! command's resolved-id table, filled in when the create completes
-//! ([`CommandStack::resolve`]). Deletion commands pre-seed their slots with
-//! the original ids, so the first redo targets the existing entity and
-//! later redos target whatever the undo most recently recreated.
+//! Entity ids are client-minted before durable enqueue. Mutations reference
+//! created entities through [`IdRef::Slot`]: an index into the command's
+//! resolved-id table. Deletion commands pre-seed their slots with the
+//! original ids, so the first redo targets the existing entity and later
+//! redos target whatever the undo most recently recreated.
 //!
 //! Area create/rename/delete intentionally bypass this stack (not
 //! undoable), and the stack is cleared when the edited area changes.
@@ -24,10 +23,10 @@ use smudgy_cloud::{
     AreaId, ConnectionArgs, ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionRouting,
     ConnectionUpdates, CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS,
     ExitArgs, ExitDirection, ExitId, ExitUpdates, LabelArgs, LabelId, LabelUpdates, Mapper,
-    PortMode, RoomNumber, RoomUpdates, SegmentShape, ShapeArgs, ShapeId, ShapeUpdates,
+    PortMode, RoomNumber, RoomUpdates, SegmentShape, ShapeArgs, ShapeId, ShapeUpdates, Uuid,
     default_anchor_for_direction,
-    mapper::{AtlasCache, RoomKey},
-    mutation::{AreaMutation, OperationId},
+    mapper::{AreaMutationBatch, AtlasCache, MutationSubmission, RoomKey},
+    mutation::{AreaMutation, MAX_MUTATION_OPERATIONS, OperationId},
 };
 use smudgy_map_widget::map_editor::{EntityId, Selection};
 
@@ -241,6 +240,7 @@ pub struct Command {
     resolved_ids: Vec<Option<ResolvedId>>,
     pending: usize,
     operation_ids: Vec<OperationId>,
+    application_error: Option<String>,
 }
 
 impl Command {
@@ -261,6 +261,7 @@ impl Command {
             resolved_ids: vec![None; slots],
             pending: 0,
             operation_ids: Vec::new(),
+            application_error: None,
         }
     }
 
@@ -343,6 +344,7 @@ pub struct CommandStack {
     undo: VecDeque<Command>,
     redo: Vec<Command>,
     next_id: CommandId,
+    last_error: Option<String>,
 }
 
 impl CommandStack {
@@ -369,8 +371,16 @@ impl CommandStack {
         self.undo.is_empty() && self.redo.is_empty()
     }
 
+    /// Takes the most recent synchronous validation or durable-enqueue error.
+    ///
+    /// The command stack keeps the error alongside its history decision so
+    /// UI callers cannot accidentally record an edit that was never staged.
+    pub fn take_last_error(&mut self) -> Option<String> {
+        self.last_error.take()
+    }
+
     /// The id assigned to the most recently pushed command (e.g. to match
-    /// its async create [`Outcome`]s later).
+    /// its create-completion [`Outcome`]s later).
     #[must_use]
     pub fn last_command_id(&self) -> Option<CommandId> {
         self.next_id.checked_sub(1)
@@ -391,15 +401,18 @@ impl CommandStack {
         mut command: Command,
     ) -> (Task<Outcome>, Vec<OperationId>) {
         self.redo.clear();
+        self.last_error = None;
 
         command.id = self.next_id;
         self.next_id += 1;
 
         let (task, applied) = Self::apply(mapper, &mut command, Direction::Redo);
         if !applied {
+            self.last_error = command.application_error.take();
             return (task, Vec::new());
         }
         let operation_ids = command.operation_ids.clone();
+        let application_error = command.application_error.take();
 
         let coalesced = command.coalesce.is_some()
             && command.pending == 0
@@ -422,6 +435,7 @@ impl CommandStack {
             }
         }
 
+        self.last_error = application_error;
         (task, operation_ids)
     }
 
@@ -448,6 +462,7 @@ impl CommandStack {
     }
 
     pub fn undo(&mut self, mapper: &Mapper) -> Task<Outcome> {
+        self.last_error = None;
         if !self.can_undo() {
             return Task::none();
         }
@@ -455,6 +470,7 @@ impl CommandStack {
             return Task::none();
         };
         let (task, applied) = Self::apply(mapper, &mut command, Direction::Undo);
+        self.last_error = command.application_error.take();
         if applied {
             self.redo.push(command);
         } else {
@@ -464,6 +480,7 @@ impl CommandStack {
     }
 
     pub fn redo(&mut self, mapper: &Mapper) -> Task<Outcome> {
+        self.last_error = None;
         if !self.can_redo() {
             return Task::none();
         }
@@ -471,6 +488,7 @@ impl CommandStack {
             return Task::none();
         };
         let (task, applied) = Self::apply(mapper, &mut command, Direction::Redo);
+        self.last_error = command.application_error.take();
         if applied {
             self.undo.push_back(command);
         } else {
@@ -479,8 +497,10 @@ impl CommandStack {
         task
     }
 
-    /// Records the completion of an asynchronous create, filling the slot
-    /// it targeted and applying any follow-up update.
+    /// Settles the UI completion marker for a synchronously staged create.
+    ///
+    /// The id slot and operation id are recorded before the command enters
+    /// history; this completion only unblocks undo and drives selection.
     pub fn resolve(&mut self, mapper: &Mapper, outcome: Outcome) {
         match outcome {
             Outcome::Exit {
@@ -498,7 +518,8 @@ impl CommandStack {
                     Ok(id) => {
                         command.resolved_ids[slot] = Some(ResolvedId::Exit(id));
                         if let Some(follow_up) = follow_up {
-                            mapper.update_exit(room_key, id, follow_up);
+                            let result = mapper.update_exit(room_key, id, follow_up);
+                            Self::record_submission(command, result, "exit follow-up update");
                         }
                     }
                     Err(error) => log::warn!("exit create failed: {error}"),
@@ -542,21 +563,50 @@ impl CommandStack {
             .find(|command| command.id == id)
     }
 
-    /// Applies one direction's mutations: synchronous writes go straight to
-    /// the mapper; creates spawn tasks whose outcomes are fed back through
-    /// [`Self::resolve`].
+    fn record_submission(
+        command: &mut Command,
+        result: smudgy_cloud::CloudResult<MutationSubmission>,
+        context: &str,
+    ) -> bool {
+        match result {
+            Ok(submission) => {
+                if let Some(operation_id) = submission.operation_id() {
+                    command.operation_ids.push(operation_id);
+                }
+                true
+            }
+            Err(error) => {
+                let message = format!(
+                    "{context} failed validation or durable enqueue: {}",
+                    display_error(&error)
+                );
+                log::warn!("{message}");
+                command.application_error = Some(message);
+                false
+            }
+        }
+    }
+
+    /// Compiles one direction into a private batch, then durably stages every
+    /// envelope before publishing any optimistic state. Create ids are still
+    /// client-minted up front, but their completion tasks are emitted only
+    /// after the complete gesture commits.
     fn apply(
         mapper: &Mapper,
         command: &mut Command,
         direction: Direction,
     ) -> (Task<Outcome>, bool) {
         command.operation_ids.clear();
+        command.application_error = None;
         let mutations = match direction {
             Direction::Redo => command.redo.clone(),
             Direction::Undo => command.undo.clone(),
         };
 
+        let resolved_before = command.resolved_ids.clone();
+        let pending_before = command.pending;
         let mut tasks = Vec::new();
+        let mut batches = Vec::new();
 
         for mutation in mutations {
             match mutation {
@@ -564,56 +614,139 @@ impl CommandStack {
                     area_id,
                     operations,
                     description,
-                } => match mapper.mutate_area(area_id, operations, description) {
-                    Ok(operation_id) => command.operation_ids.push(operation_id),
-                    Err(error) => {
-                        log::warn!("compound map edit failed validation: {error}");
-                        return (Task::batch(tasks), false);
+                } => batches.push(AreaMutationBatch::strict(area_id, operations, description)),
+                Mutation::UpsertRooms(area_id, updates) => {
+                    let description = if updates.len() == 1 {
+                        format!("Update room {}", updates[0].0)
+                    } else {
+                        format!("Update {} rooms", updates.len())
+                    };
+                    let mut operations: Vec<_> = updates
+                        .into_iter()
+                        .map(|(room_number, body)| AreaMutation::UpsertRoom { room_number, body })
+                        .collect();
+                    while operations.len() > MAX_MUTATION_OPERATIONS {
+                        let rest = operations.split_off(MAX_MUTATION_OPERATIONS);
+                        batches.push(AreaMutationBatch::strict(
+                            area_id,
+                            operations,
+                            description.clone(),
+                        ));
+                        operations = rest;
                     }
-                },
-                Mutation::UpsertRooms(area_id, updates) => mapper.upsert_rooms(area_id, updates),
-                Mutation::DeleteRoom(room_key) => mapper.delete_room(room_key),
+                    batches.push(AreaMutationBatch::strict(area_id, operations, description));
+                }
+                Mutation::DeleteRoom(room_key) => {
+                    batches.push(AreaMutationBatch::strict(
+                        room_key.area_id,
+                        vec![AreaMutation::DeleteRoom {
+                            room_number: room_key.room_number,
+                        }],
+                        format!("Delete room {}", room_key.room_number),
+                    ));
+                }
                 Mutation::SetRoomProperty(room_key, name, value) => {
-                    mapper.set_room_property(room_key, name, value);
+                    let description =
+                        format!("Set property {name} on room {}", room_key.room_number);
+                    batches.push(AreaMutationBatch::strict(
+                        room_key.area_id,
+                        vec![AreaMutation::UpsertRoomProperty {
+                            room_number: room_key.room_number,
+                            name,
+                            value,
+                            is_secret: None,
+                        }],
+                        description,
+                    ));
                 }
                 Mutation::DeleteRoomProperty(room_key, name) => {
-                    mapper.delete_room_property(room_key, name);
+                    let description =
+                        format!("Delete property {name} on room {}", room_key.room_number);
+                    batches.push(AreaMutationBatch::strict(
+                        room_key.area_id,
+                        vec![AreaMutation::DeleteRoomProperty {
+                            room_number: room_key.room_number,
+                            name,
+                        }],
+                        description,
+                    ));
                 }
                 Mutation::AddRoomTag(room_key, tag) => {
-                    mapper.add_room_tag(room_key, tag);
+                    batches.push(AreaMutationBatch::strict(
+                        room_key.area_id,
+                        vec![AreaMutation::AddRoomTag {
+                            room_number: room_key.room_number,
+                            tag,
+                        }],
+                        format!("Add tag to room {}", room_key.room_number),
+                    ));
                 }
                 Mutation::RemoveRoomTag(room_key, tag) => {
-                    mapper.remove_room_tag(room_key, tag);
+                    batches.push(AreaMutationBatch::strict(
+                        room_key.area_id,
+                        vec![AreaMutation::RemoveRoomTag {
+                            room_number: room_key.room_number,
+                            tag,
+                        }],
+                        format!("Remove tag from room {}", room_key.room_number),
+                    ));
                 }
                 Mutation::SetAreaProperty(area_id, name, value) => {
-                    mapper.set_area_property(area_id, name, value);
+                    let description = format!("Set area property {name}");
+                    batches.push(AreaMutationBatch::strict(
+                        area_id,
+                        vec![AreaMutation::UpsertAreaProperty {
+                            name,
+                            value,
+                            is_secret: None,
+                        }],
+                        description,
+                    ));
                 }
                 Mutation::DeleteAreaProperty(area_id, name) => {
-                    mapper.delete_area_property(area_id, name);
+                    let description = format!("Delete area property {name}");
+                    batches.push(AreaMutationBatch::strict(
+                        area_id,
+                        vec![AreaMutation::DeleteAreaProperty { name }],
+                        description,
+                    ));
                 }
                 Mutation::CreateExit {
                     room_key,
-                    args,
+                    mut args,
                     follow_up,
                     slot,
                 } => {
-                    command.pending += 1;
                     let command_id = command.id;
-                    let mapper = mapper.clone();
-                    let result_key = room_key.clone();
-                    tasks.push(Task::perform(
-                        {
-                            let room_key = room_key.clone();
-                            async move { mapper.create_exit(room_key, args).await }
-                        },
-                        move |result| Outcome::Exit {
-                            command: command_id,
-                            slot,
-                            room_key: result_key.clone(),
-                            follow_up: follow_up.clone(),
-                            result: result.map_err(|error| display_error(&error)),
-                        },
+                    let id = args.id.unwrap_or_else(ExitId::new);
+                    args.id = Some(id);
+                    batches.push(AreaMutationBatch::strict(
+                        room_key.area_id,
+                        vec![AreaMutation::CreateExit {
+                            room_number: room_key.room_number,
+                            body: args,
+                        }],
+                        format!("Create exit from room {}", room_key.room_number),
                     ));
+                    if let Some(follow_up) = follow_up {
+                        batches.push(AreaMutationBatch::splitting_paired_exit(
+                            room_key.area_id,
+                            vec![AreaMutation::UpdateExit {
+                                exit_id: id,
+                                body: follow_up,
+                            }],
+                            "Restore exit details",
+                        ));
+                    }
+                    command.resolved_ids[slot] = Some(ResolvedId::Exit(id));
+                    command.pending += 1;
+                    tasks.push(Task::done(Outcome::Exit {
+                        command: command_id,
+                        slot,
+                        room_key,
+                        follow_up: None,
+                        result: Ok(id),
+                    }));
                 }
                 Mutation::UpdateExit {
                     room_key,
@@ -621,30 +754,45 @@ impl CommandStack {
                     updates,
                 } => {
                     if let Some(exit_id) = command.exit_id(id) {
-                        mapper.update_exit(room_key, exit_id, updates);
+                        batches.push(AreaMutationBatch::splitting_paired_exit(
+                            room_key.area_id,
+                            vec![AreaMutation::UpdateExit {
+                                exit_id,
+                                body: updates,
+                            }],
+                            "Update exit",
+                        ));
                     }
                 }
                 Mutation::DeleteExit { room_key, id } => {
                     if let Some(exit_id) = command.exit_id(id) {
-                        mapper.delete_exit(room_key, exit_id);
+                        batches.push(AreaMutationBatch::strict(
+                            room_key.area_id,
+                            vec![AreaMutation::DeleteExit { exit_id }],
+                            "Delete exit",
+                        ));
                     }
                 }
                 Mutation::CreateLabel {
                     area_id,
-                    args,
+                    mut args,
                     slot,
                 } => {
-                    command.pending += 1;
                     let command_id = command.id;
-                    let mapper = mapper.clone();
-                    tasks.push(Task::perform(
-                        async move { mapper.create_label(area_id, args).await },
-                        move |result| Outcome::Label {
-                            command: command_id,
-                            slot,
-                            result: result.map_err(|error| display_error(&error)),
-                        },
+                    let id = args.id.unwrap_or_else(|| LabelId(Uuid::new_v4()));
+                    args.id = Some(id);
+                    batches.push(AreaMutationBatch::strict(
+                        area_id,
+                        vec![AreaMutation::CreateLabel { body: args }],
+                        "Create label",
                     ));
+                    command.resolved_ids[slot] = Some(ResolvedId::Label(id));
+                    command.pending += 1;
+                    tasks.push(Task::done(Outcome::Label {
+                        command: command_id,
+                        slot,
+                        result: Ok(id),
+                    }));
                 }
                 Mutation::UpdateLabel {
                     area_id,
@@ -652,30 +800,45 @@ impl CommandStack {
                     updates,
                 } => {
                     if let Some(label_id) = command.label_id(id) {
-                        mapper.update_label(area_id, label_id, updates);
+                        batches.push(AreaMutationBatch::strict(
+                            area_id,
+                            vec![AreaMutation::UpdateLabel {
+                                label_id,
+                                body: updates,
+                            }],
+                            "Update label",
+                        ));
                     }
                 }
                 Mutation::DeleteLabel { area_id, id } => {
                     if let Some(label_id) = command.label_id(id) {
-                        mapper.delete_label(area_id, label_id);
+                        batches.push(AreaMutationBatch::strict(
+                            area_id,
+                            vec![AreaMutation::DeleteLabel { label_id }],
+                            "Delete label",
+                        ));
                     }
                 }
                 Mutation::CreateShape {
                     area_id,
-                    args,
+                    mut args,
                     slot,
                 } => {
-                    command.pending += 1;
                     let command_id = command.id;
-                    let mapper = mapper.clone();
-                    tasks.push(Task::perform(
-                        async move { mapper.create_shape(area_id, args).await },
-                        move |result| Outcome::Shape {
-                            command: command_id,
-                            slot,
-                            result: result.map_err(|error| display_error(&error)),
-                        },
+                    let id = args.id.unwrap_or_else(|| ShapeId(Uuid::new_v4()));
+                    args.id = Some(id);
+                    batches.push(AreaMutationBatch::strict(
+                        area_id,
+                        vec![AreaMutation::CreateShape { body: args }],
+                        "Create shape",
                     ));
+                    command.resolved_ids[slot] = Some(ResolvedId::Shape(id));
+                    command.pending += 1;
+                    tasks.push(Task::done(Outcome::Shape {
+                        command: command_id,
+                        slot,
+                        result: Ok(id),
+                    }));
                 }
                 Mutation::UpdateShape {
                     area_id,
@@ -683,18 +846,49 @@ impl CommandStack {
                     updates,
                 } => {
                     if let Some(shape_id) = command.shape_id(id) {
-                        mapper.update_shape(area_id, shape_id, updates);
+                        batches.push(AreaMutationBatch::strict(
+                            area_id,
+                            vec![AreaMutation::UpdateShape {
+                                shape_id,
+                                body: updates,
+                            }],
+                            "Update shape",
+                        ));
                     }
                 }
                 Mutation::DeleteShape { area_id, id } => {
                     if let Some(shape_id) = command.shape_id(id) {
-                        mapper.delete_shape(area_id, shape_id);
+                        batches.push(AreaMutationBatch::strict(
+                            area_id,
+                            vec![AreaMutation::DeleteShape { shape_id }],
+                            "Delete shape",
+                        ));
                     }
                 }
             }
         }
 
-        (Task::batch(tasks), true)
+        match mapper.mutate_batches(batches) {
+            Ok(submissions) => {
+                command.operation_ids.extend(
+                    submissions
+                        .into_iter()
+                        .filter_map(MutationSubmission::operation_id),
+                );
+                (Task::batch(tasks), true)
+            }
+            Err(error) => {
+                command.resolved_ids = resolved_before;
+                command.pending = pending_before;
+                let message = format!(
+                    "map gesture failed validation or durable enqueue: {}",
+                    display_error(&error)
+                );
+                log::warn!("{message}");
+                command.application_error = Some(message);
+                (Task::none(), false)
+            }
+        }
     }
 }
 
@@ -2834,8 +3028,8 @@ fn classify_pasted_exit(
 /// merged-back changes line up (the caller passes a zero offset).
 ///
 /// Returns the command plus the pasted rooms' (new) numbers so the caller
-/// can select them — room upserts apply synchronously, while labels and
-/// shapes select as their async creates resolve.
+/// can select them. All entities apply synchronously; labels and shapes emit
+/// completion messages so the editor can select their client-minted ids.
 ///
 /// # Panics
 ///
@@ -3000,8 +3194,7 @@ pub fn paste_clipboard(
         // the room-delete cascade won't clean the link up on undo, so it
         // needs its own DeleteLink.
         let any_existing = !mapping.contains_key(&source_a)
-            || endpoint_b_room
-                .is_some_and(|(source, _)| !mapping.contains_key(&source));
+            || endpoint_b_room.is_some_and(|(source, _)| !mapping.contains_key(&source));
 
         let mut members = Vec::new();
         let mut viable = true;
@@ -3399,18 +3592,87 @@ mod tests {
         Mapper::new(std::sync::Arc::new(MockBackend::default()), dir)
     }
 
+    fn resolved_id(stack: &CommandStack, command_id: CommandId, slot: SlotId) -> ResolvedId {
+        stack
+            .undo
+            .iter()
+            .chain(stack.redo.iter())
+            .find(|command| command.id == command_id)
+            .and_then(|command| command.resolved_ids.get(slot))
+            .and_then(|id| *id)
+            .expect("create id was minted before enqueue")
+    }
+
+    /// Settles the ready create-completion tasks that an iced runtime would
+    /// normally feed back to the command stack.
+    fn drive_create_completions(
+        mapper: &Mapper,
+        stack: &mut CommandStack,
+        command_id: CommandId,
+        mutations: Vec<Mutation>,
+    ) {
+        for mutation in mutations {
+            match mutation {
+                Mutation::CreateExit { room_key, slot, .. } => {
+                    let ResolvedId::Exit(id) = resolved_id(stack, command_id, slot) else {
+                        panic!("exit slot held the wrong entity kind");
+                    };
+                    stack.resolve(
+                        mapper,
+                        Outcome::Exit {
+                            command: command_id,
+                            slot,
+                            room_key,
+                            follow_up: None,
+                            result: Ok(id),
+                        },
+                    );
+                }
+                Mutation::CreateLabel { slot, .. } => {
+                    let ResolvedId::Label(id) = resolved_id(stack, command_id, slot) else {
+                        panic!("label slot held the wrong entity kind");
+                    };
+                    stack.resolve(
+                        mapper,
+                        Outcome::Label {
+                            command: command_id,
+                            slot,
+                            result: Ok(id),
+                        },
+                    );
+                }
+                Mutation::CreateShape { slot, .. } => {
+                    let ResolvedId::Shape(id) = resolved_id(stack, command_id, slot) else {
+                        panic!("shape slot held the wrong entity kind");
+                    };
+                    stack.resolve(
+                        mapper,
+                        Outcome::Shape {
+                            command: command_id,
+                            slot,
+                            result: Ok(id),
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     async fn area_with_rooms(mapper: &Mapper, rooms: &[(i32, f32, f32)]) -> AreaId {
         let area_id = mapper.create_area("Test".into()).await.expect("area");
         for (number, x, y) in rooms {
-            mapper.upsert_room(
-                RoomKey::new(area_id, RoomNumber(*number)),
-                RoomUpdates {
-                    title: Some(format!("Room {number}")),
-                    x: Some(*x),
-                    y: Some(*y),
-                    ..Default::default()
-                },
-            );
+            mapper
+                .upsert_room(
+                    RoomKey::new(area_id, RoomNumber(*number)),
+                    RoomUpdates {
+                        title: Some(format!("Room {number}")),
+                        x: Some(*x),
+                        y: Some(*y),
+                        ..Default::default()
+                    },
+                )
+                .expect("stage room");
         }
         area_id
     }
@@ -3550,7 +3812,9 @@ mod tests {
         let area_id = area_with_rooms(&mapper, &[(1, 0.0, 0.0), (2, 1.0, 0.0)]).await;
         let key = RoomKey::new(area_id, RoomNumber(1));
 
-        mapper.set_room_property(key.clone(), "zone".into(), "docks".into());
+        mapper
+            .set_room_property(key.clone(), "zone".into(), "docks".into())
+            .expect("stage property");
         let exit_id = mapper
             .create_exit(
                 key.clone(),
@@ -3584,39 +3848,26 @@ mod tests {
             );
         }
 
-        // Undo: the room and property restore synchronously; the exit is an
-        // async create we drive by hand instead of through an iced runtime.
+        // Undo stages the recreation synchronously; settle the ready UI
+        // completion by hand because this test has no iced runtime.
         let _ = stack.undo(&mapper);
 
         let new_exit_id = {
             let undone = stack.redo.last().expect("undone command");
-            let mut created = None;
-            for mutation in undone.undo.clone() {
-                if let Mutation::CreateExit {
-                    room_key,
-                    args,
-                    follow_up,
-                    slot,
-                } = mutation
-                {
-                    let id = mapper
-                        .create_exit(room_key.clone(), args)
-                        .await
-                        .expect("recreate exit");
-                    stack.resolve(
-                        &mapper,
-                        Outcome::Exit {
-                            command: stack.redo.last().expect("cmd").id,
-                            slot,
-                            room_key,
-                            follow_up,
-                            result: Ok(id),
-                        },
-                    );
-                    created = Some(id);
-                }
-            }
-            created.expect("exit recreated")
+            let command_id = undone.id;
+            let mutations = undone.undo.clone();
+            let slot = mutations
+                .iter()
+                .find_map(|mutation| match mutation {
+                    Mutation::CreateExit { slot, .. } => Some(*slot),
+                    _ => None,
+                })
+                .expect("exit recreation");
+            let ResolvedId::Exit(id) = resolved_id(&stack, command_id, slot) else {
+                panic!("exit slot held the wrong entity kind");
+            };
+            drive_create_completions(&mapper, &mut stack, command_id, mutations);
+            id
         };
         assert_ne!(new_exit_id, exit_id, "recreated exit gets a fresh id");
 
@@ -3740,7 +3991,7 @@ mod tests {
 
         // Restoring room 1 (UpsertRooms) and re-linking the inbound exit
         // (UpdateExit) are both synchronous — room 1 had no outgoing exits to
-        // recreate, so no async create work is needed here.
+        // recreate, so no create-completion work is needed here.
         let _ = stack.undo(&mapper);
         assert_eq!(
             exit_destination(&mapper, &host_key, inbound),
@@ -3883,50 +4134,10 @@ mod tests {
         let _ = stack.push_and_apply(&mapper, command);
         let _ = stack.undo(&mapper);
 
-        // Drive the async recreates the dropped Task would have run.
+        // Settle the ready create-completion tasks dropped by this test.
         let command_id = stack.redo.last().expect("undone").id;
         let mutations = stack.redo.last().expect("undone").undo.clone();
-        for mutation in mutations {
-            match mutation {
-                Mutation::CreateExit {
-                    room_key,
-                    args,
-                    follow_up,
-                    slot,
-                } => {
-                    let id = mapper
-                        .create_exit(room_key.clone(), args)
-                        .await
-                        .expect("recreate exit");
-                    stack.resolve(
-                        &mapper,
-                        Outcome::Exit {
-                            command: command_id,
-                            slot,
-                            room_key,
-                            follow_up,
-                            result: Ok(id),
-                        },
-                    );
-                }
-                Mutation::CreateLabel { args, slot, .. } => {
-                    let id = mapper
-                        .create_label(area_id, args)
-                        .await
-                        .expect("recreate label");
-                    stack.resolve(
-                        &mapper,
-                        Outcome::Label {
-                            command: command_id,
-                            slot,
-                            result: Ok(id),
-                        },
-                    );
-                }
-                Mutation::UpsertRooms(..) => {}
-                other => panic!("unexpected undo mutation: {other:?}"),
-            }
-        }
+        drive_create_completions(&mapper, &mut stack, command_id, mutations);
 
         let atlas = mapper.get_current_atlas();
         let area = atlas.get_area(&area_id).expect("area");
@@ -3983,8 +4194,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let command = delete_selection(&mapper.get_current_atlas(), area_id, &selection)
-            .expect("command");
+        let command =
+            delete_selection(&mapper.get_current_atlas(), area_id, &selection).expect("command");
         let _ = stack.push_and_apply(&mapper, command);
 
         {
@@ -4036,8 +4247,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let command = delete_selection(&mapper.get_current_atlas(), area_id, &selection)
-            .expect("command");
+        let command =
+            delete_selection(&mapper.get_current_atlas(), area_id, &selection).expect("command");
         assert!(
             !command
                 .undo
@@ -4062,7 +4273,10 @@ mod tests {
         let atlas = mapper.get_current_atlas();
         let area = atlas.get_area(&area_id).expect("area");
         assert!(area.get_room(&RoomNumber(1)).is_some(), "room restored");
-        assert!(area.get_connection(connection_id).is_some(), "link restored");
+        assert!(
+            area.get_connection(connection_id).is_some(),
+            "link restored"
+        );
         let exits: Vec<_> = area
             .get_rooms()
             .iter()
@@ -4071,9 +4285,7 @@ mod tests {
             .collect();
         assert_eq!(exits.len(), 2, "both member exits restored exactly once");
         assert!(
-            exits
-                .iter()
-                .all(|exit| exit.to_room_number.is_some()),
+            exits.iter().all(|exit| exit.to_room_number.is_some()),
             "restored exits keep their destinations"
         );
     }
@@ -4086,13 +4298,8 @@ mod tests {
         let connection_id = link_rooms(&mapper, &mut stack, source, 1, 2).await;
 
         let selection: Selection = [EntityId::Connection(connection_id)].into_iter().collect();
-        let clipboard = snapshot_selection(
-            &mapper.get_current_atlas(),
-            source,
-            &selection,
-            true,
-            false,
-        );
+        let clipboard =
+            snapshot_selection(&mapper.get_current_atlas(), source, &selection, true, false);
         assert!(clipboard.rooms.is_empty());
         assert_eq!(
             clipboard.connections.len(),
@@ -4179,40 +4386,19 @@ mod tests {
         );
         let command = command.expect("command");
         assert!(pasted_rooms.is_empty());
-        let _ = stack.push_and_apply(&mapper, command);
+        let (_task, operation_ids) = stack.push_and_apply_tracked(&mapper, command);
+        assert_eq!(
+            operation_ids.len(),
+            2,
+            "both creates are represented in durable undo history"
+        );
 
         assert!(!stack.can_undo(), "pending creates block undo");
 
-        // Drive the async creates the dropped Task would have run.
+        // Settle the ready completion tasks dropped by this test.
         let command_id = stack.undo.back().expect("pushed").id;
         let mutations = stack.undo.back().expect("pushed").redo.clone();
-        for mutation in mutations {
-            match mutation {
-                Mutation::CreateLabel { args, slot, .. } => {
-                    let id = mapper.create_label(area_id, args).await.expect("label");
-                    stack.resolve(
-                        &mapper,
-                        Outcome::Label {
-                            command: command_id,
-                            slot,
-                            result: Ok(id),
-                        },
-                    );
-                }
-                Mutation::CreateShape { args, slot, .. } => {
-                    let id = mapper.create_shape(area_id, args).await.expect("shape");
-                    stack.resolve(
-                        &mapper,
-                        Outcome::Shape {
-                            command: command_id,
-                            slot,
-                            result: Ok(id),
-                        },
-                    );
-                }
-                other => panic!("unexpected paste mutation: {other:?}"),
-            }
-        }
+        drive_create_completions(&mapper, &mut stack, command_id, mutations);
 
         {
             let atlas = mapper.get_current_atlas();
@@ -4455,35 +4641,11 @@ mod tests {
         );
     }
 
-    /// Runs the async exit creates the just-pushed paste command issued
-    /// (the iced Task that would drive them is dropped in tests).
-    async fn drive_paste_exit_creates(mapper: &Mapper, stack: &mut CommandStack) {
+    /// Settles the ready exit-create completions from a just-pushed paste.
+    fn drive_paste_exit_creates(mapper: &Mapper, stack: &mut CommandStack) {
         let command_id = stack.undo.back().expect("pushed").id;
         let mutations = stack.undo.back().expect("pushed").redo.clone();
-        for mutation in mutations {
-            if let Mutation::CreateExit {
-                room_key,
-                args,
-                follow_up,
-                slot,
-            } = mutation
-            {
-                let id = mapper
-                    .create_exit(room_key.clone(), args)
-                    .await
-                    .expect("exit");
-                stack.resolve(
-                    mapper,
-                    Outcome::Exit {
-                        command: command_id,
-                        slot,
-                        room_key,
-                        follow_up,
-                        result: Ok(id),
-                    },
-                );
-            }
-        }
+        drive_create_completions(mapper, stack, command_id, mutations);
     }
 
     #[tokio::test]
@@ -4493,11 +4655,13 @@ mod tests {
         // Room 2 is taken in the target; room 1 is vacant there.
         let target = area_with_rooms(&mapper, &[(2, 50.0, 50.0)]).await;
 
-        mapper.set_room_property(
-            RoomKey::new(source, RoomNumber(1)),
-            "zone".into(),
-            "docks".into(),
-        );
+        mapper
+            .set_room_property(
+                RoomKey::new(source, RoomNumber(1)),
+                "zone".into(),
+                "docks".into(),
+            )
+            .expect("stage property");
         // 1 → 2: both ends copied. 1 → 3 is a boundary link and is omitted.
         for (direction, to) in [(ExitDirection::East, 2), (ExitDirection::North, 3)] {
             mapper
@@ -4593,7 +4757,7 @@ mod tests {
 
         let mut stack = CommandStack::default();
         let _ = stack.push_and_apply(&mapper, command);
-        drive_paste_exit_creates(&mapper, &mut stack).await;
+        drive_paste_exit_creates(&mapper, &mut stack);
 
         {
             let atlas = mapper.get_current_atlas();
@@ -4699,7 +4863,7 @@ mod tests {
 
         let mut stack = CommandStack::default();
         let _ = stack.push_and_apply(&mapper, command);
-        drive_paste_exit_creates(&mapper, &mut stack).await;
+        drive_paste_exit_creates(&mapper, &mut stack);
 
         let atlas = mapper.get_current_atlas();
         let area = atlas.get_area(&area_id).expect("area");
@@ -4746,12 +4910,15 @@ mod tests {
 
         assert!(!stack.can_undo(), "pending create blocks undo");
 
+        let ResolvedId::Label(id) = resolved_id(&stack, 7, 0) else {
+            panic!("label slot held the wrong entity kind");
+        };
         stack.resolve(
             &mapper,
             Outcome::Label {
                 command: 7,
                 slot: 0,
-                result: Ok(LabelId(Uuid::new_v4())),
+                result: Ok(id),
             },
         );
         assert!(stack.can_undo(), "resolution unblocks undo");

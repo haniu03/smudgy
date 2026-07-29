@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use smudgy_cloud::cloud_api::{CreateShareRequest, SharePatch, ShareScope};
 use smudgy_cloud::mapper::{RoomKey, SyncState};
-use smudgy_cloud::mutation::{AreaMutation, MutationEnvelope, MutationResult, Precondition, ResourceKind};
+use smudgy_cloud::mutation::{
+    AreaMutation, MutationEnvelope, MutationResult, Precondition, ResourceKind,
+};
 use smudgy_cloud::{
     AreaId, AtlasId, CachedCloudMapper, CloudApiClient, CloudError, CloudMapper, ConnectionDash,
     ConnectionKind, ConnectionRouting, Credential, CredentialSource, ExitArgs, ExitDirection,
@@ -98,7 +100,10 @@ async fn execute_ops(
     area: AreaId,
     payload: Vec<AreaMutation>,
 ) -> MutationResult {
-    let current = backend.get_area(&area).await.expect("fetch for the precondition");
+    let current = backend
+        .get_area(&area)
+        .await
+        .expect("fetch for the precondition");
     backend
         .execute_mutation(
             &area,
@@ -259,22 +264,44 @@ async fn shared_area_carries_atlas_id_and_name() {
     let loose = server.create_area(&owner, "Wilds");
 
     // AREA-scope grants only — no atlas-scope grant covers the container.
-    server.grant(&owner, &grantee, GrantScope::Area(filed), GrantFlags::VIEW_ONLY);
-    server.grant(&owner, &grantee, GrantScope::Area(loose), GrantFlags::VIEW_ONLY);
+    server.grant(
+        &owner,
+        &grantee,
+        GrantScope::Area(filed),
+        GrantFlags::VIEW_ONLY,
+    );
+    server.grant(
+        &owner,
+        &grantee,
+        GrantScope::Area(loose),
+        GrantFlags::VIEW_ONLY,
+    );
 
     let grantee_backend = CloudMapper::new(server.base_url.clone(), grantee.api_key.clone());
 
     // GET /areas list rows.
-    let list = grantee_backend.list_areas().await.expect("grantee area list");
-    let filed_row = list.iter().find(|a| a.id == filed).expect("filed area listed");
+    let list = grantee_backend
+        .list_areas()
+        .await
+        .expect("grantee area list");
+    let filed_row = list
+        .iter()
+        .find(|a| a.id == filed)
+        .expect("filed area listed");
     assert_eq!(
         filed_row.atlas_id,
         Some(AtlasId(atlas)),
         "the area-scope grantee sees the un-redacted atlas_id"
     );
     assert_eq!(filed_row.atlas_name.as_deref(), Some("Cities"));
-    let loose_row = list.iter().find(|a| a.id == loose).expect("loose area listed");
-    assert!(loose_row.atlas_id.is_none(), "atlas-less area has no atlas_id");
+    let loose_row = list
+        .iter()
+        .find(|a| a.id == loose)
+        .expect("loose area listed");
+    assert!(
+        loose_row.atlas_id.is_none(),
+        "atlas-less area has no atlas_id"
+    );
     assert!(
         loose_row.atlas_name.is_none(),
         "atlas-less area has no atlas_name"
@@ -307,8 +334,12 @@ async fn room_tags_roundtrip_through_sync() {
     let writer_dir = TempCacheDir::new("tags-writer");
     let writer = new_synced_mapper(&server.base_url, &owner.api_key, writer_dir.path()).await;
     let room = RoomKey::new(area, RoomNumber(1));
-    writer.add_room_tag(room.clone(), "inn".to_string());
-    writer.add_room_tag(room.clone(), "Peace".to_string());
+    writer
+        .add_room_tag(room.clone(), "inn".to_string())
+        .expect("enqueue tag");
+    writer
+        .add_room_tag(room.clone(), "Peace".to_string())
+        .expect("enqueue tag");
     assert!(
         writer
             .wait_for_sync_completion(10)
@@ -326,11 +357,20 @@ async fn room_tags_roundtrip_through_sync() {
         .expect("startup tick caches the area");
     let room_cache = cached.get_room(&RoomNumber(1)).expect("room present");
     let tags: Vec<&str> = room_cache.tags().collect();
-    assert_eq!(tags, vec!["INN", "PEACE"], "tags normalized to UPPERCASE and sorted");
-    assert!(room_cache.has_tag("inn"), "tag membership is case-insensitive");
+    assert_eq!(
+        tags,
+        vec!["INN", "PEACE"],
+        "tags normalized to UPPERCASE and sorted"
+    );
+    assert!(
+        room_cache.has_tag("inn"),
+        "tag membership is case-insensitive"
+    );
 
     // Removing a tag moves the rev; the reader's tick refetches and drops it.
-    writer.remove_room_tag(room, "INN".to_string());
+    writer
+        .remove_room_tag(room, "INN".to_string())
+        .expect("enqueue tag removal");
     assert!(
         writer
             .wait_for_sync_completion(10)
@@ -339,7 +379,10 @@ async fn room_tags_roundtrip_through_sync() {
         "pending queue drains"
     );
     tick(&mapper).await;
-    let cached = mapper.get_current_atlas().get_area(&area).expect("area cached");
+    let cached = mapper
+        .get_current_atlas()
+        .get_area(&area)
+        .expect("area cached");
     let room_cache = cached.get_room(&RoomNumber(1)).expect("room present");
     assert!(!room_cache.has_tag("INN"), "INN gone after sync");
     assert!(room_cache.has_tag("PEACE"), "PEACE retained");
@@ -470,7 +513,50 @@ async fn pair_member_retarget_is_refused_with_unlink_before_edit() {
 
     let backend = CloudMapper::new(server.base_url.clone(), owner.api_key.clone());
     let current = backend.get_area(&area).await.expect("fetch");
-    assert_eq!(current.connections.len(), 1, "the seed pair shares one Connection");
+    assert_eq!(
+        current.connections.len(),
+        1,
+        "the seed pair shares one Connection"
+    );
+    let seeded_exit = current
+        .rooms
+        .iter()
+        .flat_map(|room| &room.exits)
+        .find(|exit| exit.id.0 == out_id)
+        .expect("seeded exit");
+
+    // Presence is not a topology change: a full snapshot equal to the
+    // current pair member is legal.
+    backend
+        .execute_mutation(
+            &area,
+            &MutationEnvelope {
+                operation_id: Uuid::new_v4(),
+                preconditions: vec![Precondition {
+                    resource: ResourceKind::Area,
+                    id: area.0,
+                    expected_rev: current.area.rev,
+                    access_fingerprint: current.area.access.map(|access| access.fingerprint()),
+                }],
+                payload: vec![AreaMutation::UpdateExit {
+                    exit_id: smudgy_cloud::ExitId(out_id),
+                    body: ExitUpdates {
+                        from_direction: Some(seeded_exit.from_direction),
+                        to_area_id: seeded_exit.to_area_id,
+                        to_room_number: seeded_exit.to_room_number,
+                        to_direction: seeded_exit.to_direction,
+                        ..ExitUpdates::default()
+                    },
+                }],
+            },
+        )
+        .await
+        .expect("an equal full snapshot must not require unlinking");
+
+    let current = backend
+        .get_area(&area)
+        .await
+        .expect("refetch after snapshot");
 
     let envelope = |payload| MutationEnvelope {
         operation_id: Uuid::new_v4(),
@@ -497,6 +583,25 @@ async fn pair_member_retarget_is_refused_with_unlink_before_edit() {
         )
         .await
         .expect_err("a pair-breaking retarget must be refused");
+    match err {
+        CloudError::StructuralConflict(reason) => assert_eq!(reason, "unlink_before_edit"),
+        other => panic!("expected StructuralConflict, got {other:?}"),
+    }
+
+    // Arrival direction participates in reciprocity too.
+    let err = backend
+        .execute_mutation(
+            &area,
+            &envelope(vec![AreaMutation::UpdateExit {
+                exit_id: smudgy_cloud::ExitId(out_id),
+                body: ExitUpdates {
+                    to_direction: Some(smudgy_cloud::ExitDirection::North),
+                    ..ExitUpdates::default()
+                },
+            }]),
+        )
+        .await
+        .expect_err("a pair-breaking arrival-direction edit must be refused");
     match err {
         CloudError::StructuralConflict(reason) => assert_eq!(reason, "unlink_before_edit"),
         other => panic!("expected StructuralConflict, got {other:?}"),
@@ -566,14 +671,16 @@ async fn secret_pair_member_hides_the_whole_group_from_an_uncleared_editor() {
         .await
         .expect("reverse create");
     // Mark ONE member secret (a traversal-only edit — legal on a pair).
-    owner_mapper.update_exit(
-        RoomKey::new(area, RoomNumber(1)),
-        out_id,
-        ExitUpdates {
-            is_secret: Some(true),
-            ..ExitUpdates::default()
-        },
-    );
+    owner_mapper
+        .update_exit(
+            RoomKey::new(area, RoomNumber(1)),
+            out_id,
+            ExitUpdates {
+                is_secret: Some(true),
+                ..ExitUpdates::default()
+            },
+        )
+        .expect("queue secret edit");
     assert!(
         owner_mapper
             .wait_for_sync_completion(10)
@@ -627,14 +734,16 @@ async fn secret_pair_member_hides_the_whole_group_from_an_uncleared_editor() {
     // projected rev (§6.3: a reveal bumps the public projection).
     let editor_client = api_client(&server.base_url, &editor.api_key);
     let rev_hidden = sync_row_rev(&editor_client, area).await;
-    owner_mapper.update_exit(
-        RoomKey::new(area, RoomNumber(1)),
-        out_id,
-        ExitUpdates {
-            is_secret: Some(false),
-            ..ExitUpdates::default()
-        },
-    );
+    owner_mapper
+        .update_exit(
+            RoomKey::new(area, RoomNumber(1)),
+            out_id,
+            ExitUpdates {
+                is_secret: Some(false),
+                ..ExitUpdates::default()
+            },
+        )
+        .expect("queue secret clear");
     assert!(
         owner_mapper
             .wait_for_sync_completion(10)
@@ -649,7 +758,10 @@ async fn secret_pair_member_hides_the_whole_group_from_an_uncleared_editor() {
     );
 
     tick(&editor_mapper).await;
-    let projected = editor_backend.get_area(&area).await.expect("editor refetch");
+    let projected = editor_backend
+        .get_area(&area)
+        .await
+        .expect("editor refetch");
     assert_eq!(projected.connections.len(), 1, "the group reappears whole");
     let visible_exits: Vec<_> = projected
         .rooms
@@ -677,7 +789,7 @@ async fn secret_pair_member_hides_the_whole_group_from_an_uncleared_editor() {
 const SECRET_TITLE: &str = "ZZ-SECRET-VAULT-XYZZY";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn include_secrets_toggle_moves_rev_and_refetches() {
+async fn shared_rev_reports_secret_activity_and_fingerprint_refetches_capability_changes() {
     let server = MockServer::spawn().await;
     let owner = server.create_user("owner@example.com", "owner", true);
     let grantee = server.create_user("friend@example.com", "friend", true);
@@ -704,7 +816,12 @@ async fn include_secrets_toggle_moves_rev_and_refetches() {
     )
     .await;
 
-    let grant_id = server.grant(&owner, &grantee, GrantScope::Area(area), GrantFlags::VIEW_ONLY);
+    let grant_id = server.grant(
+        &owner,
+        &grantee,
+        GrantScope::Area(area),
+        GrantFlags::VIEW_ONLY,
+    );
 
     let cache_dir = TempCacheDir::new("secrets-toggle");
     let mapper = new_synced_mapper(&server.base_url, &grantee.api_key, cache_dir.path()).await;
@@ -718,6 +835,36 @@ async fn include_secrets_toggle_moves_rev_and_refetches() {
 
     let grantee_client = api_client(&server.base_url, &grantee.api_key);
     let rev_view_only = sync_row_rev(&grantee_client, area).await;
+
+    // Secret-only owner activity still advances the revision visible to this
+    // uncleared reader. The redacted document remains secret-free.
+    execute_ops(
+        &owner_mapper,
+        area,
+        vec![AreaMutation::UpsertRoom {
+            room_number: RoomNumber(7),
+            body: RoomUpdates {
+                description: Some("owner-only activity".to_string()),
+                ..RoomUpdates::default()
+            },
+        }],
+    )
+    .await;
+    let rev_after_secret_edit = sync_row_rev(&grantee_client, area).await;
+    assert!(
+        rev_after_secret_edit > rev_view_only,
+        "all readers are notified that a secret-only edit occurred"
+    );
+    tick(&mapper).await;
+    assert!(
+        mapper
+            .get_current_atlas()
+            .get_area(&area)
+            .expect("area remains cached")
+            .get_room(&RoomNumber(7))
+            .is_none(),
+        "activity notification does not reveal secret content"
+    );
 
     // Owner raises include_secrets (root, Area-scope grant: allowed).
     let owner_client = api_client(&server.base_url, &owner.api_key);
@@ -745,9 +892,9 @@ async fn include_secrets_toggle_moves_rev_and_refetches() {
     assert_eq!(room7.get_title(), SECRET_TITLE);
 
     let rev_with_secrets = sync_row_rev(&grantee_client, area).await;
-    assert_ne!(
-        rev_with_secrets, rev_view_only,
-        "served rev moves when secrets enter the projection (opaque: inequality only)"
+    assert_eq!(
+        rev_with_secrets, rev_after_secret_edit,
+        "share flags change the fingerprint, not the shared area revision"
     );
 
     // Sanity-check the disk scanner actually sees the secret bytes while the
@@ -781,9 +928,9 @@ async fn include_secrets_toggle_moves_rev_and_refetches() {
     );
 
     let rev_back = sync_row_rev(&grantee_client, area).await;
-    assert_ne!(
+    assert_eq!(
         rev_back, rev_with_secrets,
-        "served rev moves again on the downgrade (opaque: inequality only)"
+        "dropping secret access also leaves the shared area revision alone"
     );
 
     assert!(
@@ -805,7 +952,12 @@ async fn revoke_purges_cache_and_disk() {
 
     let area = server.create_area(&owner, "Borrowed Realm");
     server.add_room(area, 1, "Atrium", false);
-    let grant_id = server.grant(&owner, &grantee, GrantScope::Area(area), GrantFlags::VIEW_ONLY);
+    let grant_id = server.grant(
+        &owner,
+        &grantee,
+        GrantScope::Area(area),
+        GrantFlags::VIEW_ONLY,
+    );
 
     let cache_dir = TempCacheDir::new("revoke");
     let mapper = new_synced_mapper(&server.base_url, &grantee.api_key, cache_dir.path()).await;
@@ -854,7 +1006,12 @@ async fn unknown_link_resolves_when_neighbour_shared() {
     server.add_room(area_a, 1, "Gatehouse", false);
     server.add_room(area_b, 1, "Far Side", false);
     server.add_exit(area_a, 1, "West", Some((area_b, 1)), false);
-    server.grant(&owner, &grantee, GrantScope::Area(area_a), GrantFlags::VIEW_ONLY);
+    server.grant(
+        &owner,
+        &grantee,
+        GrantScope::Area(area_a),
+        GrantFlags::VIEW_ONLY,
+    );
 
     let cache_dir = TempCacheDir::new("unknown-link");
     let mapper = new_synced_mapper(&server.base_url, &grantee.api_key, cache_dir.path()).await;
@@ -876,7 +1033,12 @@ async fn unknown_link_resolves_when_neighbour_shared() {
     let rev_a_before = sync_row_rev(&grantee_client, area_a).await;
 
     // Owner shares B as well; A's content does not change at all.
-    server.grant(&owner, &grantee, GrantScope::Area(area_b), GrantFlags::VIEW_ONLY);
+    server.grant(
+        &owner,
+        &grantee,
+        GrantScope::Area(area_b),
+        GrantFlags::VIEW_ONLY,
+    );
 
     tick(&mapper).await;
 
@@ -956,13 +1118,15 @@ async fn concurrent_edits_conflict_refetch_replay_and_converge() {
     let mapper_b = new_synced_mapper(&server.base_url, &user.api_key, cache_b.path()).await;
 
     // A's write lands, moving the server past B's confirmed revision.
-    mapper_a.upsert_room(
-        RoomKey::new(area, RoomNumber(2)),
-        RoomUpdates {
-            title: Some("From A".to_string()),
-            ..RoomUpdates::default()
-        },
-    );
+    mapper_a
+        .upsert_room(
+            RoomKey::new(area, RoomNumber(2)),
+            RoomUpdates {
+                title: Some("From A".to_string()),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("enqueue mapper A room");
     mapper_a.sync_now();
     assert!(
         mapper_a
@@ -984,13 +1148,15 @@ async fn concurrent_edits_conflict_refetch_replay_and_converge() {
     // write), leaving room 2 out of B's atlas until a later tick. Only the
     // stale-revision send pins the 409 → refetch → replay path this test is
     // about.
-    mapper_b.upsert_room(
-        RoomKey::new(area, RoomNumber(3)),
-        RoomUpdates {
-            title: Some("From B".to_string()),
-            ..RoomUpdates::default()
-        },
-    );
+    mapper_b
+        .upsert_room(
+            RoomKey::new(area, RoomNumber(3)),
+            RoomUpdates {
+                title: Some("From B".to_string()),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("enqueue mapper B room");
     assert!(
         mapper_b
             .wait_for_sync_completion(10)
@@ -1064,13 +1230,15 @@ async fn receipt_dedupes_a_retry_after_a_lost_response() {
     // The first response is lost AFTER the mock commits and stores the
     // receipt; the client sees a transport failure and retries.
     server.drop_next_mutation_responses(1);
-    mapper.upsert_room(
-        RoomKey::new(area, RoomNumber(2)),
-        RoomUpdates {
-            title: Some("Once Only".to_string()),
-            ..RoomUpdates::default()
-        },
-    );
+    mapper
+        .upsert_room(
+            RoomKey::new(area, RoomNumber(2)),
+            RoomUpdates {
+                title: Some("Once Only".to_string()),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("enqueue room");
     assert!(
         mapper
             .wait_for_sync_completion(15)
@@ -1083,12 +1251,19 @@ async fn receipt_dedupes_a_retry_after_a_lost_response() {
     // receipt, so nothing re-applied and the rev moved exactly once.
     let requests = server.mutation_requests();
     assert_eq!(requests.len(), 2, "original send plus one retry");
-    assert_eq!(requests[0].0, requests[1].0, "the retry reuses the operation id");
+    assert_eq!(
+        requests[0].0, requests[1].0,
+        "the retry reuses the operation id"
+    );
     assert!(!requests[0].1, "the first request applied fresh");
     assert!(requests[1].1, "the retry replayed the stored receipt");
 
     let (rev_after, _) = server.area_revs(area);
-    assert_eq!(rev_after, rev_before + 1, "the mutation applied exactly once");
+    assert_eq!(
+        rev_after,
+        rev_before + 1,
+        "the mutation applied exactly once"
+    );
 
     // The client's confirmed state matches the single application.
     let cached = mapper
@@ -1124,7 +1299,10 @@ async fn replay_after_fingerprint_change_yields_projection_changed() {
 
     // The grantee applies an envelope through the real client stack.
     let grantee_backend = CloudMapper::new(server.base_url.clone(), grantee.api_key.clone());
-    let before = grantee_backend.get_area(&area).await.expect("fetch for the precondition");
+    let before = grantee_backend
+        .get_area(&area)
+        .await
+        .expect("fetch for the precondition");
     let envelope = MutationEnvelope {
         operation_id: Uuid::new_v4(),
         preconditions: vec![Precondition {
@@ -1217,7 +1395,9 @@ async fn idempotent_tag_readd_moves_no_rev() {
     let rev_initial = sync_row_rev(&client, area).await;
 
     // First add: a real insert, the served rev moves.
-    mapper.add_room_tag(RoomKey::new(area, RoomNumber(1)), "inn".to_string());
+    mapper
+        .add_room_tag(RoomKey::new(area, RoomNumber(1)), "inn".to_string())
+        .expect("enqueue tag");
     assert!(
         mapper
             .wait_for_sync_completion(10)
@@ -1235,7 +1415,9 @@ async fn idempotent_tag_readd_moves_no_rev() {
     // is accepted and acknowledged, but every op no-ops, so neither rev nor
     // public_rev moves.
     let revs_before_readd = server.area_revs(area);
-    mapper.add_room_tag(RoomKey::new(area, RoomNumber(1)), "Inn".to_string());
+    mapper
+        .add_room_tag(RoomKey::new(area, RoomNumber(1)), "Inn".to_string())
+        .expect("enqueue duplicate tag");
     assert!(
         mapper
             .wait_for_sync_completion(10)

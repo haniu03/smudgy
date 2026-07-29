@@ -15,14 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use smudgy_core::models::local_packages::packages_dir;
-use smudgy_core::models::shared_packages::{self, UpdateMode};
-use smudgy_core::session::runtime::RuntimeAction;
-use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
 use smudgy_cloud::{
     CloudMapper, CompositeBackend, Credential, CredentialSource, LocalBackend, Mapper,
     MapperBackend, PackageApiClient, RoomNumber, RoomUpdates, mapper::RoomKey,
 };
+use smudgy_core::models::local_packages::packages_dir;
+use smudgy_core::models::shared_packages::{self, UpdateMode};
+use smudgy_core::session::runtime::RuntimeAction;
+use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
 use std::collections::HashSet;
 
 const QUIET_PERIOD: Duration = Duration::from_millis(900);
@@ -33,7 +33,9 @@ fn copy_package_source(server: &str) {
         .join("..")
         .join("packages")
         .join("auto-mapper");
-    let dest = packages_dir(server).expect("packages dir").join("auto-mapper");
+    let dest = packages_dir(server)
+        .expect("packages dir")
+        .join("auto-mapper");
     std::fs::create_dir_all(&dest).unwrap();
     for entry in std::fs::read_dir(&source).expect("read packages/auto-mapper") {
         let entry = entry.unwrap();
@@ -187,16 +189,16 @@ async fn auto_mapper_maps_follows_and_promotes() {
     assert_eq!(area.get_name(), "midgaard");
     // 100, 101, 103 visited + the unvisited placeholder for 102 (every room the server
     // names is on the map); revisiting room 100 must not duplicate anything.
-    assert_eq!(area.room_count(), 4, "three visited rooms + the 102 placeholder");
+    assert_eq!(
+        area.room_count(),
+        4,
+        "three visited rooms + the 102 placeholder"
+    );
     assert_eq!(room100.get_title(), "Temple Square");
     assert_eq!(room101.get_title(), "Market Street");
     // No two rooms may stack: catches both trusting the zone-granular Aardwolf
     // coord and reading placement through a stale area-handle snapshot.
-    let positions = [
-        ("100", &room100),
-        ("101", &room101),
-        ("103", &room103),
-    ];
+    let positions = [("100", &room100), ("101", &room101), ("103", &room103)];
     for (i, (name_a, a)) in positions.iter().enumerate() {
         for (name_b, b) in positions.iter().skip(i + 1) {
             assert!(
@@ -259,7 +261,10 @@ async fn auto_mapper_maps_follows_and_promotes() {
     let (key102, room102) = atlas
         .find_room_by_external_id("102")
         .unwrap_or_else(|| panic!("neighbor 102 exists as a placeholder.\n{transcript}"));
-    assert_eq!(key102.area_id, key100.area_id, "the placeholder joins the zone area");
+    assert_eq!(
+        key102.area_id, key100.area_id,
+        "the placeholder joins the zone area"
+    );
     assert_eq!(
         room102.get_property("unvisited"),
         Some("true"),
@@ -274,7 +279,8 @@ async fn auto_mapper_maps_follows_and_promotes() {
     );
 
     // ---- savemap: promote to the local tier, drop the session original. ----
-    tx.send(RuntimeAction::Send(Arc::new("savemap".to_string()))).unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("savemap".to_string())))
+        .unwrap();
     while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
         if let SessionEvent::UpdateBuffer(updates) = event.event {
             collect(&updates, &mut lines);
@@ -290,7 +296,10 @@ async fn auto_mapper_maps_follows_and_promotes() {
     let (promoted_key, promoted_room) = atlas
         .find_room_by_external_id("100")
         .expect("room 100 still resolves after promotion");
-    assert_ne!(promoted_key.area_id, key100.area_id, "a fresh (imported) area");
+    assert_ne!(
+        promoted_key.area_id, key100.area_id,
+        "a fresh (imported) area"
+    );
     assert!(
         !mapper.is_ephemeral(&promoted_key.area_id),
         "the promoted area is no longer ephemeral"
@@ -332,9 +341,7 @@ async fn auto_mapper_maps_follows_and_promotes() {
     let north = exits_100
         .iter()
         .find(|e| e.to_room_number == Some(key102.room_number))
-        .unwrap_or_else(|| {
-            panic!("promoted 100's north stub upgraded to link 102.\n{transcript}")
-        });
+        .unwrap_or_else(|| panic!("promoted 100's north stub upgraded to link 102.\n{transcript}"));
     let (_, room102) = atlas.find_room_by_external_id("102").expect("room 102");
     let exits_102 = room102.get_exits();
     let south = exits_102
@@ -440,7 +447,10 @@ async fn auto_mapper_maps_follows_and_promotes() {
         "no duplicate session area is minted for a saved zone.\n{transcript}"
     );
     assert_eq!(
-        atlas.get_area(&key105.area_id).expect("midgaard").get_name(),
+        atlas
+            .get_area(&key105.area_id)
+            .expect("midgaard")
+            .get_name(),
         "midgaard"
     );
     // Revisit reconciliation: run 1 saved room 102 with only its south exit; run 2's
@@ -574,13 +584,19 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         .unwrap_or_else(|| panic!("room 202 was auto-created after the return.\n{transcript}"));
 
     // ---- Crossing: one new area for wildwood, and only one.
-    assert_eq!(key200.area_id, key201.area_id, "old-town rooms share one area");
+    assert_eq!(
+        key200.area_id, key201.area_id,
+        "old-town rooms share one area"
+    );
     assert_ne!(
         key300.area_id, key200.area_id,
         "crossing zones opens a separate area"
     );
     assert_eq!(
-        atlas.get_area(&key300.area_id).expect("wildwood area").get_name(),
+        atlas
+            .get_area(&key300.area_id)
+            .expect("wildwood area")
+            .get_name(),
         "wildwood"
     );
 
@@ -596,7 +612,10 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         "exactly two session areas: old-town and wildwood.\n{transcript}"
     );
     assert_eq!(
-        atlas.get_area(&key200.area_id).expect("old-town area").room_count(),
+        atlas
+            .get_area(&key200.area_id)
+            .expect("old-town area")
+            .room_count(),
         3,
         "old-town holds rooms 200, 201, 202 — revisits created nothing.\n{transcript}"
     );
@@ -609,8 +628,7 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         .get_exits()
         .iter()
         .find(|e| {
-            e.to_area_id == Some(key300.area_id)
-                && e.to_room_number == Some(key300.room_number)
+            e.to_area_id == Some(key300.area_id) && e.to_room_number == Some(key300.room_number)
         })
         .unwrap_or_else(|| panic!("201 links east into wildwood.\n{transcript}"));
     assert!(
@@ -621,8 +639,7 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         .get_exits()
         .iter()
         .find(|e| {
-            e.to_area_id == Some(key201.area_id)
-                && e.to_room_number == Some(key201.room_number)
+            e.to_area_id == Some(key201.area_id) && e.to_room_number == Some(key201.room_number)
         })
         .unwrap_or_else(|| panic!("300 links west back to 201.\n{transcript}"));
     assert!(border_west.to_room_number.is_some());
@@ -633,8 +650,7 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         .get_exits()
         .iter()
         .find(|e| {
-            e.to_area_id == Some(key202.area_id)
-                && e.to_room_number == Some(key202.room_number)
+            e.to_area_id == Some(key202.area_id) && e.to_room_number == Some(key202.room_number)
         })
         .unwrap_or_else(|| panic!("200's north stub upgraded to link 202.\n{transcript}"));
     assert!(north.to_room_number.is_some());
@@ -669,7 +685,10 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         "an unmappable fix opens no area.\n{transcript}"
     );
     assert_eq!(
-        atlas.get_area(&key200.area_id).expect("old-town area").room_count(),
+        atlas
+            .get_area(&key200.area_id)
+            .expect("old-town area")
+            .room_count(),
         3,
         "an unmappable fix adds no room.\n{transcript}"
     );
@@ -1079,7 +1098,8 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
         }
     }
     // Walk east — the sent command is observed via sys:send and attributed to the next fix.
-    tx.send(RuntimeAction::Send(Arc::new("e".to_string()))).unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("e".to_string())))
+        .unwrap();
     tx.send(gmcp(
         "Room.Info",
         r#"{ "num": 901, "name": "Open Trail", "zone": "trailfields", "exits": { "w": "", "e": "" } }"#,
@@ -1091,7 +1111,8 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
         }
     }
     // Walk back west into known terrain: follow only, nothing new minted.
-    tx.send(RuntimeAction::Send(Arc::new("w".to_string()))).unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("w".to_string())))
+        .unwrap();
     tx.send(gmcp(
         "Room.Info",
         r#"{ "num": 900, "name": "Trail Head", "zone": "trailfields", "exits": { "e": "" } }"#,
@@ -1142,7 +1163,10 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
     // The unexplored east exit of 901 stays a dangling stub; walking back minted nothing.
     assert!(exits_901.iter().any(|e| e.to_room_number.is_none()));
     assert_eq!(
-        atlas.get_area(&key900.area_id).expect("zone area").room_count(),
+        atlas
+            .get_area(&key900.area_id)
+            .expect("zone area")
+            .room_count(),
         2,
         "the return walk re-used the mapped rooms.\n{transcript}"
     );
@@ -1186,7 +1210,9 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
     let giant = "x".repeat(5000);
     tx.send(gmcp(
         "Room.Info",
-        &format!(r#"{{ "num": "{giant}", "name": "Bogus", "zone": "trailfields", "exits": {{}} }}"#),
+        &format!(
+            r#"{{ "num": "{giant}", "name": "Bogus", "zone": "trailfields", "exits": {{}} }}"#
+        ),
     ))
     .unwrap();
     tx.send(gmcp(
@@ -1216,7 +1242,8 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
     );
 
     // ---- mapprune (opt-in): 900 stops advertising its east exit; the revisit prunes it.
-    tx.send(RuntimeAction::Send(Arc::new("mapprune on".to_string()))).unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("mapprune on".to_string())))
+        .unwrap();
     tx.send(gmcp(
         "Room.Info",
         r#"{ "num": 900, "name": "Trail Head", "zone": "trailfields", "exits": {} }"#,
@@ -1276,14 +1303,16 @@ async fn auto_mapper_follows_continent_rooms_without_drawing() {
         .create_area_ephemeral("Mesolar".to_string())
         .await
         .expect("create the overland area");
-    mapper.upsert_room(
-        RoomKey::new(mesolar, RoomNumber(1)),
-        RoomUpdates {
-            title: Some("On a dusty road".to_string()),
-            external_id: Some(Some("35200".to_string())),
-            ..RoomUpdates::default()
-        },
-    );
+    mapper
+        .upsert_room(
+            RoomKey::new(mesolar, RoomNumber(1)),
+            RoomUpdates {
+                title: Some("On a dusty road".to_string()),
+                external_id: Some(Some("35200".to_string())),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("seed room should enqueue");
 
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(9340_u32),
@@ -1407,14 +1436,16 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
         .create_area_ephemeral("Other Server Map".to_string())
         .await
         .expect("create the stand-in area");
-    mapper.upsert_room(
-        RoomKey::new(elsewhere, RoomNumber(1)),
-        RoomUpdates {
-            title: Some("A Familiar Cell".to_string()),
-            external_id: Some(Some("9500".to_string())),
-            ..RoomUpdates::default()
-        },
-    );
+    mapper
+        .upsert_room(
+            RoomKey::new(elsewhere, RoomNumber(1)),
+            RoomUpdates {
+                title: Some("A Familiar Cell".to_string()),
+                external_id: Some(Some("9500".to_string())),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("seed room should enqueue");
     mapper.set_scope_exclusions(HashSet::new(), std::iter::once(elsewhere).collect());
     assert!(
         mapper

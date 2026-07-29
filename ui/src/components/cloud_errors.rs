@@ -48,6 +48,7 @@ pub fn display_error(err: &CloudError) -> String {
         CloudError::AuthenticationError(detail) => {
             crate::i18n::t!("cloud-error-authentication", "detail" => detail)
         }
+        CloudError::CredentialChanged => crate::i18n::t!("cloud-error-unauthorized"),
         CloudError::PermissionDenied(detail) => {
             crate::i18n::t!("cloud-error-permission", "detail" => detail)
         }
