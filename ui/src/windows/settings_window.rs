@@ -134,6 +134,7 @@ pub enum Message {
     PrefRawLoggingToggled(bool),
     PrefAdvancedScriptingToggled(bool),
     PrefAutoCheckForUpdatesToggled(bool),
+    PrefDiscordRichPresenceToggled(bool),
     SystemFontsLoaded(Vec<String>),
 
     TweakTabSelected(TweakTab),
@@ -722,6 +723,10 @@ impl SettingsWindow {
                 // The user took explicit control of this preference, so drop the
                 // installer seed; `settings.json` is authoritative from now on.
                 clear_update_check_seed();
+                self.settings_changed()
+            }
+            Message::PrefDiscordRichPresenceToggled(enabled) => {
+                self.settings.discord_rich_presence = enabled;
                 self.settings_changed()
             }
             Message::SystemFontsLoaded(fonts) => {
@@ -1406,6 +1411,20 @@ impl SettingsWindow {
                     .label(t!("preferences-advanced-scripting"))
                     .on_toggle(Message::PrefAdvancedScriptingToggled),
                 dim_text_owned(t!("preferences-advanced-scripting-help")),
+            ]
+            .spacing(2),
+        );
+
+        col = col.push(rule::horizontal(1));
+
+        // ===== integrations =====
+        col = col.push(text(t!("preferences-integrations")).size(15));
+        col = col.push(
+            column![
+                checkbox(self.settings.discord_rich_presence)
+                    .label(t!("preferences-discord-rich-presence"))
+                    .on_toggle(Message::PrefDiscordRichPresenceToggled),
+                dim_text_owned(t!("preferences-discord-rich-presence-help")),
             ]
             .spacing(2),
         );

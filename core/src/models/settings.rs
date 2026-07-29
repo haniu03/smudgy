@@ -175,6 +175,17 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub auto_check_for_updates: bool,
 
+    /// Show smudgy as the game being played on a Discord client running on
+    /// this machine: "Playing smudgy" while the app is open, plus one server
+    /// hostname while connected (its display name instead when the host is
+    /// an IP or localhost). That label is the entire disclosure. Everything
+    /// rides Discord's local IPC pipe, which is also why it works signed
+    /// out and is inert on machines without Discord. On by default; the
+    /// Preferences toggle is the opt-out for anyone who'd rather keep what
+    /// they play to themselves.
+    #[serde(default = "default_true")]
+    pub discord_rich_presence: bool,
+
     /// The client version the map editor's "sign in to use cloud maps" banner
     /// was dismissed at. While this equals the running client version the banner
     /// stays hidden; upgrading to a newer version surfaces it once more (mirrors
@@ -518,6 +529,7 @@ impl Default for Settings {
             api_base_url: None,
             dismissed_upgrade_version: None,
             auto_check_for_updates: true,
+            discord_rich_presence: true,
             dismissed_signin_banner_version: None,
             terminal_font_family: default_terminal_font_family(),
             terminal_font_size: default_terminal_font_size(),
@@ -926,6 +938,23 @@ mod tests {
         let parsed: Settings =
             serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!parsed.auto_check_for_updates);
+    }
+
+    #[test]
+    fn discord_rich_presence_defaults_on_and_round_trips() {
+        // A settings file predating the field deserializes with presence ON —
+        // the feature is opt-out via Preferences.
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("parse");
+        assert!(settings.discord_rich_presence, "presence defaults on");
+
+        let off = Settings {
+            discord_rich_presence: false,
+            ..Settings::default()
+        };
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!parsed.discord_rich_presence);
     }
 
     #[test]

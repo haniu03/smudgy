@@ -196,6 +196,10 @@ pub struct ManagedSession {
     input_history_feed: InputHistoryFeed,
 
     connected: bool,
+    /// Unix time in milliseconds the current connection was established,
+    /// `None` while disconnected. Feeds the Discord Rich Presence
+    /// elapsed-time counter.
+    connected_at_unix_ms: Option<i64>,
     /// Whether to establish a connection automatically once the runtime is
     /// ready (and to reconnect after a reload). `false` for a session opened
     /// offline, until the user presses Connect; an explicit Disconnect clears
@@ -742,6 +746,7 @@ impl ManagedSession {
             input_mirror_feed: InputMirrorFeed::default(),
             input_history_feed: InputHistoryFeed::default(),
             connected: false,
+            connected_at_unix_ms: None,
             auto_connect,
             ever_connected: false,
             mapper,
@@ -754,6 +759,19 @@ impl ManagedSession {
     /// Returns whether this session is currently connected
     pub fn is_connected(&self) -> bool {
         self.connected
+    }
+
+    /// Unix time in milliseconds the current connection was established,
+    /// `None` while disconnected.
+    pub fn connected_at_unix_ms(&self) -> Option<i64> {
+        self.connected_at_unix_ms
+    }
+
+    /// The configured hostname this session connects to
+    /// ("mud.example.org"); empty when the server config failed to load
+    /// (the fallback config has an empty host).
+    pub fn server_host(&self) -> String {
+        self.server_config.borrow().host.clone()
     }
 
     /// Materialize the display state for a freshly opened pane. Idempotent by
@@ -1517,10 +1535,13 @@ impl ManagedSession {
                     SessionEvent::Connected => {
                         self.connected = true;
                         self.ever_connected = true;
+                        self.connected_at_unix_ms =
+                            Some(crate::discord_presence::unix_now_ms());
                         Task::none()
                     }
                     SessionEvent::Disconnected => {
                         self.connected = false;
+                        self.connected_at_unix_ms = None;
                         Task::none()
                     }
                     SessionEvent::StoreBindingsChanged => {

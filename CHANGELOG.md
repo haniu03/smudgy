@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **The client speaks your language.** Smudgy's interface is now
-  localizable, and ships its first translation: 繁體中文（臺灣）
+ - **The client speaks your language.** Smudgy's interface is now
+   localizable, and ships its first translation: 繁體中文（臺灣）
   (Traditional Chinese, Taiwan). Preferences gains a Language picker —
   System (matching your OS locale), English (United States), or
   Traditional Chinese — and switching takes effect immediately, no
@@ -21,9 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now pin a legacy transport encoding (Big5, GBK, Shift_JIS, KOI8-R, and
   other MUD-relevant charsets) independent of the interface language;
   CHARSET negotiation still overrides it mid-connection. Outbound
-  commands a legacy encoding cannot represent are rejected atomically
-  with a clear message — nothing garbled goes to the wire.
-  (Thanks @GTanger — #7, #8.)
+   commands a legacy encoding cannot represent are rejected atomically
+   with a clear message — nothing garbled goes to the wire.
+   (Thanks @GTanger — #7, #8.)
+ - **Discord Rich Presence.** Discord now shows "Playing smudgy" with
+   elapsed time while the client is open, and adds the server once you
+  connect: "on mud.arctic.org", falling back to the server's name from
+  your list when its address is an IP or localhost. That one label is
+  all Discord gets, delivered to the Discord app on your own computer
+  over its local IPC pipe; who sees it from there is up to your Discord
+   privacy settings. On by default; opt out in Preferences under
+   Integrations.
 - **Scripts can drive pane display state.** A pane handle now covers what
   the eyeball and dividers already let you do by hand: `hide()`/`show()`
   and `isHidden` (the same toggle as the title-bar eyeball, in both
