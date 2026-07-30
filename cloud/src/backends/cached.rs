@@ -76,9 +76,8 @@ fn remove_legacy_cache_files(cache_dir: &Path) {
 }
 
 /// What we last learned about an area's server-side state. A cache hit
-/// requires the cached copy to match on **both** fields: `rev` is opaque
-/// (equality only — projected revs can move down when capabilities change)
-/// and `fingerprint` detects capability flips that bump no rev.
+/// requires the cached copy to match on **both** fields: `rev` detects area
+/// activity and `fingerprint` detects capability flips that bump no rev.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KnownAreaState {
     rev: i64,
@@ -127,6 +126,20 @@ where
     pub fn new(inner: T, cache_dir: impl Into<PathBuf>) -> Self {
         let cache_dir = cache_dir.into();
         remove_legacy_cache_files(&cache_dir);
+        if inner.supports_sync() {
+            // Cloud bytes are written only after `/me` proves their viewer
+            // namespace. Remove anonymous files left by older clients so
+            // same-id/same-rev areas cannot collide across accounts.
+            let anonymous = cache_dir.join(CACHE_FORMAT_NAMESPACE).join("anon");
+            if let Err(error) = fs::remove_dir_all(&anonymous)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                warn!(
+                    "Failed to remove legacy anonymous cloud cache {}: {error}",
+                    anonymous.display()
+                );
+            }
+        }
         let seen_auth_generation = AtomicU64::new(inner.auth_generation());
         Self {
             inner,
@@ -158,11 +171,14 @@ where
 
         // Disk persistence is best-effort: a read-only or full disk must not
         // turn a successful network fetch into a failed read.
-        if let Err(err) = self.write_area_to_disk(area, fingerprint.as_deref()).await {
-            warn!(
-                "Failed to persist area {} to the disk cache: {err}",
-                area.area.id
-            );
+        let disk_namespace_is_proven = !self.inner.supports_sync() || self.viewer.read().is_some();
+        if disk_namespace_is_proven {
+            if let Err(err) = self.write_area_to_disk(area, fingerprint.as_deref()).await {
+                warn!(
+                    "Failed to persist area {} to the disk cache: {err}",
+                    area.area.id
+                );
+            }
         }
 
         {
@@ -184,11 +200,13 @@ where
         // Remove every other on-disk rev/fingerprint for this area by scan:
         // the sync engine records fresh revs into `known` *before* refetching,
         // so a previously-known-state comparison cannot identify stale files.
-        let keep = self
-            .cache_file_path(&area.area.id, area.area.rev, fingerprint.as_deref())
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned());
-        self.remove_area_files(&area.area.id, keep).await;
+        if disk_namespace_is_proven {
+            let keep = self
+                .cache_file_path(&area.area.id, area.area.rev, fingerprint.as_deref())
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            self.remove_area_files(&area.area.id, keep).await;
+        }
     }
 
     async fn try_cache_hit(&self, area_id: &AreaId) -> Option<AreaWithDetails> {
@@ -207,14 +225,16 @@ where
             return Some(area);
         }
 
-        if let Some(area) = self
-            .read_area_from_disk(area_id, known.rev, known.fingerprint.as_deref())
-            .await
-        {
-            let mut cache = self.area_cache.write();
-            cache.insert(*area_id, Arc::new(area.clone()));
-            self.record_source(area_id, AreaLoadSource::Cache);
-            return Some(area);
+        if !self.inner.supports_sync() || self.viewer.read().is_some() {
+            if let Some(area) = self
+                .read_area_from_disk(area_id, known.rev, known.fingerprint.as_deref())
+                .await
+            {
+                let mut cache = self.area_cache.write();
+                cache.insert(*area_id, Arc::new(area.clone()));
+                self.record_source(area_id, AreaLoadSource::Cache);
+                return Some(area);
+            }
         }
 
         None
@@ -301,6 +321,27 @@ where
         let generation = self.inner.auth_generation();
         if self.seen_auth_generation.swap(generation, Ordering::AcqRel) != generation {
             *self.viewer.write() = None;
+            self.area_cache.write().clear();
+            self.known.write().clear();
+            self.last_sources.write().clear();
+        }
+    }
+
+    fn install_viewer_identity(&self, identity: Option<Uuid>) {
+        let Some(id) = identity else {
+            return;
+        };
+        let changed = {
+            let mut viewer = self.viewer.write();
+            if *viewer == Some(id) {
+                false
+            } else {
+                *viewer = Some(id);
+                true
+            }
+        };
+        if changed {
+            // A different viewer must never see another viewer's cache.
             self.area_cache.write().clear();
             self.known.write().clear();
             self.last_sources.write().clear();
@@ -448,19 +489,55 @@ where
     }
 
     async fn list_areas(&self) -> CloudResult<Vec<Area>> {
+        let auth_generation = self.inner.auth_generation();
         self.check_auth_generation();
         let areas = self.inner.list_areas().await?;
+        if self.inner.auth_generation() != auth_generation {
+            self.check_auth_generation();
+            return Err(CloudError::CredentialChanged);
+        }
         self.remember_server_state(&areas).await;
         Ok(areas)
     }
 
     async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
+        let auth_generation = self.inner.auth_generation();
         self.check_auth_generation();
         if let Some(area) = self.try_cache_hit(area_id).await {
             return Ok(area);
         }
 
         let fetched = self.inner.get_area(area_id).await?;
+        if self.inner.auth_generation() != auth_generation {
+            self.check_auth_generation();
+            return Err(CloudError::CredentialChanged);
+        }
+        self.cache_area(&fetched).await;
+        self.record_source(area_id, AreaLoadSource::Remote);
+        Ok(fetched)
+    }
+
+    async fn get_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        auth_generation: u64,
+    ) -> CloudResult<AreaWithDetails> {
+        if self.inner.auth_generation() != auth_generation {
+            self.check_auth_generation();
+            return Err(CloudError::CredentialChanged);
+        }
+        self.check_auth_generation();
+        if let Some(area) = self.try_cache_hit(area_id).await {
+            return Ok(area);
+        }
+        let fetched = self
+            .inner
+            .get_area_at_generation(area_id, auth_generation)
+            .await?;
+        if self.inner.auth_generation() != auth_generation {
+            self.check_auth_generation();
+            return Err(CloudError::CredentialChanged);
+        }
         self.cache_area(&fetched).await;
         self.record_source(area_id, AreaLoadSource::Remote);
         Ok(fetched)
@@ -472,28 +549,35 @@ where
     }
 
     async fn viewer_identity(&self) -> CloudResult<Option<Uuid>> {
+        let auth_generation = self.inner.auth_generation();
         // Errors propagate without touching the current viewer.
         let identity = self.inner.viewer_identity().await?;
-
-        if let Some(id) = identity {
-            let changed = {
-                let mut viewer = self.viewer.write();
-                if *viewer == Some(id) {
-                    false
-                } else {
-                    *viewer = Some(id);
-                    true
-                }
-            };
-
-            if changed {
-                // A different viewer must never see another viewer's cache.
-                self.area_cache.write().clear();
-                self.known.write().clear();
-                self.last_sources.write().clear();
-            }
+        if self.inner.auth_generation() != auth_generation {
+            self.check_auth_generation();
+            return Err(CloudError::CredentialChanged);
         }
 
+        self.install_viewer_identity(identity);
+        Ok(identity)
+    }
+
+    async fn viewer_identity_at_generation(
+        &self,
+        auth_generation: u64,
+    ) -> CloudResult<Option<Uuid>> {
+        if self.inner.auth_generation() != auth_generation {
+            self.check_auth_generation();
+            return Err(CloudError::CredentialChanged);
+        }
+        let identity = self
+            .inner
+            .viewer_identity_at_generation(auth_generation)
+            .await?;
+        if self.inner.auth_generation() != auth_generation {
+            self.check_auth_generation();
+            return Err(CloudError::CredentialChanged);
+        }
+        self.install_viewer_identity(identity);
         Ok(identity)
     }
 
@@ -541,15 +625,52 @@ where
         self.inner.supports_sync()
     }
 
+    fn mutation_journal_namespace(&self) -> Option<String> {
+        self.inner.mutation_journal_namespace()
+    }
+
     async fn update_area(&self, area_id: &AreaId, updates: AreaUpdates) -> CloudResult<()> {
         self.inner.update_area(area_id, updates).await?;
         self.invalidate_area(area_id).await;
         Ok(())
     }
 
+    async fn update_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        updates: AreaUpdates,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.inner
+            .update_area_at_generation(area_id, updates, auth_generation)
+            .await?;
+        if self.inner.auth_generation() == auth_generation {
+            self.invalidate_area(area_id).await;
+        } else {
+            self.check_auth_generation();
+        }
+        Ok(())
+    }
+
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
         self.inner.delete_area(area_id).await?;
         self.invalidate_area(area_id).await;
+        Ok(())
+    }
+
+    async fn delete_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.inner
+            .delete_area_at_generation(area_id, auth_generation)
+            .await?;
+        if self.inner.auth_generation() == auth_generation {
+            self.invalidate_area(area_id).await;
+        } else {
+            self.check_auth_generation();
+        }
         Ok(())
     }
 
@@ -564,6 +685,24 @@ where
         // nothing and keeps the cache.
         let result = self.inner.execute_mutation(area_id, envelope).await?;
         self.invalidate_area(area_id).await;
+        Ok(result)
+    }
+
+    async fn execute_mutation_at_generation(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+        auth_generation: u64,
+    ) -> CloudResult<MutationResult> {
+        let result = self
+            .inner
+            .execute_mutation_at_generation(area_id, envelope, auth_generation)
+            .await?;
+        if self.inner.auth_generation() == auth_generation {
+            self.invalidate_area(area_id).await;
+        } else {
+            self.check_auth_generation();
+        }
         Ok(result)
     }
 
@@ -819,8 +958,8 @@ mod tests {
         fs::remove_dir_all(cache_dir).ok();
     }
 
-    /// Revs are opaque: a *downward* move (projected rev shrinking after a
-    /// capability change) must still trigger a refetch.
+    /// A downward move after a database reconstruction must still trigger a
+    /// refetch.
     #[tokio::test]
     async fn refetches_when_rev_moves_backwards() {
         let area_id = AreaId(Uuid::new_v4());

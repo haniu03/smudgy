@@ -1,10 +1,4 @@
-use std::{
-    fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{fmt, sync::Arc};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -63,16 +57,23 @@ impl fmt::Debug for Credential {
 /// updates immediately, so logging in upgrades every live mapper at once.
 #[derive(Clone)]
 pub struct CredentialSource {
-    slot: Arc<ArcSwap<Option<Credential>>>,
-    generation: Arc<AtomicU64>,
+    slot: Arc<ArcSwap<CredentialSnapshot>>,
+}
+
+#[derive(Clone)]
+struct CredentialSnapshot {
+    generation: u64,
+    credential: Option<Credential>,
 }
 
 impl CredentialSource {
     #[must_use]
     pub fn new(initial: Option<Credential>) -> Self {
         Self {
-            slot: Arc::new(ArcSwap::from_pointee(initial)),
-            generation: Arc::new(AtomicU64::new(0)),
+            slot: Arc::new(ArcSwap::from_pointee(CredentialSnapshot {
+                generation: 0,
+                credential: initial,
+            })),
         }
     }
 
@@ -82,20 +83,41 @@ impl CredentialSource {
     }
 
     pub fn set(&self, credential: Option<Credential>) {
-        self.slot.store(Arc::new(credential));
-        self.generation.fetch_add(1, Ordering::Release);
+        // Credential and generation are one atomic ArcSwap snapshot: no
+        // reader can pair a new token with an old generation, even when
+        // multiple sessions update the shared source concurrently.
+        self.slot.rcu(|current| {
+            Arc::new(CredentialSnapshot {
+                generation: current.generation.wrapping_add(1),
+                credential: credential.clone(),
+            })
+        });
     }
 
     #[must_use]
     pub fn get(&self) -> Option<Credential> {
-        self.slot.load().as_ref().clone()
+        self.slot.load().credential.clone()
+    }
+
+    #[must_use]
+    fn snapshot(&self) -> (u64, Option<Credential>) {
+        let snapshot = self.slot.load();
+        (snapshot.generation, snapshot.credential.clone())
+    }
+
+    fn credential_at_generation(&self, generation: u64) -> CloudResult<Credential> {
+        let (current, credential) = self.snapshot();
+        if current != generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        credential.ok_or_else(|| CloudError::Unauthorized("no credential configured".to_string()))
     }
 
     /// Monotonic counter bumped on every credential change; pollers compare
     /// it to detect login/logout without holding the credential itself.
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.slot.load().generation
     }
 }
 
@@ -235,6 +257,23 @@ impl CloudMapper {
         Self::parse_data(response).await
     }
 
+    async fn get_with_credential<T>(&self, path: &str, credential: &Credential) -> CloudResult<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let url = format!("{}{}", self.base_url, path);
+        info!("GET {url} - (initiating)");
+        let response = self
+            .client
+            .get(&url)
+            .header("authorization", credential.header_value())
+            .header("content-type", "application/json")
+            .send()
+            .await?;
+        info!("GET {url} - {}", response.status());
+        Self::parse_data(response).await
+    }
+
     /// Helper method to make POST requests
     async fn post<T, B>(&self, path: &str, body: &B) -> CloudResult<T>
     where
@@ -257,6 +296,30 @@ impl CloudMapper {
 
         info!("POST {url} - {}", response.status());
 
+        Self::parse_data(response).await
+    }
+
+    async fn post_with_credential<T, B>(
+        &self,
+        path: &str,
+        body: &B,
+        credential: &Credential,
+    ) -> CloudResult<T>
+    where
+        T: serde::de::DeserializeOwned,
+        B: serde::Serialize,
+    {
+        let url = format!("{}{}", self.base_url, path);
+        info!("POST {url}");
+        let response = self
+            .client
+            .post(&url)
+            .header("authorization", credential.header_value())
+            .header("content-type", "application/json")
+            .json(body)
+            .send()
+            .await?;
+        info!("POST {url} - {}", response.status());
         Self::parse_data(response).await
     }
 
@@ -309,6 +372,29 @@ impl CloudMapper {
         Self::parse_no_data(response).await
     }
 
+    async fn put_no_response_with_credential<B>(
+        &self,
+        path: &str,
+        body: &B,
+        credential: &Credential,
+    ) -> CloudResult<()>
+    where
+        B: serde::Serialize,
+    {
+        let url = format!("{}{}", self.base_url, path);
+        info!("PUT {url}");
+        let response = self
+            .client
+            .put(&url)
+            .header("authorization", credential.header_value())
+            .header("content-type", "application/json")
+            .json(body)
+            .send()
+            .await?;
+        info!("PUT {url} - {}", response.status());
+        Self::parse_no_data(response).await
+    }
+
     /// Helper method to make DELETE requests
     async fn delete(&self, path: &str) -> CloudResult<()> {
         let url = format!("{}{}", self.base_url, path);
@@ -324,6 +410,19 @@ impl CloudMapper {
 
         info!("DELETE {url} - {}", response.status());
 
+        Self::parse_no_data(response).await
+    }
+
+    async fn delete_with_credential(&self, path: &str, credential: &Credential) -> CloudResult<()> {
+        let url = format!("{}{}", self.base_url, path);
+        info!("DELETE {url}");
+        let response = self
+            .client
+            .delete(&url)
+            .header("authorization", credential.header_value())
+            .send()
+            .await?;
+        info!("DELETE {url} - {}", response.status());
         Self::parse_no_data(response).await
     }
 }
@@ -344,6 +443,21 @@ impl MapperBackend for CloudMapper {
         self.get(&format!("/areas/{area_id}")).await
     }
 
+    async fn get_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        auth_generation: u64,
+    ) -> CloudResult<AreaWithDetails> {
+        let credential = self.credentials.credential_at_generation(auth_generation)?;
+        let area = self
+            .get_with_credential(&format!("/areas/{area_id}"), &credential)
+            .await?;
+        if self.credentials.generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        Ok(area)
+    }
+
     fn last_area_source(&self, _area_id: &AreaId) -> AreaLoadSource {
         AreaLoadSource::Remote
     }
@@ -362,6 +476,22 @@ impl MapperBackend for CloudMapper {
         Ok(Some(me.id))
     }
 
+    async fn viewer_identity_at_generation(
+        &self,
+        auth_generation: u64,
+    ) -> CloudResult<Option<Uuid>> {
+        #[derive(serde::Deserialize)]
+        struct Me {
+            id: Uuid,
+        }
+        let credential = self.credentials.credential_at_generation(auth_generation)?;
+        let me: Me = self.get_with_credential("/me", &credential).await?;
+        if self.credentials.generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        Ok(Some(me.id))
+    }
+
     fn auth_generation(&self) -> u64 {
         self.credentials.generation()
     }
@@ -374,13 +504,38 @@ impl MapperBackend for CloudMapper {
         true
     }
 
+    fn mutation_journal_namespace(&self) -> Option<String> {
+        Some(self.base_url.clone())
+    }
+
     async fn update_area(&self, area_id: &AreaId, updates: AreaUpdates) -> CloudResult<()> {
         self.put_no_response(&format!("/areas/{area_id}"), &updates)
             .await
     }
 
+    async fn update_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        updates: AreaUpdates,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let credential = self.credentials.credential_at_generation(auth_generation)?;
+        self.put_no_response_with_credential(&format!("/areas/{area_id}"), &updates, &credential)
+            .await
+    }
+
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
         self.delete(&format!("/areas/{area_id}")).await
+    }
+
+    async fn delete_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let credential = self.credentials.credential_at_generation(auth_generation)?;
+        self.delete_with_credential(&format!("/areas/{area_id}"), &credential)
+            .await
     }
 
     // ===== VERSIONED MUTATIONS =====
@@ -392,6 +547,21 @@ impl MapperBackend for CloudMapper {
     ) -> CloudResult<crate::mutation::MutationResult> {
         self.post(&format!("/areas/{area_id}/mutations"), envelope)
             .await
+    }
+
+    async fn execute_mutation_at_generation(
+        &self,
+        area_id: &AreaId,
+        envelope: &crate::mutation::MutationEnvelope,
+        auth_generation: u64,
+    ) -> CloudResult<crate::mutation::MutationResult> {
+        let credential = self.credentials.credential_at_generation(auth_generation)?;
+        self.post_with_credential(
+            &format!("/areas/{area_id}/mutations"),
+            envelope,
+            &credential,
+        )
+        .await
     }
 
     // ===== ATLAS (FOLDER) OPERATIONS =====

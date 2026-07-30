@@ -143,7 +143,11 @@ struct CreateAreaRequest {
 }
 
 /// POST /areas — no verified gate; atlas (when given) must be caller-owned.
-pub async fn create_area(State(state): State<Shared>, headers: HeaderMap, body: String) -> Response {
+pub async fn create_area(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     let mut st = state.lock();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
@@ -291,8 +295,7 @@ pub async fn update_area(
             .iter()
             .filter(|g| {
                 g.area_id == Some(area_id)
-                    && g.parent_grant_id
-                        .is_some_and(|p| parent_ids.contains(&p))
+                    && g.parent_grant_id.is_some_and(|p| parent_ids.contains(&p))
             })
             .map(|g| g.id)
             .collect();
@@ -1277,7 +1280,7 @@ pub async fn sync(State(state): State<Shared>, headers: HeaderMap) -> Response {
             let caps = st.caps(viewer, a.id).expect("area exists");
             json!({
                 "area_id": a.id,
-                "rev": if caps.see_secrets() { a.rev } else { a.public_rev },
+                "rev": a.rev,
                 "access_fingerprint": access_fingerprint(&caps),
             })
         })

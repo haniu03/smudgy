@@ -560,7 +560,7 @@ async function relinkExit(
     toAreaId: AreaId,
     toRoomNumber: RoomNumber,
 ): Promise<ExitId> {
-    mapper.deleteRoomExit(areaId, room, exit.id);
+    await mapper.deleteRoomExit(areaId, room, exit.id);
     return await mapper.createRoomExit(areaId, room, {
         from_direction: exit.from_direction,
         to_area_id: toAreaId,
@@ -591,7 +591,12 @@ function isUnvisited(room: Room): boolean {
  *  A placeholder carries only its identity (externalId), position guess, the `unvisited`
  *  marker, and a neutral wash; the first real visit materializes it. Returns undefined
  *  on failure so the caller can fall back to a dangling stub. */
-function createPlaceholder(fromAreaId: AreaId, fromRoom: RoomNumber, dir: string, destId: string): Room | undefined {
+async function createPlaceholder(
+    fromAreaId: AreaId,
+    fromRoom: RoomNumber,
+    dir: string,
+    destId: string,
+): Promise<Room | undefined> {
     try {
         const area = mapper.getAreaById(fromAreaId);
         const from = area.room(fromRoom);
@@ -604,14 +609,14 @@ function createPlaceholder(fromAreaId: AreaId, fromRoom: RoomNumber, dir: string
             x += (dx || 1) * GRID;
             y += dy * GRID;
         }
-        const number = mapper.createRoom(fromAreaId, {
+        const number = await mapper.createRoom(fromAreaId, {
             externalId: destId,
             x,
             y,
             level,
             color: PLACEHOLDER_COLOR,
         });
-        mapper.setRoomProperty(fromAreaId, number, "unvisited", "true");
+        await mapper.setRoomProperty(fromAreaId, number, "unvisited", "true");
         return mapper.getAreaById(fromAreaId).room(number);
     } catch {
         return undefined;
@@ -631,7 +636,7 @@ async function linkOrStub(
         // A named destination is always a room on the map: the mapped one, or a fresh
         // unvisited placeholder.
         const dest = mapper.findRoomByExternalId(destId)
-            ?? createPlaceholder(areaId, room, dir, destId);
+            ?? await createPlaceholder(areaId, room, dir, destId);
         if (dest) {
             const exitId = await mapper.createRoomExit(areaId, room, {
                 from_direction,
@@ -752,7 +757,7 @@ async function reconcileReportedExit(
 
     if (destId === null) {
         if (door && (existing.is_closed !== door.closed || existing.is_locked !== door.locked)) {
-            mapper.setRoomExit(areaId, roomNumber, existing.id, {
+            await mapper.setRoomExit(areaId, roomNumber, existing.id, {
                 is_closed: door.closed,
                 is_locked: door.locked,
             });
@@ -761,7 +766,7 @@ async function reconcileReportedExit(
     }
 
     const destination = mapper.findRoomByExternalId(destId)
-        ?? createPlaceholder(areaId, roomNumber, dir, destId);
+        ?? await createPlaceholder(areaId, roomNumber, dir, destId);
     if (!destination) {
         if (!exitIsPending(existing.id)) {
             trackPending(destId, areaId, roomNumber, existing.id, dir);
@@ -785,7 +790,7 @@ async function reconcileReportedExit(
         );
     }
     if (door && (existing.is_closed !== door.closed || existing.is_locked !== door.locked)) {
-        mapper.setRoomExit(areaId, roomNumber, exitId, {
+        await mapper.setRoomExit(areaId, roomNumber, exitId, {
             is_closed: door.closed,
             is_locked: door.locked,
         });
@@ -805,18 +810,18 @@ async function reconcileKnownRoom(room: Room, fix: RoomFix) {
     const areaId = room.area_id;
     const roomNumber = room.room_number;
     if (fix.name && fix.name !== room.title) {
-        mapper.updateRoom(areaId, roomNumber, { title: fix.name });
+        await mapper.updateRoom(areaId, roomNumber, { title: fix.name });
     }
     if (fix.coords) {
         const at = placement(areaId, fix, null);
         if (room.x !== at.x || room.y !== at.y || room.level !== at.level) {
-            mapper.updateRoom(areaId, roomNumber, at);
+            await mapper.updateRoom(areaId, roomNumber, at);
         }
     }
     if (fix.terrain && room.data("terrain") !== fix.terrain) {
-        mapper.setRoomProperty(areaId, roomNumber, "terrain", fix.terrain);
+        await mapper.setRoomProperty(areaId, roomNumber, "terrain", fix.terrain);
         const color = TERRAIN_COLORS[fix.terrain.toLowerCase()];
-        if (color) mapper.setRoomColor(areaId, roomNumber, color);
+        if (color) await mapper.setRoomColor(areaId, roomNumber, color);
     }
     for (const [dir, dest] of Object.entries(fix.exits)) {
         await reconcileReportedExit(areaId, roomNumber, dir, dest, fix.doors?.[dir]);
@@ -826,7 +831,7 @@ async function reconcileKnownRoom(room: Room, fix: RoomFix) {
             if (exit.from_direction === "Special" || exit.from_direction === "Other") continue;
             const dir = exit.from_direction.toLowerCase();
             if (!(dir in fix.exits)) {
-                mapper.deleteRoomExit(areaId, roomNumber, exit.id);
+                await mapper.deleteRoomExit(areaId, roomNumber, exit.id);
                 dropPendingExit(exit.id);
             }
         }
@@ -845,23 +850,23 @@ async function materialize(room: Room, fix: RoomFix, dir: string | null): Promis
     if (sameArea(target, room.area_id)) {
         if (fix.coords) {
             const at = placement(room.area_id, fix, null);
-            mapper.updateRoom(room.area_id, room.room_number, { x: at.x, y: at.y, level: at.level });
+            await mapper.updateRoom(room.area_id, room.room_number, { x: at.x, y: at.y, level: at.level });
         }
-        mapper.setRoomProperty(room.area_id, room.room_number, "unvisited", "");
+        await mapper.setRoomProperty(room.area_id, room.room_number, "unvisited", "");
         // Tracked exits already point at this room; they need no re-targeting.
         pendingLinks.delete(id);
         return mapper.findRoomByExternalId(id) ?? room;
     }
     const at = placement(target, fix, dir);
-    const rebuilt = mapper.createRoom(target, {
+    const rebuilt = await mapper.createRoom(target, {
         title: fix.name,
         x: at.x,
         y: at.y,
         level: at.level,
     });
     await resolvePending(id, target, rebuilt, { areaId: room.area_id, room: room.room_number });
-    mapper.deleteRoom(room.area_id, room.room_number);
-    mapper.setRoomExternalId(target, rebuilt, id);
+    await mapper.deleteRoom(room.area_id, room.room_number);
+    await mapper.setRoomExternalId(target, rebuilt, id);
     return mapper.getAreaById(target).room(rebuilt) ?? room;
 }
 
@@ -893,7 +898,7 @@ async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir
             };
             const color = fix.terrain ? TERRAIN_COLORS[fix.terrain.toLowerCase()] : undefined;
             if (color) params.color = color;
-            room = mapper.createRoom(areaId, params);
+            room = await mapper.createRoom(areaId, params);
         } catch (err) {
             if (attempt === 1) throw err;
             // The bound map refused the write: an adopted map we cannot write (a
@@ -906,7 +911,7 @@ async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir
         }
     }
     if (room === null) return;
-    if (fix.terrain) mapper.setRoomProperty(areaId, room, "terrain", fix.terrain);
+    if (fix.terrain) await mapper.setRoomProperty(areaId, room, "terrain", fix.terrain);
 
     // Every exit of the new room: a real link when the destination is mapped, a fresh
     // unvisited placeholder when only its id is known, a dangling stub when even the id
@@ -960,10 +965,10 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
                         ? TERRAIN_COLORS[reported.terrain.toLowerCase()]
                         : PLACEHOLDER_COLOR,
                 };
-                const roomNumber = mapper.createRoom(areaId, params);
-                mapper.setRoomProperty(areaId, roomNumber, "unvisited", "true");
+                const roomNumber = await mapper.createRoom(areaId, params);
+                await mapper.setRoomProperty(areaId, roomNumber, "unvisited", "true");
                 if (reported.terrain) {
-                    mapper.setRoomProperty(areaId, roomNumber, "terrain", reported.terrain);
+                    await mapper.setRoomProperty(areaId, roomNumber, "terrain", reported.terrain);
                 }
                 room = mapper.getAreaById(areaId).room(roomNumber);
                 await resolvePending(reported.id, areaId, roomNumber);
@@ -976,14 +981,14 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
             && room.level === level
             && (room.x !== x || room.y !== y)
         ) {
-            mapper.updateRoom(areaId, room.room_number, { x, y });
+            await mapper.updateRoom(areaId, room.room_number, { x, y });
             room = mapper.getAreaById(areaId).room(room.room_number) ?? room;
         }
 
         if (room && isUnvisited(room) && reported.terrain) {
-            mapper.setRoomProperty(room.area_id, room.room_number, "terrain", reported.terrain);
+            await mapper.setRoomProperty(room.area_id, room.room_number, "terrain", reported.terrain);
             const color = TERRAIN_COLORS[reported.terrain.toLowerCase()];
-            if (color) mapper.setRoomColor(room.area_id, room.room_number, color);
+            if (color) await mapper.setRoomColor(room.area_id, room.room_number, color);
         }
     }
 
@@ -1095,11 +1100,11 @@ async function doSavemap(zone: string | undefined) {
     const importedIds = await mapper.importAreas(exports);
     // Rebind so mapping continues seamlessly into the saved copies, and drop the session
     // originals so each room id resolves to exactly one room again.
-    chosen.forEach(([key, areaId], index) => {
+    for (const [index, [key, areaId]] of chosen.entries()) {
         const importedId = importedIds[index];
         if (importedId) zoneAreas.set(key, importedId);
-        mapper.deleteArea(areaId);
-    });
+        await mapper.deleteArea(areaId);
+    }
     // Re-key tracked exits into the imported copies: the deleted originals took their
     // exit ids with them, but import preserves room numbers, so each waiter's exit is
     // recoverable in the promoted area by (room, direction) — whether it links to an

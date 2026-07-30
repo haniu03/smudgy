@@ -10,6 +10,7 @@
 
 use crate::cloud_account::CloudHandles;
 use crate::components::session_input;
+use crate::images::image_store;
 use crate::terminal_buffer::selection::Selection;
 use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer};
 use crate::theme::Element;
@@ -40,7 +41,6 @@ use smudgy_core::session::{self, SessionEvent, SessionId};
 use smudgy_core::session::{BufferUpdate, TaggedSessionEvent};
 use smudgy_map_widget::map_view;
 use smudgy_theme::builtins::container::default;
-use crate::images::image_store;
 use smudgy_widgets::{
     MapStore, MapWidgetId, TextEditorStore, WidgetRoot, with_store_context, with_text_store_context,
 };
@@ -445,7 +445,10 @@ struct PaneSizeFeed {
 /// The whole-pixel comparison key for a reported size.
 fn size_key(width: f32, height: f32) -> (u32, u32) {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    (width.round().max(0.0) as u32, height.round().max(0.0) as u32)
+    (
+        width.round().max(0.0) as u32,
+        height.round().max(0.0) as u32,
+    )
 }
 
 impl PaneSizeFeed {
@@ -643,6 +646,10 @@ impl ManagedSession {
         // ([`migrate_legacy_global_local_maps`]), so by session time this dir
         // is authoritative.
         let local_map_dir = Self::local_map_dir(&server_name);
+        // Cloud pending writes are isolated per server entry first, then per
+        // authenticated viewer inside the journal. Two simultaneously open
+        // game sessions therefore never drain one another's queue.
+        let map_mutation_journal_dir = local_map_dir.join("pending-cloud-mutations");
 
         // The mapper always exists; with no credential the cloud tier idles
         // logged-out (cached reads still work) while the local tier stays
@@ -655,7 +662,11 @@ impl ManagedSession {
             );
             let local = LocalBackend::new(local_map_dir);
             let backend = CompositeBackend::new(Arc::new(local), Arc::new(cloud));
-            let mapper = Mapper::new(Arc::new(backend), map_cache_dir.clone());
+            let mapper = Mapper::new_with_journal(
+                Arc::new(backend),
+                map_cache_dir.clone(),
+                map_mutation_journal_dir,
+            );
             // Honor the user's per-area "don't use for room identification"
             // preferences. Unknown ids are preserved until their area lands,
             // so applying before load_all_areas is safe.

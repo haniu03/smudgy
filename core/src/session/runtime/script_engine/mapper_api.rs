@@ -15,7 +15,7 @@ use smudgy_cloud::{
     ExitUpdates, HorizontalAlignment, Label, LabelArgs, LabelId, LabelUpdates, MapPoint, Mapper,
     PortMode, RoomNumber, RoomSide, RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId,
     ShapeType, ShapeUpdates, Uuid, VerticalAlignment,
-    mapper::{RoomKey, area_cache::AreaCache, room_cache::RoomCache},
+    mapper::{MutationSubmission, RoomKey, area_cache::AreaCache, room_cache::RoomCache},
     mutation::AreaMutation,
 };
 
@@ -69,6 +69,7 @@ deno_core::extension!(
       op_smudgy_mapper_update_rooms,
       op_smudgy_mapper_create_room_exit,
       op_smudgy_mapper_set_room_exit,
+      op_smudgy_mapper_merge_rooms,
       op_smudgy_mapper_delete_room,
       op_smudgy_mapper_delete_room_exit,
       op_smudgy_mapper_get_area_labels,
@@ -142,6 +143,20 @@ fn ensure_mapper(state: &OpState, write: bool) -> Result<(), MapperError> {
     } else {
         Err(MapperError::NotCapable(cap))
     }
+}
+
+async fn await_mapper_submission(
+    mapper: &Mapper,
+    submission: MutationSubmission,
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let Some(operation_id) = submission.operation_id() else {
+        return Ok(None);
+    };
+    mapper
+        .wait_for_mutation(operation_id)
+        .await
+        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+    Ok(Some(operation_id.as_u64_pair()))
 }
 
 /// A room reference as serialized to JS: the area id as a `u64` pair plus the
@@ -273,39 +288,45 @@ fn op_smudgy_mapper_get_area_by_id(
     Err(MapperError::MapperNotEnabled)
 }
 
-#[op2]
-fn op_smudgy_mapper_delete_area(
-    state: &OpState,
+#[op2(async(lazy))]
+async fn op_smudgy_mapper_delete_area(
+    state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
 ) -> Result<(), MapperError> {
-    ensure_mapper(state, true)?;
-    let mapper = state.try_borrow::<Mapper>();
-
-    if let Some(mapper) = mapper {
-        let id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.delete_area(id);
-        Ok(())
-    } else {
-        Err(MapperError::MapperNotEnabled)
-    }
+    let mapper = {
+        let state = state.borrow();
+        ensure_mapper(&state, true)?;
+        state
+            .try_borrow::<Mapper>()
+            .cloned()
+            .ok_or(MapperError::MapperNotEnabled)?
+    };
+    let id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
+    mapper
+        .delete_area_and_wait(id)
+        .await
+        .map_err(|error| MapperError::FailedToCreate(error.to_string()))
 }
 
-#[op2]
-fn op_smudgy_mapper_rename_area(
-    state: &OpState,
+#[op2(async(lazy))]
+async fn op_smudgy_mapper_rename_area(
+    state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[string] name: String,
 ) -> Result<(), MapperError> {
-    ensure_mapper(state, true)?;
-    let mapper = state.try_borrow::<Mapper>();
-
-    if let Some(mapper) = mapper {
-        let id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.rename_area(id, name.as_str());
-        Ok(())
-    } else {
-        Err(MapperError::MapperNotEnabled)
-    }
+    let mapper = {
+        let state = state.borrow();
+        ensure_mapper(&state, true)?;
+        state
+            .try_borrow::<Mapper>()
+            .cloned()
+            .ok_or(MapperError::MapperNotEnabled)?
+    };
+    let id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
+    mapper
+        .rename_area_and_wait(id, name.as_str())
+        .await
+        .map_err(|error| MapperError::FailedToCreate(error.to_string()))
 }
 
 /// AREA WRAPPER METHODS
@@ -590,6 +611,30 @@ impl From<JSRoomParams> for RoomUpdates {
     }
 }
 
+fn submit_room_update(
+    state: &Rc<RefCell<OpState>>,
+    area_id: (u64, u64),
+    room_number: i32,
+    updates: RoomUpdates,
+) -> Result<(Mapper, MutationSubmission), MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    let mapper = state
+        .try_borrow::<Mapper>()
+        .cloned()
+        .ok_or(MapperError::MapperNotEnabled)?;
+    let submission = mapper
+        .upsert_room(
+            RoomKey {
+                area_id: AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+                room_number: RoomNumber(room_number),
+            },
+            updates,
+        )
+        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+    Ok((mapper, submission))
+}
+
 #[op2]
 #[serde]
 fn op_smudgy_mapper_get_room_exits(#[cppgc] room_wrapper: &JSRoom) -> Vec<JSExit> {
@@ -616,64 +661,49 @@ fn op_smudgy_mapper_get_room_exits(#[cppgc] room_wrapper: &JSRoom) -> Vec<JSExit
 
 /// ROOM SETTER METHODS
 ///
-#[op2]
-fn op_smudgy_mapper_set_room_title(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_room_title(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     #[string] title: String,
-) -> Result<(), MapperError> {
-    let state = state.borrow();
-    ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
-        let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.upsert_room(
-            RoomKey {
-                area_id,
-                room_number: RoomNumber(room_number),
-            },
-            RoomUpdates {
-                title: Some(title),
-                ..Default::default()
-            },
-        );
-        Ok(())
-    } else {
-        Err(MapperError::MapperNotEnabled)
-    }
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let (mapper, submission) = submit_room_update(
+        &state,
+        area_id,
+        room_number,
+        RoomUpdates {
+            title: Some(title),
+            ..Default::default()
+        },
+    )?;
+    await_mapper_submission(&mapper, submission).await
 }
 
-#[op2]
-fn op_smudgy_mapper_set_room_external_id(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_room_external_id(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     #[string] external_id: String,
-) -> Result<(), MapperError> {
-    let state = state.borrow();
-    ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
-        let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        // Empty string clears the binding (the script spelling of null).
-        let binding = if external_id.is_empty() {
-            None
-        } else {
-            Some(external_id)
-        };
-        mapper.upsert_room(
-            RoomKey {
-                area_id,
-                room_number: RoomNumber(room_number),
-            },
-            RoomUpdates {
-                external_id: Some(binding),
-                ..Default::default()
-            },
-        );
-        Ok(())
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let binding = if external_id.is_empty() {
+        None
     } else {
-        Err(MapperError::MapperNotEnabled)
-    }
+        Some(external_id)
+    };
+    let (mapper, submission) = submit_room_update(
+        &state,
+        area_id,
+        room_number,
+        RoomUpdates {
+            external_id: Some(binding),
+            ..Default::default()
+        },
+    )?;
+    await_mapper_submission(&mapper, submission).await
 }
 
 /// `mapper.findRoomByExternalId`: O(1) resolve of a server-global room id
@@ -732,243 +762,224 @@ fn op_smudgy_mapper_rescue_room_by_external_id(
     Ok(true)
 }
 
-#[op2]
-fn op_smudgy_mapper_set_room_description(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_room_description(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     #[string] description: String,
-) -> Result<(), MapperError> {
-    let state = state.borrow();
-    ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
-        let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.upsert_room(
-            RoomKey {
-                area_id,
-                room_number: RoomNumber(room_number),
-            },
-            RoomUpdates {
-                description: Some(description),
-                ..Default::default()
-            },
-        );
-        Ok(())
-    } else {
-        Err(MapperError::MapperNotEnabled)
-    }
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let (mapper, submission) = submit_room_update(
+        &state,
+        area_id,
+        room_number,
+        RoomUpdates {
+            description: Some(description),
+            ..Default::default()
+        },
+    )?;
+    await_mapper_submission(&mapper, submission).await
 }
 
-#[op2]
-fn op_smudgy_mapper_set_room_color(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_room_color(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     #[string] color: String,
-) -> Result<(), MapperError> {
-    let state = state.borrow();
-    ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
-        let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.upsert_room(
-            RoomKey {
-                area_id,
-                room_number: RoomNumber(room_number),
-            },
-            RoomUpdates {
-                color: Some(color),
-                ..Default::default()
-            },
-        );
-        Ok(())
-    } else {
-        Err(MapperError::MapperNotEnabled)
-    }
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let (mapper, submission) = submit_room_update(
+        &state,
+        area_id,
+        room_number,
+        RoomUpdates {
+            color: Some(color),
+            ..Default::default()
+        },
+    )?;
+    await_mapper_submission(&mapper, submission).await
 }
 
-#[op2]
-fn op_smudgy_mapper_set_room_level(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_room_level(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     level: i32,
-) -> Result<(), MapperError> {
-    let state = state.borrow();
-    ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
-        let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.upsert_room(
-            RoomKey {
-                area_id,
-                room_number: RoomNumber(room_number),
-            },
-            RoomUpdates {
-                level: Some(level),
-                ..Default::default()
-            },
-        );
-        Ok(())
-    } else {
-        Err(MapperError::MapperNotEnabled)
-    }
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let (mapper, submission) = submit_room_update(
+        &state,
+        area_id,
+        room_number,
+        RoomUpdates {
+            level: Some(level),
+            ..Default::default()
+        },
+    )?;
+    await_mapper_submission(&mapper, submission).await
 }
 
-#[op2]
-fn op_smudgy_mapper_set_room_x(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_room_x(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     x: f32,
-) -> Result<(), MapperError> {
-    let state = state.borrow();
-    ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
-        let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.upsert_room(
-            RoomKey {
-                area_id,
-                room_number: RoomNumber(room_number),
-            },
-            RoomUpdates {
-                x: Some(x),
-                ..Default::default()
-            },
-        );
-        Ok(())
-    } else {
-        Err(MapperError::MapperNotEnabled)
-    }
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let (mapper, submission) = submit_room_update(
+        &state,
+        area_id,
+        room_number,
+        RoomUpdates {
+            x: Some(x),
+            ..Default::default()
+        },
+    )?;
+    await_mapper_submission(&mapper, submission).await
 }
 
-#[op2]
-fn op_smudgy_mapper_set_room_y(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_room_y(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     y: f32,
-) -> Result<(), MapperError> {
-    let state = state.borrow();
-    ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
-        let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.upsert_room(
-            RoomKey {
-                area_id,
-                room_number: RoomNumber(room_number),
-            },
-            RoomUpdates {
-                y: Some(y),
-                ..Default::default()
-            },
-        );
-        Ok(())
-    } else {
-        Err(MapperError::MapperNotEnabled)
-    }
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let (mapper, submission) = submit_room_update(
+        &state,
+        area_id,
+        room_number,
+        RoomUpdates {
+            y: Some(y),
+            ..Default::default()
+        },
+    )?;
+    await_mapper_submission(&mapper, submission).await
 }
 
-#[op2]
-fn op_smudgy_mapper_set_room_property(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_room_property(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     #[string] name: String,
     #[string] value: String,
-) -> Result<(), MapperError> {
+) -> Result<Option<(u64, u64)>, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.set_room_property(
-            RoomKey {
-                area_id,
-                room_number: RoomNumber(room_number),
-            },
-            name,
-            value,
-        );
-        Ok(())
+        let submission = mapper
+            .set_room_property(
+                RoomKey {
+                    area_id,
+                    room_number: RoomNumber(room_number),
+                },
+                name,
+                value,
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }
 }
 
-#[op2]
-fn op_smudgy_mapper_set_area_property(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_area_property(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[string] name: String,
     #[string] value: String,
-) -> Result<(), MapperError> {
+) -> Result<Option<(u64, u64)>, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.set_area_property(area_id, name, value);
-        Ok(())
+        let submission = mapper
+            .set_area_property(area_id, name, value)
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }
 }
 
-#[op2]
-fn op_smudgy_mapper_add_room_tag(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_add_room_tag(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     #[string] tag: String,
-) -> Result<(), MapperError> {
+) -> Result<Option<(u64, u64)>, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.add_room_tag(
-            RoomKey {
-                area_id,
-                room_number: RoomNumber(room_number),
-            },
-            tag,
-        );
-        Ok(())
+        let submission = mapper
+            .add_room_tag(
+                RoomKey {
+                    area_id,
+                    room_number: RoomNumber(room_number),
+                },
+                tag,
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }
 }
 
-#[op2]
-fn op_smudgy_mapper_remove_room_tag(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_remove_room_tag(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     #[string] tag: String,
-) -> Result<(), MapperError> {
+) -> Result<Option<(u64, u64)>, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.remove_room_tag(
-            RoomKey {
-                area_id,
-                room_number: RoomNumber(room_number),
-            },
-            tag,
-        );
-        Ok(())
+        let submission = mapper
+            .remove_room_tag(
+                RoomKey {
+                    area_id,
+                    room_number: RoomNumber(room_number),
+                },
+                tag,
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }
 }
 
-#[op2]
+#[op2(async(lazy))]
 #[smi]
-fn op_smudgy_mapper_create_room(
+async fn op_smudgy_mapper_create_room(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[serde] params: JSRoomParams,
 ) -> Result<i32, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
         let current_atlas = mapper.get_current_atlas();
         let area = current_atlas.get_area(&area_id);
@@ -976,14 +987,17 @@ fn op_smudgy_mapper_create_room(
         if let Some(area) = area {
             let room_number = area.get_max_room_number().0 + 1;
 
-            mapper.upsert_room(
-                RoomKey {
-                    area_id,
-                    room_number: RoomNumber(room_number),
-                },
-                params.into(),
-            );
-
+            let submission = mapper
+                .upsert_room(
+                    RoomKey {
+                        area_id,
+                        room_number: RoomNumber(room_number),
+                    },
+                    params.into(),
+                )
+                .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            drop(state);
+            await_mapper_submission(&mapper, submission).await?;
             Ok(room_number)
         } else {
             Err(MapperError::AreaNotFound)
@@ -996,25 +1010,29 @@ fn op_smudgy_mapper_create_room(
 /// `updateRoom(area, room, fields)`: upsert multiple room fields in ONE cache update
 /// (one index rebuild) instead of N `setRoomX` ops. Only the fields present in `params` change;
 /// absent fields are left untouched (`RoomUpdates` is all-`Option`). Write-gated.
-#[op2]
-fn op_smudgy_mapper_update_room(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_update_room(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     #[serde] params: JSRoomParams,
-) -> Result<(), MapperError> {
+) -> Result<Option<(u64, u64)>, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        mapper.upsert_room(
-            RoomKey {
-                area_id,
-                room_number: RoomNumber(room_number),
-            },
-            params.into(),
-        );
-        Ok(())
+        let submission = mapper
+            .upsert_room(
+                RoomKey {
+                    area_id,
+                    room_number: RoomNumber(room_number),
+                },
+                params.into(),
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }
@@ -1023,22 +1041,32 @@ fn op_smudgy_mapper_update_room(
 /// `updateRooms(area, [[n, fields], ...])`: batch-upsert many rooms of one area in a single
 /// cache update (one index rebuild) via the cloud `upsert_rooms`. Each entry is a
 /// `(room_number, fields)` pair; only the present fields of each change. Write-gated.
-#[op2]
-fn op_smudgy_mapper_update_rooms(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_update_rooms(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[serde] updates: Vec<(i32, JSRoomParams)>,
-) -> Result<(), MapperError> {
+) -> Result<Vec<(u64, u64)>, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
         let updates = updates
             .into_iter()
             .map(|(room_number, params)| (RoomNumber(room_number), params.into()))
             .collect();
-        mapper.upsert_rooms(area_id, updates);
-        Ok(())
+        let submissions = mapper
+            .upsert_rooms(area_id, updates)
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        let mut operation_ids = Vec::new();
+        for submission in submissions {
+            if let Some(operation_id) = await_mapper_submission(&mapper, submission).await? {
+                operation_ids.push(operation_id);
+            }
+        }
+        Ok(operation_ids)
     } else {
         Err(MapperError::MapperNotEnabled)
     }
@@ -1057,119 +1085,155 @@ async fn op_smudgy_mapper_create_room_exit(
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         drop(state);
 
-        let id = mapper
-            .create_exit(
-                RoomKey {
-                    area_id: AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+        let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
+        let id = ExitId::new();
+        let submission = mapper
+            .mutate_area(
+                area_id,
+                vec![AreaMutation::CreateExit {
                     room_number: RoomNumber(room_number),
-                },
-                ExitArgs {
-                    // Script-created exits carry no pre-minted identity; the
-                    // mapper mints one before enqueue.
-                    id: None,
-                    connection_id: None,
-                    from_direction: params.from_direction,
-                    to_direction: params.to_direction,
-                    to_area_id: params
-                        .to_area_id
-                        .map(|area_id| AreaId(Uuid::from_u64_pair(area_id.0, area_id.1))),
-                    to_room_number: params.to_room_number.map(RoomNumber),
-                    is_hidden: params.is_hidden.unwrap_or(false),
-                    is_closed: params.is_closed.unwrap_or(false),
-                    is_locked: params.is_locked.unwrap_or(false),
-                    weight: params.weight.unwrap_or(1.0),
-                    command: params.command,
-                    path: None,
-                    is_secret: None,
-                },
+                    body: ExitArgs {
+                        id: Some(id),
+                        connection_id: None,
+                        from_direction: params.from_direction,
+                        to_direction: params.to_direction,
+                        to_area_id: params
+                            .to_area_id
+                            .map(|area_id| AreaId(Uuid::from_u64_pair(area_id.0, area_id.1))),
+                        to_room_number: params.to_room_number.map(RoomNumber),
+                        is_hidden: params.is_hidden.unwrap_or(false),
+                        is_closed: params.is_closed.unwrap_or(false),
+                        is_locked: params.is_locked.unwrap_or(false),
+                        weight: params.weight.unwrap_or(1.0),
+                        command: params.command,
+                        path: None,
+                        is_secret: None,
+                    },
+                }],
+                "Create scripted exit",
             )
-            .await
             .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
-
+        await_mapper_submission(&mapper, submission).await?;
         Ok(id.0.as_u64_pair())
     } else {
         Err(MapperError::MapperNotEnabled)
     }
 }
 
-#[op2]
-fn op_smudgy_mapper_set_room_exit(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_room_exit(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     #[serde] exit_id: (u64, u64),
     #[serde] params: JSExitUpdateParams,
-) -> Result<(), MapperError> {
+) -> Result<Option<(u64, u64)>, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
-        mapper.update_exit(
-            RoomKey {
-                area_id: AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
-                room_number: RoomNumber(room_number),
-            },
-            ExitId(Uuid::from_u64_pair(exit_id.0, exit_id.1)),
-            ExitUpdates {
-                from_direction: params.from_direction,
-                to_direction: params.to_direction,
-                to_area_id: params
-                    .to_area_id
-                    .map(|area_id| AreaId(Uuid::from_u64_pair(area_id.0, area_id.1))),
-                to_room_number: params.to_room_number.map(RoomNumber),
-                is_hidden: params.is_hidden,
-                is_closed: params.is_closed,
-                is_locked: params.is_locked,
-                weight: params.weight,
-                command: params.command,
-                path: None,
-                is_secret: None,
-                clear_to: None,
-            },
-        );
-
-        Ok(())
+        drop(state);
+        let submission = mapper
+            .update_exit(
+                RoomKey {
+                    area_id: AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+                    room_number: RoomNumber(room_number),
+                },
+                ExitId(Uuid::from_u64_pair(exit_id.0, exit_id.1)),
+                ExitUpdates {
+                    from_direction: params.from_direction,
+                    to_direction: params.to_direction,
+                    to_area_id: params
+                        .to_area_id
+                        .map(|area_id| AreaId(Uuid::from_u64_pair(area_id.0, area_id.1))),
+                    to_room_number: params.to_room_number.map(RoomNumber),
+                    is_hidden: params.is_hidden,
+                    is_closed: params.is_closed,
+                    is_locked: params.is_locked,
+                    weight: params.weight,
+                    command: params.command,
+                    path: None,
+                    is_secret: None,
+                    clear_to: None,
+                },
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }
 }
 
-#[op2]
-fn op_smudgy_mapper_delete_room(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_merge_rooms(
+    state: Rc<RefCell<OpState>>,
+    #[serde] area_id: (u64, u64),
+    keep_room_number: i32,
+    remove_room_number: i32,
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
+        drop(state);
+        let submission = mapper
+            .merge_rooms(
+                AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+                RoomNumber(keep_room_number),
+                RoomNumber(remove_room_number),
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        await_mapper_submission(&mapper, submission).await
+    } else {
+        Err(MapperError::MapperNotEnabled)
+    }
+}
+
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_delete_room(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
-) -> Result<(), MapperError> {
+) -> Result<Option<(u64, u64)>, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
-        mapper.delete_room(RoomKey {
-            area_id: AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
-            room_number: RoomNumber(room_number),
-        });
-        Ok(())
+        let submission = mapper
+            .delete_room(RoomKey {
+                area_id: AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+                room_number: RoomNumber(room_number),
+            })
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }
 }
 
-#[op2]
-fn op_smudgy_mapper_delete_room_exit(
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_delete_room_exit(
     state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     room_number: i32,
     #[serde] exit_id: (u64, u64),
-) -> Result<(), MapperError> {
+) -> Result<Option<(u64, u64)>, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
-        mapper.delete_exit(
-            RoomKey {
-                area_id: AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
-                room_number: RoomNumber(room_number),
-            },
-            ExitId(Uuid::from_u64_pair(exit_id.0, exit_id.1)),
-        );
-        Ok(())
+        let submission = mapper
+            .delete_exit(
+                RoomKey {
+                    area_id: AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+                    room_number: RoomNumber(room_number),
+                },
+                ExitId(Uuid::from_u64_pair(exit_id.0, exit_id.1)),
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }
@@ -1304,17 +1368,19 @@ fn op_smudgy_mapper_get_area_connections(#[cppgc] area_wrapper: &JSArea) -> Vec<
         .collect()
 }
 
-#[op2]
+#[op2(async(lazy))]
 #[serde]
-fn op_smudgy_mapper_create_link(
-    state: &OpState,
+async fn op_smudgy_mapper_create_link(
+    state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[serde] params: JSLinkCreateParams,
 ) -> Result<(u64, u64), MapperError> {
-    ensure_mapper(state, true)?;
-    let Some(mapper) = state.try_borrow::<Mapper>() else {
-        return Err(MapperError::MapperNotEnabled);
-    };
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    let mapper = state
+        .try_borrow::<Mapper>()
+        .cloned()
+        .ok_or(MapperError::MapperNotEnabled)?;
     let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
     let connection_id = ConnectionId::new();
     let mut operations = Vec::with_capacity(params.traversals.len() + 1);
@@ -1357,24 +1423,29 @@ fn op_smudgy_mapper_create_link(
             },
         });
     }
-    mapper
+    let submission = mapper
         .mutate_area(area_id, operations, "Create scripted link")
         .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+    drop(state);
+    await_mapper_submission(&mapper, submission).await?;
     Ok(connection_id.0.as_u64_pair())
 }
 
-#[op2]
-fn op_smudgy_mapper_set_connection(
-    state: &OpState,
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_connection(
+    state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[serde] connection_id: (u64, u64),
     #[serde] params: JSConnectionUpdateParams,
-) -> Result<(), MapperError> {
-    ensure_mapper(state, true)?;
-    let Some(mapper) = state.try_borrow::<Mapper>() else {
-        return Err(MapperError::MapperNotEnabled);
-    };
-    mapper
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    let mapper = state
+        .try_borrow::<Mapper>()
+        .cloned()
+        .ok_or(MapperError::MapperNotEnabled)?;
+    let submission = mapper
         .mutate_area(
             AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
             vec![AreaMutation::UpdateConnection {
@@ -1384,22 +1455,25 @@ fn op_smudgy_mapper_set_connection(
             "Update scripted connection",
         )
         .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
-    Ok(())
+    drop(state);
+    await_mapper_submission(&mapper, submission).await
 }
 
-#[op2]
+#[op2(async(lazy))]
 #[serde]
-fn op_smudgy_mapper_unlink_exit(
-    state: &OpState,
+async fn op_smudgy_mapper_unlink_exit(
+    state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[serde] exit_id: (u64, u64),
 ) -> Result<(u64, u64), MapperError> {
-    ensure_mapper(state, true)?;
-    let Some(mapper) = state.try_borrow::<Mapper>() else {
-        return Err(MapperError::MapperNotEnabled);
-    };
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    let mapper = state
+        .try_borrow::<Mapper>()
+        .cloned()
+        .ok_or(MapperError::MapperNotEnabled)?;
     let connection_id = ConnectionId::new();
-    mapper
+    let submission = mapper
         .mutate_area(
             AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
             vec![AreaMutation::Unlink {
@@ -1409,21 +1483,26 @@ fn op_smudgy_mapper_unlink_exit(
             "Unlink scripted traversal",
         )
         .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+    drop(state);
+    await_mapper_submission(&mapper, submission).await?;
     Ok(connection_id.0.as_u64_pair())
 }
 
-#[op2]
-fn op_smudgy_mapper_pair_connections(
-    state: &OpState,
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_pair_connections(
+    state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[serde] keep_connection_id: (u64, u64),
     #[serde] merge_connection_id: (u64, u64),
-) -> Result<(), MapperError> {
-    ensure_mapper(state, true)?;
-    let Some(mapper) = state.try_borrow::<Mapper>() else {
-        return Err(MapperError::MapperNotEnabled);
-    };
-    mapper
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    let mapper = state
+        .try_borrow::<Mapper>()
+        .cloned()
+        .ok_or(MapperError::MapperNotEnabled)?;
+    let submission = mapper
         .mutate_area(
             AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
             vec![AreaMutation::Pair {
@@ -1439,20 +1518,24 @@ fn op_smudgy_mapper_pair_connections(
             "Pair scripted connections",
         )
         .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
-    Ok(())
+    drop(state);
+    await_mapper_submission(&mapper, submission).await
 }
 
-#[op2]
-fn op_smudgy_mapper_delete_link(
-    state: &OpState,
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_delete_link(
+    state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[serde] connection_id: (u64, u64),
-) -> Result<(), MapperError> {
-    ensure_mapper(state, true)?;
-    let Some(mapper) = state.try_borrow::<Mapper>() else {
-        return Err(MapperError::MapperNotEnabled);
-    };
-    mapper
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    let mapper = state
+        .try_borrow::<Mapper>()
+        .cloned()
+        .ok_or(MapperError::MapperNotEnabled)?;
+    let submission = mapper
         .mutate_area(
             AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
             vec![AreaMutation::DeleteLink {
@@ -1461,7 +1544,8 @@ fn op_smudgy_mapper_delete_link(
             "Delete scripted link",
         )
         .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
-    Ok(())
+    drop(state);
+    await_mapper_submission(&mapper, submission).await
 }
 
 // ============================================================================
@@ -1723,10 +1807,17 @@ async fn op_smudgy_mapper_create_label(
     };
     if let Some(mapper) = mapper {
         let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        let id = mapper
-            .create_label(area_id, params.into())
-            .await
+        let id = LabelId(Uuid::new_v4());
+        let mut body: LabelArgs = params.into();
+        body.id = Some(id);
+        let submission = mapper
+            .mutate_area(
+                area_id,
+                vec![AreaMutation::CreateLabel { body }],
+                "Create scripted label",
+            )
             .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
+        await_mapper_submission(&mapper, submission).await?;
         Ok(id.0.as_u64_pair())
     } else {
         Err(MapperError::MapperNotEnabled)
@@ -1748,10 +1839,17 @@ async fn op_smudgy_mapper_create_shape(
     };
     if let Some(mapper) = mapper {
         let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        let id = mapper
-            .create_shape(area_id, params.into())
-            .await
+        let id = ShapeId(Uuid::new_v4());
+        let mut body: ShapeArgs = params.into();
+        body.id = Some(id);
+        let submission = mapper
+            .mutate_area(
+                area_id,
+                vec![AreaMutation::CreateShape { body }],
+                "Create scripted shape",
+            )
             .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
+        await_mapper_submission(&mapper, submission).await?;
         Ok(id.0.as_u64_pair())
     } else {
         Err(MapperError::MapperNotEnabled)
@@ -1759,38 +1857,48 @@ async fn op_smudgy_mapper_create_shape(
 }
 
 /// `deleteLabel(area, labelId)`: remove a label from an area. Write-gated.
-#[op2]
-fn op_smudgy_mapper_delete_label(
-    state: &OpState,
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_delete_label(
+    state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[serde] label_id: (u64, u64),
-) -> Result<(), MapperError> {
-    ensure_mapper(state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
-        mapper.delete_label(
-            AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
-            LabelId(Uuid::from_u64_pair(label_id.0, label_id.1)),
-        );
-        Ok(())
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
+        let submission = mapper
+            .delete_label(
+                AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+                LabelId(Uuid::from_u64_pair(label_id.0, label_id.1)),
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }
 }
 
 /// `deleteShape(area, shapeId)`: remove a shape from an area. Write-gated.
-#[op2]
-fn op_smudgy_mapper_delete_shape(
-    state: &OpState,
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_delete_shape(
+    state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[serde] shape_id: (u64, u64),
-) -> Result<(), MapperError> {
-    ensure_mapper(state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
-        mapper.delete_shape(
-            AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
-            ShapeId(Uuid::from_u64_pair(shape_id.0, shape_id.1)),
-        );
-        Ok(())
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
+        let submission = mapper
+            .delete_shape(
+                AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+                ShapeId(Uuid::from_u64_pair(shape_id.0, shape_id.1)),
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }
@@ -1798,21 +1906,26 @@ fn op_smudgy_mapper_delete_shape(
 
 /// `setLabel(area, labelId, updates)`: update an existing label; only the present fields
 /// change. Write-gated.
-#[op2]
-fn op_smudgy_mapper_set_label(
-    state: &OpState,
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_label(
+    state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[serde] label_id: (u64, u64),
     #[serde] params: JSLabelUpdateParams,
-) -> Result<(), MapperError> {
-    ensure_mapper(state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
-        mapper.update_label(
-            AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
-            LabelId(Uuid::from_u64_pair(label_id.0, label_id.1)),
-            params.into(),
-        );
-        Ok(())
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
+        let submission = mapper
+            .update_label(
+                AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+                LabelId(Uuid::from_u64_pair(label_id.0, label_id.1)),
+                params.into(),
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }
@@ -1820,21 +1933,26 @@ fn op_smudgy_mapper_set_label(
 
 /// `setShape(area, shapeId, updates)`: update an existing shape; only the present fields
 /// change. Write-gated.
-#[op2]
-fn op_smudgy_mapper_set_shape(
-    state: &OpState,
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_set_shape(
+    state: Rc<RefCell<OpState>>,
     #[serde] area_id: (u64, u64),
     #[serde] shape_id: (u64, u64),
     #[serde] params: JSShapeUpdateParams,
-) -> Result<(), MapperError> {
-    ensure_mapper(state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>() {
-        mapper.update_shape(
-            AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
-            ShapeId(Uuid::from_u64_pair(shape_id.0, shape_id.1)),
-            params.into(),
-        );
-        Ok(())
+) -> Result<Option<(u64, u64)>, MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
+        let submission = mapper
+            .update_shape(
+                AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+                ShapeId(Uuid::from_u64_pair(shape_id.0, shape_id.1)),
+                params.into(),
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
     }

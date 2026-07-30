@@ -223,7 +223,9 @@ fn inactive_chip() -> ThemedElement<'static, Message> {
                 .font(fonts::BOOTSTRAP_ICONS)
                 .size(13.0)
                 .style(muted),
-            text(crate::i18n::t!("inspector-inactive")).size(12).style(muted),
+            text(crate::i18n::t!("inspector-inactive"))
+                .size(12)
+                .style(muted),
         ]
         .spacing(4)
         .align_y(Vertical::Center),
@@ -238,7 +240,7 @@ fn inactive_chip() -> ThemedElement<'static, Message> {
 /// sync — the engine no longer polls on a timer, so this is how the user pulls
 /// remote changes (and retries after a failure) on demand.
 fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
-    const PENDING_WARNING: &str = "Pending changes are held only for this session. Closing now attempts a final sync, but may lose unsent work.";
+    const PENDING_WARNING: &str = "Cloud and local map edits are staged on disk for retry. Ephemeral session maps are not saved after closing.";
     let status = window
         .editor
         .area_id()
@@ -269,7 +271,7 @@ fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
             "Conflict needs review".to_string(),
             error,
         ),
-        AreaSaveStatus::CouldNotSave(_) => (
+        AreaSaveStatus::CouldNotSave { .. } => (
             bootstrap_icons::EXCLAMATION_TRIANGLE,
             "Could not save".to_string(),
             error,
@@ -299,7 +301,7 @@ fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
         .spacing(4)
         .align_y(Vertical::Center)
         .into(),
-        AreaSaveStatus::CouldNotSave(message) => row![
+        AreaSaveStatus::CouldNotSave { message, retryable } => row![
             tooltip(
                 container(content).padding([2, 6]),
                 text(message).size(12),
@@ -307,7 +309,7 @@ fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
             ),
             button(text(crate::i18n::t!("action-retry")).size(11))
                 .style(builtins::button::secondary)
-                .on_press(Message::RetrySaveRequested),
+                .on_press_maybe(retryable.then_some(Message::RetrySaveRequested)),
             button(text(crate::i18n::t!("editor-discard")).size(11))
                 .style(builtins::button::secondary)
                 .on_press(Message::DiscardFailedSaveRequested),

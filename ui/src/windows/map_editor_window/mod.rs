@@ -118,7 +118,10 @@ pub enum Message {
     LinkCreateConfirmed,
     /// Keep-theirs finished for a Link gesture whose proposed new room
     /// number was taken while its CAS envelope was in flight.
-    NewRoomLinkConflictResolved(OperationId),
+    NewRoomLinkConflictResolved {
+        operation_id: OperationId,
+        result: Result<(), String>,
+    },
     CopyIncludeBoundaryChanged(bool),
     CopySelectionConfirmed,
     LevelUp,
@@ -144,8 +147,13 @@ pub enum Message {
     RenameAreaStarted(AreaId),
     RenameAreaChanged(String),
     RenameAreaCommitted,
+    RenameAreaCompleted(Result<(), String>),
     DeleteAreaRequested(AreaId),
     DeleteAreaConfirmed,
+    DeleteAreaCompleted {
+        area_id: AreaId,
+        result: Result<(), String>,
+    },
     DeleteConnectionConfirmed,
     RedistributePortsConfirmed,
     ModalDismissed,
@@ -193,7 +201,10 @@ pub enum Message {
     KeepTheirsRequested,
     RetrySaveRequested,
     DiscardFailedSaveRequested,
-    SaveResolutionCompleted,
+    SaveResolutionCompleted {
+        result: Result<(), String>,
+        discarded_operation: Option<OperationId>,
+    },
     /// Toggle whether `area_id` participates in room identification/routing.
     ToggleAreaEnabled(AreaId),
     /// Make `area_id` the active copy of its copy-family: enable it and
@@ -203,6 +214,7 @@ pub enum Message {
     /// (signed-in only); rebuilds [`Self::sharers`] from the grants and
     /// [`Self::family_index`] from the areas' `family_token`s.
     IndicesLoaded {
+        auth_projection_revision: u64,
         grants: Result<Vec<ShareGrantRow>, CloudError>,
         areas: Result<Vec<Area>, CloudError>,
     },
@@ -212,7 +224,10 @@ pub enum Message {
 
     // ===== atlases (folders for your own maps) =====
     /// The owned-atlas inventory finished loading (refreshed on the sync tick).
-    AtlasesLoaded(Result<Vec<AtlasListItem>, CloudError>),
+    AtlasesLoaded {
+        auth_projection_revision: u64,
+        result: Result<Vec<AtlasListItem>, CloudError>,
+    },
     /// Open the create-folder modal.
     NewAtlasRequested,
     CreateAtlasNameChanged(String),
@@ -238,6 +253,7 @@ pub enum Message {
         area: AreaId,
         atlas: Option<AtlasId>,
     },
+    MoveAreaCompleted(Result<(), String>),
     /// Collapse/expand a folder in the area list (pure view state).
     ToggleFolderCollapsed(FolderKey),
     /// Open the atlas-scoped "Share folder…" dialog.
@@ -435,6 +451,9 @@ pub struct MapEditorWindow {
     /// The mapper sync revision the sharer index was last refreshed at; a
     /// change (background sync swapped the cache) triggers a refetch.
     last_seen_sync_revision: Option<u64>,
+    /// Credential-boundary revision. A change clears cloud atlas metadata
+    /// before any fallible identity/atlas request can retain stale names.
+    last_seen_auth_projection_revision: Option<u64>,
     /// Owned-atlas inventory (the only source of atlas *names*), refreshed on
     /// the same tick as [`Self::sharers`]. Empty while signed out / no
     /// credential. Drives the "My maps" folder labels.
@@ -722,6 +741,7 @@ impl MapEditorWindow {
             // Seeded None so the first Tick fetches the sharer index (the
             // mapper's revision will differ from this).
             last_seen_sync_revision: None,
+            last_seen_auth_projection_revision: None,
             atlases: Vec::new(),
             collapsed_folders: HashSet::new(),
             renaming_atlas: None,
@@ -856,6 +876,7 @@ impl MapEditorWindow {
         }
         let client = self.cloud.client.clone();
         let mapper = self.mapper.clone();
+        let auth_projection_revision = self.mapper.auth_projection_revision();
         Task::perform(
             async move {
                 let grants = client.shares(ShareDirection::Received).await;
@@ -865,7 +886,11 @@ impl MapEditorWindow {
                 let areas = mapper.list_areas().await;
                 (grants, areas)
             },
-            |(grants, areas)| Message::IndicesLoaded { grants, areas },
+            move |(grants, areas)| Message::IndicesLoaded {
+                auth_projection_revision,
+                grants,
+                areas,
+            },
         )
     }
 
@@ -972,10 +997,13 @@ impl MapEditorWindow {
     /// 401 on every tick.
     fn fetch_atlases(&self) -> Task<Message> {
         let mapper = self.mapper.clone();
-        Task::perform(
-            async move { mapper.list_atlases().await },
-            Message::AtlasesLoaded,
-        )
+        let auth_projection_revision = self.mapper.auth_projection_revision();
+        Task::perform(async move { mapper.list_atlases().await }, move |result| {
+            Message::AtlasesLoaded {
+                auth_projection_revision,
+                result,
+            }
+        })
     }
 
     /// The copy-family of `area_id`: the connected component over **both** the
@@ -1076,10 +1104,12 @@ impl MapEditorWindow {
             .and_then(|id| atlas.get_area(&id))
             .map_or_else(
                 || crate::i18n::t!("mapper-window-title"),
-                |area| crate::i18n::t!(
-                    "mapper-window-area-title",
-                    "area" => area.get_name()
-                ),
+                |area| {
+                    crate::i18n::t!(
+                        "mapper-window-area-title",
+                        "area" => area.get_name()
+                    )
+                },
             )
     }
 
@@ -1266,6 +1296,9 @@ impl MapEditorWindow {
                 self.clear_automatic_route_state();
                 let (task, operation_ids) =
                     self.stack.push_and_apply_tracked(&self.mapper, command);
+                if let Some(error) = self.stack.take_last_error() {
+                    self.editor_notice = Some((Instant::now(), error));
+                }
                 self.refresh_seen_rev();
                 (
                     Update::with_task(task.map(Message::CommandCompleted)),
@@ -1334,10 +1367,16 @@ impl MapEditorWindow {
         let mapper = self.mapper.clone();
         Task::perform(
             async move {
-                mapper.resolve_conflict(area_id, false).await;
-                operation_id
+                let result = mapper
+                    .resolve_conflict(area_id, false)
+                    .await
+                    .map_err(|error| display_error(&error));
+                (operation_id, result)
             },
-            Message::NewRoomLinkConflictResolved,
+            |(operation_id, result)| Message::NewRoomLinkConflictResolved {
+                operation_id,
+                result,
+            },
         )
     }
 
@@ -1531,9 +1570,10 @@ impl MapEditorWindow {
                         .get_current_atlas()
                         .get_area(&area_id)
                         .is_some_and(|area| {
-                            area.get_connection(connection_id).is_some_and(|connection| {
-                                connection.routing == smudgy_cloud::ConnectionRouting::Automatic
-                            })
+                            area.get_connection(connection_id)
+                                .is_some_and(|connection| {
+                                    connection.routing == smudgy_cloud::ConnectionRouting::Automatic
+                                })
                         })
                 {
                     self.automatic_routes_maybe_stale.insert(connection_id);
@@ -1918,6 +1958,9 @@ impl MapEditorWindow {
                 }
                 self.clear_automatic_route_state();
                 let task = self.stack.undo(&self.mapper).map(Message::CommandCompleted);
+                if let Some(error) = self.stack.take_last_error() {
+                    self.editor_notice = Some((Instant::now(), error));
+                }
                 self.refresh_seen_rev();
                 self.inspector.resync(&self.mapper, &self.editor);
                 Update::with_task(task)
@@ -1929,6 +1972,9 @@ impl MapEditorWindow {
                 }
                 self.clear_automatic_route_state();
                 let task = self.stack.redo(&self.mapper).map(Message::CommandCompleted);
+                if let Some(error) = self.stack.take_last_error() {
+                    self.editor_notice = Some((Instant::now(), error));
+                }
                 self.refresh_seen_rev();
                 self.inspector.resync(&self.mapper, &self.editor);
                 Update::with_task(task)
@@ -2070,6 +2116,15 @@ impl MapEditorWindow {
                 // the first tick). Both are no-ops while signed out.
                 let sync_rev = self.mapper.sync_revision();
                 let mut sharer_task = Task::none();
+                let auth_projection_rev = self.mapper.auth_projection_revision();
+                if self.last_seen_auth_projection_revision != Some(auth_projection_rev) {
+                    self.last_seen_auth_projection_revision = Some(auth_projection_rev);
+                    self.local_atlas_ids = self.mapper.local_atlas_ids();
+                    self.atlases
+                        .retain(|atlas| self.local_atlas_ids.contains(&atlas.id));
+                    self.sharers = None;
+                    self.family_index = FamilyIndex::default();
+                }
                 if self.last_seen_sync_revision != Some(sync_rev) {
                     self.last_seen_sync_revision = Some(sync_rev);
                     sharer_task = self.fetch_sharers();
@@ -2100,6 +2155,16 @@ impl MapEditorWindow {
                     .is_some_and(|(shown, _)| shown.elapsed() >= ROOM_COPY_NOTICE_TTL)
                 {
                     self.editor_notice = None;
+                }
+                let recovery_errors = self.mapper.take_mutation_recovery_errors();
+                if !recovery_errors.is_empty() {
+                    self.editor_notice = Some((
+                        Instant::now(),
+                        format!(
+                            "{} pending map edit journal record(s) could not be recovered and were quarantined; see the application log for details.",
+                            recovery_errors.len()
+                        ),
+                    ));
                 }
 
                 // A clone we requested selects itself once sync lands it.
@@ -2454,14 +2519,30 @@ impl MapEditorWindow {
             }
             Message::RenameAreaCommitted => {
                 if let Some((area_id, name)) = self.renaming_area.take() {
-                    let name = name.trim();
+                    let name = name.trim().to_string();
                     if !name.is_empty() && self.area_owned(area_id) {
                         // Area management deliberately bypasses the undo
-                        // stack.
-                        self.mapper.rename_area(area_id, name);
-                        self.refresh_seen_rev();
+                        // stack, but waits for backend acknowledgement.
+                        let mapper = self.mapper.clone();
+                        return Update::with_task(Task::perform(
+                            async move {
+                                mapper
+                                    .rename_area(area_id, &name)
+                                    .await
+                                    .map_err(|error| display_error(&error))
+                            },
+                            Message::RenameAreaCompleted,
+                        ));
                     }
                 }
+                Update::none()
+            }
+            Message::RenameAreaCompleted(result) => {
+                if let Err(error) = result {
+                    self.editor_notice = Some((Instant::now(), error));
+                }
+                self.refresh_seen_rev();
+                self.inspector.resync(&self.mapper, &self.editor);
                 Update::none()
             }
             Message::DeleteAreaRequested(area_id) => {
@@ -2486,19 +2567,36 @@ impl MapEditorWindow {
                     return Update::none();
                 }
 
-                self.mapper.delete_area(area_id);
+                let mapper = self.mapper.clone();
+                Update::with_task(Task::perform(
+                    async move {
+                        let result = mapper
+                            .delete_area(area_id)
+                            .await
+                            .map_err(|error| display_error(&error));
+                        (area_id, result)
+                    },
+                    |(area_id, result)| Message::DeleteAreaCompleted { area_id, result },
+                ))
+            }
+            Message::DeleteAreaCompleted { area_id, result } => {
+                if let Err(error) = result {
+                    self.editor_notice = Some((Instant::now(), error));
+                    return Update::none();
+                }
                 self.stack.clear();
-
-                let next_area = area_list::first_area_id(
-                    &self.mapper.get_current_atlas(),
-                    &self.mapper.ephemeral_area_ids(),
-                );
-                self.editor.set_area(next_area);
-                let editable = self.can_edit_active_area();
-                self.editor.set_editable(editable);
-                self.hovered_room = None;
-                if !self.can_edit_active_area() && self.editor.tool() != Tool::Select {
-                    self.editor.set_tool(Tool::Select);
+                if self.editor.area_id() == Some(area_id) {
+                    let next_area = area_list::first_area_id(
+                        &self.mapper.get_current_atlas(),
+                        &self.mapper.ephemeral_area_ids(),
+                    );
+                    self.editor.set_area(next_area);
+                    let editable = self.can_edit_active_area();
+                    self.editor.set_editable(editable);
+                    self.hovered_room = None;
+                    if !self.can_edit_active_area() && self.editor.tool() != Tool::Select {
+                        self.editor.set_tool(Tool::Select);
+                    }
                 }
                 self.refresh_seen_rev();
                 self.inspector.resync(&self.mapper, &self.editor);
@@ -2684,8 +2782,18 @@ impl MapEditorWindow {
                 self.inspector.resync(&self.mapper, &self.editor);
                 update
             }
-            Message::NewRoomLinkConflictResolved(operation_id) => {
-                self.finish_new_room_link_conflict_recovery(Some(operation_id));
+            Message::NewRoomLinkConflictResolved {
+                operation_id,
+                result,
+            } => {
+                if let Err(error) = result {
+                    if let Some((recovery_id, draft, _)) = self.recovering_new_room_link.take() {
+                        self.pending_new_room_links.insert(recovery_id, draft);
+                    }
+                    self.editor_notice = Some((Instant::now(), error));
+                } else {
+                    self.finish_new_room_link_conflict_recovery(Some(operation_id));
+                }
                 Update::none()
             }
             Message::DeleteConnectionConfirmed => {
@@ -2744,12 +2852,21 @@ impl MapEditorWindow {
                     return Update::none();
                 };
                 let keep_mine = matches!(resolution, Message::KeepMineRequested);
+                let discarded_operation = (!keep_mine)
+                    .then(|| self.mapper.conflicted_operation_id(area_id))
+                    .flatten();
                 let mapper = self.mapper.clone();
                 Update::with_task(Task::perform(
                     async move {
-                        mapper.resolve_conflict(area_id, keep_mine).await;
+                        mapper
+                            .resolve_conflict(area_id, keep_mine)
+                            .await
+                            .map_err(|error| display_error(&error))
                     },
-                    |_| Message::SaveResolutionCompleted,
+                    move |result| Message::SaveResolutionCompleted {
+                        result,
+                        discarded_operation,
+                    },
                 ))
             }
             resolution @ (Message::RetrySaveRequested | Message::DiscardFailedSaveRequested) => {
@@ -2757,20 +2874,50 @@ impl MapEditorWindow {
                     return Update::none();
                 };
                 let retry = matches!(resolution, Message::RetrySaveRequested);
+                let discarded_operation = (!retry)
+                    .then(|| self.mapper.failed_operation_id(area_id))
+                    .flatten();
                 let mapper = self.mapper.clone();
                 Update::with_task(Task::perform(
                     async move {
-                        mapper.resolve_failed(area_id, retry).await;
+                        mapper
+                            .resolve_failed(area_id, retry)
+                            .await
+                            .map_err(|error| display_error(&error))
                     },
-                    |_| Message::SaveResolutionCompleted,
+                    move |result| Message::SaveResolutionCompleted {
+                        result,
+                        discarded_operation,
+                    },
                 ))
             }
-            Message::SaveResolutionCompleted => {
+            Message::SaveResolutionCompleted {
+                result,
+                discarded_operation,
+            } => {
+                match result {
+                    Ok(()) => {
+                        if let Some(operation_id) = discarded_operation {
+                            self.stack.discard_operation(operation_id);
+                            self.pending_new_room_links.remove(&operation_id);
+                        }
+                    }
+                    Err(error) => {
+                        self.editor_notice = Some((Instant::now(), error));
+                    }
+                }
                 self.refresh_seen_rev();
                 self.inspector.resync(&self.mapper, &self.editor);
                 Update::none()
             }
-            Message::IndicesLoaded { grants, areas } => {
+            Message::IndicesLoaded {
+                auth_projection_revision,
+                grants,
+                areas,
+            } => {
+                if auth_projection_revision != self.mapper.auth_projection_revision() {
+                    return Update::none();
+                }
                 // §5 first-sight homing needs BOTH halves (the grants carry the
                 // host hints; the areas map an area-scope grant to its atlas).
                 // Bubble the resulting scope change up to the central flow so
@@ -3055,7 +3202,13 @@ impl MapEditorWindow {
             }
 
             // ===== atlases (folders) =====
-            Message::AtlasesLoaded(result) => {
+            Message::AtlasesLoaded {
+                auth_projection_revision,
+                result,
+            } => {
+                if auth_projection_revision != self.mapper.auth_projection_revision() {
+                    return Update::none();
+                }
                 let mut deltas = Vec::new();
                 match result {
                     Ok(atlases) => {
@@ -3281,11 +3434,27 @@ impl MapEditorWindow {
                 Update::none()
             }
             Message::MoveAreaToAtlas { area, atlas } => {
-                if self.area_owned(area) {
-                    self.mapper.move_area_to_atlas(area, atlas);
-                    self.refresh_seen_rev();
-                }
                 self.modal = None;
+                if self.area_owned(area) {
+                    let mapper = self.mapper.clone();
+                    return Update::with_task(Task::perform(
+                        async move {
+                            mapper
+                                .move_area_to_atlas(area, atlas)
+                                .await
+                                .map_err(|error| display_error(&error))
+                        },
+                        Message::MoveAreaCompleted,
+                    ));
+                }
+                Update::none()
+            }
+            Message::MoveAreaCompleted(result) => {
+                if let Err(error) = result {
+                    self.editor_notice = Some((Instant::now(), error));
+                }
+                self.refresh_seen_rev();
+                self.inspector.resync(&self.mapper, &self.editor);
                 Update::none()
             }
             Message::ToggleFolderCollapsed(key) => {
@@ -3434,8 +3603,8 @@ impl MapEditorWindow {
                                     button(
                                         text(crate::i18n::t!("mapper-create-first-room")).size(14)
                                     )
-                                        .style(theme::builtins::button::primary)
-                                        .on_press(Message::ToolSelected(Tool::AddRoom)),
+                                    .style(theme::builtins::button::primary)
+                                    .on_press(Message::ToolSelected(Tool::AddRoom)),
                                     text(crate::i18n::t!("mapper-create-first-room-help")).size(12),
                                 ]
                                 .spacing(6)
@@ -3488,8 +3657,7 @@ impl MapEditorWindow {
             layout = layout.push(
                 container(
                     row![
-                        text(crate::i18n::t!("mapper-local-maps-signin"))
-                        .size(13),
+                        text(crate::i18n::t!("mapper-local-maps-signin")).size(13),
                         button(text(crate::i18n::t!("mapper-sign-in-create")).size(12))
                             .style(theme::builtins::button::primary)
                             .padding([2, 8])
@@ -3837,7 +4005,9 @@ mod tests {
             .await
             .expect("create area");
         for room_number in [RoomNumber(1), RoomNumber(2)] {
-            mapper.upsert_room(RoomKey::new(area_id, room_number), RoomUpdates::default());
+            mapper
+                .upsert_room(RoomKey::new(area_id, room_number), RoomUpdates::default())
+                .expect("stage room");
         }
 
         // Existing one-way traversal: room 2 west -> room 1 east.

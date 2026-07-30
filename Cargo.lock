@@ -10521,6 +10521,7 @@ dependencies = [
  "tokio-test",
  "url",
  "uuid 1.16.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

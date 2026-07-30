@@ -114,7 +114,11 @@ pub fn connection_verdict_in(
 /// The derived, never-stored Connection kind, exactly as the server derives
 /// it at projection: endpoint shape first, then external membership, then
 /// room levels.
-pub fn connection_kind(area: &AreaRecord, connection: &ConnectionRecord, any_external: bool) -> &'static str {
+pub fn connection_kind(
+    area: &AreaRecord,
+    connection: &ConnectionRecord,
+    any_external: bool,
+) -> &'static str {
     match connection.endpoint_b.as_ref() {
         None => {
             if any_external {
@@ -393,7 +397,7 @@ pub fn project_area(state: &MockState, viewer: Uuid, area_id: Uuid) -> Option<Va
         "atlas_id": area.atlas_id,
         "name": area.name,
         "created_at": area.created_at,
-        "rev": if see { area.rev } else { area.public_rev },
+        "rev": area.rev,
         "access": {
             "is_owner": caps.is_owner,
             "can_edit": caps.can_edit,
@@ -447,14 +451,13 @@ pub fn atlas_name(state: &MockState, area: &AreaRecord) -> Option<String> {
 /// One row of `GET /areas` (`ProjectedAreaListItem`).
 pub fn project_list_item(state: &MockState, viewer: Uuid, area: &AreaRecord) -> Value {
     let caps = state.caps(viewer, area.id).expect("area exists");
-    let see = caps.see_secrets();
     let mut out = json!({
         "id": area.id,
         "user_id": area.user_id,
         "atlas_id": area.atlas_id,
         "name": area.name,
         "created_at": area.created_at,
-        "rev": if see { area.rev } else { area.public_rev },
+        "rev": area.rev,
         "access": {
             "is_owner": caps.is_owner,
             "can_edit": caps.can_edit,

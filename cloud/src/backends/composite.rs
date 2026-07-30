@@ -226,6 +226,17 @@ impl MapperBackend for CompositeBackend {
         self.area_backend(*area_id).await.get_area(area_id).await
     }
 
+    async fn get_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        auth_generation: u64,
+    ) -> CloudResult<AreaWithDetails> {
+        self.area_backend(*area_id)
+            .await
+            .get_area_at_generation(area_id, auth_generation)
+            .await
+    }
+
     fn last_area_source(&self, area_id: &AreaId) -> AreaLoadSource {
         // Sync method: route on the current sets without seeding (a best-effort
         // load-source hint; cloud is a fine fallback for an unseeded id).
@@ -245,10 +256,39 @@ impl MapperBackend for CompositeBackend {
             .await
     }
 
+    async fn update_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        updates: AreaUpdates,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.area_backend(*area_id)
+            .await
+            .update_area_at_generation(area_id, updates, auth_generation)
+            .await
+    }
+
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
         let result = self.area_backend(*area_id).await.delete_area(area_id).await;
         self.ephemeral_areas.write().remove(area_id);
         self.local_areas.write().remove(area_id);
+        result
+    }
+
+    async fn delete_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let result = self
+            .area_backend(*area_id)
+            .await
+            .delete_area_at_generation(area_id, auth_generation)
+            .await;
+        if result.is_ok() {
+            self.ephemeral_areas.write().remove(area_id);
+            self.local_areas.write().remove(area_id);
+        }
         result
     }
 
@@ -264,6 +304,18 @@ impl MapperBackend for CompositeBackend {
         self.area_backend(*area_id)
             .await
             .execute_mutation(area_id, envelope)
+            .await
+    }
+
+    async fn execute_mutation_at_generation(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+        auth_generation: u64,
+    ) -> CloudResult<MutationResult> {
+        self.area_backend(*area_id)
+            .await
+            .execute_mutation_at_generation(area_id, envelope, auth_generation)
             .await
     }
 
@@ -293,6 +345,31 @@ impl MapperBackend for CompositeBackend {
         self.area_backend(*area_id)
             .await
             .move_area_to_atlas(area_id, atlas_id)
+            .await
+    }
+
+    async fn move_area_to_atlas_at_generation(
+        &self,
+        area_id: &AreaId,
+        atlas_id: Option<AtlasId>,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.ensure_routing_seeded().await;
+        if let Some(target) = atlas_id {
+            if self.is_ephemeral_area(*area_id) {
+                return Err(CloudError::InvalidInput(
+                    "session maps can't be filed into folders — save the map first".to_string(),
+                ));
+            }
+            if self.is_local_area(*area_id) != self.is_local_atlas(target) {
+                return Err(CloudError::InvalidInput(
+                    "moving a map between the local and cloud tiers isn't supported".to_string(),
+                ));
+            }
+        }
+        self.area_backend(*area_id)
+            .await
+            .move_area_to_atlas_at_generation(area_id, atlas_id, auth_generation)
             .await
     }
 
@@ -362,6 +439,10 @@ impl MapperBackend for CompositeBackend {
         // The cloud tier drives /sync; the local rows ride along (see module
         // docs) so the engine never prunes them.
         self.cloud.supports_sync()
+    }
+
+    fn mutation_journal_namespace(&self) -> Option<String> {
+        self.cloud.mutation_journal_namespace()
     }
 
     fn local_atlas_ids(&self) -> HashSet<AtlasId> {
@@ -442,6 +523,22 @@ impl MapperBackend for CompositeBackend {
         // path while signed out.)
         if self.cloud.has_credential() {
             self.cloud.viewer_identity().await
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn viewer_identity_at_generation(
+        &self,
+        auth_generation: u64,
+    ) -> CloudResult<Option<Uuid>> {
+        if self.cloud.auth_generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        if self.cloud.has_credential() {
+            self.cloud
+                .viewer_identity_at_generation(auth_generation)
+                .await
         } else {
             Ok(None)
         }

@@ -19,17 +19,15 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::areas::{
-    DIRECTIONS, H_ALIGN, SHAPE_TYPES, V_ALIGN, check_enum, double_option,
-    embedded_exit_json, embedded_label_json, embedded_shape_json, require_caps,
+    DIRECTIONS, H_ALIGN, SHAPE_TYPES, V_ALIGN, check_enum, double_option, embedded_exit_json,
+    embedded_label_json, embedded_shape_json, require_caps,
 };
 use super::connections::{
     self, NewExitLink, attach_for_new_exit, cleanup_after_exit_delete, maintain_after_retarget,
 };
-use super::projection::connection_verdict_in;
-use super::http::{
-    authenticate, bad_request, err, err_with_details, not_found, ok, parse_area_id,
-};
+use super::http::{authenticate, bad_request, err, err_with_details, not_found, ok, parse_area_id};
 use super::mock_server::Shared;
+use super::projection::connection_verdict_in;
 use super::state::{
     AreaPropRecord, AreaRecord, Caps, ExitRecord, LabelRecord, MockState, MutationReceipt,
     RoomPropRecord, RoomRecord, ShapeRecord, access_fingerprint,
@@ -69,6 +67,10 @@ enum AreaOp {
     },
     DeleteRoom {
         room_number: i32,
+    },
+    AssertMergeSafe {
+        keep_room_number: i32,
+        remove_room_number: i32,
     },
     UpsertRoomProperty {
         room_number: i32,
@@ -343,7 +345,9 @@ pub async fn area_mutations(
         return bad_request("empty mutation");
     }
     if envelope.payload.len() > MAX_MUTATION_OPERATIONS {
-        return bad_request(&format!("too many operations (max {MAX_MUTATION_OPERATIONS})"));
+        return bad_request(&format!(
+            "too many operations (max {MAX_MUTATION_OPERATIONS})"
+        ));
     }
 
     let request_hash = request_hash(area_id, &envelope.payload);
@@ -374,23 +378,19 @@ pub async fn area_mutations(
         return finish(&mut st, ok(stored));
     }
 
-    // Preconditions: exactly one, naming the scope area, judged against the
-    // CALLER'S projection (full rev for secret-seers, public rev otherwise).
-    let projected_rev = {
-        let area = st.areas.get(&area_id).expect("caps proved the area exists");
-        if caps.see_secrets() {
-            area.rev
-        } else {
-            area.public_rev
-        }
-    };
+    // Preconditions name the shared area revision. The access fingerprint
+    // separately protects the caller's redacted projection.
+    let current_rev = st
+        .areas
+        .get(&area_id)
+        .expect("caps proved the area exists")
+        .rev;
     let precondition = match envelope.preconditions.as_slice() {
         [p] if p.resource == "area" && p.id == area_id => p,
         _ => return bad_request("expected exactly one precondition naming the mutated area"),
     };
-    // The fingerprint is mandatory: rev and public_rev are independent
-    // counters that can numerically coincide, so a bare revision could pass
-    // against the wrong projection class right after a capability change.
+    // The fingerprint remains mandatory because capabilities can change the
+    // redacted document without changing the shared revision.
     let Some(precondition_fingerprint) = precondition.access_fingerprint.as_deref() else {
         return bad_request("area precondition requires the access fingerprint");
     };
@@ -401,7 +401,7 @@ pub async fn area_mutations(
             json!({ "access_fingerprint": current_fingerprint }),
         );
     }
-    if precondition.expected_rev != projected_rev {
+    if precondition.expected_rev != current_rev {
         return err_with_details(
             409,
             "revision_conflict",
@@ -409,7 +409,7 @@ pub async fn area_mutations(
                 "resource": "area",
                 "id": area_id,
                 "expected_rev": precondition.expected_rev,
-                "current_rev": projected_rev,
+                "current_rev": current_rev,
                 "operation_id": envelope.operation_id,
             }),
         );
@@ -462,7 +462,7 @@ pub async fn area_mutations(
         versions.push(json!({
             "resource": "area",
             "id": area_id,
-            "rev": projected_rev,
+            "rev": current_rev,
             "deleted": false,
         }));
     }
@@ -475,16 +475,17 @@ pub async fn area_mutations(
             versions.push(json!({
                 "resource": "area",
                 "id": bump_area,
-                "rev": if ctx.see { area.rev } else { area.public_rev },
+                "rev": area.rev,
                 "deleted": false,
             }));
-        } else if let Some(foreign_caps) =
-            st.caps(viewer, *bump_area).filter(|c| c.can_view)
+        } else if st
+            .caps(viewer, *bump_area)
+            .is_some_and(|caps| caps.can_view)
         {
             versions.push(json!({
                 "resource": "area",
                 "id": bump_area,
-                "rev": if foreign_caps.see_secrets() { area.rev } else { area.public_rev },
+                "rev": area.rev,
                 "deleted": false,
             }));
         }
@@ -524,6 +525,45 @@ fn apply_op(
     op: AreaOp,
 ) -> Result<OpOutcome, Response> {
     match op {
+        AreaOp::AssertMergeSafe {
+            keep_room_number,
+            remove_room_number,
+        } => {
+            if !ctx.cleared || !ctx.see {
+                return Err(err_with_details(
+                    409,
+                    "structural_conflict",
+                    json!({ "reason": "merge_requires_full_projection" }),
+                ));
+            }
+            let has_foreign_link = working.iter().any(|(origin_area, area)| {
+                area.exits.iter().any(|exit| {
+                    (*origin_area == ctx.area_id
+                        && exit.from_room_number == remove_room_number
+                        && exit.to_area_id.is_some_and(|target| target != ctx.area_id))
+                        || (*origin_area != ctx.area_id
+                            && exit.to_area_id == Some(ctx.area_id)
+                            && exit.to_room_number == Some(remove_room_number))
+                })
+            });
+            if has_foreign_link {
+                return Err(err_with_details(
+                    409,
+                    "structural_conflict",
+                    json!({ "reason": "merge_cross_area_links" }),
+                ));
+            }
+            Ok(OpOutcome {
+                result: json!({
+                    "entity": "merge_safety_checked",
+                    "keep_room_number": keep_room_number,
+                    "remove_room_number": remove_room_number,
+                }),
+                changed: false,
+                public_changed: false,
+                foreign_bumps: Vec::new(),
+            })
+        }
         AreaOp::UpsertRoom { room_number, body } => {
             apply_upsert_room(st, working, ctx, room_number, &body)
         }
@@ -1110,19 +1150,36 @@ fn apply_update_exit(
             body.to_room_number.or(current.to_room_number),
         )
     };
-    let destination_changed =
-        clear_to || body.to_area_id.is_some() || body.to_room_number.is_some();
+    let new_from_direction = body
+        .from_direction
+        .clone()
+        .unwrap_or_else(|| current.from_direction.clone());
+    let new_to_direction = if clear_to {
+        None
+    } else {
+        body.to_direction
+            .clone()
+            .or_else(|| current.to_direction.clone())
+    };
+    let destination_changed = (new_to_area, new_to_room, new_to_direction)
+        != (
+            current.to_area_id,
+            current.to_room_number,
+            current.to_direction.clone(),
+        );
+    let topology_changed = new_from_direction != current.from_direction || destination_changed;
 
     // §3.2: a member of a pair cannot be made non-reciprocal in place —
     // retargets and departure-direction changes on a two-member Connection
     // are refused with the unlink-then-edit prompt. Traversal-only fields
-    // (path, command, weight, flags, secrecy) stay editable.
+    // (path, command, weight, flags, secrecy) stay editable. Field presence
+    // alone is not a change: redundant full snapshots are valid.
     let member_count = working[&ctx.area_id]
         .exits
         .iter()
         .filter(|e| e.connection_id == current.connection_id)
         .count();
-    if member_count == 2 && (destination_changed || body.from_direction.is_some()) {
+    if member_count == 2 && topology_changed {
         return Err(err_with_details(
             409,
             "structural_conflict",
@@ -1131,9 +1188,7 @@ fn apply_update_exit(
     }
 
     let mut destination_placeholder = false;
-    if destination_changed
-        && let Some(to_area_id) = new_to_area
-    {
+    if destination_changed && let Some(to_area_id) = new_to_area {
         destination_placeholder = resolve_destination(st, working, ctx, to_area_id, new_to_room)?;
     }
 
@@ -1186,16 +1241,15 @@ fn apply_update_exit(
         exit.clone()
     };
 
-    // A destination change on a (now guaranteed) one-member Connection
-    // atomically maintains endpoint B per §3.2.
-    if destination_changed {
+    // Any topology change on a (now guaranteed) one-member Connection
+    // atomically maintains its endpoints per §3.2.
+    if topology_changed {
         maintain_after_retarget(working, ctx.area_id, current.connection_id);
     }
 
     let new_secret = updated.is_secret;
     // A same-area destination placeholder is a new public room in the scope.
-    let same_area_placeholder =
-        destination_placeholder && updated.to_area_id == Some(ctx.area_id);
+    let same_area_placeholder = destination_placeholder && updated.to_area_id == Some(ctx.area_id);
     let public_changed = !(current.is_secret && new_secret) || same_area_placeholder;
     let mut foreign_bumps: Vec<(Uuid, bool)> = Vec::new();
     let target_unchanged = current.to_area_id == updated.to_area_id;
@@ -1208,7 +1262,10 @@ fn apply_update_exit(
         } else {
             !current.is_secret
         };
-        foreign_bumps.push((old_to, old_public || (target_unchanged && destination_placeholder)));
+        foreign_bumps.push((
+            old_to,
+            old_public || (target_unchanged && destination_placeholder),
+        ));
     }
     if let Some(new_to) = updated
         .to_area_id
@@ -1389,7 +1446,10 @@ fn apply_create_shape(
         width: body.width,
         height: body.height,
         background_color: Some(body.background_color.unwrap_or_else(|| "grey".to_string())),
-        stroke_color: Some(body.stroke_color.unwrap_or_else(|| "transparent".to_string())),
+        stroke_color: Some(
+            body.stroke_color
+                .unwrap_or_else(|| "transparent".to_string()),
+        ),
         shape_type: body.shape_type,
         border_radius: body.border_radius.unwrap_or(0.0),
         stroke_width: body.stroke_width.unwrap_or(1.0),

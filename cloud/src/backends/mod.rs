@@ -51,7 +51,7 @@ pub trait MapperBackend: Send + Sync {
 
     // ===== SYNC / IDENTITY =====
 
-    /// One row per viewable area: projected rev + access fingerprint.
+    /// One row per viewable area: shared revision + access fingerprint.
     /// `Ok(None)` means the backend has no `/sync` support and callers should
     /// fall back to `list_areas` reconciliation.
     async fn sync_state(&self) -> CloudResult<Option<Vec<SyncRow>>> {
@@ -62,6 +62,23 @@ pub trait MapperBackend: Send + Sync {
     /// scope on-disk caches per viewer.
     async fn viewer_identity(&self) -> CloudResult<Option<Uuid>> {
         Ok(None)
+    }
+
+    /// Resolve identity using the exact credential generation captured by the
+    /// caller. Cloud backends override this to build the request from one
+    /// atomic credential snapshot.
+    async fn viewer_identity_at_generation(
+        &self,
+        auth_generation: u64,
+    ) -> CloudResult<Option<Uuid>> {
+        if self.auth_generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        let identity = self.viewer_identity().await?;
+        if self.auth_generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        Ok(identity)
     }
 
     /// Bumped whenever the backend's credential changes; pollers use it to
@@ -92,9 +109,57 @@ pub trait MapperBackend: Send + Sync {
         false
     }
 
+    /// Stable namespace for durable cloud writes. Cloud-capable wrappers must
+    /// forward the canonical API origin so identical viewer/area UUIDs from
+    /// different deployments can never share a replay queue.
+    fn mutation_journal_namespace(&self) -> Option<String> {
+        None
+    }
+
     async fn update_area(&self, area_id: &AreaId, updates: AreaUpdates) -> CloudResult<()>;
 
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()>;
+
+    /// Read an area using the exact credential generation captured by the
+    /// caller, rejecting a response that straddled a credential change.
+    async fn get_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        auth_generation: u64,
+    ) -> CloudResult<AreaWithDetails> {
+        if self.auth_generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        let area = self.get_area(area_id).await?;
+        if self.auth_generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        Ok(area)
+    }
+
+    /// Metadata-write counterparts to the generation-bound mutation API.
+    async fn update_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        updates: AreaUpdates,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        if self.auth_generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        self.update_area(area_id, updates).await
+    }
+
+    async fn delete_area_at_generation(
+        &self,
+        area_id: &AreaId,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        if self.auth_generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        self.delete_area(area_id).await
+    }
 
     // ===== VERSIONED MUTATIONS (the CAS envelope) =====
 
@@ -107,6 +172,21 @@ pub trait MapperBackend: Send + Sync {
         area_id: &AreaId,
         envelope: &MutationEnvelope,
     ) -> CloudResult<MutationResult>;
+
+    /// Execute with the credential generation captured when this operation's
+    /// viewer was activated. Cloud backends override this to build the request
+    /// from one atomic credential snapshot.
+    async fn execute_mutation_at_generation(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+        auth_generation: u64,
+    ) -> CloudResult<MutationResult> {
+        if self.auth_generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        self.execute_mutation(area_id, envelope).await
+    }
 
     // ===== ATLAS (FOLDER) OPERATIONS =====
     //
@@ -167,6 +247,23 @@ pub trait MapperBackend: Send + Sync {
                 name: None,
                 atlas_id: Some(atlas_id),
             },
+        )
+        .await
+    }
+
+    async fn move_area_to_atlas_at_generation(
+        &self,
+        area_id: &AreaId,
+        atlas_id: Option<AtlasId>,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.update_area_at_generation(
+            area_id,
+            AreaUpdates {
+                name: None,
+                atlas_id: Some(atlas_id),
+            },
+            auth_generation,
         )
         .await
     }
