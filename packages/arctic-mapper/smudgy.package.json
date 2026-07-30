@@ -1,0 +1,121 @@
+{
+  "version": "0.0.16",
+  "description": "An auto-mapper for ArcticMUD",
+  "entry": "index.ts",
+  "min_smudgy_version": "0.5.1",
+  "requires": [
+    "smudgy://kapusniak/arctic-prompt"
+  ],
+  "hosts": [
+    "mud.arctic.org"
+  ],
+  "params": [
+    {
+      "key": "mode",
+      "label": "Mapper mode on load",
+      "secret": false,
+      "required": false,
+      "type": "dropdown",
+      "default": "active",
+      "options": [
+        {
+          "value": "active",
+          "label": "Active (follow, plus movement opens doors / uses exit commands)"
+        },
+        {
+          "value": "follow",
+          "label": "Follow (track movement on the map only)"
+        },
+        {
+          "value": "off",
+          "label": "Off"
+        }
+      ]
+    },
+    {
+      "key": "textSize",
+      "label": "Map panel text size",
+      "secret": false,
+      "required": false,
+      "type": "dropdown",
+      "default": "medium",
+      "options": [
+        {
+          "value": "x-small",
+          "label": "Extra small"
+        },
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "large",
+          "label": "Large"
+        },
+        {
+          "value": "x-large",
+          "label": "Extra large"
+        }
+      ]
+    },
+    {
+      "key": "widgetSize",
+      "label": "Map panel widget size (px)",
+      "secret": false,
+      "required": false,
+      "type": "number",
+      "default": 350
+    },
+    {
+      "key": "zMode",
+      "label": "Vertical (up/down) movement capturing",
+      "secret": false,
+      "required": false,
+      "type": "dropdown",
+      "default": "normal",
+      "options": [
+        {
+          "value": "normal",
+          "label": "Normal — up/down move between separate map levels"
+        },
+        {
+          "value": "isometric",
+          "label": "Isometric — up/down drawn diagonally on one plane"
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "smudgy": {
+      "automations": [
+        "aliases",
+        "triggers"
+      ],
+      "session": [
+        "send",
+        "send-direct",
+        "echo"
+      ],
+      "mapper": [
+        "write"
+      ],
+      "display": [
+        "change"
+      ],
+      "widgets": [
+        "create"
+      ],
+      "interop": [
+        "read",
+        "write"
+      ],
+      "panes": [
+        "create"
+      ]
+    }
+  }
+}
