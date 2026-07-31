@@ -63,6 +63,9 @@ pub mod fonts {
     pub const VT323_BYTES: &[u8] = include_bytes!("../../assets/fonts/VT323-Regular.ttf");
     pub const VT323: Font = Font::with_name("VT323");
 
+    pub const FIXEDSYS_EX_BYTES: &[u8] = include_bytes!("../../assets/fonts/FSEX302.ttf");
+    pub const FIXEDSYS_EX: Font = Font::with_name("Fixedsys Excelsior");
+
     #[cfg(test)]
     mod tests {
         /// The `Font::with_name` strings (and the family names offered in the
@@ -86,6 +89,7 @@ pub mod fonts {
                 (super::FIRA_MONO_BYTES, "Fira Mono"),
                 (super::LILEX_BYTES, "Lilex"),
                 (super::VT323_BYTES, "VT323"),
+                (super::FIXEDSYS_EX_BYTES, "Fixedsys Excelsior"),
             ];
 
             for (bytes, expected) in cases {
