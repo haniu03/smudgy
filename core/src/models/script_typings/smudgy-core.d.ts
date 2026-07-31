@@ -1057,7 +1057,7 @@ declare module "smudgy:core" {
     /** Move this pane into a fresh window of its own — the drag tear-out,
      *  scripted. Windows stay anonymous: there is no window handle, the
      *  window closes when its last pane leaves it, and re-docking is a
-     *  {@link relocate} onto a pane elsewhere. `width`/`height` size the new
+     *  {@link Pane.relocate} onto a pane elsewhere. `width`/`height` size the new
      *  window (floored by the window minimum); omitted dimensions follow the
      *  pane's current size. Throws on main. */
     tearOut(opts?: { width?: number; height?: number }): void;
