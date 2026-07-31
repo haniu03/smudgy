@@ -10,6 +10,8 @@ export interface PathDir {
 export interface PathStep {
   dir: string;
   reverse: string;
+  /** Per-step delay saved by TinTin's `#path save both` form. */
+  delay?: number;
 }
 
 /** TinTin's default pathdir pairs, both directions of each. */
@@ -31,6 +33,26 @@ export function defaultPathDirs(): Record<string, PathDir> {
  *  perfectly bad direction name). */
 export function lookupDir(pathdirs: Record<string, PathDir>, name: string): PathDir | null {
   return Object.hasOwn(pathdirs, name) ? pathdirs[name] : null;
+}
+
+/**
+ * Expand a manually entered TinTin v1 speedwalk. Input-line speedwalks only
+ * recognize the six one-letter cardinal/vertical directions, even though the
+ * v2 format used by #path unzip also understands multi-letter #pathdirs.
+ *
+ * TinTin accepts at most three digits before each direction. Returning `null`
+ * means the line is ordinary MUD input rather than a speedwalk.
+ */
+export function expandLegacySpeedwalk(input: string): string[] | null {
+  const text = String(input ?? "");
+  if (!/^(?:\d{0,3}[neswud])+$/.test(text)) return null;
+
+  const steps: string[] = [];
+  for (const match of text.matchAll(/(\d*)([neswud])/g)) {
+    const count = match[1] ? Number(match[1]) : 1;
+    for (let index = 0; index < count; index++) steps.push(match[2]);
+  }
+  return steps;
 }
 
 /**

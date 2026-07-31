@@ -37,6 +37,7 @@ import { openSplit, closeSplit, splitEcho } from "./panes.ts";
 import {
   pathCreate, pathDestroy, pathStart, pathStop, pathState,
   pathInsert, pathDelete, pathUndo, pathRun, pathUnzip, pathSave,
+  pathWalk, pathGoto, pathMove, pathSwap, pathLoad, pathZip, pathMap,
 } from "./paths.ts";
 
 const MAX_DEPTH = 50;
@@ -71,8 +72,9 @@ const DECLINED = new Map<string, string>([
 ]);
 
 const PATH_OPTIONS = [
-  "create", "delete", "describe", "destroy", "end", "insert", "new",
-  "run", "save", "start", "stop", "undo", "unzip", "zip",
+  "create", "delete", "describe", "destroy", "end", "get", "goto", "insert",
+  "load", "map", "move", "new", "run", "save", "show", "start", "stop",
+  "swap", "undo", "unzip", "walk", "zip",
 ];
 
 const CLASS_OPTIONS = ["assign", "clear", "close", "kill", "open", "size"];
@@ -262,7 +264,6 @@ function executeCommand(node: CommandNode, env: ExecutionEnv, depth: number): Si
       }
       return null;
     }
-
     // ---- Control flow ------------------------------------------------------
 
     case "break":
@@ -809,6 +810,10 @@ function executeCommand(node: CommandNode, env: ExecutionEnv, depth: number): Si
     case "path": {
       const optionInput = interpolate(arg(0), env).trim().toLowerCase();
       const option = PATH_OPTIONS.find((candidate) => optionInput && candidate.startsWith(optionInput));
+      if (!optionInput) {
+        echo(`${cc("path")} options: ${PATH_OPTIONS.join(", ")}`);
+        return null;
+      }
       switch (option) {
         case "new":
         case "create":
@@ -825,30 +830,62 @@ function executeCommand(node: CommandNode, env: ExecutionEnv, depth: number): Si
           if (!quiet) echoOk(`#OK. TRACKING MOVEMENT.`);
           return null;
         case "end":
-        case "stop":
-          pathStop();
-          if (!quiet) echoOk(`#OK. NO LONGER TRACKING.`);
+        case "stop": {
+          const stopped = pathStop();
+          if (!quiet && stopped === "recording") echoOk(`#OK. NO LONGER TRACKING.`);
+          else if (!quiet && stopped === "running") echoOk(`#OK. PATH RUN STOPPED.`);
+          else if (!quiet) echoNote(`${cc("path")} is not mapping or running.`);
           return null;
+        }
         case "describe": {
           const state = pathState();
-          echo(`${cc("path")}: ${state.steps.length} steps${state.recording ? " (recording)" : ""}: ${state.zipped || "(empty)"}`);
+          echo(
+            `${cc("path")}: ${state.steps.length} steps, position ${state.position + 1}` +
+            `${state.recording ? " (recording)" : ""}${state.running ? " (running)" : ""}: ` +
+            `${state.zipped || "(empty)"}`,
+          );
+          return null;
+        }
+        case "map":
+        case "show": {
+          const mapped = pathMap();
+          if (mapped === null) echoError(`#ERROR: the path is empty.`);
+          else echo(`${cc("path")}: ${mapped}`);
           return null;
         }
         case "insert": {
-          const dir = interpolate(arg(1), env).trim();
-          if (!pathInsert(dir)) echoError(`#ERROR: {${dir}} IS NOT A PATHDIR.`);
+          const forward = decodeTinTinOutputEscapes(interpolate(arg(1), env)).trim();
+          const reverse = node.args[2]
+            ? decodeTinTinOutputEscapes(interpolate(arg(2), env)).trim()
+            : undefined;
+          const delayText = interpolate(arg(3), env).trim();
+          const delay = delayText ? Number(delayText) : 0;
+          if (delayText && (!Number.isFinite(delay) || delay < 0)) {
+            echoError(`#ERROR: {${delayText}} is not a valid path delay.`);
+            return null;
+          }
+          if (!pathInsert(forward, reverse, delay)) {
+            echoError(`#ERROR: ${cc("path")} insert needs a forward command.`);
+          } else if (!quiet) {
+            echoOk(`#OK. PATH STEP {${forward}} INSERTED.`);
+          }
           return null;
         }
         case "delete":
           if (!pathDelete()) echoError(`#ERROR: the path is empty.`);
           return null;
-        case "undo":
-          if (pathUndo() === null) echoError(`#ERROR: the path is empty.`);
+        case "undo": {
+          const result = pathUndo();
+          if (result.ok) return null;
+          if (result.reason === "empty") echoError(`#ERROR: the path is empty.`);
+          else if (result.reason === "position") echoError(`#ERROR: your position is not at the end of the path.`);
+          else echoError(`#ERROR: you are not currently mapping a path.`);
           return null;
+        }
         case "run": {
           const secondsText = interpolate(arg(1), env).trim();
           const seconds = secondsText ? Number(secondsText) : null;
-          if (secondsText && !Number.isFinite(seconds)) {
+          if (secondsText && (!Number.isFinite(seconds) || Number(seconds) < 0)) {
             echoError(`#ERROR: {${secondsText}} is not a number of seconds.`);
             return null;
           }
@@ -857,9 +894,58 @@ function executeCommand(node: CommandNode, env: ExecutionEnv, depth: number): Si
           else if (!quiet) echoOk(`#OK. RUNNING ${count} STEPS.`);
           return null;
         }
-        case "zip":
-          echo(pathState().zipped || "(empty)");
+        case "walk": {
+          const directionInput = interpolate(arg(1), env).trim().toLowerCase();
+          const direction = !directionInput || "forwards".startsWith(directionInput) || directionInput === "+1"
+            ? "forward"
+            : "backwards".startsWith(directionInput) || directionInput === "-1"
+              ? "backward"
+              : null;
+          if (!direction) {
+            echoError(`#SYNTAX: ${cc("path")} walk {FORWARD|BACKWARD}`);
+            return null;
+          }
+          if (pathWalk(direction) === null) {
+            echoNote(direction === "forward" ? "#END OF PATH." : "#START OF PATH.");
+          }
           return null;
+        }
+        case "goto": {
+          const targetInput = interpolate(arg(1), env).trim().toLowerCase();
+          const target: "start" | "end" | number | null =
+            targetInput && "start".startsWith(targetInput) ? "start"
+              : targetInput && "end".startsWith(targetInput) ? "end"
+                : /^[-+]?\d+$/.test(targetInput) ? Number(targetInput)
+                  : null;
+          const next = target === null ? null : pathGoto(target);
+          if (next === null) {
+            echoError(`#ERROR: ${cc("path")} goto needs START, END, or a position from 1 to ${pathState().steps.length + 1}.`);
+          } else if (!quiet) {
+            echoOk(`#OK. PATH POSITION SET TO ${next}.`);
+          }
+          return null;
+        }
+        case "move": {
+          const moveInput = interpolate(arg(1), env).trim().toLowerCase();
+          const amount = moveInput && "backward".startsWith(moveInput) ? -1
+            : moveInput && "forward".startsWith(moveInput) ? 1
+              : /^[-+]?\d+$/.test(moveInput) ? Number(moveInput)
+                : Number.NaN;
+          const moved = pathMove(amount);
+          if (!moved) echoError(`#SYNTAX: ${cc("path")} move {BACKWARD|FORWARD|NUMBER}`);
+          else if (!quiet) echoOk(`#OK. PATH POSITION MOVED FROM ${moved.from} TO ${moved.to}.`);
+          return null;
+        }
+        case "swap":
+          if (!pathSwap()) echoError(`#ERROR: the path is empty.`);
+          else if (!quiet) echoOk(`#OK. PATH HAS BEEN SWAPPED.`);
+          return null;
+        case "zip": {
+          const zipped = pathZip();
+          if (!zipped) echoError(`#ERROR: the path is empty.`);
+          else echo(`${zipped.forward} ${zipped.backward}`);
+          return null;
+        }
         case "unzip": {
           const literals = pathUnzip(interpolate(argText(1), env));
           if (!quiet) {
@@ -868,22 +954,68 @@ function executeCommand(node: CommandNode, env: ExecutionEnv, depth: number): Si
           }
           return null;
         }
-        case "save": {
-          // TinTin: #path save {forward|backward|both} {variable}.
-          const modeInput = interpolate(arg(1), env).trim().toLowerCase();
-          const mode = (["forward", "backward", "both"] as const)
-            .find((candidate) => modeInput && candidate.startsWith(modeInput));
-          const destinationText = interpolate(arg(2), env).trim();
-          if (!mode || !destinationText) {
-            echoError(`#ERROR: ${cc("path")} save {forward|backward|both} {variable}.`);
+        case "load": {
+          const source = interpolate(argText(1), env).trim();
+          if (!source) {
+            echoError(`#ERROR: ${cc("path")} load needs a variable or command list.`);
             return null;
           }
-          env.setVar(variablePath(destinationText), pathSave(mode));
+          const sourcePath = variablePath(source);
+          const value = env.hasVar(sourcePath) ? env.getVar(sourcePath) : source;
+          const count = pathLoad(value);
+          if (!quiet) echoOk(`#OK. PATH WITH ${count} NODES LOADED.`);
+          return null;
+        }
+        case "get": {
+          const state = pathState();
+          const getInput = interpolate(arg(1), env).trim().toLowerCase();
+          if (!getInput) {
+            echo(`length: ${state.steps.length}`);
+            echo(`position: ${state.position + 1}`);
+            echo(`mapping: ${state.recording ? 1 : 0}`);
+            echo(`running: ${state.running ? 1 : 0}`);
+            return null;
+          }
+          const getOption = ["info", "length", "mapping", "position", "running"]
+            .find((candidate) => candidate.startsWith(getInput));
+          const destination = interpolate(arg(2), env).trim();
+          if (!getOption || !destination) {
+            echoError(`#SYNTAX: ${cc("path")} get {INFO|LENGTH|MAPPING|POSITION|RUNNING} {VARIABLE}`);
+            return null;
+          }
+          const values = {
+            length: state.steps.length,
+            position: state.position + 1,
+            mapping: state.recording ? 1 : 0,
+            running: state.running ? 1 : 0,
+          };
+          env.setVar(
+            variablePath(destination),
+            getOption === "info" ? values : values[getOption as keyof typeof values],
+          );
+          if (!quiet) echoOk(`#OK. PATH ${getOption.toUpperCase()} SAVED TO {${destination}}.`);
+          return null;
+        }
+        case "save": {
+          const modeInput = interpolate(arg(1), env).trim().toLowerCase();
+          const modeEntry = ([
+            ["forwards", "forward"],
+            ["backwards", "backward"],
+            ["both", "both"],
+            ["length", "length"],
+            ["position", "position"],
+          ] as const).find(([candidate]) => modeInput && candidate.startsWith(modeInput));
+          const destinationText = interpolate(arg(2), env).trim();
+          if (!modeEntry || !destinationText) {
+            echoError(`#ERROR: ${cc("path")} save {forward|backward|both|length|position} {variable}.`);
+            return null;
+          }
+          env.setVar(variablePath(destinationText), pathSave(modeEntry[1]));
           if (!quiet) echoOk(`#OK. PATH SAVED TO {${destinationText}}.`);
           return null;
         }
         default:
-          echoNote(`${cc("path")} ${optionInput || "?"} is not supported (walk/goto/load/map/swap/move/get are not implemented).`);
+          echoError(`#ERROR: ${cc("path")} {${optionInput}} IS NOT A VALID PATH OPTION.`);
           return null;
       }
     }

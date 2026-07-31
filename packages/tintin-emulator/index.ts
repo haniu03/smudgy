@@ -1,10 +1,11 @@
 // tintin-emulator: type TinTin++ commands at the input line.
 //
-// One sys:input handler is the whole entry point. It runs before smudgy's
+// One sys:input handler is the command entry point. It runs before smudgy's
 // raw-prefix handling and command-separator splitting, so a TinTin command
 // line is seen whole: `#alias {k} {kill %1;kick}` must not be shredded at
 // `;` before the parser gets it. Lines starting with the command character
-// are cancelled and interpreted; everything else passes through untouched.
+// are cancelled and interpreted; everything else passes through. Optional
+// SPEEDWALK handling is a low-priority native alias so user aliases win first.
 //
 // Definitions (#alias, #action, #gag, #highlight, #substitute, #ticker)
 // become native smudgy automations, visible in the automations window, and
@@ -16,8 +17,11 @@ import { submit } from "smudgy:events/sys";
 import { get } from "smudgy:params";
 import { asciiPunctuation, parseTinTin, formatDiagnostic, TINTIN_COMMANDS } from "./engine/parse.ts";
 import { executeNodes, setDispatcherCommandChar } from "./runtime/dispatcher.ts";
-import { setCommandChar, replayStored, makeExecutionEnv } from "./runtime/definitions.ts";
+import {
+  setCommandChar, replayStored, makeExecutionEnv, syncSpeedwalkAutomation,
+} from "./runtime/definitions.ts";
 import { echoNote } from "./runtime/output.ts";
+import { pathRecordCommand } from "./runtime/paths.ts";
 
 function resolveCommandChar(): string {
   const configured = String(get("commandChar") ?? "#").trim();
@@ -45,6 +49,7 @@ function resolveCommandChar(): string {
 const commandChar = resolveCommandChar();
 setCommandChar(commandChar);
 setDispatcherCommandChar(commandChar);
+const speedwalk = get("speedwalk") === true;
 
 // Tab completion for every TinTin command spelling.
 input.completion.add(...TINTIN_COMMANDS.map((name) => `${commandChar}${name}`));
@@ -68,6 +73,7 @@ submit.on(() => {
 });
 
 const replayed = replayStored();
+syncSpeedwalkAutomation(speedwalk, pathRecordCommand);
 if (replayed > 0) {
   echo(style.echo`tintin-emulator restored ${replayed} definition${replayed === 1 ? "" : "s"}. Type ${commandChar}help for the supported commands.`);
 }

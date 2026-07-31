@@ -1098,7 +1098,7 @@ automation-publish-failed = Publish failed: { $error }
 automation-reloaded = Reloaded scripts for { $server }.
 automation-nav-unsaved = You have unsaved changes.
 automation-keep-editing = Keep editing
-editor-priority-order-help = Higher runs first; ties keep registration order.
+editor-priority-order-help = Higher numbers are given priority
 
 # Package management
 package-sign-in-shared = Sign in from the main window's Settings → Account to see the packages you own and ones friends have shared.

@@ -7,7 +7,10 @@ const S = globalThis.__smudgyStub;
 export const vars = S.vars;
 export const echo = (value, ...rest) => S.record("echo", S.textOf(value, rest));
 export const send = (command) => S.record("send", command);
-export const sendRaw = (text) => S.record("sendRaw", text);
+export const sendRaw = (text) => {
+  S.requireGrant("session", "send-direct");
+  S.record("sendRaw", text);
+};
 export const style = S.style;
 export const input = S.input;
 export const getSettings = () => ({ commandSeparator: ";", rawLinePrefix: "\\\\\\\\" });
