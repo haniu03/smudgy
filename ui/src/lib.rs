@@ -1589,6 +1589,7 @@ fn swap_script_panes(smudgy: &mut Smudgy, first: PaneRef, second: PaneRef) -> Ta
     if first_window == second_window {
         if let Some(window) = smudgy.smudgy_windows.get_mut(&first_window) {
             window.swap_pane_slots(first, second);
+            window.sync_active_session_after_pane_swap(first, second);
         }
         return report_pane_sizes(smudgy);
     }
@@ -1619,10 +1620,10 @@ fn swap_script_panes(smudgy: &mut Smudgy, first: PaneRef, second: PaneRef) -> Ta
     }
 
     if let Some(window) = smudgy.smudgy_windows.get_mut(&first_window) {
-        window.repair_active_session_without_focus();
+        window.sync_active_session_after_pane_swap(first, second);
     }
     if let Some(window) = smudgy.smudgy_windows.get_mut(&second_window) {
-        window.repair_active_session_without_focus();
+        window.sync_active_session_after_pane_swap(first, second);
     }
     report_pane_sizes(smudgy)
 }

@@ -964,8 +964,9 @@ impl ManagedSession {
     /// without ever firing a stray shutdown; the daemon calls this exactly
     /// once, when the session closes (user close or window-close cascade).
     /// Taking the channel makes a repeat call structurally a no-op. A session
-    /// closed before its runtime ever reported ready has no channel yet; its
-    /// runtime notices the dropped event stream instead.
+    /// closed before its runtime ever reported ready has no channel yet; the
+    /// dropped session-event subscription owns the corresponding early
+    /// shutdown signal instead.
     fn shutdown(&mut self) {
         if let Some(tx) = self.runtime_tx.take() {
             tx.send(RuntimeAction::Shutdown).ok();
