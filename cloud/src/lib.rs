@@ -636,6 +636,11 @@ pub struct ExitArgs {
     /// absent, the backend runs the conservative auto-pair/create rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_id: Option<ConnectionId>,
+    /// Stable identity for a fresh Connection. Mutually exclusive with
+    /// `connection_id`; when present, auto-pairing is skipped and every
+    /// backend creates the new one-member Connection with exactly this id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_connection_id: Option<ConnectionId>,
     pub from_direction: ExitDirection,
     pub to_area_id: Option<AreaId>,
     pub to_room_number: Option<RoomNumber>,

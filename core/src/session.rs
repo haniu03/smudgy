@@ -2,7 +2,12 @@ use derive_more::{Add, Display, From, Into};
 use futures::Stream;
 use runtime::RuntimeAction;
 use smudgy_cloud::{AreaId, AtlasId, Mapper};
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::Debug,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 use styled_line::StyledLine;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -195,6 +200,30 @@ pub struct SessionParams {
     pub on_engine_rebuild: Option<EngineResetHook>,
 }
 
+/// The UI subscription owns a session runtime's lifetime. Dropping the
+/// subscription can happen before [`SessionEvent::RuntimeReady`] gives the UI
+/// its normal control channel, so the stream itself retains a shutdown sender.
+/// Without this guard, a session closed while its scripts were still loading
+/// remained in the global registry with no hosted pane or event receiver.
+struct SessionEventStream {
+    events: futures::channel::mpsc::Receiver<TaggedSessionEvent>,
+    shutdown_tx: UnboundedSender<RuntimeAction>,
+}
+
+impl Stream for SessionEventStream {
+    type Item = TaggedSessionEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.events).poll_next(cx)
+    }
+}
+
+impl Drop for SessionEventStream {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(RuntimeAction::Shutdown);
+    }
+}
+
 impl Debug for SessionParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionParams")
@@ -281,9 +310,13 @@ fn spawn_inner(
         params.on_engine_rebuild.clone(),
         ui_tx,
     );
+    let shutdown_tx = runtime.tx();
 
     // Register the runtime in the global registry
     registry::register_session(params.session_id, runtime.into());
 
-    ui_rx
+    SessionEventStream {
+        events: ui_rx,
+        shutdown_tx,
+    }
 }
