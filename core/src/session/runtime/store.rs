@@ -195,6 +195,19 @@ pub(crate) fn is_home(homes: &HomeRegistry, producer: &ProducerKey, isolate: &Is
     }
 }
 
+/// Whether a procedure producer can have an implementation in this engine.
+/// User procedures live on main, platform producers are host-only, and a
+/// package is addressable only while installed in the engine's home registry.
+pub(crate) fn is_addressable(homes: &HomeRegistry, producer: &ProducerKey) -> bool {
+    match producer {
+        ProducerKey::User => true,
+        ProducerKey::Platform(_) => false,
+        ProducerKey::Package { owner, name } => {
+            homes.borrow().contains_key(&(owner.clone(), name.clone()))
+        }
+    }
+}
+
 /// A store producer the host itself maintains (`docs/gmcp.md`). A closed set by design:
 /// no creator descriptor resolves to one, so scripts can never obtain a producer seat — the
 /// host writes through [`SessionStore::set`] directly and is structurally the sole writer.
@@ -2505,6 +2518,14 @@ mod tests {
         // User/module code is home exactly on main.
         assert!(is_home(&homes, &ProducerKey::User, &IsolateId::Main));
         assert!(!is_home(&homes, &ProducerKey::User, &pkg_isolate("wbk", "sandboxed")));
+        assert!(is_addressable(&homes, &ProducerKey::User));
+        assert!(is_addressable(&homes, &sandboxed));
+        assert!(is_addressable(&homes, &trusted));
+        assert!(!is_addressable(&homes, &uninstalled));
+        assert!(!is_addressable(
+            &homes,
+            &ProducerKey::Platform(PlatformProducer::Gmcp)
+        ));
     }
 
     // ---- persistent-tree internals (docs/interop.md §2) ------------------------

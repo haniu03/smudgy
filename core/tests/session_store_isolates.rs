@@ -848,9 +848,25 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
         server,
         "directed.ts",
         r#"
-        import { byName, createAlias, echo, session } from "smudgy:core";
+        import {
+            byName,
+            createAlias,
+            createProcedure,
+            createState,
+            echo,
+            session,
+        } from "smudgy:core";
         import { vitals } from "smudgy:state/wbk/tracker";
         import { refresh } from "smudgy:procedures/wbk/tracker";
+
+        const userConsumer = (globalThis as any).__smudgy_interop_consumer("user");
+        const orderedState = createState<{ answer: number }>("orderedProcedureState");
+        const orderedConsumer = userConsumer.state("orderedProcedureState");
+        const observeOrderedState = createProcedure((_payload, caller) => {
+            const source = orderedConsumer.from(caller.session);
+            echo("REMOTE_ORDERED:" + source.value?.answer);
+        });
+        const orderedPoster = userConsumer.procedure("observeOrderedState");
 
         if (session.profile.name === "Alpha") {
             createAlias("^remote-call$", () => {
@@ -871,6 +887,8 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
                 const directed = refresh.to(beta);
                 echo("REMOTE_TERMINAL:" + (!("from" in remote) && !("to" in directed)));
                 directed.post({ n: 7 });
+                orderedState.set({ answer: 42 });
+                orderedPoster.to(beta).post({});
             });
         }
         "#,
@@ -923,7 +941,8 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
             && has_line(&alpha_lines, "REMOTE_PREVIOUS:2")
             && has_line(&alpha_lines, "REMOTE_WRITE:hp=3")
             && has_line(&alpha_lines, "REMOTE_TERMINAL:true")
-            && has_line(&beta_lines, "REMOTE_PROC:Alpha:user:7"))
+            && has_line(&beta_lines, "REMOTE_PROC:Alpha:user:7")
+            && has_line(&beta_lines, "REMOTE_ORDERED:42"))
     {
         tokio::select! {
             event = alpha_events.next() => {
@@ -963,6 +982,10 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
     assert!(
         has_line(&beta_lines, "REMOTE_PROC:Alpha:user:7"),
         "remote procedure did not receive its host-stamped caller; {transcript}"
+    );
+    assert!(
+        has_line(&beta_lines, "REMOTE_ORDERED:42"),
+        "remote procedure overtook the caller's state publication; {transcript}"
     );
 }
 

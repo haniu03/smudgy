@@ -265,6 +265,9 @@ pub struct Runtime {
     pub(crate) pane_size_mirror: SharedPaneSizeMirror,
     pub(crate) input_word_sets: SharedInputWordSets,
     pub(crate) pane_input_callbacks: SharedPaneInputCallbacks,
+    /// The worker waits on this one-shot gate until the fully-constructed
+    /// runtime has been inserted into the global session registry.
+    start_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 static RUNTIME_THREADS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
@@ -365,8 +368,16 @@ impl Runtime {
         let local_pane_size_mirror = Arc::clone(&pane_size_mirror);
         let local_input_word_sets = Arc::clone(&input_word_sets);
         let local_pane_input_callbacks = Arc::clone(&pane_input_callbacks);
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
 
         let thread = thread::spawn(move || {
+            // `Runtime::new` must spawn before it can return the registry
+            // handle, but script top-level code may consult that registry.
+            // Do not construct/evaluate the engine until registration opens
+            // this gate.
+            if start_rx.recv().is_err() {
+                return;
+            }
             let pending_line_operations = Rc::new(RefCell::new(Vec::new()));
 
             // We start at 1 because the first line ("Loading session...") is already emitted
@@ -905,6 +916,14 @@ impl Runtime {
             pane_size_mirror,
             input_word_sets,
             pane_input_callbacks,
+            start_tx: Mutex::new(Some(start_tx)),
+        }
+    }
+
+    /// Allow the worker to begin engine construction after registry insertion.
+    pub(crate) fn start(&self) {
+        if let Some(start_tx) = self.start_tx.lock().unwrap().take() {
+            let _ = start_tx.send(());
         }
     }
 
@@ -1528,14 +1547,18 @@ impl Inner<'_> {
         }
         let (published, writes) = {
             let store = self.session_store.borrow();
-            (store.published(), Arc::new(store.last_published_writes()))
+            (
+                Arc::new(store.published()),
+                Arc::new(store.last_published_writes()),
+            )
         };
-        *self.published_store.write().unwrap() = published;
+        *self.published_store.write().unwrap() = published.as_ref().clone();
         for runtime in registry::get_runtimes_for_server(self.server_name.as_str()) {
             if runtime
                 .tx
                 .send(RuntimeAction::RemoteStoreFlushed {
                     source: self.session_id,
+                    published: Arc::clone(&published),
                     writes: Arc::clone(&writes),
                 })
                 .is_err()

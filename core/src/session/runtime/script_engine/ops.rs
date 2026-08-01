@@ -70,7 +70,6 @@ deno_core::extension!(
     op_smudgy_redirect,
     op_smudgy_copy,
     op_smudgy_pane_split,
-    op_smudgy_pane_input_on_submit,
     op_smudgy_pane_close,
     op_smudgy_pane_set_hidden,
     op_smudgy_pane_set_font_size,
@@ -1294,21 +1293,20 @@ fn op_smudgy_emit(
     let canonical: Arc<str> = Arc::from(event.canonical.as_str());
     let stamped: Arc<str> = Arc::from(event.stamped.as_str());
     let payload: Arc<str> = Arc::from(payload_json);
-    let server = state.borrow::<ServerName>().0.clone();
-    for runtime in registry::get_runtimes_for_server(server.as_str()) {
-        let action = RuntimeAction::InteropEvent {
-            canonical: Arc::clone(&canonical),
-            stamped: Arc::clone(&stamped),
-            payload: Arc::clone(&payload),
-            source: source.clone(),
+    // Queue fan-out at home rather than sending foreign actions here. The
+    // runtime flushes this turn's store journal before dispatching the action,
+    // so `state.set(...); event.emit(...)` is observed in that order by every
+    // same-server target.
+    queue_own_action(
+        state,
+        RuntimeAction::FanOutInteropEvent {
+            canonical,
+            stamped,
+            payload,
+            source,
             depth: depth + 1,
-        };
-        if runtime.session_id == source_id {
-            queue_own_action(state, action);
-        } else if runtime.tx.send(action).is_err() {
-            log::warn!("Dropping interop event for session {}", runtime.session_id);
-        }
-    }
+        },
+    );
     Ok(())
 }
 
@@ -2498,7 +2496,11 @@ fn op_smudgy_procedure_post(
                 "smudgy: directed interop cannot cross configured server entries".to_string(),
             ));
         }
-        let action = RuntimeAction::ProcedurePost {
+        // Forward from the caller runtime after its current turn flushes. This
+        // gives directed procedures the same write-before-notify ordering as
+        // events and local procedure deliveries.
+        let action = RuntimeAction::ForwardProcedurePost {
+            target,
             canonical: Arc::from(canonical),
             producer: Arc::clone(&root.producer_spec),
             name: Arc::from(name),
@@ -2507,9 +2509,7 @@ fn op_smudgy_procedure_post(
             caller_session: caller,
             depth: depth + 1,
         };
-        if runtime.tx.send(action).is_err() {
-            log::warn!("Dropping procedure post for session {target}");
-        }
+        queue_own_action(state, action);
         return Ok(());
     }
     let receivers = state
@@ -2520,16 +2520,10 @@ fn op_smudgy_procedure_post(
         // Queue-briefly (D1): only for a producer that can ever receive — one with a home
         // (`user` always has one). A post to an uninstalled producer can never deliver, so
         // buffering it would just hoard garbage.
-        let addressable = match &root.producer {
-            store::ProducerKey::User => true,
-            // Platform producers never receive procedures (the host is not a procedure
-            // implementer); buffering a post to one would hoard garbage.
-            store::ProducerKey::Platform(_) => false,
-            store::ProducerKey::Package { owner, name } => state
-                .borrow::<store::HomeRegistry>()
-                .borrow()
-                .contains_key(&(owner.clone(), name.clone())),
-        };
+        let addressable = store::is_addressable(
+            state.borrow::<store::HomeRegistry>(),
+            &root.producer,
+        );
         if addressable {
             let dropped_oldest = state
                 .borrow::<crate::session::runtime::SharedMessageBus>()
@@ -5071,9 +5065,8 @@ fn op_smudgy_input_history_list(
 }
 
 /// The display half of a `PaneSpec.input` (`docs/input.md` §3.7).
-/// The `onSubmit` handler itself never rides the serde spec — the facade
-/// registers it through [`op_smudgy_pane_input_on_submit`] right after the
-/// split, since a v8 function cannot cross a serde boundary.
+/// The `onSubmit` handler itself rides beside this serde spec as a direct v8
+/// argument, allowing the split op to seat it before publishing `PaneOpened`.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneInputSpecJs {
@@ -5145,12 +5138,14 @@ fn parse_split_def_state(
 /// queued on that owning runtime.
 #[op2]
 #[serde]
-fn op_smudgy_pane_split(
+fn op_smudgy_pane_split<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     state: &mut OpState,
     session_id: u32,
     #[string] ref_name: &str,
     #[string] direction: &str,
     #[serde] spec: PaneSpecJs,
+    on_submit: v8::Local<'s, v8::Value>,
 ) -> Result<PaneInfo, PaneCallError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
@@ -5177,6 +5172,7 @@ fn op_smudgy_pane_split(
         ensure(grants(state).change_display, "change-display")?;
     }
 
+    let register_input = spec.input.is_some();
     let input = spec.input.map(|input| pane::PaneInputDef {
         placeholder: input.placeholder.map(Arc::from),
     });
@@ -5187,6 +5183,12 @@ fn op_smudgy_pane_split(
             .lock()
             .unwrap()
             .split(&namespace, &spec.name, kind, def_state, input)?;
+        if register_input {
+            let callback = v8::Local::<v8::Function>::try_from(on_submit).map_err(|_| {
+                PaneOpError("input.onSubmit must be a function".to_string())
+            })?;
+            register_pane_input_callback(scope, state, target, outcome.def.key, callback)?;
+        }
         if outcome.created {
             let reference = registry
                 .lock()
@@ -5219,39 +5221,13 @@ fn op_smudgy_pane_split(
     }
 }
 
-/// Register (or replace) the `onSubmit` handler for a pane input
-/// (`docs/input.md` §3.7). The facade calls this right after the
-/// split that carried `input` in its spec — a v8 function cannot ride the
-/// serde spec — and again on every re-claiming split, which is what brings a
-/// handler back after a reload (handler addresses are engine facts and die
-/// with their isolate generation, like widget callbacks). Gated by `panes`
-/// like the split itself, plus `reach-others` for a foreign target. `main` is
-/// refused with the split's
-/// [`pane::PaneError::MainInput`] teaching — its fused input is
-/// `session.input`, and typed submissions are intercepted through
-/// `sys:input`, never an `onSubmit`.
-#[op2(fast)]
-fn op_smudgy_pane_input_on_submit<'s>(
+fn register_pane_input_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     state: &mut OpState,
-    session_id: u32,
-    #[string] name: &str,
+    target: SessionId,
+    key: pane::PaneKey,
     f: v8::Local<'s, v8::Function>,
 ) -> Result<(), PaneCallError> {
-    ensure(grants(state).panes, "panes")?;
-    let target = SessionId::from(session_id);
-    ensure_session_target(state, target, grants(state).panes, "panes")?;
-    if pane::is_main_pane_name(name) {
-        return Err(PaneOpError(format!(
-            "{}; intercept typed submissions with the sys:input event instead",
-            pane::PaneError::MainInput
-        ))
-        .into());
-    }
-    let key = resolve_pane_input(state, target, name)?;
-    // The handler lives in this isolate's `script_functions` registry (append-only,
-    // reclaimed with the engine), like event subscribers; only its address crosses
-    // to the session-side registry the dispatch arm resolves through.
     let f = v8::Global::new(scope, f);
     let function_id = {
         let mut script_functions = state

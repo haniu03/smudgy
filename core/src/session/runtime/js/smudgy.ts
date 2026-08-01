@@ -62,7 +62,6 @@ const {
     op_smudgy_redirect,
     op_smudgy_copy,
     op_smudgy_pane_split,
-    op_smudgy_pane_input_on_submit,
     op_smudgy_pane_close,
     op_smudgy_pane_set_hidden,
     op_smudgy_pane_set_font_size,
@@ -1183,31 +1182,31 @@ function __smudgy_pane_split(
             );
         }
     }
-    const info = op_smudgy_pane_split(sessionId, refName, direction, {
-        name: spec.name,
-        width: typeof spec.width === "number" ? spec.width : null,
-        height: typeof spec.height === "number" ? spec.height : null,
-        terminal: spec.terminal !== undefined ? Boolean(spec.terminal) : null,
-        titleBar: typeof spec.titleBar === "string" ? spec.titleBar : null,
-        hidden: typeof spec.hidden === "boolean" ? spec.hidden : null,
-        fontSize: typeof spec.fontSize === "number" ? spec.fontSize : null,
-        input:
-            spec.input !== undefined
-                ? {
-                      placeholder:
-                          typeof spec.input.placeholder === "string"
-                              ? spec.input.placeholder
-                              : null,
-                  }
-                : null,
-    });
-    // The handler cannot ride the serde spec; register it against the pane the
-    // split just created (or re-claimed). Re-running this on every split is
-    // what re-arms the handler after a reload -- handler registrations die
-    // with their isolate generation, like widget callbacks.
-    if (spec.input !== undefined) {
-        op_smudgy_pane_input_on_submit(sessionId, spec.name, spec.input.onSubmit);
-    }
+    const info = op_smudgy_pane_split(
+        sessionId,
+        refName,
+        direction,
+        {
+            name: spec.name,
+            width: typeof spec.width === "number" ? spec.width : null,
+            height: typeof spec.height === "number" ? spec.height : null,
+            terminal:
+                spec.terminal !== undefined ? Boolean(spec.terminal) : null,
+            titleBar: typeof spec.titleBar === "string" ? spec.titleBar : null,
+            hidden: typeof spec.hidden === "boolean" ? spec.hidden : null,
+            fontSize: typeof spec.fontSize === "number" ? spec.fontSize : null,
+            input:
+                spec.input !== undefined
+                    ? {
+                          placeholder:
+                              typeof spec.input.placeholder === "string"
+                                  ? spec.input.placeholder
+                                  : null,
+                      }
+                    : null,
+        },
+        spec.input?.onSubmit ?? null,
+    );
     return new Pane(sessionId, info, creatorId);
 }
 

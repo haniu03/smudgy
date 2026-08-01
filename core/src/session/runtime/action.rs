@@ -23,7 +23,7 @@ use super::origin::{IsolateId, Origin};
 use super::pane::{PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection};
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
-use super::store::PublishedWrite;
+use super::store::{PublishedStore, PublishedWrite};
 use super::trigger::MatchCapture;
 
 #[derive(Clone, Debug)]
@@ -32,7 +32,18 @@ pub enum RuntimeAction {
     /// resolves only its own directed watchers and binding cells.
     RemoteStoreFlushed {
         source: SessionId,
+        published: Arc<PublishedStore>,
         writes: Arc<Vec<PublishedWrite>>,
+    },
+    /// A script event waiting on its source runtime's queue. The source
+    /// dispatches this only after the current turn's store journal has been
+    /// flushed, then fans out [`Self::InteropEvent`] to same-server runtimes.
+    FanOutInteropEvent {
+        canonical: Arc<str>,
+        stamped: Arc<str>,
+        payload: Arc<str>,
+        source: crate::session::registry::SessionSnapshot,
+        depth: u32,
     },
     /// A same-server event. The receiver resolves its own engine-local
     /// subscriptions, so no foreign V8 handle or `FunctionId` crosses threads.
@@ -45,6 +56,19 @@ pub enum RuntimeAction {
     },
     /// A directed procedure post. The target resolves its own receiver.
     ProcedurePost {
+        canonical: Arc<str>,
+        producer: Arc<str>,
+        name: Arc<str>,
+        payload: Arc<str>,
+        caller_origin: Arc<str>,
+        caller_session: crate::session::registry::SessionSnapshot,
+        depth: u32,
+    },
+    /// A directed procedure post waiting on the caller runtime's queue. Like
+    /// script-event fan-out, forwarding happens after the caller's store
+    /// journal is flushed so the target observes preceding state writes.
+    ForwardProcedurePost {
+        target: SessionId,
         canonical: Arc<str>,
         producer: Arc<str>,
         name: Arc<str>,

@@ -89,12 +89,13 @@ pub fn register_session(session_id: SessionId, runtime: Arc<Runtime>) {
     let server = Arc::clone(&runtime.server_name);
     let registry = get_registry();
     let mut sessions = registry.lock().unwrap();
-    sessions.insert(session_id, runtime);
+    sessions.insert(session_id, Arc::clone(&runtime));
     drop(sessions);
     log::info!("Registered session {session_id} in global registry");
     if let Some(snapshot) = snapshot(session_id) {
         broadcast_lifecycle(&server, "created", &snapshot, false);
     }
+    runtime.start();
 }
 
 /// Return the shared standard `BroadcastChannel` backend for one configured server entry.

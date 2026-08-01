@@ -151,9 +151,14 @@ impl Inner<'_> {
         action: RuntimeAction,
     ) -> Result<ActionResult, anyhow::Error> {
         match action {
-            RuntimeAction::RemoteStoreFlushed { source, writes } => {
+            RuntimeAction::RemoteStoreFlushed {
+                source,
+                published,
+                writes,
+            } => {
                 let (actions, bindings_changed) =
-                    self.script_engine.remote_store_flushed(source, &writes);
+                    self.script_engine
+                        .remote_store_flushed(source, &published, &writes);
                 if bindings_changed
                     && let Err(error) = self.ui_tx.try_send(TaggedSessionEvent {
                         session_id: self.session_id,
@@ -164,6 +169,32 @@ impl Inner<'_> {
                     warn!("Failed to send directed store-bindings wake: {error:?}");
                 }
                 Ok(ActionResult::Run(actions))
+            }
+            RuntimeAction::FanOutInteropEvent {
+                canonical,
+                stamped,
+                payload,
+                source,
+                depth,
+            } => {
+                let mut local = Vec::new();
+                for runtime in crate::session::registry::get_runtimes_for_server(
+                    self.server_name.as_str(),
+                ) {
+                    let action = RuntimeAction::InteropEvent {
+                        canonical: Arc::clone(&canonical),
+                        stamped: Arc::clone(&stamped),
+                        payload: Arc::clone(&payload),
+                        source: source.clone(),
+                        depth,
+                    };
+                    if runtime.session_id == self.session_id {
+                        local.push(action);
+                    } else if runtime.tx.send(action).is_err() {
+                        warn!("Dropping interop event for session {}", runtime.session_id);
+                    }
+                }
+                Ok(ActionResult::Run(local))
             }
             RuntimeAction::InteropEvent {
                 canonical,
@@ -212,6 +243,40 @@ impl Inner<'_> {
                     depth,
                 ),
             )),
+            RuntimeAction::ForwardProcedurePost {
+                target,
+                canonical,
+                producer,
+                name,
+                payload,
+                caller_origin,
+                caller_session,
+                depth,
+            } => {
+                let Some(runtime) = crate::session::registry::get_runtime(target) else {
+                    return Ok(ActionResult::None);
+                };
+                if runtime.server_name.as_str() != self.server_name.as_str() {
+                    warn!("Dropping cross-server procedure post for session {target}");
+                    return Ok(ActionResult::None);
+                }
+                if runtime
+                    .tx
+                    .send(RuntimeAction::ProcedurePost {
+                        canonical,
+                        producer,
+                        name,
+                        payload,
+                        caller_origin,
+                        caller_session,
+                        depth,
+                    })
+                    .is_err()
+                {
+                    warn!("Dropping procedure post for session {target}");
+                }
+                Ok(ActionResult::None)
+            }
             RuntimeAction::Connect {
                 host,
                 port,
@@ -1203,10 +1268,28 @@ impl Inner<'_> {
                 Ok(ActionResult::None)
             }
             RuntimeAction::PaneOpened { def, placement } => {
-                // The registry mutation already happened synchronously in the op; this just
-                // publishes the open on the ordered UI channel. Anything already buffered
-                // cannot reference the new key (the key didn't exist when it was queued), so
-                // no flush is needed for ordering.
+                // A foreign split mutates this data-only registry on its caller
+                // thread before queueing the open. Reconcile at the owner queue:
+                // an intervening close retires the key (drop the stale open),
+                // while an intervening update is reflected in the def we publish.
+                let Some(def) = self.pane_registry.lock().unwrap().get(def.key).cloned() else {
+                    return Ok(ActionResult::None);
+                };
+                let placement = {
+                    let registry = self.pane_registry.lock().unwrap();
+                    super::pane::PanePlacement {
+                        reference: if registry.is_live(placement.reference) {
+                            placement.reference
+                        } else {
+                            super::pane::MAIN_PANE_KEY
+                        },
+                        direction: placement.direction,
+                        size_px: placement.size_px,
+                    }
+                };
+                // Input callbacks are seated by the same split op before this
+                // action is sent, so the UI cannot expose a submit path whose
+                // first input races its handler registration.
                 self.ui_tx
                     .send(TaggedSessionEvent {
                         session_id: self.session_id,

@@ -690,6 +690,7 @@ import {
   byName,
   createAlias,
   createEvent,
+  createState,
   echo,
   events,
   getSessions,
@@ -703,12 +704,17 @@ import {
 } from "smudgy:events/sessions";
 
 const crossSession = createEvent("crossSession");
+const orderedState = createState<{ answer: number }>("orderedState");
+const orderedConsumer = (globalThis as any).__smudgy_interop_consumer("user").state("orderedState");
 const channel = new BroadcastChannel("smudgy-cross-session-test");
+
+echo(`BOOT_SESSION:${getSessions().some(peer => peer.id === session.id)}`);
 
 const remoteEvents = events.lookup("user", "crossSession")
   .fromAll({ includeSelf: false });
 remoteEvents.on((payload, source) => {
     echo(`EVENT:${source.profile.name}:${payload.answer}`);
+    echo(`ORDERED_STATE:${orderedConsumer.from(source).value?.answer}`);
 });
 remoteEvents.once().then((payload) => {
   echo(`ONCE_PAYLOAD:${payload.answer}:${Array.isArray(payload)}`);
@@ -756,6 +762,7 @@ createAlias("^fire-cross-session$", () => {
   });
   echo(`SURFACE:${byId(alpha.id)?.profile.name}:${alpha.panes.exists("remote")}:${alpha.panes.list().length}:${remote.input !== undefined}:${alpha.input.completion.has("remoteword")}:${seededValue}:${seededHistory}`);
   remote.swap(session.mainPane);
+  orderedState.set({ answer: 42 });
   crossSession.emit({ answer: 42 });
   channel.postMessage({ from: session.profile.name, answer: 42 });
 });
@@ -797,25 +804,43 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
 
     // Alpha is fully ready before Beta is registered, pinning `created` as a future,
     // non-replayed occurrence rather than a startup snapshot.
+    let mut alpha_lines = Vec::new();
     let mut alpha_events = Box::pin(spawn(params(7090, "Alpha")));
     let alpha_tx = loop {
         let event = tokio::time::timeout(Duration::from_mins(1), alpha_events.next())
             .await
             .expect("timed out waiting for Alpha RuntimeReady")
             .expect("Alpha event stream ended before RuntimeReady");
-        if let SessionEvent::RuntimeReady(tx) = event.event {
-            break tx;
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => {
+                for update in updates.iter() {
+                    if let BufferUpdate::Append(line) = update {
+                        alpha_lines.push(line.text.clone());
+                    }
+                }
+            }
+            _ => {}
         }
     };
 
+    let mut beta_lines = Vec::new();
     let mut beta_events = Box::pin(spawn(params(7091, "Beta")));
     let beta_tx = loop {
         let event = tokio::time::timeout(Duration::from_mins(1), beta_events.next())
             .await
             .expect("timed out waiting for Beta RuntimeReady")
             .expect("Beta event stream ended before RuntimeReady");
-        if let SessionEvent::RuntimeReady(tx) = event.event {
-            break tx;
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => {
+                for update in updates.iter() {
+                    if let BufferUpdate::Append(line) = update {
+                        beta_lines.push(line.text.clone());
+                    }
+                }
+            }
+            _ => {}
         }
     };
 
@@ -841,8 +866,6 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
         }
     };
 
-    let mut alpha_lines = Vec::new();
-    let mut beta_lines = Vec::new();
     let mut remote_input_key = None;
     let mut saw_remote_input_ops = 0;
     let mut saw_cross_session_swap = false;
@@ -911,6 +934,9 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
     let delivery_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < delivery_deadline
         && !(alpha_lines.iter().any(|line| line == "EVENT:Beta:42")
+            && alpha_lines
+                .iter()
+                .any(|line| line == "ORDERED_STATE:42")
             && alpha_lines
                 .iter()
                 .any(|line| line == "BROADCAST:Beta:42")
@@ -1000,6 +1026,7 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
         "CONNECTED:Beta",
         "DISCONNECTED:Beta:false",
         "EVENT:Beta:42",
+        "ORDERED_STATE:42",
         "ONCE_PAYLOAD:42:false",
         "BROADCAST:Beta:42",
         "DESTROYED:Beta:false",
@@ -1009,6 +1036,15 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
             "missing {expected:?} from Alpha transcript:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
         );
     }
+    assert!(
+        alpha_lines
+            .iter()
+            .any(|line| line == "BOOT_SESSION:true")
+            && beta_lines
+                .iter()
+                .any(|line| line == "BOOT_SESSION:true"),
+        "top-level enumeration must include the already-registered current session.\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
+    );
     assert!(
         beta_lines
             .iter()

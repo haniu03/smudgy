@@ -381,6 +381,51 @@ mod tests {
     }
 
     #[test]
+    fn queued_flushes_use_the_snapshot_published_with_each_journal() {
+        let source = SessionId::from(7);
+        let producer = ProducerKey::User;
+        let watched = path("vitals.hp");
+        let mut store = SessionStore::new();
+        let mut registry = RemoteStateRegistry::new(StoreBindings::new());
+        registry.watch(
+            source,
+            producer.clone(),
+            watched.clone(),
+            IsolateId::Main,
+            FunctionId(1),
+            WatchCadence::Coalesced,
+        );
+
+        store
+            .set(
+                producer.clone(),
+                watched.clone(),
+                json!(1),
+                IsolateId::Main,
+                0,
+            )
+            .unwrap();
+        store.flush();
+        let first_published = store.published();
+        let first_writes = store.last_published_writes();
+
+        store
+            .set(producer, watched, json!(2), IsolateId::Main, 0)
+            .unwrap();
+        store.flush();
+        let second_published = store.published();
+        let second_writes = store.last_published_writes();
+
+        // Model a lagging target draining both queued actions only after the
+        // source has already published the second flush. Each action must keep
+        // the immutable snapshot paired with its own write journal.
+        let (first, _) = registry.deliver(source, &first_published, &first_writes);
+        let (second, _) = registry.deliver(source, &second_published, &second_writes);
+        assert_eq!(capture(&first[0], "snapshot"), "1");
+        assert_eq!(capture(&second[0], "snapshot"), "2");
+    }
+
+    #[test]
     fn path_comparison_is_case_insensitive_and_ancestor_aware() {
         assert!(paths_comparable(
             path("Vitals.HP").segments(),

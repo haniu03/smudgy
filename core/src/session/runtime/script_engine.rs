@@ -293,6 +293,9 @@ pub struct ScriptEngine<'a> {
     event_registry: ops::EventRegistry,
     remote_state_registry: super::SharedRemoteStateRegistry,
     message_bus: super::SharedMessageBus,
+    /// Installed producer homes for this engine generation. Directed posts
+    /// consult the target's registry before entering its pending buffer.
+    home_registry: crate::session::runtime::store::HomeRegistry,
     /// The runtime catalogue (`docs/interop.md` §10), kept so [`Self::host_emit`]
     /// can sample platform events at its choke point (the same `Rc` cloned into every
     /// isolate's ops, where package emits/posts sample).
@@ -1610,6 +1613,17 @@ impl<'a> ScriptEngine<'a> {
                         continue;
                     }
                 };
+                // The JavaScript facade replaces the global constructor for a
+                // denied package, but Node's worker_threads shim imports the
+                // web constructor directly. Keep the enforcement boundary at
+                // the isolate service too: an ungranted sandbox gets a private
+                // backend and therefore cannot join this server's channels by
+                // any constructor path.
+                let isolate_broadcast_channel = if effective.smudgy.interop_broadcast {
+                    broadcast_channel.clone()
+                } else {
+                    smudgy_script::InMemoryBroadcastChannel::default()
+                };
                 let mut runtime = match build_script_runtime(
                     extensions,
                     data_dir,
@@ -1625,7 +1639,7 @@ impl<'a> ScriptEngine<'a> {
                     // level (`None` = smudgy:// only, `Registries` = + npm/jsr, `Any` = + the web).
                     effective.import,
                     params.tokio_runtime.clone(),
-                    broadcast_channel.clone(),
+                    isolate_broadcast_channel,
                 ) {
                     Ok(runtime) => runtime,
                     Err(e) => {
@@ -1945,6 +1959,7 @@ impl<'a> ScriptEngine<'a> {
             event_registry,
             remote_state_registry,
             message_bus,
+            home_registry,
             catalogue,
             platform_event_keys: RefCell::new(HashMap::new()),
             server_name: params.server_name,
@@ -2059,18 +2074,12 @@ impl<'a> ScriptEngine<'a> {
     pub fn remote_store_flushed(
         &self,
         source: SessionId,
+        published: &super::store::PublishedStore,
         writes: &[super::store::PublishedWrite],
     ) -> (Vec<super::RuntimeAction>, bool) {
-        let Some(runtime) = crate::session::registry::get_runtime(source) else {
-            return (Vec::new(), false);
-        };
-        if runtime.server_name.as_str() != self.server_name.as_str() {
-            return (Vec::new(), false);
-        }
-        let published = runtime.published_store.read().unwrap();
         self.remote_state_registry
             .borrow_mut()
-            .deliver(source, &published, writes)
+            .deliver(source, published, writes)
     }
 
     /// Make all directed state views of a destroyed source absent.
@@ -2103,6 +2112,16 @@ impl<'a> ScriptEngine<'a> {
         let receivers = self.message_bus.borrow().receivers(&canonical);
         let session = caller_session.to_json(false);
         if receivers.is_empty() {
+            let addressable = super::store::ProducerKey::parse(&producer)
+                .is_some_and(|producer| {
+                    super::store::is_addressable(&self.home_registry, &producer)
+                });
+            if !addressable {
+                log::warn!(
+                    "smudgy: directed procedure post to {producer}#{name} dropped: the producer is not installed"
+                );
+                return Vec::new();
+            }
             let dropped = self.message_bus.borrow_mut().push_pending(
                 canonical.to_string(),
                 super::message_bus::PendingPost {
