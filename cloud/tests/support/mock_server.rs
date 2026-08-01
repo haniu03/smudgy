@@ -378,6 +378,7 @@ impl MockHandle {
                 to_room_number: to.map(|(_, n)| n),
                 to_direction: None,
                 is_secret,
+                new_connection_id: None,
             },
             true, // direct pokes are owner-level setup
         );

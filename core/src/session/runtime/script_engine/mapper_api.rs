@@ -1095,6 +1095,7 @@ async fn op_smudgy_mapper_create_room_exit(
                     body: ExitArgs {
                         id: Some(id),
                         connection_id: None,
+                        new_connection_id: None,
                         from_direction: params.from_direction,
                         to_direction: params.to_direction,
                         to_area_id: params
@@ -1406,6 +1407,7 @@ async fn op_smudgy_mapper_create_link(
             body: ExitArgs {
                 id: Some(ExitId::new()),
                 connection_id: Some(connection_id),
+                new_connection_id: None,
                 from_direction: traversal.exit.from_direction,
                 to_direction: traversal.exit.to_direction,
                 to_area_id: traversal

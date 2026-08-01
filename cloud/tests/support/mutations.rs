@@ -155,6 +155,10 @@ struct CreateExitBody {
     /// Client-minted entity id (v2 contract); minted here when absent.
     #[serde(default)]
     id: Option<Uuid>,
+    #[serde(default)]
+    connection_id: Option<Uuid>,
+    #[serde(default)]
+    new_connection_id: Option<Uuid>,
     from_direction: String,
     to_area_id: Option<Uuid>,
     to_room_number: Option<i32>,
@@ -1068,19 +1072,78 @@ fn apply_create_exit(
     // The Connection carrying the new exit: auto-pair with the unique
     // reciprocal one-member candidate, or mint a one-member Connection with
     // §1.5 anchors and §4.3 port slots (mirrors `attach_for_new_exit`).
-    let connection_id = attach_for_new_exit(
-        working,
-        ctx.area_id,
-        &NewExitLink {
-            from_room: room_number,
-            from_direction: body.from_direction.clone(),
-            to_area_id: body.to_area_id,
-            to_room_number: body.to_room_number,
-            to_direction: body.to_direction.clone(),
-            is_secret: body.is_secret.unwrap_or(false),
-        },
-        ctx.cleared,
-    );
+    if body.connection_id.is_some() && body.new_connection_id.is_some() {
+        return Err(err_with_details(
+            422,
+            "invalid_connection",
+            json!({ "reason": "ambiguous_connection" }),
+        ));
+    }
+    let connection_id = if let Some(connection_id) = body.connection_id {
+        let area = working.get(&ctx.area_id).expect("scope area exists");
+        let Some(connection) = area
+            .connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+        else {
+            return Err(err_with_details(
+                422,
+                "invalid_connection",
+                json!({ "reason": "connection_not_found" }),
+            ));
+        };
+        if area
+            .exits
+            .iter()
+            .filter(|exit| exit.connection_id == connection_id)
+            .count()
+            >= 2
+        {
+            return Err(err_with_details(
+                422,
+                "invalid_connection",
+                json!({ "reason": "too_many_members" }),
+            ));
+        }
+        let verdict = connection_verdict_in(
+            working,
+            |target| st.caps(ctx.viewer, target),
+            area,
+            connection,
+        );
+        if !ctx.cleared && (verdict.host_secret_cause || verdict.any_cross_secret) {
+            return Err(not_found());
+        }
+        connection_id
+    } else {
+        if body.new_connection_id.is_some_and(|new_connection_id| {
+            working.values().any(|area| {
+                area.connections
+                    .iter()
+                    .any(|connection| connection.id == new_connection_id)
+            })
+        }) {
+            return Err(err_with_details(
+                422,
+                "invalid_connection",
+                json!({ "reason": "duplicate_connection" }),
+            ));
+        }
+        attach_for_new_exit(
+            working,
+            ctx.area_id,
+            &NewExitLink {
+                from_room: room_number,
+                from_direction: body.from_direction.clone(),
+                to_area_id: body.to_area_id,
+                to_room_number: body.to_room_number,
+                to_direction: body.to_direction.clone(),
+                is_secret: body.is_secret.unwrap_or(false),
+                new_connection_id: body.new_connection_id,
+            },
+            ctx.cleared,
+        )
+    };
 
     let exit = ExitRecord {
         id: body.id.unwrap_or_else(Uuid::new_v4),

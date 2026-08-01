@@ -916,8 +916,13 @@ impl AreaCache {
             None => {
                 let peers = Self::topologies_of(&self.id, &self.rooms_by_number, None);
                 let topology = Self::exit_topology(&self.id, room_number, &exit);
-                exit.connection_id =
-                    connection_lifecycle::attach_exit(&topology, &peers, &mut connections, site);
+                exit.connection_id = connection_lifecycle::attach_exit(
+                    &topology,
+                    &peers,
+                    &mut connections,
+                    site,
+                    None,
+                );
             }
             Some(existing) => {
                 exit.connection_id = existing.connection_id;

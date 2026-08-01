@@ -75,13 +75,18 @@ pub fn attach_exit(
     peers: &[ExitTopology],
     connections: &mut Vec<Connection>,
     room_site: impl Fn(RoomNumber) -> Option<RoomSite>,
+    new_connection_id: Option<ConnectionId>,
 ) -> ConnectionId {
-    if let Some(candidate) = reciprocal_candidate(exit, peers)
+    if new_connection_id.is_none()
+        && let Some(candidate) = reciprocal_candidate(exit, peers)
         && connections.iter().any(|c| c.id == candidate)
     {
         return candidate;
     }
-    let connection = default_connection_for(exit, &room_site);
+    let mut connection = default_connection_for(exit, &room_site);
+    if let Some(new_connection_id) = new_connection_id {
+        connection.id = new_connection_id;
+    }
     let id = connection.id;
     connections.push(connection);
     id
@@ -268,7 +273,7 @@ pub fn reattach_after_update(
         if reciprocal {
             return before.connection_id;
         }
-        return attach_exit(after, peers, connections, room_site);
+        return attach_exit(after, peers, connections, room_site, None);
     }
 
     let Some(connection) = connections
@@ -277,7 +282,7 @@ pub fn reattach_after_update(
     else {
         // The membership row is missing (corrupt input): self-heal by
         // attaching fresh.
-        return attach_exit(after, peers, connections, room_site);
+        return attach_exit(after, peers, connections, room_site, None);
     };
 
     retarget_in_place(connection, after, &room_site);
@@ -506,7 +511,7 @@ mod tests {
             Some(2),
             Some(ExitDirection::West),
         );
-        let id = attach_exit(&new_exit, &[peer], &mut connections, flat_site);
+        let id = attach_exit(&new_exit, &[peer], &mut connections, flat_site, None);
         assert_eq!(id, existing);
         assert_eq!(connections.len(), 1);
     }
@@ -533,7 +538,7 @@ mod tests {
             Some(2),
             Some(ExitDirection::West),
         );
-        let id = attach_exit(&new_exit, &[peer], &mut connections, flat_site);
+        let id = attach_exit(&new_exit, &[peer], &mut connections, flat_site, None);
         assert_ne!(id, existing);
         assert_eq!(connections.len(), 2, "a fresh one-way Connection appears");
     }

@@ -240,6 +240,46 @@ fn compile_area_mutations(
 
     for operation in operations {
         let expanded = match operation {
+            AreaMutation::CreateExit {
+                room_number,
+                mut body,
+            } => {
+                let exit_id = body.id.unwrap_or_else(ExitId::new);
+                body.id = Some(exit_id);
+
+                if body.connection_id.is_none() && body.new_connection_id.is_none() {
+                    // Resolve the legacy auto-pair/create choice once against
+                    // the optimistic base, then persist that exact decision.
+                    // The server must never independently mint the identity
+                    // of a Connection the durable client already references.
+                    let mut preview = scratch.clone();
+                    area_edits::apply_mutation(
+                        &mut preview,
+                        &AreaMutation::CreateExit {
+                            room_number,
+                            body: body.clone(),
+                        },
+                    )?;
+                    let resolved_connection_id = preview
+                        .rooms
+                        .iter()
+                        .flat_map(|room| room.exits.iter())
+                        .find(|exit| exit.id == exit_id)
+                        .map(|exit| exit.connection_id)
+                        .ok_or(CloudError::ExitNotFound(exit_id))?;
+                    if scratch
+                        .connections
+                        .iter()
+                        .any(|connection| connection.id == resolved_connection_id)
+                    {
+                        body.connection_id = Some(resolved_connection_id);
+                    } else {
+                        body.new_connection_id = Some(resolved_connection_id);
+                    }
+                }
+
+                vec![AreaMutation::CreateExit { room_number, body }]
+            }
             AreaMutation::UpdateExit { exit_id, body } => {
                 let current = scratch
                     .rooms
@@ -446,6 +486,7 @@ fn merge_room_operations(
                 body: ExitArgs {
                     id: Some(ExitId(Uuid::new_v4())),
                     connection_id: None,
+                    new_connection_id: None,
                     from_direction: exit.from_direction,
                     to_area_id: exit.to_area_id,
                     to_room_number: exit.to_room_number,
@@ -3926,6 +3967,110 @@ mod tests {
     }
 
     #[test]
+    fn exit_compiler_persists_fresh_connection_identity() {
+        let area_id = AreaId(Uuid::new_v4());
+        let details = sample_area(area_id, "Origin");
+
+        let compiled = compile_area_mutations(
+            &details,
+            vec![AreaMutation::CreateExit {
+                room_number: RoomNumber(1),
+                body: ExitArgs {
+                    from_direction: crate::ExitDirection::Special,
+                    weight: 1.0,
+                    ..ExitArgs::default()
+                },
+            }],
+            PairedExitPolicy::Reject,
+        )
+        .expect("fresh exit compiles");
+
+        let [AreaMutation::CreateExit { body, .. }] = compiled.as_slice() else {
+            panic!("one explicit exit create expected: {compiled:?}");
+        };
+        let exit_id = body.id.expect("exit identity is durable");
+        let connection_id = body
+            .new_connection_id
+            .expect("fresh connection identity is durable");
+        assert!(
+            body.connection_id.is_none(),
+            "a fresh identity is not an existing-membership request"
+        );
+
+        let mut applied = details;
+        let envelope = MutationEnvelope {
+            operation_id: Uuid::new_v4(),
+            preconditions: vec![Precondition {
+                resource: ResourceKind::Area,
+                id: area_id.0,
+                expected_rev: applied.area.rev,
+                access_fingerprint: applied.area.access.map(|access| access.fingerprint()),
+            }],
+            payload: compiled,
+        };
+        area_edits::apply_envelope(&mut applied, area_id, &envelope)
+            .expect("compiled create validates");
+        assert_eq!(applied.connections[0].id, connection_id);
+        assert_eq!(applied.rooms[0].exits[0].id, exit_id);
+        assert_eq!(applied.rooms[0].exits[0].connection_id, connection_id);
+    }
+
+    #[test]
+    fn exit_compiler_persists_existing_auto_pair_identity() {
+        let area_id = AreaId(Uuid::new_v4());
+        let mut details = sample_v2_document(area_id, AreaId(Uuid::new_v4()));
+        let pair_id = details.rooms[0].exits[0].connection_id;
+        details.rooms[1].exits.clear();
+
+        let compiled = compile_area_mutations(
+            &details,
+            vec![AreaMutation::CreateExit {
+                room_number: RoomNumber(2),
+                body: ExitArgs {
+                    from_direction: crate::ExitDirection::West,
+                    to_area_id: Some(area_id),
+                    to_room_number: Some(RoomNumber(1)),
+                    to_direction: Some(crate::ExitDirection::East),
+                    weight: 1.0,
+                    ..ExitArgs::default()
+                },
+            }],
+            PairedExitPolicy::Reject,
+        )
+        .expect("reciprocal exit compiles");
+
+        let [AreaMutation::CreateExit { body, .. }] = compiled.as_slice() else {
+            panic!("one explicit exit create expected: {compiled:?}");
+        };
+        assert_eq!(body.connection_id, Some(pair_id));
+        assert!(
+            body.new_connection_id.is_none(),
+            "auto-pairing addresses the existing connection"
+        );
+
+        let mut applied = details;
+        let envelope = MutationEnvelope {
+            operation_id: Uuid::new_v4(),
+            preconditions: vec![Precondition {
+                resource: ResourceKind::Area,
+                id: area_id.0,
+                expected_rev: applied.area.rev,
+                access_fingerprint: applied.area.access.map(|access| access.fingerprint()),
+            }],
+            payload: compiled,
+        };
+        area_edits::apply_envelope(&mut applied, area_id, &envelope)
+            .expect("compiled auto-pair validates");
+        let member_count = applied
+            .rooms
+            .iter()
+            .flat_map(|room| room.exits.iter())
+            .filter(|exit| exit.connection_id == pair_id)
+            .count();
+        assert_eq!(member_count, 2);
+    }
+
+    #[test]
     fn exit_compiler_requires_explicit_split_for_real_pair_topology_change() {
         let area_id = AreaId(Uuid::new_v4());
         let details = sample_v2_document(area_id, AreaId(Uuid::new_v4()));
@@ -4329,6 +4474,7 @@ mod tests {
                     body: ExitArgs {
                         id: Some(exit.id),
                         connection_id: None,
+                        new_connection_id: None,
                         from_direction: exit.from_direction,
                         to_area_id: exit.to_area_id,
                         to_room_number: exit.to_room_number,
