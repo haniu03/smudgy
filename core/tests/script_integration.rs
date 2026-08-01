@@ -681,3 +681,249 @@ async fn script_automation_names_match_ui_rules() {
          TypeError in 0.5.\nTranscript:\n{transcript}"
     );
 }
+
+const CROSS_SESSION_TS: &str = r#"
+import {
+  byName,
+  createAlias,
+  createEvent,
+  echo,
+  events,
+  getSessions,
+  session,
+} from "smudgy:core";
+import {
+  connected,
+  created,
+  destroyed,
+  disconnected,
+} from "smudgy:events/sessions";
+
+const crossSession = createEvent("crossSession");
+const channel = new BroadcastChannel("smudgy-cross-session-test");
+
+const remoteEvents = events.lookup("user", "crossSession")
+  .fromAll({ includeSelf: false });
+remoteEvents.on((payload, source) => {
+    echo(`EVENT:${source.profile.name}:${payload.answer}`);
+});
+remoteEvents.once().then((payload) => {
+  echo(`ONCE_PAYLOAD:${payload.answer}:${Array.isArray(payload)}`);
+});
+
+channel.onmessage = (event) => {
+  echo(`BROADCAST:${event.data.from}:${event.data.answer}`);
+};
+
+created.on((affected, source) => {
+  if (affected.profile.name === "Beta") {
+    echo(`CREATED:${source.profile.name}:${affected.connected}`);
+  }
+});
+connected.on((affected, source) => {
+  if (affected.profile.name === "Beta") {
+    echo(`CONNECTED:${source.profile.name}`);
+  }
+});
+disconnected.on((affected, source) => {
+  if (affected.profile.name === "Beta") {
+    echo(`DISCONNECTED:${source.profile.name}:${affected.connected}`);
+  }
+});
+destroyed.on((affected, source) => {
+  if (affected.profile.name === "Beta") {
+    echo(`DESTROYED:${source.profile.name}:${affected.connected}`);
+  }
+});
+
+createAlias("^fire-cross-session$", () => {
+  const peers = getSessions();
+  echo(`ENUM:${peers.length}:${byName("Alpha")?.id !== undefined}:${byName("Gamma") === undefined}`);
+  crossSession.emit({ answer: 42 });
+  channel.postMessage({ from: session.profile.name, answer: 42 });
+});
+"#;
+
+/// The public cross-session surface is exercised through two real session threads:
+/// lifecycle events are live/non-replaying, event filters name their source, enumeration
+/// is server-scoped, and Deno's standard `BroadcastChannel` crosses the shared backend.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_channel() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let home_path = smudgy_core::get_smudgy_home().expect("smudgy home");
+
+    let server = "CrossSessionInterop";
+    let modules_dir = home_path.join(server).join("modules");
+    std::fs::create_dir_all(&modules_dir).unwrap();
+    std::fs::create_dir_all(home_path.join(server).join("logs")).unwrap();
+    std::fs::write(modules_dir.join("cross-session.ts"), CROSS_SESSION_TS).unwrap();
+    let other_server = "CrossSessionInteropOther";
+    std::fs::create_dir_all(home_path.join(other_server).join("modules")).unwrap();
+    std::fs::create_dir_all(home_path.join(other_server).join("logs")).unwrap();
+
+    let params = |id, name: &str| {
+        Arc::new(SessionParams {
+            session_id: SessionId::from(id),
+            server_name: Arc::new(server.to_string()),
+            profile_name: Arc::new(name.to_string()),
+            profile_subtext: Arc::new(String::new()),
+            mapper: None,
+            package_client: None,
+            extra_script_extensions: Arc::new(Vec::new),
+            on_engine_rebuild: None,
+        })
+    };
+
+    // Alpha is fully ready before Beta is registered, pinning `created` as a future,
+    // non-replayed occurrence rather than a startup snapshot.
+    let mut alpha_events = Box::pin(spawn(params(7090, "Alpha")));
+    let alpha_tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), alpha_events.next())
+            .await
+            .expect("timed out waiting for Alpha RuntimeReady")
+            .expect("Alpha event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
+
+    let mut beta_events = Box::pin(spawn(params(7091, "Beta")));
+    let beta_tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), beta_events.next())
+            .await
+            .expect("timed out waiting for Beta RuntimeReady")
+            .expect("Beta event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
+
+    // A simultaneously-live session on another configured server entry must be
+    // absent from Alpha/Beta enumeration and routing.
+    let mut gamma_events = Box::pin(spawn(Arc::new(SessionParams {
+        session_id: SessionId::from(7092),
+        server_name: Arc::new(other_server.to_string()),
+        profile_name: Arc::new("Gamma".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    })));
+    let gamma_tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), gamma_events.next())
+            .await
+            .expect("timed out waiting for Gamma RuntimeReady")
+            .expect("Gamma event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
+
+    let mut alpha_lines = Vec::new();
+    let mut beta_lines = Vec::new();
+
+    beta_tx.send(RuntimeAction::Connected).unwrap();
+    let connected_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < connected_deadline
+        && !alpha_lines.iter().any(|line| line == "CONNECTED:Beta")
+    {
+        if let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, alpha_events.next()).await
+            && let SessionEvent::UpdateBuffer(updates) = event.event
+        {
+            for update in updates.iter() {
+                if let BufferUpdate::Append(line) = update {
+                    alpha_lines.push(line.text.clone());
+                }
+            }
+        }
+    }
+
+    beta_tx.send(RuntimeAction::Disconnected).unwrap();
+    beta_tx
+        .send(RuntimeAction::Send(Arc::new("fire-cross-session".to_string())))
+        .unwrap();
+
+    let delivery_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < delivery_deadline
+        && !(alpha_lines.iter().any(|line| line == "EVENT:Beta:42")
+            && alpha_lines
+                .iter()
+                .any(|line| line == "BROADCAST:Beta:42")
+            && alpha_lines
+                .iter()
+                .any(|line| line == "ONCE_PAYLOAD:42:false")
+            && beta_lines.iter().any(|line| line == "ENUM:2:true:true"))
+    {
+        tokio::select! {
+            event = alpha_events.next() => {
+                if let Some(event) = event
+                    && let SessionEvent::UpdateBuffer(updates) = event.event
+                {
+                    for update in updates.iter() {
+                        if let BufferUpdate::Append(line) = update {
+                            alpha_lines.push(line.text.clone());
+                        }
+                    }
+                }
+            }
+            event = beta_events.next() => {
+                if let Some(event) = event
+                    && let SessionEvent::UpdateBuffer(updates) = event.event
+                {
+                    for update in updates.iter() {
+                        if let BufferUpdate::Append(line) = update {
+                            beta_lines.push(line.text.clone());
+                        }
+                    }
+                }
+            }
+            () = tokio::time::sleep(QUIET_PERIOD) => {}
+        }
+    }
+
+    beta_tx.send(RuntimeAction::Shutdown).ok();
+    let destroyed_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < destroyed_deadline
+        && !alpha_lines
+            .iter()
+            .any(|line| line == "DESTROYED:Beta:false")
+    {
+        if let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, alpha_events.next()).await
+            && let SessionEvent::UpdateBuffer(updates) = event.event
+        {
+            for update in updates.iter() {
+                if let BufferUpdate::Append(line) = update {
+                    alpha_lines.push(line.text.clone());
+                }
+            }
+        }
+    }
+    alpha_tx.send(RuntimeAction::Shutdown).ok();
+    gamma_tx.send(RuntimeAction::Shutdown).ok();
+
+    let alpha_transcript = alpha_lines.join("\n");
+    let beta_transcript = beta_lines.join("\n");
+    for expected in [
+        "CREATED:Beta:false",
+        "CONNECTED:Beta",
+        "DISCONNECTED:Beta:false",
+        "EVENT:Beta:42",
+        "ONCE_PAYLOAD:42:false",
+        "BROADCAST:Beta:42",
+        "DESTROYED:Beta:false",
+    ] {
+        assert!(
+            alpha_lines.iter().any(|line| line == expected),
+            "missing {expected:?} from Alpha transcript:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
+        );
+    }
+    assert!(
+        beta_lines.iter().any(|line| line == "ENUM:2:true:true"),
+        "same-server enumeration/byName failed.\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
+    );
+}

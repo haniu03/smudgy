@@ -302,16 +302,16 @@ tick.emit({});
 "#;
 
 /// Module exercising procedures on the `user` producer (interop.md §6):
-/// host-stamped senders, async next-pump delivery (after `SYNC`), and the queue-briefly
+/// host-stamped callers, async next-pump delivery (after `SYNC`), and the queue-briefly
 /// buffer (a post before any receiver registers is drained FIFO at registration).
 const PROCEDURES_TS: &str = r#"
 import { createProcedure, echo } from "smudgy:core";
 const consumers = (globalThis as any).__smudgy_interop_consumer("user");
 
 let delivered = false;
-export const req = createProcedure((payload: { n: number }, sender) => {
+export const req = createProcedure((payload: { n: number }, caller) => {
     delivered = true;
-    echo("MSG:" + payload.n + ":" + sender);
+    echo("MSG:" + payload.n + ":" + caller.origin + ":" + caller.session.profile.name);
 });
 consumers.procedure("req").post({ n: 1 });
 echo("SYNC:" + delivered);
@@ -971,13 +971,13 @@ async fn derived_computes_publishes_and_stops_on_off() {
 }
 
 #[tokio::test]
-async fn procedures_deliver_async_with_stamped_sender_and_queue_briefly() {
+async fn procedures_deliver_async_with_stamped_caller_and_queue_briefly() {
     let lines = run_module(7307, "StoreProcedures", PROCEDURES_TS).await;
     let transcript = lines.join("\n");
 
     assert!(
-        lines.iter().any(|l| l == "MSG:1:user"),
-        "a post reaches the implementation with the host-stamped sender.\n{transcript}"
+        lines.iter().any(|l| l == "MSG:1:user:Test"),
+        "a post reaches the implementation with its host-stamped origin and session.\n{transcript}"
     );
     assert!(
         lines.iter().any(|l| l == "SYNC:false"),
