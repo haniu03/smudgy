@@ -7,7 +7,7 @@
 //! map editor's Sync button. There is no periodic poll: the cloud is contacted
 //! only on user or app action. Each tick polls the backend's sync rows and
 //! reconciles the shared atlas cache:
-//! refetching areas whose projected rev or access fingerprint moved, dropping
+//! refetching areas whose shared rev or access fingerprint moved, dropping
 //! areas the viewer lost, and refreshing areas whose `to_unknown` exits may
 //! have resolved when the row set changed. Areas with in-flight local writes
 //! are never overwritten; their refetch is deferred to a later tick.
@@ -478,7 +478,7 @@ fn clear_cloud_projection(inner: &Inner) {
 }
 
 /// Records every sync row as backend truth for the pending queue's CAS
-/// preconditions (projected revision + access fingerprint).
+/// preconditions (shared revision + access fingerprint).
 fn note_rows_confirmed(inner: &Inner, rows: &[SyncRow]) {
     for row in rows {
         inner.pending.note_confirmed_rev(

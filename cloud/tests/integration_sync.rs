@@ -93,7 +93,7 @@ fn api_client(base_url: &str, api_key: &str) -> CloudApiClient {
 }
 
 /// Executes one compound envelope as `backend`'s viewer, preconditioned on
-/// the viewer's freshly-fetched projected revision — the direct-wire way to
+/// the viewer's freshly-fetched shared revision — the direct-wire way to
 /// drive `POST /areas/{id}/mutations` outside a `Mapper`.
 async fn execute_ops(
     backend: &CloudMapper,
@@ -627,7 +627,7 @@ async fn pair_member_retarget_is_refused_with_unlink_before_edit() {
 // 1d. §6.4 closure through the real stack: one secret member in a pair
 //     hides BOTH exits and the Connection from an uncleared editor's
 //     projection (no to_unknown trace), and clearing the secret reveals the
-//     group and moves the editor's projected rev.
+//     group and moves the editor's shared rev.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -731,7 +731,7 @@ async fn secret_pair_member_hides_the_whole_group_from_an_uncleared_editor() {
     );
 
     // Clearing the secret reveals the whole group and moves the editor's
-    // projected rev (§6.3: a reveal bumps the public projection).
+    // shared rev (§6.3: a reveal changes visible content).
     let editor_client = api_client(&server.base_url, &editor.api_key);
     let rev_hidden = sync_row_rev(&editor_client, area).await;
     owner_mapper
@@ -754,7 +754,7 @@ async fn secret_pair_member_hides_the_whole_group_from_an_uncleared_editor() {
     let rev_revealed = sync_row_rev(&editor_client, area).await;
     assert_ne!(
         rev_revealed, rev_hidden,
-        "revealing the group moves the editor's projected rev"
+        "revealing the group moves the editor's shared rev"
     );
 
     tick(&editor_mapper).await;
