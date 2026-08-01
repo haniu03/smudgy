@@ -1703,14 +1703,15 @@ impl<'a> ScriptEngine<'a> {
                                 name: Arc::from(spec.name.as_str()),
                             };
                             let doomed: Vec<(Arc<str>, super::pane::PaneKey)> = pane_registry
-                                .borrow()
+                                .lock()
+                                .unwrap()
                                 .list(&namespace)
                                 .into_iter()
                                 .filter(|def| !def.is_main && def.input.is_some())
                                 .map(|def| (def.name.clone(), def.key))
                                 .collect();
                             for (name, key) in doomed {
-                                if pane_registry.borrow_mut().close(&namespace, &name).is_ok() {
+                                if pane_registry.lock().unwrap().close(&namespace, &name).is_ok() {
                                     super::input::purge_pane_input_state(
                                         &input_mirror,
                                         &input_word_sets,
@@ -1732,8 +1733,8 @@ impl<'a> ScriptEngine<'a> {
                         // retained above — it names no isolate — and reads the purged sets at
                         // dispatch; the flag check keeps this from queueing a duplicate.)
                         {
-                            let mut sets = input_word_sets.borrow_mut();
-                            for key in sets.purge_isolate(&isolate_id) {
+                            let mut sets = input_word_sets.lock().unwrap();
+                            for key in sets.purge_isolate(session_id, &isolate_id) {
                                 if sets.flag_push(key) {
                                     spawned_actions.borrow_mut().push_back(
                                         super::RuntimeAction::InputWordSetsChanged { key },
@@ -1744,7 +1745,31 @@ impl<'a> ScriptEngine<'a> {
                         // Pane-input onSubmit registrations land synchronously too; a
                         // handler seated under this dead isolate could only ever be a
                         // warn-and-drop at dispatch, so purge it with the isolate.
-                        pane_input_callbacks.borrow_mut().purge_isolate(&isolate_id);
+                        pane_input_callbacks
+                            .lock()
+                            .unwrap()
+                            .purge_isolate(session_id, &isolate_id);
+                        // Registry ops land synchronously, including when the
+                        // input belongs to another same-server runtime. Purge
+                        // this failed isolate's foreign seats as narrowly as
+                        // the local cleanup above; other isolates from this
+                        // runtime must survive.
+                        for other in crate::session::registry::get_runtimes_for_server(
+                            params.server_name.as_str(),
+                        ) {
+                            if other.session_id != session_id {
+                                for key in super::input::purge_isolate_input_interop(
+                                    &other.input_word_sets,
+                                    &other.pane_input_callbacks,
+                                    session_id,
+                                    &isolate_id,
+                                ) {
+                                    let _ = other
+                                        .tx
+                                        .send(super::RuntimeAction::InputWordSetsChanged { key });
+                                }
+                            }
+                        }
                         // This isolate is NOT being moved into `isolates`, so it drops here.
                         // Model B left it off the enter-stack (and the load bracket already
                         // released it), but `OwnedIsolate::Drop` requires it be the thread's

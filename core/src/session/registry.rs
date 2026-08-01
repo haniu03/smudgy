@@ -136,6 +136,19 @@ pub fn unregister_session(session_id: SessionId) {
     }
     snapshot.connected = false;
     broadcast_lifecycle(&server, "destroyed", &snapshot, true);
+    for other in get_runtimes_for_server(&server) {
+        if other.session_id != session_id {
+            for key in super::runtime::input::purge_session_input_interop(
+                &other.input_word_sets,
+                &other.pane_input_callbacks,
+                session_id,
+            ) {
+                let _ = other
+                    .tx
+                    .send(super::runtime::RuntimeAction::InputWordSetsChanged { key });
+            }
+        }
+    }
     let registry = get_registry();
     let mut sessions = registry.lock().unwrap();
     inspector_addresses().lock().unwrap().remove(&session_id);
@@ -175,10 +188,12 @@ pub fn broadcast_lifecycle(server: &str, kind: &str, snapshot: &SessionSnapshot,
 pub fn get_session_ids_for_server(server: &str) -> Vec<SessionId> {
     let registry = get_registry();
     let sessions = registry.lock().unwrap();
-    sessions
+    let mut ids: Vec<SessionId> = sessions
         .iter()
         .filter_map(|(id, runtime)| (runtime.server_name.as_str() == server).then_some(*id))
-        .collect()
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// Runtime handles on one configured server entry, cloned out before callers

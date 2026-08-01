@@ -70,6 +70,7 @@ const {
     op_smudgy_pane_resize,
     op_smudgy_pane_relocate,
     op_smudgy_pane_tear_out,
+    op_smudgy_pane_swap,
     op_smudgy_pane_size,
     op_smudgy_pane_echo,
     op_smudgy_pane_echo_styled,
@@ -930,7 +931,7 @@ interface PaneInfoWire {
     kind: "terminal" | "widgets";
     isMain: boolean;
     /** The interned per-session name identity (the per-line routing fast
-     *  path); null on a cross-session optimistic handle. */
+     *  path). Kept nullable for wire compatibility. */
     nameId: number | null;
     created: boolean;
     /** Whether the pane hosts its own input line (`pane.input`). */
@@ -1035,7 +1036,7 @@ class Pane {
     /** The eyeball's toggle state -- never effective visibility (a hidden
      *  pane still renders, veiled, while the toolbar is expanded, and an
      *  all-hidden window ignores the toggles rather than go blank). Live per
-     *  access; own-session only. */
+     *  access; works through same-server foreign handles. */
     get isHidden(): boolean {
         return op_smudgy_pane_def_state(this._sessionId, this._name).hidden;
     }
@@ -1053,7 +1054,7 @@ class Pane {
     }
 
     /** This pane's font override in px, or undefined while following the
-     *  global setting. Live per access; own-session only. */
+     *  global setting. Live per access, including foreign handles. */
     get fontSize(): number | undefined {
         const fontSize = op_smudgy_pane_def_state(this._sessionId, this._name).fontSize;
         return fontSize === null ? undefined : fontSize;
@@ -1074,8 +1075,8 @@ class Pane {
     }
 
     /** The pane's last laid-out size in logical px, or undefined before the
-     *  first layout report reaches the mirror. Live per access; own-session
-     *  only. A hidden pane keeps its last laid-out size. */
+     *  first layout report reaches the mirror. Live per access. A hidden
+     *  pane keeps its last laid-out size. */
     get size(): { width: number; height: number } | undefined {
         const size = op_smudgy_pane_size(this._sessionId, this._name);
         return size === null ? undefined : { width: size[0], height: size[1] };
@@ -1137,6 +1138,22 @@ class Pane {
             if (typeof opts.height === "number" && Number.isFinite(opts.height)) height = opts.height;
         }
         op_smudgy_pane_tear_out(this._sessionId, this._name, width, height);
+    }
+
+    /** Atomically exchange this pane's layout position with another pane.
+     *  The other pane may belong to another same-server session or window;
+     *  each destination keeps its existing split geometry and the operation
+     *  requests no window activation or input focus. */
+    swap(otherPane: Pane): void {
+        if (!(otherPane instanceof Pane)) {
+            throw new TypeError("swap expects a Pane");
+        }
+        op_smudgy_pane_swap(
+            this._sessionId,
+            this._name,
+            otherPane._sessionId,
+            otherPane._name,
+        );
     }
 }
 
@@ -1615,8 +1632,8 @@ function __smudgy_pane_route_arg(pane: Pane | string): [number, string] {
  *
  * A handle: every member routes to the session the handle names, own or foreign.
  * Cross-session calls are gated by the `reach-others` capability for sandboxed
- * packages, and pane introspection (`panes.get`/`list`/`exists`) is own-session
- * only (see `__smudgy_make_pane_registry`); everything else routes by id.
+ * packages. Data-only pane/input reads resolve synchronously from the owning
+ * runtime; effects route by id through its ordered queues.
  */
 class Session {
     _id: number;
@@ -1712,14 +1729,12 @@ class Session {
         );
     }
 
-    /** This session's pane registry (`get`/`list`/`exists` + dot access).
-     *  Introspection is own-session only; a foreign session's `get`/`list`/
-     *  `exists` throw (pane mutations still route by name). */
+    /** This session's pane registry (`get`/`list`/`exists` + dot access). */
     get panes(): PaneRegistry {
         return __smudgy_make_pane_registry(this.id, this.#creatorId);
     }
 
-    /** This session's main command input. Own-session only. */
+    /** This session's main command input. */
     get input(): InputHandle {
         return __smudgy_make_input_handle(this.id, "main", this.#creatorId);
     }
@@ -1829,13 +1844,21 @@ class Trigger {
 const getCurrentSession = (creatorId: number | null = null): Session =>
     new Session(op_smudgy_get_current_session(), creatorId);
 
-/** All live sessions using this session's configured server entry. The set changes as
- *  sessions are created and destroyed, so this is a function (read live), not a snapshot
- *  value. For sandboxed packages the
+/** All live sessions using this session's configured server entry, ordered by numeric
+ *  session id. The set changes as sessions are created and destroyed, so this is a
+ *  function (read live), not a snapshot value. For sandboxed packages the
  *  enumeration itself is the `reach-others` capability (see the Session class doc).
  *  `creatorId` binds the handles like {@link getCurrentSession}'s. */
 const getSessions = (creatorId: number | null = null): Session[] =>
     op_smudgy_get_sessions().map((id: number) => new Session(id, creatorId));
+
+/** Look up a same-server live session by its numeric id. */
+const byId = (id: number, creatorId: number | null = null): Session | undefined => {
+    if (typeof id !== "number" || !Number.isInteger(id) || id < 0) {
+        throw new TypeError("byId expects a non-negative integer session id");
+    }
+    return getSessions(creatorId).find((s) => s.id === id);
+};
 
 /** The current session's profile (name + subtext), read live. */
 const getProfile = (): Profile => getCurrentSession().profile;
@@ -3992,6 +4015,7 @@ function __smudgy_make_api(creator: { kind: string }) {
         // module-level functions themselves: exposing the creator-id parameter would
         // let a caller name another creator's contribution set.
         byName: (name: string): Session | undefined => byName(String(name), creatorId),
+        byId: (id: number): Session | undefined => byId(id, creatorId),
         getSessions: (): Session[] => getSessions(creatorId),
         getProfile,
         getSettings,

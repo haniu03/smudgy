@@ -11,7 +11,7 @@ use crate::models::ScriptLang;
 use crate::session::connection::Connection;
 use crate::session::{BufferUpdate, SessionEvent, TaggedSessionEvent};
 
-use super::pane::{MAIN_PANE_KEY, PaneError, PaneKey, PaneKind, PaneNamespace, PanePlacement};
+use super::pane::{MAIN_PANE_KEY, PaneError, PaneKey, PaneKind, PaneNamespace};
 use super::trigger::{self, PushTriggerParams};
 use super::{ActionResult, Inner, IsolateId, RuntimeAction, ScriptAction};
 use crate::session::styled_line::StyledLine;
@@ -108,7 +108,8 @@ impl Inner<'_> {
             Some(key) => Some((key, PaneKind::Terminal, key == MAIN_PANE_KEY)),
             None => self
                 .pane_registry
-                .borrow()
+                .lock()
+                .unwrap()
                 .resolve(namespace, name)
                 .map(|def| (def.key, def.kind, def.is_main)),
         }
@@ -1218,7 +1219,7 @@ impl Inner<'_> {
                 // Flush first: buffered updates may hold `AppendTo`s for this key, and the
                 // dangling-sink rule promises the UI that `PaneClosed` arrives behind them.
                 // The closed pane's mirrored size dies with it (keys are never reused).
-                self.pane_size_mirror.borrow_mut().remove(key);
+                self.pane_size_mirror.lock().unwrap().remove(key);
                 if let Some(fut) = self.flush_buffer_updates()? {
                     fut.await?;
                 }
@@ -1262,7 +1263,7 @@ impl Inner<'_> {
                 // behind the load's own actions, so a pane the reloading scripts
                 // echoed into before abandoning still shows those lines before it
                 // closes; the flush upholds the AppendTo-before-PaneClosed promise.
-                let swept = self.pane_registry.borrow_mut().sweep_unclaimed();
+                let swept = self.pane_registry.lock().unwrap().sweep_unclaimed();
                 if !swept.is_empty() {
                     if let Some(fut) = self.flush_buffer_updates()? {
                         fut.await?;
@@ -1276,7 +1277,7 @@ impl Inner<'_> {
                             &self.pane_input_callbacks,
                             key,
                         );
-                        self.pane_size_mirror.borrow_mut().remove(key);
+                        self.pane_size_mirror.lock().unwrap().remove(key);
                         self.ui_tx
                             .send(TaggedSessionEvent {
                                 session_id: self.session_id,
@@ -1287,72 +1288,8 @@ impl Inner<'_> {
                 }
                 Ok(ActionResult::None)
             }
-            RuntimeAction::PaneSplitRemote {
-                namespace,
-                name,
-                kind,
-                def_state,
-                reference,
-                direction,
-                size_px,
-            } => {
-                // Cross-session create, resolved on this (owning) runtime; last-writer-wins
-                // in queue order. Best-effort: a refused split logs instead of erroring the
-                // caller (who has already moved on).
-                // Cross-session splits never carry an input (the op refuses
-                // the spec), so the registry sees `None` here by construction.
-                let outcome =
-                    self.pane_registry
-                        .borrow_mut()
-                        .split(&namespace, &name, kind, def_state, None);
-                match outcome {
-                    Ok(outcome) if outcome.created => {
-                        let reference = reference
-                            .as_deref()
-                            .and_then(|ref_name| {
-                                self.pane_registry
-                                    .borrow()
-                                    .resolve(&namespace, ref_name)
-                                    .map(|def| def.key)
-                            })
-                            .unwrap_or(MAIN_PANE_KEY);
-                        self.ui_tx
-                            .send(TaggedSessionEvent {
-                                session_id: self.session_id,
-                                event: SessionEvent::PaneOpened {
-                                    def: outcome.def,
-                                    placement: PanePlacement {
-                                        reference,
-                                        direction,
-                                        size_px,
-                                    },
-                                },
-                            })
-                            .await?;
-                    }
-                    // Get-or-create hit: the pane already exists, but an explicit
-                    // def-state field may still have updated it.
-                    Ok(outcome) if outcome.def_changed => {
-                        self.ui_tx
-                            .send(TaggedSessionEvent {
-                                session_id: self.session_id,
-                                event: SessionEvent::PaneUpdated(outcome.def.clone()),
-                            })
-                            .await?;
-                        if outcome.hidden_changed {
-                            let actions = self.pane_visibility_emit(&outcome.def);
-                            if !actions.is_empty() {
-                                return Ok(ActionResult::Run(actions));
-                            }
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(err) => warn!("Cross-session pane split '{name}' refused: {err}"),
-                }
-                Ok(ActionResult::None)
-            }
             RuntimeAction::PaneCloseRemote { namespace, name } => {
-                let closed = self.pane_registry.borrow_mut().close(&namespace, &name);
+                let closed = self.pane_registry.lock().unwrap().close(&namespace, &name);
                 match closed {
                     Ok(key) => {
                         // The closed pane's input state dies with it, like the
@@ -1363,7 +1300,7 @@ impl Inner<'_> {
                             &self.pane_input_callbacks,
                             key,
                         );
-                        self.pane_size_mirror.borrow_mut().remove(key);
+                        self.pane_size_mirror.lock().unwrap().remove(key);
                         if let Some(fut) = self.flush_buffer_updates()? {
                             fut.await?;
                         }
@@ -1390,7 +1327,8 @@ impl Inner<'_> {
                 // name (the `PaneCloseRemote` rule).
                 let updated = self
                     .pane_registry
-                    .borrow_mut()
+                    .lock()
+                    .unwrap()
                     .set_hidden(&namespace, &name, hidden);
                 match updated {
                     Ok(Some(def)) => {
@@ -1417,7 +1355,8 @@ impl Inner<'_> {
             } => {
                 let updated = self
                     .pane_registry
-                    .borrow_mut()
+                    .lock()
+                    .unwrap()
                     .set_font_size(&namespace, &name, font_size);
                 match updated {
                     Ok(Some(def)) => {
@@ -1441,7 +1380,11 @@ impl Inner<'_> {
                 // pane, including main (the all-hidden fallback keeps a window
                 // usable). A retired key or an already-matching state drops
                 // the report whole, like a stale `InputStateChanged`.
-                let updated = self.pane_registry.borrow_mut().set_hidden_by_key(key, hidden);
+                let updated = self
+                    .pane_registry
+                    .lock()
+                    .unwrap()
+                    .set_hidden_by_key(key, hidden);
                 match updated {
                     Some(def) => {
                         self.ui_tx
@@ -1495,6 +1438,23 @@ impl Inner<'_> {
                     .send(TaggedSessionEvent {
                         session_id: self.session_id,
                         event: SessionEvent::PaneTearOut { key, width, height },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneSwap {
+                key,
+                other_session,
+                other_key,
+            } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneSwap {
+                            key,
+                            other_session,
+                            other_key,
+                        },
                     })
                     .await?;
                 Ok(ActionResult::None)
@@ -1584,25 +1544,58 @@ impl Inner<'_> {
                 }
                 Ok(ActionResult::None)
             }
-            RuntimeAction::PaneInputSubmit { key, text } => {
+            RuntimeAction::PaneInputSubmit { key, text, retry } => {
                 // Deliver a pane input's submission to its registered onSubmit
                 // handler — and to nothing else: no pipeline entry, no
                 // `sys:input`, no main history. The handler runs in the
                 // creating isolate under its instantiation nonce; every stale
                 // form of the address (reload, uninstall) is a warn-and-drop
                 // inside the engine call, like widget callbacks.
-                let callback = self.pane_input_callbacks.borrow().get(key);
+                let callback = self.pane_input_callbacks.lock().unwrap().get(key);
                 let Some(cb) = callback else {
+                    if !retry {
+                        let _ = self.session_runtime_tx.send(RuntimeAction::PaneInputSubmit {
+                            key,
+                            text,
+                            retry: true,
+                        });
+                        return Ok(ActionResult::None);
+                    }
                     warn!(
                         "Dropping pane-input submission for {key}: no registered onSubmit \
                          handler (a reloaded script re-registers by re-splitting its pane)"
                     );
                     return Ok(ActionResult::None);
                 };
+                if cb.home_session != self.session_id {
+                    if let Some(runtime) = crate::session::registry::get_runtime(cb.home_session)
+                        && runtime.server_name.as_str() == self.server_name.as_str()
+                    {
+                        let _ = runtime.tx.send(RuntimeAction::InvokePaneInputSubmit {
+                            callback: cb,
+                            text,
+                        });
+                    } else {
+                        warn!("Dropping pane-input submission: callback home session is gone");
+                    }
+                    return Ok(ActionResult::None);
+                }
                 self.script_engine.invoke_pane_input_submit(
                     &cb.isolate,
                     cb.instance,
                     cb.function_id,
+                    text.as_str(),
+                )
+            }
+            RuntimeAction::InvokePaneInputSubmit { callback, text } => {
+                if callback.home_session != self.session_id {
+                    warn!("Dropping misrouted pane-input callback");
+                    return Ok(ActionResult::None);
+                }
+                self.script_engine.invoke_pane_input_submit(
+                    &callback.isolate,
+                    callback.instance,
+                    callback.function_id,
                     text.as_str(),
                 )
             }
@@ -1644,14 +1637,14 @@ impl Inner<'_> {
                 // live registry entry drops whole (the update was in flight
                 // when the close purge ran), like a stale `InputStateChanged`.
                 let pane_name = {
-                    let registry = self.pane_registry.borrow();
+                    let registry = self.pane_registry.lock().unwrap();
                     match registry.get(key) {
                         Some(def) => def.name.to_string(),
                         None => return Ok(ActionResult::None),
                     }
                 };
                 let size = super::pane::PaneSize { width, height };
-                let prior = self.pane_size_mirror.borrow_mut().apply(key, size);
+                let prior = self.pane_size_mirror.lock().unwrap().apply(key, size);
                 // A pane's first-ever report is a BASELINE, not an edge: the
                 // UI pushes current sizes unconditionally when interest is
                 // flagged (and when a pane opens under standing interest), so
@@ -1708,7 +1701,8 @@ impl Inner<'_> {
                 } else {
                     let name = self
                         .pane_registry
-                        .borrow()
+                        .lock()
+                        .unwrap()
                         .get(key)
                         .map(|def| def.name.to_string());
                     if name.is_none() {
@@ -1717,7 +1711,7 @@ impl Inner<'_> {
                     name
                 };
                 let (prior, effective) = {
-                    let mut mirror = self.input_mirror.borrow_mut();
+                    let mut mirror = self.input_mirror.lock().unwrap();
                     let prior = mirror.apply(key, snapshot);
                     (prior, mirror.snapshot(key))
                 };
@@ -1779,7 +1773,7 @@ impl Inner<'_> {
                 // The UI's history update: write the mirror the history read op
                 // consults. Unconditional — history changes per submission, not
                 // per keystroke, so there is no interest gate to check.
-                self.input_mirror.borrow_mut().apply_history(key, entries);
+                self.input_mirror.lock().unwrap().apply_history(key, entries);
                 Ok(ActionResult::None)
             }
             RuntimeAction::InputWordSetsChanged { key } => {
@@ -1788,7 +1782,7 @@ impl Inner<'_> {
                 // this one action all ride the same (final) view — and clearing the
                 // pending flag re-arms the ops' queue-on-flip.
                 let merged = {
-                    let mut sets = self.input_word_sets.borrow_mut();
+                    let mut sets = self.input_word_sets.lock().unwrap();
                     sets.take_push(key);
                     sets.merged(key)
                 };

@@ -998,9 +998,9 @@ declare module "smudgy:core" {
     /** Give the pane its own input line (see {@link PaneInputSpec}). Part of
      *  what the pane is, like `terminal`: `split()` naming an existing pane
      *  that has no input while asking for one throws (close it first). Works
-     *  on either pane kind; usable on your own session only. Re-splitting
-     *  with the same spec re-registers `onSubmit`, which is also how a
-     *  handler comes back after your script reloads. */
+     *  on either pane kind, including a same-server session reached through
+     *  `sessions`. Re-splitting with the same spec re-registers `onSubmit`,
+     *  which is also how a handler comes back after your script reloads. */
     input?: PaneInputSpec;
   }
 
@@ -1078,7 +1078,7 @@ declare module "smudgy:core" {
     /** The eyeball's toggle state — never effective visibility: a hidden
      *  pane still renders, veiled, while the toolbar is expanded, and a
      *  window whose every pane is hidden shows them all rather than go
-     *  blank. Reads are live; your own session only. */
+     *  blank. Reads are live, including through foreign session handles. */
     readonly isHidden: boolean;
     /** Set (or with `null` clear) this pane's terminal font override in px
      *  (8–40; out of range throws). Scrollback text only — input lines stay
@@ -1087,7 +1087,7 @@ declare module "smudgy:core" {
      *  `change-display` capability. */
     setFontSize(px: number | null): void;
     /** This pane's font override in px, or `undefined` while following the
-     *  global setting. Your own session only. */
+     *  global setting. */
     readonly fontSize: number | undefined;
     /** Resize this pane in px. Each given dimension adjusts the nearest
      *  divider on that axis, which becomes script-owned until the user drags
@@ -1096,8 +1096,7 @@ declare module "smudgy:core" {
      *  there. Throws on main (resize the sibling script pane instead). */
     resize(size: { width?: number; height?: number }): void;
     /** The pane's last laid-out size in logical px, or `undefined` before
-     *  the first layout report. A hidden pane keeps its last laid-out size.
-     *  Your own session only. */
+     *  the first layout report. A hidden pane keeps its last laid-out size. */
     readonly size: { width: number; height: number } | undefined;
     /** Move this pane next to `reference` (default: the session's main
      *  pane). The direction reads exactly like `split`'s — where this pane
@@ -1118,13 +1117,18 @@ declare module "smudgy:core" {
      *  window (floored by the window minimum); omitted dimensions follow the
      *  pane's current size. Throws on main. */
     tearOut(opts?: { width?: number; height?: number }): void;
+    /** Exchange this pane's position with another pane. Works across
+     *  same-server sessions and windows; destination split geometry stays,
+     *  pane state travels with pane identity, and no window activation or
+     *  input focus is requested. */
+    swap(otherPane: Pane): void;
   }
 
   /**
-   * A session's pane registry: `get`/`list`/`exists` cover your own panes
-   * (plus the main pane), and dot access reaches any name
-   * (`session.panes.chat`). On another session, only `split`, `close`, and a
-   * pane's `echo`/`clear` may be used; lookups work on your own session only.
+   * A session's pane registry: `get`/`list`/`exists` cover panes in the
+   * caller's namespace (plus main), and dot access reaches any name
+   * (`session.panes.chat`). The same lookup surface works on a same-server
+   * foreign session handle.
    */
   export interface PaneRegistryMethods {
     get(name: string): Pane | undefined;
@@ -1327,12 +1331,13 @@ declare module "smudgy:core" {
   /**
    * A MUD session. Every method acts on the session the handle names, which
    * need not be the one your script is running in: {@link session} is your
-   * own, and {@link getSessions} / {@link byName} reach sessions using the
-   * same configured server entry, so
+   * own, and {@link getSessions} / {@link byId} / {@link byName} reach
+   * sessions using the same configured server entry, so
    * `byName("scout")?.send("look")` drives another character.
    *
-   * On a session other than your own, panes can be split, closed, and written
-   * to, but not listed or looked up.
+   * Same-server foreign handles expose the same pane lookup, placement, and
+   * input surface. Sandboxed packages additionally need `reach-others` for
+   * every non-own target.
    */
   export interface Session {
     /** The session's numeric id. */
@@ -1355,8 +1360,7 @@ declare module "smudgy:core" {
     readonly mainPane: Pane;
     /** This session's pane registry (see {@link PaneRegistry}). */
     readonly panes: PaneRegistry;
-    /** This session's command input (see {@link InputHandle}). Usable on your
-     *  own session only. */
+    /** This session's command input (see {@link InputHandle}). */
     readonly input: InputHandle;
     toString(): string;
   }
@@ -1368,7 +1372,8 @@ declare module "smudgy:core" {
   /** Your session's numeric id. */
   export const id: number;
   /**
-   * All live sessions using this session's configured server entry.
+   * All live sessions using this session's configured server entry, ordered
+   * by numeric session id.
    *
    * ```ts
    * import { getSessions, createAlias } from "smudgy:core";
@@ -1379,6 +1384,8 @@ declare module "smudgy:core" {
    * ```
    */
   export function getSessions(): Session[];
+  /** The live same-server session with numeric `id`, or `undefined`. */
+  export function byId(id: number): Session | undefined;
   /** Your session's profile. */
   export function getProfile(): Profile;
   /** The current app settings as set in the preferences window. Read-only. */
@@ -2032,6 +2039,7 @@ declare module "smudgy:core" {
     capture(value: boolean): void;
     fallthrough(value: boolean): void;
     byName(name: string): Session | undefined;
+    byId(id: number): Session | undefined;
     getSessions(): Session[];
     getProfile(): Profile;
     getSettings(): Settings;

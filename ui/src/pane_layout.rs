@@ -419,6 +419,23 @@ impl<T: Copy + PartialEq> WindowLayout<T> {
         }
     }
 
+    /// Replace one leaf payload in place, preserving every ancestor's axis,
+    /// sizing, and cluster weight. Returns false when `old` is not live.
+    pub fn replace(&mut self, old: T, new: T) -> bool {
+        let Some((cluster, path)) = self.find_path(old) else {
+            return false;
+        };
+        let Some(LayoutNode::Leaf(slot)) = self
+            .clusters
+            .get_mut(cluster)
+            .and_then(|c| c.root.node_at_mut(&path))
+        else {
+            return false;
+        };
+        *slot = new;
+        true
+    }
+
     /// Fold the whole current layout into a single cluster and split the
     /// dragged pane against it (whole-grid Top/Bottom edge drops).
     pub fn wrap_all(&mut self, axis: Axis, new_first: bool, slot: T) {
@@ -887,6 +904,18 @@ mod tests {
         layout.swap(A_MAIN, A_MAIN);
         layout.swap(A_MAIN, 99);
         assert_eq!(layout.panes(), vec![A_MAIN, B_MAIN, A_NOTES]);
+    }
+
+    #[test]
+    fn replace_changes_only_the_leaf_payload() {
+        let mut layout = WindowLayout::new();
+        layout.push_cluster(A_MAIN);
+        script_split(&mut layout, A_MAIN, A_NOTES);
+        let before = built(&layout).0;
+        assert!(layout.replace(A_NOTES, B_MAIN));
+        assert_eq!(layout.panes(), vec![A_MAIN, B_MAIN]);
+        assert_eq!(built(&layout).0, before, "split geometry is preserved");
+        assert!(!layout.replace(A_NOTES, 99));
     }
 
     #[test]

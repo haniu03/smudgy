@@ -346,6 +346,69 @@ async fn reach_others_gates_get_sessions() {
     );
 }
 
+/// Every newly opened Session child surface re-checks `reach-others` at the
+/// op boundary. Reflection constructs a foreign handle without using the
+/// already-gated enumerator, proving input, pane lookup, and two-pane swap do
+/// not rely on `getSessions()` as their security boundary.
+#[tokio::test]
+async fn reach_others_gates_foreign_input_panes_and_swap_directly() {
+    let src = r#"
+        import session, { echo } from "smudgy:core";
+        const current = session.session;
+        const SessionClass = Object.getPrototypeOf(current).constructor;
+        const foreign = new SessionClass(current.id + 1);
+        const probe = (name, fn) => {
+            try { fn(); echo(name + ":NO_THROW"); }
+            catch (e) { echo(name + ":ERR:" + (e?.message ?? String(e))); }
+        };
+        probe("input", () => foreign.input.focus());
+        probe("panes", () => foreign.panes.list());
+        probe("swap", () => current.mainPane.swap(foreign.mainPane));
+        echo("DONE");
+    "#;
+
+    let denied = run_capability_case(
+        9644,
+        "pi_caps_foreign_children_deny",
+        "smudgy://wbk/remote-controller",
+        Some(consent_with(|s| {
+            s.input = true;
+            s.panes = true;
+        })),
+        make_package("wbk", "remote-controller", "1.0.0", src),
+    )
+    .await;
+    for probe in ["input", "panes", "swap"] {
+        assert!(
+            !has_line(&denied, &format!("{probe}:NO_THROW"))
+                && denied.iter().any(|line| {
+                    line.contains(&format!("{probe}:ERR:")) && line.contains("reach-others")
+                }),
+            "foreign {probe} must be denied at its own op boundary; transcript:\n{denied:#?}"
+        );
+    }
+
+    let allowed = run_capability_case(
+        9645,
+        "pi_caps_foreign_children_allow",
+        "smudgy://wbk/remote-controller",
+        Some(consent_with(|s| {
+            s.input = true;
+            s.panes = true;
+            s.reach_others = true;
+        })),
+        make_package("wbk", "remote-controller", "1.0.0", src),
+    )
+    .await;
+    assert!(
+        !has_line(&allowed, "reach-others")
+            && ["input", "panes", "swap"].iter().all(|probe| allowed.iter().any(|line| {
+                line.contains(&format!("{probe}:ERR:smudgy: no live session"))
+            })),
+        "with reach granted, each child surface must advance to live-target validation; transcript:\n{allowed:#?}"
+    );
+}
+
 /// `get_session_character` is the ungated baseline for the OWN session, but reading ANOTHER
 /// session's character is cross-session access gated on `reach-others` (closing the foreign-character
 /// read a package could otherwise do by id). A package with only `echo` reads its own character but

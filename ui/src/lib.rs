@@ -815,6 +815,15 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     width: *width,
                     height: *height,
                 }),
+                SessionEvent::PaneSwap {
+                    key,
+                    other_session,
+                    other_key,
+                } => Some(PaneFollowUp::Swap {
+                    key: *key,
+                    other_session: *other_session,
+                    other_key: *other_key,
+                }),
                 SessionEvent::PaneMirrorInterest => Some(PaneFollowUp::MirrorInterest),
                 _ => None,
             };
@@ -862,6 +871,18 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     Some(PaneFollowUp::TearOut { key, width, height }) => {
                         tear_out_script_pane(smudgy, session_id, key, width, height)
                     }
+                    Some(PaneFollowUp::Swap {
+                        key,
+                        other_session,
+                        other_key,
+                    }) => swap_script_panes(
+                        smudgy,
+                        PaneRef { session_id, key },
+                        PaneRef {
+                            session_id: other_session,
+                            key: other_key,
+                        },
+                    ),
                     Some(PaneFollowUp::MirrorInterest) => {
                         // Warm-up: measure everything now and flush without
                         // the debounce, so the first `pane.size` reads see
@@ -1431,6 +1452,11 @@ enum PaneFollowUp {
         width: Option<f32>,
         height: Option<f32>,
     },
+    Swap {
+        key: PaneKey,
+        other_session: SessionId,
+        other_key: PaneKey,
+    },
     MirrorInterest,
 }
 
@@ -1537,6 +1563,67 @@ fn relocate_script_pane(
     };
     let report = report_pane_sizes(smudgy);
     Task::batch([repair, close, report])
+}
+
+/// Atomically exchange two pane payloads while leaving both destination split
+/// trees untouched. Across windows, hidden state follows each pane identity;
+/// no window can become empty because each loses and gains exactly one leaf.
+fn swap_script_panes(smudgy: &mut Smudgy, first: PaneRef, second: PaneRef) -> Task<Message> {
+    if first == second {
+        return Task::none();
+    }
+    let first_window = smudgy
+        .smudgy_windows
+        .iter()
+        .find_map(|(id, window)| window.hosts_pane(first.session_id, first.key).then_some(*id));
+    let second_window = smudgy
+        .smudgy_windows
+        .iter()
+        .find_map(|(id, window)| window.hosts_pane(second.session_id, second.key).then_some(*id));
+    let (Some(first_window), Some(second_window)) = (first_window, second_window) else {
+        log::warn!("Dropping pane swap because one of its leaves is no longer hosted");
+        return Task::none();
+    };
+
+    if first_window == second_window {
+        if let Some(window) = smudgy.smudgy_windows.get_mut(&first_window) {
+            window.swap_pane_slots(first, second);
+        }
+        return report_pane_sizes(smudgy);
+    }
+
+    // Both leaves were resolved before either model changes. The window map is
+    // exclusively borrowed by this update, so both in-place replacements are
+    // guaranteed to address the leaves just found (never a half-swap).
+    let first_hidden = smudgy.smudgy_windows[&first_window].pane_hidden(first);
+    let second_hidden = smudgy.smudgy_windows[&second_window].pane_hidden(second);
+    let replaced_first = smudgy
+        .smudgy_windows
+        .get_mut(&first_window)
+        .is_some_and(|window| window.replace_pane_slot(first, second));
+    let replaced_second = smudgy
+        .smudgy_windows
+        .get_mut(&second_window)
+        .is_some_and(|window| window.replace_pane_slot(second, first));
+    debug_assert!(replaced_first && replaced_second);
+    if !(replaced_first && replaced_second) {
+        log::error!("Pane swap invariant failed after both leaves were resolved");
+        return Task::none();
+    }
+    if let Some(window) = smudgy.smudgy_windows.get_mut(&first_window) {
+        window.set_pane_hidden(second, second_hidden);
+    }
+    if let Some(window) = smudgy.smudgy_windows.get_mut(&second_window) {
+        window.set_pane_hidden(first, first_hidden);
+    }
+
+    if let Some(window) = smudgy.smudgy_windows.get_mut(&first_window) {
+        window.repair_active_session_without_focus();
+    }
+    if let Some(window) = smudgy.smudgy_windows.get_mut(&second_window) {
+        window.repair_active_session_without_focus();
+    }
+    report_pane_sizes(smudgy)
 }
 
 /// Apply a script `pane.tearOut`: the drag tear-out flow minus the drag —

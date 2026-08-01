@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use smudgy_core::session::runtime::RuntimeAction;
+use smudgy_core::session::runtime::input::{InputSnapshot, InputSource};
+use smudgy_core::session::runtime::pane::MAIN_PANE_KEY;
 use smudgy_core::session::{BufferUpdate, HotkeyId, SessionEvent, SessionId, SessionParams, spawn};
 
 const QUIET_PERIOD: Duration = Duration::from_millis(900);
@@ -684,6 +686,7 @@ async fn script_automation_names_match_ui_rules() {
 
 const CROSS_SESSION_TS: &str = r#"
 import {
+  byId,
   byName,
   createAlias,
   createEvent,
@@ -738,7 +741,21 @@ destroyed.on((affected, source) => {
 
 createAlias("^fire-cross-session$", () => {
   const peers = getSessions();
-  echo(`ENUM:${peers.length}:${byName("Alpha")?.id !== undefined}:${byName("Gamma") === undefined}`);
+  echo(`ENUM:${peers.length}:${byName("Alpha")?.id !== undefined}:${byName("Gamma") === undefined}:${peers.map(peer => peer.id).join(",")}`);
+  const alpha = byName("Alpha")!;
+  const seededValue = alpha.input.value;
+  const seededHistory = alpha.input.history.list()[0];
+  alpha.input.propose("remote draft");
+  alpha.input.focus();
+  alpha.input.history.push("remote history");
+  alpha.input.completion.add("remoteWord");
+  const remote = alpha.mainPane.split("right", {
+    name: "Remote",
+    width: 240,
+    input: { onSubmit: (text) => echo(`PANE_SUBMIT:${text}`) },
+  });
+  echo(`SURFACE:${byId(alpha.id)?.profile.name}:${alpha.panes.exists("remote")}:${alpha.panes.list().length}:${remote.input !== undefined}:${alpha.input.completion.has("remoteword")}:${seededValue}:${seededHistory}`);
+  remote.swap(session.mainPane);
   crossSession.emit({ answer: 42 });
   channel.postMessage({ from: session.profile.name, answer: 42 });
 });
@@ -826,6 +843,49 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
 
     let mut alpha_lines = Vec::new();
     let mut beta_lines = Vec::new();
+    let mut remote_input_key = None;
+    let mut saw_remote_input_ops = 0;
+    let mut saw_cross_session_swap = false;
+
+    // Seed Alpha's UI-authoritative mirrors, then use an ordered UI event as
+    // the barrier proving both updates landed before Beta reads them.
+    alpha_tx
+        .send(RuntimeAction::InputStateChanged {
+            key: MAIN_PANE_KEY,
+            snapshot: InputSnapshot {
+                value: Arc::new("seeded-alpha".to_string()),
+                cursor: 12,
+                selection: None,
+                focused: false,
+                masked: false,
+            },
+            source: InputSource::User,
+        })
+        .unwrap();
+    alpha_tx
+        .send(RuntimeAction::InputHistoryChanged {
+            key: MAIN_PANE_KEY,
+            entries: Arc::new(vec![Arc::new("seeded history".to_string())]),
+        })
+        .unwrap();
+    alpha_tx.send(RuntimeAction::InputMirrorInterest).unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), alpha_events.next())
+            .await
+            .expect("timed out waiting for Alpha input-mirror barrier")
+            .expect("Alpha event stream ended before input-mirror barrier");
+        match event.event {
+            SessionEvent::InputMirrorInterest => break,
+            SessionEvent::UpdateBuffer(updates) => {
+                for update in updates.iter() {
+                    if let BufferUpdate::Append(line) = update {
+                        alpha_lines.push(line.text.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     beta_tx.send(RuntimeAction::Connected).unwrap();
     let connected_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -857,17 +917,44 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
             && alpha_lines
                 .iter()
                 .any(|line| line == "ONCE_PAYLOAD:42:false")
-            && beta_lines.iter().any(|line| line == "ENUM:2:true:true"))
+            && beta_lines
+                .iter()
+                .any(|line| line == "ENUM:2:true:true:7090,7091")
+            && beta_lines
+                .iter()
+                .any(|line| line == "SURFACE:Alpha:true:2:true:true:seeded-alpha:seeded history")
+            && beta_lines
+                .iter()
+                .any(|line| line == "PANE_SUBMIT:from-alpha-ui")
+            && saw_remote_input_ops >= 3
+            && saw_cross_session_swap)
     {
         tokio::select! {
             event = alpha_events.next() => {
-                if let Some(event) = event
-                    && let SessionEvent::UpdateBuffer(updates) = event.event
-                {
-                    for update in updates.iter() {
-                        if let BufferUpdate::Append(line) = update {
-                            alpha_lines.push(line.text.clone());
+                if let Some(event) = event {
+                    match event.event {
+                        SessionEvent::UpdateBuffer(updates) => {
+                            for update in updates.iter() {
+                                if let BufferUpdate::Append(line) = update {
+                                    alpha_lines.push(line.text.clone());
+                                }
+                            }
                         }
+                        SessionEvent::InputOp { key, .. } if key == smudgy_core::session::runtime::pane::MAIN_PANE_KEY => {
+                            saw_remote_input_ops += 1;
+                        }
+                        SessionEvent::PaneOpened { def, .. } if def.name.as_ref() == "Remote" => {
+                            remote_input_key = Some(def.key);
+                            alpha_tx.send(RuntimeAction::PaneInputSubmit {
+                                key: def.key,
+                                text: Arc::new("from-alpha-ui".to_string()),
+                                retry: false,
+                            }).unwrap();
+                        }
+                        SessionEvent::PaneSwap { other_session, .. } if other_session == SessionId::from(7091) => {
+                            saw_cross_session_swap = true;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -923,7 +1010,20 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
         );
     }
     assert!(
-        beta_lines.iter().any(|line| line == "ENUM:2:true:true"),
+        beta_lines
+            .iter()
+            .any(|line| line == "ENUM:2:true:true:7090,7091"),
         "same-server enumeration/byName failed.\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
     );
+    assert!(
+        beta_lines
+            .iter()
+            .any(|line| line == "SURFACE:Alpha:true:2:true:true:seeded-alpha:seeded history"),
+        "cross-session pane/input lookup and completion registry failed.\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
+    );
+    assert!(
+        beta_lines.iter().any(|line| line == "PANE_SUBMIT:from-alpha-ui"),
+        "a foreign pane input must route onSubmit back to its creating runtime (key={remote_input_key:?}, ops={saw_remote_input_ops}, swap={saw_cross_session_swap}).\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
+    );
+    assert!(remote_input_key.is_some() && saw_remote_input_ops >= 3 && saw_cross_session_swap);
 }

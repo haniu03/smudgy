@@ -106,6 +106,13 @@ pub enum SessionEvent {
         width: Option<f32>,
         height: Option<f32>,
     },
+    /// Atomically exchange this pane's layout leaf with another pane's leaf.
+    /// Pane payloads move; the destination split geometry stays in place.
+    PaneSwap {
+        key: PaneKey,
+        other_session: SessionId,
+        other_key: PaneKey,
+    },
     /// A session-store flush updated widget-binding cells
     /// (`docs/interop.md` §7). Pure repaint wake: the cells already
     /// hold the new values and the widget render closures read them lock-free,

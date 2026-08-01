@@ -33,6 +33,7 @@ use indexmap::IndexMap;
 use super::origin::{IsolateId, Origin};
 use super::pane::PaneKey;
 use super::script_engine::FunctionId;
+use crate::session::SessionId;
 
 /// One scripted mutation of an input, applied by the UI to the live widget.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,7 +228,7 @@ impl InputMirror {
 
 /// The mirror handle shared between the runtime (whose dispatch arm writes
 /// delivered state) and every isolate's ops (which read it synchronously).
-pub(crate) type SharedInputMirror = Rc<RefCell<InputMirror>>;
+pub(crate) type SharedInputMirror = Arc<std::sync::Mutex<InputMirror>>;
 
 /// One in-flight typed submission, alive while its `sys:input` handlers run.
 /// The dispatch arm installs it before the handler splice and consumes it in
@@ -355,11 +356,10 @@ pub enum WordSetKind {
     Blacklist,
 }
 
-/// The identity a word-set contribution is scoped by: the same
-/// `(isolate, origin)` pair that namespaces automations, so user scripts and
-/// each package own separate contribution sets even where they share an
-/// isolate.
-pub type WordSetCreator = (IsolateId, Origin);
+/// The identity a word-set contribution is scoped by. The home session is
+/// part of the key because a creator may contribute to a same-server foreign
+/// input; isolate/origin ids are only unique inside that home runtime.
+pub type WordSetCreator = (SessionId, IsolateId, Origin);
 
 /// The longest registrable completion word, in `char`s. Completion inserts
 /// single tokens; anything longer is not a word the user would Tab toward,
@@ -478,10 +478,10 @@ impl CreatorWordSets {
     /// Drop every seat owned by `isolate` (a failed isolate load leaves its
     /// already-landed contributions with no live owner to clear them).
     /// Returns whether any dropped seat still held words.
-    fn purge_isolate(&mut self, isolate: &IsolateId) -> bool {
+    fn purge_isolate(&mut self, session: SessionId, isolate: &IsolateId) -> bool {
         let mut dropped_words = false;
-        self.seats.retain(|(seat_isolate, _), words| {
-            if seat_isolate == isolate {
+        self.seats.retain(|(seat_session, seat_isolate, _), words| {
+            if *seat_session == session && seat_isolate == isolate {
                 dropped_words |= !words.is_empty();
                 false
             } else {
@@ -491,9 +491,21 @@ impl CreatorWordSets {
         dropped_words
     }
 
-    fn is_empty(&self) -> bool {
-        self.seats.values().all(IndexMap::is_empty)
+    /// Drop every seat whose creator lives in `session`, preserving foreign
+    /// creators that contributed to this input across the same-server API.
+    fn purge_session(&mut self, session: SessionId) -> bool {
+        let mut dropped_words = false;
+        self.seats.retain(|(seat_session, _, _), words| {
+            if *seat_session == session {
+                dropped_words |= !words.is_empty();
+                false
+            } else {
+                true
+            }
+        });
+        dropped_words
     }
+
 }
 
 /// One input's suggestion set + blacklist, both per-creator.
@@ -534,12 +546,11 @@ pub struct MergedWordSets {
 
 /// The authoritative per-creator completion word sets
 /// (`docs/input.md` §3.8), keyed by input. The registry ops mutate
-/// and read it synchronously on the session thread (reads are exact, no
-/// staleness); the UI holds only the [merged](Self::merged) copy, re-pushed
-/// whenever a mutation lands. Engine-scoped contents in a session-scoped
-/// cell: a reload clears every contribution (words die with their creator's
-/// isolate generation and reappear as the reloaded scripts re-register), like
-/// hotkeys.
+/// and read it synchronously through the owning runtime's shared data-only
+/// registry (reads are exact, no staleness); the UI holds only the
+/// [merged](Self::merged) copy, re-pushed whenever a mutation lands. Creator
+/// identity includes the home session, so a reload removes only that source
+/// runtime's contributions and preserves foreign creators seated here.
 #[derive(Debug, Default)]
 pub struct InputWordSets {
     inputs: HashMap<PaneKey, InputWordSetEntry>,
@@ -648,9 +659,10 @@ impl InputWordSets {
         }
     }
 
-    /// Drop every contribution — the reload teardown's half of the word-set
-    /// lifecycle (contents are engine facts; the rebuilt engine's modules
-    /// re-register theirs). Returns the inputs to resync, each flagged
+    /// Drop every contribution created by `session` — the reload teardown's
+    /// half of the word-set lifecycle (contents are engine facts; the rebuilt
+    /// engine's modules re-register theirs). Foreign contributors remain.
+    /// Returns the inputs to resync, each flagged
     /// pending so the caller queues one push per input behind the rebuild:
     /// re-registered words go out merged, and an input nobody re-claimed goes
     /// out empty rather than lingering stale in the UI.
@@ -661,21 +673,21 @@ impl InputWordSets {
     /// with no action behind it would wedge the coalescing — `flag_push` would
     /// report "already queued" forever. Every returned key gets a fresh flag
     /// and a fresh push.
-    pub fn reset_engine_state(&mut self) -> Vec<PaneKey> {
+    pub fn reset_engine_state(&mut self, session: SessionId) -> Vec<PaneKey> {
         let mut resync: Vec<PaneKey> = self
             .inputs
-            .iter()
-            .filter(|(_, entry)| {
-                !entry.suggestions.is_empty() || !entry.blacklist.is_empty()
+            .iter_mut()
+            .filter_map(|(key, entry)| {
+                let suggestions = entry.suggestions.purge_session(session);
+                let blacklist = entry.blacklist.purge_session(session);
+                (suggestions || blacklist).then_some(*key)
             })
-            .map(|(key, _)| *key)
             .collect();
         for key in self.pending_push.drain() {
             if !resync.contains(&key) {
                 resync.push(key);
             }
         }
-        self.inputs.clear();
         for key in &resync {
             self.pending_push.insert(*key);
         }
@@ -698,12 +710,25 @@ impl InputWordSets {
     /// landed here synchronously; with no live owner they could never be
     /// cleared short of a full reload. Returns the inputs that lost words
     /// (the caller flags each for a UI push so the merged view drops them).
-    pub fn purge_isolate(&mut self, isolate: &IsolateId) -> Vec<PaneKey> {
+    pub fn purge_isolate(&mut self, session: SessionId, isolate: &IsolateId) -> Vec<PaneKey> {
         self.inputs
             .iter_mut()
             .filter_map(|(key, entry)| {
-                let suggestions = entry.suggestions.purge_isolate(isolate);
-                let blacklist = entry.blacklist.purge_isolate(isolate);
+                let suggestions = entry.suggestions.purge_isolate(session, isolate);
+                let blacklist = entry.blacklist.purge_isolate(session, isolate);
+                (suggestions || blacklist).then_some(*key)
+            })
+            .collect()
+    }
+
+    /// Drop all contributions whose creator runtime is `session` (source
+    /// reload/teardown cleanup for foreign inputs).
+    pub fn purge_session(&mut self, session: SessionId) -> Vec<PaneKey> {
+        self.inputs
+            .iter_mut()
+            .filter_map(|(key, entry)| {
+                let suggestions = entry.suggestions.purge_session(session);
+                let blacklist = entry.blacklist.purge_session(session);
                 (suggestions || blacklist).then_some(*key)
             })
             .collect()
@@ -712,8 +737,8 @@ impl InputWordSets {
 
 /// The shared handle to the session's [`InputWordSets`], bound into every
 /// isolate's registry ops and held by the runtime (whose push arm builds the
-/// merged view and whose reload path resets the contents).
-pub(crate) type SharedInputWordSets = Rc<RefCell<InputWordSets>>;
+/// merged view and whose reload path removes the reloading source's seats).
+pub(crate) type SharedInputWordSets = Arc<std::sync::Mutex<InputWordSets>>;
 
 /// The address of one pane input's registered `onSubmit` handler
 /// (`docs/input.md` §3.7): the creating isolate, the exact isolate
@@ -724,14 +749,15 @@ pub(crate) type SharedInputWordSets = Rc<RefCell<InputWordSets>>;
 /// instance nonce before resolving the slot, exactly like link callbacks.
 #[derive(Debug, Clone)]
 pub struct PaneInputCallback {
+    pub home_session: SessionId,
     pub isolate: IsolateId,
     pub instance: u64,
     pub function_id: FunctionId,
 }
 
 /// The registered `onSubmit` handler per pane input, keyed by the pane's
-/// incarnation key. Session-scoped cell, engine-scoped contents: handlers
-/// name functions of the engine that registered them, die with it on reload
+/// incarnation key. The address includes its home session: handlers name
+/// functions of the engine that registered them and die with it on reload
 /// ([`Self::reset_engine_state`]), and reappear when the reloaded script
 /// re-splits its pane (the split's facade re-registers the handler). A
 /// submission arriving with no live handler is dropped with a warning at
@@ -760,19 +786,28 @@ impl PaneInputCallbacks {
         self.callbacks.remove(&key);
     }
 
-    /// Drop every handler — the reload teardown's half of the lifecycle
-    /// (function ids index the dead engine's registries; the reloaded
-    /// scripts re-register theirs beside their re-claiming splits).
-    pub fn reset_engine_state(&mut self) {
-        self.callbacks.clear();
+    /// Drop every handler owned by `home_session` — the reload teardown's
+    /// half of the lifecycle (function ids index the dead engine's registries;
+    /// the reloaded scripts re-register theirs beside their reclaiming splits).
+    pub fn reset_engine_state(&mut self, home_session: SessionId) {
+        self.callbacks
+            .retain(|_, callback| callback.home_session != home_session);
     }
 
     /// Drop every handler registered by `isolate` — the failed-isolate-load
     /// cleanup, like the word sets': a sandboxed isolate that throws during
     /// load already landed its registrations synchronously, and they would
     /// otherwise dangle with no live owner.
-    pub fn purge_isolate(&mut self, isolate: &IsolateId) {
-        self.callbacks.retain(|_, cb| cb.isolate != *isolate);
+    pub fn purge_isolate(&mut self, home_session: SessionId, isolate: &IsolateId) {
+        self.callbacks.retain(|_, cb| {
+            cb.home_session != home_session || cb.isolate != *isolate
+        });
+    }
+
+    /// Drop callback addresses owned by a reloaded/destroyed source runtime.
+    pub fn purge_session(&mut self, home_session: SessionId) {
+        self.callbacks
+            .retain(|_, cb| cb.home_session != home_session);
     }
 }
 
@@ -780,7 +815,47 @@ impl PaneInputCallbacks {
 /// every isolate's pane ops (the registration op writes it) and held by the
 /// runtime (whose `PaneInputSubmit` dispatch arm resolves through it and
 /// whose reload path resets it).
-pub(crate) type SharedPaneInputCallbacks = Rc<RefCell<PaneInputCallbacks>>;
+pub(crate) type SharedPaneInputCallbacks = Arc<std::sync::Mutex<PaneInputCallbacks>>;
+
+/// Synchronously remove every input-interoperability seat owned by one source
+/// runtime from a target runtime. The returned keys were flagged for exactly
+/// one target-queue UI refresh. Doing the registry purge before a source
+/// rebuild starts prevents an old queued purge from deleting fresh
+/// registrations made by the rebuilt engine.
+pub(crate) fn purge_session_input_interop(
+    word_sets: &SharedInputWordSets,
+    callbacks: &SharedPaneInputCallbacks,
+    home_session: SessionId,
+) -> Vec<PaneKey> {
+    callbacks.lock().unwrap().purge_session(home_session);
+    let mut sets = word_sets.lock().unwrap();
+    let affected = sets.purge_session(home_session);
+    affected
+        .into_iter()
+        .filter(|key| sets.flag_push(*key))
+        .collect()
+}
+
+/// The failed-isolate sibling of [`purge_session_input_interop`]: remove only
+/// that isolate's synchronously landed seats, preserving every healthy
+/// creator in the same source runtime.
+pub(crate) fn purge_isolate_input_interop(
+    word_sets: &SharedInputWordSets,
+    callbacks: &SharedPaneInputCallbacks,
+    home_session: SessionId,
+    isolate: &IsolateId,
+) -> Vec<PaneKey> {
+    callbacks
+        .lock()
+        .unwrap()
+        .purge_isolate(home_session, isolate);
+    let mut sets = word_sets.lock().unwrap();
+    let affected = sets.purge_isolate(home_session, isolate);
+    affected
+        .into_iter()
+        .filter(|key| sets.flag_push(*key))
+        .collect()
+}
 
 /// The single "input state for this pane died" purge, invoked from every
 /// pane-close path — the own-session close op, a cross-session close, the
@@ -796,9 +871,9 @@ pub(crate) fn purge_pane_input_state(
     callbacks: &SharedPaneInputCallbacks,
     key: PaneKey,
 ) {
-    mirror.borrow_mut().remove(key);
-    word_sets.borrow_mut().remove_input(key);
-    callbacks.borrow_mut().remove(key);
+    mirror.lock().unwrap().remove(key);
+    word_sets.lock().unwrap().remove_input(key);
+    callbacks.lock().unwrap().remove(key);
 }
 
 #[cfg(test)]
@@ -903,11 +978,12 @@ mod tests {
     }
 
     fn user_creator() -> WordSetCreator {
-        (IsolateId::Main, Origin::User)
+        (SessionId::from(1), IsolateId::Main, Origin::User)
     }
 
     fn module_creator() -> WordSetCreator {
         (
+            SessionId::from(1),
             IsolateId::Main,
             Origin::Module {
                 subpath: "combat/healer.ts".to_string(),
@@ -1037,7 +1113,7 @@ mod tests {
         sets.take_push(MAIN_PANE_KEY);
 
         add_words(&mut sets, WordSetKind::Suggestions, &user_creator(), &["alpha"]);
-        let populated = sets.reset_engine_state();
+        let populated = sets.reset_engine_state(SessionId::from(1));
         assert_eq!(populated, vec![MAIN_PANE_KEY], "reset names the inputs that held words");
         assert!(
             !sets.flag_push(MAIN_PANE_KEY),
@@ -1047,12 +1123,109 @@ mod tests {
         // A second reset before the resync dispatched re-names the input: its
         // pending flag is still up and the second reload dropped the first
         // resync action, so it needs a fresh one.
-        assert_eq!(sets.reset_engine_state(), vec![MAIN_PANE_KEY]);
+        assert_eq!(sets.reset_engine_state(SessionId::from(1)), vec![MAIN_PANE_KEY]);
         // Once the resync actually dispatches, a further reset has nothing.
         sets.take_push(MAIN_PANE_KEY);
         assert!(
-            sets.reset_engine_state().is_empty(),
+            sets.reset_engine_state(SessionId::from(1)).is_empty(),
             "a delivered resync leaves nothing to flag"
+        );
+    }
+
+    #[test]
+    fn source_reload_preserves_foreign_completion_contributors() {
+        let mut sets = InputWordSets::default();
+        let local = user_creator();
+        let foreign = (SessionId::from(2), IsolateId::Main, Origin::User);
+
+        add_words(&mut sets, WordSetKind::Suggestions, &local, &["local"]);
+        add_words(&mut sets, WordSetKind::Suggestions, &foreign, &["foreign"]);
+
+        assert_eq!(
+            sets.reset_engine_state(SessionId::from(1)),
+            vec![MAIN_PANE_KEY]
+        );
+        assert_eq!(merged_suggestions(&sets), vec!["foreign"]);
+        assert!(!sets.has(
+            MAIN_PANE_KEY,
+            WordSetKind::Suggestions,
+            &local,
+            "local"
+        ));
+        assert!(sets.has(
+            MAIN_PANE_KEY,
+            WordSetKind::Suggestions,
+            &foreign,
+            "foreign"
+        ));
+    }
+
+    #[test]
+    fn synchronous_source_purge_precedes_fresh_foreign_registrations() {
+        let word_sets: SharedInputWordSets =
+            Arc::new(std::sync::Mutex::new(InputWordSets::default()));
+        let callbacks: SharedPaneInputCallbacks =
+            Arc::new(std::sync::Mutex::new(PaneInputCallbacks::default()));
+        let creator = user_creator();
+
+        word_sets
+            .lock()
+            .unwrap()
+            .add(
+                MAIN_PANE_KEY,
+                WordSetKind::Suggestions,
+                &creator,
+                &["old".to_string()],
+            )
+            .unwrap();
+        callbacks.lock().unwrap().register(
+            MAIN_PANE_KEY,
+            PaneInputCallback {
+                home_session: SessionId::from(1),
+                isolate: IsolateId::Main,
+                instance: 1,
+                function_id: FunctionId(0),
+            },
+        );
+
+        assert_eq!(
+            purge_session_input_interop(&word_sets, &callbacks, SessionId::from(1)),
+            vec![MAIN_PANE_KEY]
+        );
+
+        // Model the rebuilt source synchronously registering before the
+        // target queue drains its already-scheduled merged UI refresh.
+        word_sets
+            .lock()
+            .unwrap()
+            .add(
+                MAIN_PANE_KEY,
+                WordSetKind::Suggestions,
+                &creator,
+                &["fresh".to_string()],
+            )
+            .unwrap();
+        callbacks.lock().unwrap().register(
+            MAIN_PANE_KEY,
+            PaneInputCallback {
+                home_session: SessionId::from(1),
+                isolate: IsolateId::Main,
+                instance: 2,
+                function_id: FunctionId(1),
+            },
+        );
+
+        assert_eq!(
+            word_sets.lock().unwrap().merged(MAIN_PANE_KEY).suggestions,
+            vec![Arc::new("fresh".to_string())]
+        );
+        assert_eq!(
+            callbacks.lock().unwrap().get(MAIN_PANE_KEY).unwrap().instance,
+            2
+        );
+        assert!(
+            !word_sets.lock().unwrap().flag_push(MAIN_PANE_KEY),
+            "the queued post-purge refresh also carries fresh registrations"
         );
     }
 
@@ -1093,7 +1266,7 @@ mod tests {
 
         // Reset must name that input for the post-rebuild resync even though
         // it holds no words...
-        assert_eq!(sets.reset_engine_state(), vec![MAIN_PANE_KEY]);
+        assert_eq!(sets.reset_engine_state(SessionId::from(1)), vec![MAIN_PANE_KEY]);
         // ...and once the resync push dispatches, the coalescing is re-armed:
         // the next mutation queues a push instead of riding a ghost.
         sets.take_push(MAIN_PANE_KEY);
@@ -1148,6 +1321,7 @@ mod tests {
         let mut sets = InputWordSets::default();
         let main_creator = user_creator();
         let dead_creator = (
+            SessionId::from(1),
             IsolateId::Package {
                 owner: "wbk".into(),
                 name: "broken".into(),
@@ -1164,7 +1338,7 @@ mod tests {
         add_words(&mut sets, WordSetKind::Suggestions, &dead_creator, &["zombie"]);
         add_words(&mut sets, WordSetKind::Blacklist, &dead_creator, &["shade"]);
 
-        let affected = sets.purge_isolate(&dead_creator.0);
+        let affected = sets.purge_isolate(dead_creator.0, &dead_creator.1);
         assert_eq!(affected, vec![MAIN_PANE_KEY], "the purge names the inputs that lost words");
 
         let merged = sets.merged(MAIN_PANE_KEY);
@@ -1176,7 +1350,7 @@ mod tests {
         assert!(merged.blacklist.is_empty(), "its blacklist words are gone too");
 
         // A second purge finds nothing: no push spam.
-        assert!(sets.purge_isolate(&dead_creator.0).is_empty());
+        assert!(sets.purge_isolate(dead_creator.0, &dead_creator.1).is_empty());
     }
 
     #[test]
@@ -1186,6 +1360,7 @@ mod tests {
         assert!(callbacks.get(key).is_none());
 
         let main_cb = PaneInputCallback {
+            home_session: SessionId::from(1),
             isolate: IsolateId::Main,
             instance: 7,
             function_id: FunctionId(3),
@@ -1207,7 +1382,7 @@ mod tests {
         callbacks.remove(key);
         assert!(callbacks.get(key).is_none());
         callbacks.register(key, main_cb.clone());
-        callbacks.reset_engine_state();
+        callbacks.reset_engine_state(SessionId::from(1));
         assert!(callbacks.get(key).is_none());
 
         // purge_isolate drops only the failed isolate's registrations.
@@ -1221,26 +1396,28 @@ mod tests {
         callbacks.register(
             other,
             PaneInputCallback {
+                home_session: SessionId::from(1),
                 isolate: dead.clone(),
                 instance: 11,
                 function_id: FunctionId(0),
             },
         );
-        callbacks.purge_isolate(&dead);
+        callbacks.purge_isolate(SessionId::from(1), &dead);
         assert!(callbacks.get(key).is_some(), "the survivor stays");
         assert!(callbacks.get(other).is_none(), "the dead isolate's entry is purged");
     }
 
     #[test]
     fn pane_close_purge_removes_every_map_entry_for_the_key() {
-        let mirror: SharedInputMirror = Rc::new(RefCell::new(InputMirror::default()));
-        let word_sets: SharedInputWordSets = Rc::new(RefCell::new(InputWordSets::default()));
+        let mirror: SharedInputMirror = Arc::new(std::sync::Mutex::new(InputMirror::default()));
+        let word_sets: SharedInputWordSets =
+            Arc::new(std::sync::Mutex::new(InputWordSets::default()));
         let callbacks: SharedPaneInputCallbacks =
-            Rc::new(RefCell::new(PaneInputCallbacks::default()));
+            Arc::new(std::sync::Mutex::new(PaneInputCallbacks::default()));
         let key = PaneKey::from_raw_for_tests(4);
         let other = PaneKey::from_raw_for_tests(5);
 
-        mirror.borrow_mut().apply(
+        mirror.lock().unwrap().apply(
             key,
             InputSnapshot {
                 value: Arc::new("draft".to_string()),
@@ -1248,17 +1425,20 @@ mod tests {
             },
         );
         mirror
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .apply_history(key, Arc::new(vec![Arc::new("cmd".to_string())]));
-        mirror.borrow_mut().apply(other, InputSnapshot::default());
+        mirror.lock().unwrap().apply(other, InputSnapshot::default());
         word_sets
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .add(key, WordSetKind::Suggestions, &user_creator(), &["alpha".to_string()])
             .unwrap();
-        word_sets.borrow_mut().flag_push(key);
-        callbacks.borrow_mut().register(
+        word_sets.lock().unwrap().flag_push(key);
+        callbacks.lock().unwrap().register(
             key,
             PaneInputCallback {
+                home_session: SessionId::from(1),
                 isolate: IsolateId::Main,
                 instance: 1,
                 function_id: FunctionId(0),
@@ -1267,12 +1447,12 @@ mod tests {
 
         purge_pane_input_state(&mirror, &word_sets, &callbacks, key);
 
-        assert_eq!(mirror.borrow().snapshot(key), InputSnapshot::default());
-        assert!(mirror.borrow().history(key).is_empty());
-        assert!(word_sets.borrow().merged(key).suggestions.is_empty());
-        assert!(callbacks.borrow().get(key).is_none());
+        assert_eq!(mirror.lock().unwrap().snapshot(key), InputSnapshot::default());
+        assert!(mirror.lock().unwrap().history(key).is_empty());
+        assert!(word_sets.lock().unwrap().merged(key).suggestions.is_empty());
+        assert!(callbacks.lock().unwrap().get(key).is_none());
         // Another pane's state is untouched.
-        assert!(mirror.borrow().states.contains_key(&other));
+        assert!(mirror.lock().unwrap().states.contains_key(&other));
     }
 
     #[test]
@@ -1291,7 +1471,7 @@ mod tests {
         sets.remove_input(dead);
 
         assert_eq!(
-            sets.reset_engine_state(),
+            sets.reset_engine_state(SessionId::from(1)),
             vec![MAIN_PANE_KEY],
             "only the live input is named for the post-rebuild resync"
         );

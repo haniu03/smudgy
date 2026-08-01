@@ -1747,6 +1747,7 @@ pub(crate) fn load_core_module(url: &ModuleSpecifier) -> Result<ModuleSource, Mo
          export const buffer = __api.buffer;\n\
          export const submission = __api.submission;\n\
          export const vars = __api.vars;\n\
+         export const byId = __api.byId;\n\
          export const byName = __api.byName;\n\
          export const getSessions = __api.getSessions;\n\
          export const getProfile = __api.getProfile;\n\
@@ -3034,7 +3035,7 @@ mod tests {
         // The convenience surface is delivered as named exports too.
         for name in [
             "send", "sendRaw", "echo", "style", "link", "reload", "capture", "fallthrough",
-            "line", "buffer", "submission", "vars", "byName",
+            "line", "buffer", "submission", "vars", "byId", "byName",
         ] {
             assert!(
                 code.contains(&format!("export const {name} = __api.{name};")),

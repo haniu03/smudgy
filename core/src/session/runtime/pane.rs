@@ -384,10 +384,11 @@ fn validate_name(name: &str) -> Result<(), PaneError> {
     Ok(())
 }
 
-/// The session's pane registry. An `Rc<RefCell<PaneRegistry>>` on the runtime
-/// is shared into every isolate's `OpState` (like `pending_line_operations`),
-/// so pane ops mutate it synchronously; it is preserved across script reloads
-/// (like `recent_lines`), which is what makes "panes survive reloads" true.
+/// The session's data-only pane registry. An `Arc<Mutex<PaneRegistry>>` on the
+/// runtime is shared into every isolate's `OpState`, so own- and same-server
+/// foreign pane ops can resolve and mutate it synchronously without sharing
+/// V8 state across threads. It is preserved across script reloads (like
+/// `recent_lines`), which is what makes "panes survive reloads" true.
 #[derive(Debug)]
 pub struct PaneRegistry {
     /// Live panes by incarnation key.

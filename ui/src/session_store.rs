@@ -572,7 +572,11 @@ fn submit_runtime_action(text: Arc<String>, masked: bool) -> RuntimeAction {
 /// Its own function so the masked half is unit-testable without a live
 /// session, like [`submit_runtime_action`].
 fn pane_submit_runtime_action(key: PaneKey, text: Arc<String>, _masked: bool) -> RuntimeAction {
-    RuntimeAction::PaneInputSubmit { key, text }
+    RuntimeAction::PaneInputSubmit {
+        key,
+        text,
+        retry: false,
+    }
 }
 
 /// The scrollback limit to fall back to when the configured value is zero.
@@ -1542,7 +1546,8 @@ impl ManagedSession {
                     // forward; no session-store state is involved.
                     SessionEvent::PaneResize { .. }
                     | SessionEvent::PaneRelocate { .. }
-                    | SessionEvent::PaneTearOut { .. } => Task::none(),
+                    | SessionEvent::PaneTearOut { .. }
+                    | SessionEvent::PaneSwap { .. } => Task::none(),
                     SessionEvent::Connected => {
                         self.connected = true;
                         self.ever_connected = true;
@@ -2356,7 +2361,7 @@ mod tests {
         for masked in [false, true] {
             let action = pane_submit_runtime_action(key, Arc::new("hunter2".to_string()), masked);
             match action {
-                RuntimeAction::PaneInputSubmit { key: k, text } => {
+                RuntimeAction::PaneInputSubmit { key: k, text, .. } => {
                     assert_eq!(k, key);
                     assert_eq!(text.as_str(), "hunter2");
                 }
