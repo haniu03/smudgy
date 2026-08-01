@@ -152,6 +152,22 @@ pub struct PaneRef {
     pub key: PaneKey,
 }
 
+/// Active-session state follows the render-tree position when two main
+/// session panes exchange payloads. iced preserves focus at that position;
+/// mirroring the identity change here keeps toolbar/session routing aligned
+/// with the input that remains focused.
+fn active_after_main_pane_swap(
+    active: Option<SessionId>,
+    first: SessionId,
+    second: SessionId,
+) -> Option<SessionId> {
+    match active {
+        Some(active) if active == first => Some(second),
+        Some(active) if active == second => Some(first),
+        _ => active,
+    }
+}
+
 /// The pane grid's inter-pane spacing (must match the `.spacing()` set on the
 /// `PaneGrid` widget — `pane_regions` and the layout model's px→ratio math
 /// need the real value).
@@ -446,6 +462,26 @@ impl SmudgyWindow {
             .previous_active_session_id
             .filter(|id| self.hosts_session(*id))
             .or_else(|| self.hosted_sessions().into_iter().min());
+    }
+
+    /// Reconcile this window's active-session identity after a pane payload
+    /// swap without issuing a focus operation. When both payloads are main
+    /// session panes, active state follows the render-tree position exactly as
+    /// iced's existing widget focus does. Other swaps retain the old active
+    /// session when it is still hosted and otherwise use the normal fallback.
+    pub fn sync_active_session_after_pane_swap(&mut self, first: PaneRef, second: PaneRef) {
+        if first.key == MAIN_PANE_KEY && second.key == MAIN_PANE_KEY {
+            let next = active_after_main_pane_swap(
+                self.active_session_id,
+                first.session_id,
+                second.session_id,
+            );
+            if next != self.active_session_id {
+                self.previous_active_session_id = self.active_session_id;
+                self.active_session_id = next;
+            }
+        }
+        self.repair_active_session_without_focus();
     }
 
     /// Create session context information for the toolbar
@@ -1552,5 +1588,38 @@ impl SmudgyWindow {
             .height(Length::Fill)
             .into()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn main_pane_swap_transfers_the_active_session_identity() {
+        let first = SessionId::from(10);
+        let second = SessionId::from(20);
+
+        assert_eq!(
+            active_after_main_pane_swap(Some(first), first, second),
+            Some(second)
+        );
+        assert_eq!(
+            active_after_main_pane_swap(Some(second), first, second),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn main_pane_swap_leaves_an_uninvolved_active_session_alone() {
+        let first = SessionId::from(10);
+        let second = SessionId::from(20);
+        let other = SessionId::from(30);
+
+        assert_eq!(
+            active_after_main_pane_swap(Some(other), first, second),
+            Some(other)
+        );
+        assert_eq!(active_after_main_pane_swap(None, first, second), None);
     }
 }

@@ -1702,6 +1702,16 @@ impl Inner<'_> {
 
 
     pub async fn run(&mut self) -> RunAction {
+        // The UI subscription is the session's lifetime owner. It may be
+        // dropped while engine construction is still blocking, before the UI
+        // receives RuntimeReady and can send an explicit Shutdown. The stream
+        // guard queues that shutdown, while this check prevents any startup
+        // actions from running against an already-disconnected event sink.
+        if self.ui_tx.is_closed() {
+            info!("Session event receiver closed during startup; stopping runtime");
+            return RunAction::None;
+        }
+
         let mut script_engine_tick_interval = ScriptEngine::tick_interval();
 
         // Stack-based action processing
@@ -1829,6 +1839,14 @@ impl Inner<'_> {
         info!("Starting session event loop");
 
         loop {
+            // A receiver can disappear between any two actions. Stop after the
+            // first failed delivery instead of leaving a registry-visible
+            // runtime that repeatedly executes against a dead UI channel.
+            if self.ui_tx.is_closed() {
+                info!("Session event receiver closed; stopping runtime");
+                break;
+            }
+
             let mut deno_iters = 0;
             // Phase 1: Poll script engine until no more immediate work is available
             std::future::poll_fn(|cx| {
