@@ -323,6 +323,10 @@ pub enum RuntimeAction {
     PaneOpened {
         def: PaneDef,
         placement: PanePlacement,
+        /// Foreign splits mutate the owner's shared registry from another
+        /// runtime. Reconcile those opens when the owner drains its queue;
+        /// own-runtime opens must preserve their historical open/close order.
+        reconcile_registry: bool,
     },
     /// Emit `SessionEvent::PaneClosed` for a pane the close op already
     /// retired from the registry. The dispatch handler flushes buffered

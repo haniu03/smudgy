@@ -5149,6 +5149,7 @@ fn op_smudgy_pane_split<'s>(
 ) -> Result<PaneInfo, PaneCallError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
+    let reconcile_registry = target != *state.borrow::<SessionId>();
 
     let direction = pane::SplitDirection::parse(direction)
         .ok_or_else(|| PaneOpError(format!("invalid split direction '{direction}'")))?;
@@ -5205,6 +5206,7 @@ fn op_smudgy_pane_split<'s>(
                         direction,
                         size_px,
                     },
+                    reconcile_registry,
                 },
             );
         } else if outcome.def_changed {

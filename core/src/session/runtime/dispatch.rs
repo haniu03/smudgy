@@ -16,6 +16,30 @@ use super::trigger::{self, PushTriggerParams};
 use super::{ActionResult, Inner, IsolateId, RuntimeAction, ScriptAction};
 use crate::session::styled_line::StyledLine;
 
+fn prepare_pane_open(
+    registry: &super::SharedPaneRegistry,
+    def: super::pane::PaneDef,
+    placement: super::pane::PanePlacement,
+    reconcile_registry: bool,
+) -> Option<(super::pane::PaneDef, super::pane::PanePlacement)> {
+    if !reconcile_registry {
+        return Some((def, placement));
+    }
+
+    let registry = registry.lock().unwrap();
+    let def = registry.get(def.key)?.clone();
+    let placement = super::pane::PanePlacement {
+        reference: if registry.is_live(placement.reference) {
+            placement.reference
+        } else {
+            super::pane::MAIN_PANE_KEY
+        },
+        direction: placement.direction,
+        size_px: placement.size_px,
+    };
+    Some((def, placement))
+}
+
 impl Inner<'_> {
     /// Deliver a host-native (`sys:`/`map:`) event, returning an `ActionResult::Run` that splices the
     /// subscriber calls depth-first (or `None` when nobody is listening). (See `PACKAGE-EVENTS.md`.)
@@ -1267,26 +1291,28 @@ impl Inner<'_> {
                     .await?;
                 Ok(ActionResult::None)
             }
-            RuntimeAction::PaneOpened { def, placement } => {
-                // A foreign split mutates this data-only registry on its caller
-                // thread before queueing the open. Reconcile at the owner queue:
-                // an intervening close retires the key (drop the stale open),
-                // while an intervening update is reflected in the def we publish.
-                let Some(def) = self.pane_registry.lock().unwrap().get(def.key).cloned() else {
+            RuntimeAction::PaneOpened {
+                def,
+                placement,
+                reconcile_registry,
+            } => {
+                let Some((def, placement)) = prepare_pane_open(
+                    &self.pane_registry,
+                    def,
+                    placement,
+                    reconcile_registry,
+                ) else {
+                    // A foreign split mutates this data-only registry on its
+                    // caller thread before queueing the open. Reconcile at the
+                    // owner queue: an intervening close retires the key (drop
+                    // the stale open), while an intervening update is reflected
+                    // in the def we publish.
                     return Ok(ActionResult::None);
                 };
-                let placement = {
-                    let registry = self.pane_registry.lock().unwrap();
-                    super::pane::PanePlacement {
-                        reference: if registry.is_live(placement.reference) {
-                            placement.reference
-                        } else {
-                            super::pane::MAIN_PANE_KEY
-                        },
-                        direction: placement.direction,
-                        size_px: placement.size_px,
-                    }
-                };
+                // Own-runtime split/close sequences are already ordered on
+                // this queue. `prepare_pane_open` preserves their historical
+                // UI transition even when close or failed-load cleanup has
+                // retired the key by the time the queued open is dispatched.
                 // Input callbacks are seated by the same split op before this
                 // action is sent, so the UI cannot expose a submit path whose
                 // first input races its handler registration.
@@ -1901,5 +1927,104 @@ impl Inner<'_> {
             RuntimeAction::Shutdown => Ok(ActionResult::CloseSession),
             RuntimeAction::Noop => Ok(ActionResult::None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::prepare_pane_open;
+    use crate::session::runtime::pane::{
+        DefStateSpec, MAIN_PANE_KEY, PaneKind, PaneNamespace, PanePlacement, PaneRegistry,
+        SplitDirection,
+    };
+
+    #[test]
+    fn retired_own_open_is_preserved_but_retired_foreign_open_is_dropped() {
+        let registry = Arc::new(Mutex::new(PaneRegistry::new()));
+        let namespace = PaneNamespace::User;
+        let def = registry
+            .lock()
+            .unwrap()
+            .split(
+                &namespace,
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap()
+            .def;
+        let placement = PanePlacement {
+            reference: MAIN_PANE_KEY,
+            direction: SplitDirection::Right,
+            size_px: None,
+        };
+        registry.lock().unwrap().close(&namespace, "chat").unwrap();
+
+        let own = prepare_pane_open(&registry, def.clone(), placement, false)
+            .expect("an own-runtime open keeps its ordered UI history");
+        assert_eq!(own.0, def);
+        assert!(prepare_pane_open(&registry, def, placement, true).is_none());
+    }
+
+    #[test]
+    fn foreign_open_uses_current_def_and_falls_back_from_a_retired_reference() {
+        let registry = Arc::new(Mutex::new(PaneRegistry::new()));
+        let namespace = PaneNamespace::User;
+        let (original, reference) = {
+            let mut registry = registry.lock().unwrap();
+            let original = registry
+                .split(
+                    &namespace,
+                    "chat",
+                    PaneKind::Terminal,
+                    DefStateSpec::default(),
+                    None,
+                )
+                .unwrap()
+                .def;
+            let reference = registry
+                .split(
+                    &namespace,
+                    "reference",
+                    PaneKind::Terminal,
+                    DefStateSpec::default(),
+                    None,
+                )
+                .unwrap()
+                .def;
+            registry
+                .split(
+                    &namespace,
+                    "chat",
+                    PaneKind::Terminal,
+                    DefStateSpec {
+                        hidden: Some(true),
+                        ..DefStateSpec::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            registry.close(&namespace, "reference").unwrap();
+            (original, reference)
+        };
+
+        let prepared = prepare_pane_open(
+            &registry,
+            original,
+            PanePlacement {
+                reference: reference.key,
+                direction: SplitDirection::Left,
+                size_px: Some(240.0),
+            },
+            true,
+        )
+        .expect("the foreign target remains live");
+        assert!(prepared.0.hidden);
+        assert_eq!(prepared.1.reference, MAIN_PANE_KEY);
+        assert_eq!(prepared.1.direction, SplitDirection::Left);
+        assert_eq!(prepared.1.size_px, Some(240.0));
     }
 }
