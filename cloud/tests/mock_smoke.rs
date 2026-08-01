@@ -381,11 +381,11 @@ async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Opaque revs + fingerprints: secret-only edits and include_secrets flips
+// 4. Shared revs + fingerprints: secret-only edits and include_secrets flips
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn opaque_rev_and_fingerprint_semantics() {
+async fn shared_rev_and_fingerprint_semantics() {
     let server = MockServer::spawn().await;
     let owner = server.create_user("owner@example.com", "owner", true);
     let grantee = server.create_user("friend@example.com", "friend", true);
@@ -441,8 +441,12 @@ async fn opaque_rev_and_fingerprint_semantics() {
     let (_, body) = get_json(&client, &sync_url, &grantee.api_key).await;
     let (grantee_rev1, grantee_fp1) = sync_row(&body, area);
     assert_eq!(
-        grantee_rev1, grantee_rev0,
-        "served public rev does NOT move on a secret-only edit"
+        grantee_rev1, owner_rev1,
+        "all viewers receive the shared rev after a secret-only edit"
+    );
+    assert!(
+        grantee_rev1 > grantee_rev0,
+        "the shared rev reports secret-only activity without exposing content"
     );
     assert_eq!(grantee_fp1, grantee_fp0, "share writes change no fingerprint");
 
@@ -465,8 +469,8 @@ async fn opaque_rev_and_fingerprint_semantics() {
         "include_secrets flip changes the fingerprint"
     );
     assert_eq!(
-        grantee_rev2, owner_rev1,
-        "with include_secrets the served rev jumps to the full rev"
+        grantee_rev2, grantee_rev1,
+        "a capability change alters the projection without bumping the shared rev"
     );
 
     // The cleared grantee now sees the secret room too.

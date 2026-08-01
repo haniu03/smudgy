@@ -1260,7 +1260,7 @@ pub async fn delete_shape(
 // GET /sync
 // ---------------------------------------------------------------------------
 
-/// GET /sync — VERIFIED only; `[{area_id, rev (projected), fingerprint}]`,
+/// GET /sync — VERIFIED only; `[{area_id, rev (shared), fingerprint}]`,
 /// ordered by area id.
 pub async fn sync(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let st = state.lock();

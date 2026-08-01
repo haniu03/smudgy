@@ -1,7 +1,7 @@
 //! Viewer-scoped area projection — the redaction core (`get_area_projection`
 //! in the real db.rs): the §6 Connection closure, the exit survival
 //! predicate (an exit survives exactly when its Connection does), hidden
-//! target tokens, linked areas, the viewer-salted content hash, projected
+//! target tokens, linked areas, the viewer-salted content hash, and shared
 //! rev.
 
 use std::collections::BTreeMap;
