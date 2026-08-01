@@ -293,6 +293,16 @@ pub(super) fn create_room_exit(
         to_direction: exit_data.to_direction,
         leaves_area: !same_area && exit_data.to_area_id.is_some(),
     };
+    if exit_data.connection_id.is_some() && exit_data.new_connection_id.is_some() {
+        return Err(invalid_connection("ambiguous_connection"));
+    }
+    if exit_data.new_connection_id.is_some_and(|new_connection_id| {
+        area.connections
+            .iter()
+            .any(|connection| connection.id == new_connection_id)
+    }) {
+        return Err(invalid_connection("duplicate_connection"));
+    }
     let connection_id = if let Some(connection_id) = exit_data.connection_id {
         let member_count = exit_topologies(area, None)
             .iter()
@@ -309,8 +319,13 @@ pub(super) fn create_room_exit(
     } else {
         let peers = exit_topologies(area, None);
         let mut connections = std::mem::take(&mut area.connections);
-        let connection_id =
-            connection_lifecycle::attach_exit(&topology, &peers, &mut connections, room_site(area));
+        let connection_id = connection_lifecycle::attach_exit(
+            &topology,
+            &peers,
+            &mut connections,
+            room_site(area),
+            exit_data.new_connection_id,
+        );
         area.connections = connections;
         connection_id
     };

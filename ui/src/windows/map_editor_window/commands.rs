@@ -1284,6 +1284,7 @@ fn exit_args_from_cache(
         // Recreation mints a fresh identity at apply time.
         id: None,
         connection_id: None,
+        new_connection_id: None,
         is_secret: restore_secrecy.then_some(exit.is_secret),
         from_direction: exit.from_direction,
         to_area_id: exit.to_area_id,
@@ -1735,6 +1736,7 @@ fn restore_exit_args(
     ExitArgs {
         id: Some(exit.id),
         connection_id: Some(connection_id),
+        new_connection_id: None,
         is_secret: restore_secrecy.then_some(exit.is_secret),
         from_direction: exit.from_direction,
         to_area_id: exit.to_area_id,
@@ -1873,6 +1875,7 @@ pub fn add_return_exit(
     let body = ExitArgs {
         id: Some(new_id),
         connection_id: Some(connection_id),
+        new_connection_id: None,
         // The return of a secret/closed/locked passage is the same
         // passage: mirror those, but not the direction-specific
         // path/command.
@@ -3144,6 +3147,7 @@ pub fn paste_clipboard(
                 body: ExitArgs {
                     id: Some(ExitId::new()),
                     connection_id: None,
+                    new_connection_id: None,
                     is_secret: cleared.then_some(exit.is_secret),
                     from_direction: exit.from_direction,
                     to_area_id,
@@ -3274,6 +3278,7 @@ pub fn paste_clipboard(
                 body: ExitArgs {
                     id: Some(ExitId::new()),
                     connection_id: Some(new_connection_id),
+                    new_connection_id: None,
                     is_secret: cleared.then_some(exit.is_secret),
                     from_direction: exit.from_direction,
                     to_area_id,

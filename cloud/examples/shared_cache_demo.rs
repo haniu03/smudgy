@@ -74,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let exit_args = ExitArgs {
             id: None,
             connection_id: None,
+            new_connection_id: None,
             is_secret: None,
             from_direction: ExitDirection::East,
             to_area_id: Some(area_id),

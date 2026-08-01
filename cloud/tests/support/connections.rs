@@ -244,6 +244,7 @@ pub struct NewExitLink {
     pub to_room_number: Option<i32>,
     pub to_direction: Option<String>,
     pub is_secret: bool,
+    pub new_connection_id: Option<Uuid>,
 }
 
 fn endpoint(room_number: i32, side: &str, port_offset: f32) -> EndpointRecord {
@@ -272,7 +273,7 @@ pub fn attach_for_new_exit(
         && link.to_room_number.is_some()
         && link.to_room_number != Some(link.from_room);
 
-    if same_area_dest {
+    if link.new_connection_id.is_none() && same_area_dest {
         let area = working.get(&area_id).expect("scope area exists");
         let compatible: Vec<Uuid> = area
             .exits
@@ -334,7 +335,7 @@ pub fn attach_for_new_exit(
         )
     };
 
-    let cid = Uuid::new_v4();
+    let cid = link.new_connection_id.unwrap_or_else(Uuid::new_v4);
     if !has_b {
         let o_port = insert_port_slot(
             working,

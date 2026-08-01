@@ -395,6 +395,45 @@ async fn room_tags_roundtrip_through_sync() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_exit_connection_identity_roundtrips_without_remint() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("stableid@example.com", "stableid", true);
+    let area = server.create_area(&owner, "Stable Identity Area");
+    server.add_room(area, 1, "Landing", false);
+
+    let cache_dir = TempCacheDir::new("stable-connection-id");
+    let mapper = new_synced_mapper(&server.base_url, &owner.api_key, cache_dir.path()).await;
+    mapper
+        .create_exit(
+            RoomKey::new(area, RoomNumber(1)),
+            ExitArgs {
+                from_direction: ExitDirection::Special,
+                weight: 1.0,
+                ..ExitArgs::default()
+            },
+        )
+        .await
+        .expect("exit create resolves immediately");
+    let connection_id = mapper
+        .get_current_atlas()
+        .get_area(&area)
+        .expect("area cached")
+        .get_connections()[0]
+        .id;
+    assert!(
+        mapper
+            .wait_for_sync_completion(10)
+            .await
+            .expect("exit create acknowledged"),
+        "create queue drains"
+    );
+
+    let projection = mapper.export_area(area).await.expect("server projection");
+    assert_eq!(projection.connections[0].id, connection_id);
+    assert_eq!(projection.rooms[0].exits[0].connection_id, connection_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bidirectional_pair_roundtrips_as_one_connection() {
     let server = MockServer::spawn().await;
     let owner = server.create_user("pairowner@example.com", "pairowner", true);
