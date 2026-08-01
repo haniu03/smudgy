@@ -1,0 +1,78 @@
+{
+  "version": "0.0.3",
+  "description": "Adds a simple, configurable map pane to a Smudgy session.",
+  "entry": "index.tsx",
+  "min_smudgy_version": "0.5.0",
+  "params": [
+    {
+      "key": "position",
+      "label": "Map pane position",
+      "type": "dropdown",
+      "default": "right",
+      "options": [
+        {
+          "value": "top",
+          "label": "Top"
+        },
+        {
+          "value": "left",
+          "label": "Left"
+        },
+        {
+          "value": "bottom",
+          "label": "Bottom"
+        },
+        {
+          "value": "right",
+          "label": "Right"
+        }
+      ]
+    },
+    {
+      "key": "size",
+      "label": "Map area size (px)",
+      "type": "number",
+      "default": 350
+    },
+    {
+      "key": "showAreaName",
+      "label": "Show area name and notes",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "showRoomName",
+      "label": "Show room name and notes",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "editAreaNotes",
+      "label": "Allow editing area notes",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "editRoomNotes",
+      "label": "Allow editing room notes",
+      "type": "bool",
+      "default": true
+    }
+  ],
+  "permissions": {
+    "smudgy": {
+      "mapper": [
+        "write"
+      ],
+      "widgets": [
+        "create"
+      ],
+      "interop": [
+        "read"
+      ],
+      "panes": [
+        "create"
+      ]
+    }
+  }
+}

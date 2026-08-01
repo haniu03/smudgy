@@ -45,6 +45,9 @@ const SMUDGY_MAPPER_DTS: &str = include_str!("script_typings/smudgy-mapper.d.ts"
 /// `import … from "smudgy:widgets"` resolves and its `.tsx` modules type-check + emit against
 /// the `JSX` namespace at publish time.
 const SMUDGY_WIDGETS_DTS: &str = include_str!("script_typings/smudgy-widgets.d.ts");
+/// Package parameter declarations, so packages that read their manifest settings through
+/// `smudgy:params` type-check at publish time as they do in the editor.
+const SMUDGY_PARAMS_DTS: &str = include_str!("script_typings/smudgy-params.d.ts");
 
 /// What a successful publish reports back: the published version plus the outcome of the
 /// publish-time TypeScript declaration generation. Declaration generation is **best-effort
@@ -587,6 +590,7 @@ async fn generate_publish_typings(modules: &[LocalModule]) -> (Vec<PublishModule
     ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
     ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
     ambient.insert("smudgy-widgets.d.ts".to_string(), SMUDGY_WIDGETS_DTS.to_string());
+    ambient.insert("smudgy-params.d.ts".to_string(), SMUDGY_PARAMS_DTS.to_string());
 
     match tokio::task::spawn_blocking(move || {
         smudgy_script::dts::generate_declarations(&sources, &ambient)
@@ -838,6 +842,29 @@ mod tests {
         let (dts, warnings) = generate_publish_typings(&modules).await;
         assert!(dts.is_empty());
         assert!(warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn map_widget_manifest_and_publish_typings_are_valid() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("packages")
+            .join("map-widget");
+        let manifest = PackageManifest::parse(
+            &fs::read_to_string(root.join(MANIFEST_FILE)).expect("read map-widget manifest"),
+        )
+        .expect("parse map-widget manifest");
+        assert_eq!(manifest.entry.as_deref(), Some("index.tsx"));
+        assert_eq!(manifest.params.len(), 6);
+
+        let mut modules = Vec::new();
+        collect_modules(&root, &root, &mut modules).expect("collect map-widget modules");
+        let (dts, warnings) = generate_publish_typings(&modules).await;
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(
+            dts.iter().any(|module| module.subpath == "index.d.ts"),
+            "missing index.d.ts"
+        );
     }
 
     fn module(subpath: &str, content: &[u8]) -> PublishModule {
