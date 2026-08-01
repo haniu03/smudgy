@@ -2,6 +2,7 @@
 locale-system = Język systemowy
 locale-english = Angielski (Stany Zjednoczone)
 locale-polish = Polski
+locale-ukrainian = Ukraiński
 locale-traditional-chinese = Chiński Tradycyjny (Taiwan)
 
 # Shared actions and states
@@ -712,22 +713,64 @@ inspector-exit-target-area-room = { $area }, pokój { $room }
 inspector-exit-target-room = pokój { $room }
 inspector-exit-target-nowhere = donikąd
 inspector-shape-summary = { $width }×{ $height } w ({ $x }, { $y })
-inspector-room-count = { $count } pokoi
+inspector-room-count =
+    { $count ->
+        [one] { $count } pokój
+        [few] { $count } pokoje
+        [many] { $count } pokoi
+       *[other] { $count } pokoje
+       }
 inspector-entities-selected = zaznaczono elementy: { $count }
 inspector-marked-secret = oznaczono jako tajne: { $items }
 inspector-unmarked = odtajniono: { $items }
 inspector-count-room-one = 1 pokój
-inspector-count-rooms = { $count } pokoi
+inspector-count-rooms =
+    { $count ->
+        [one] { $count } pokój
+        [few] { $count } pokoje
+        [many] { $count } pokoi
+       *[other] { $count } pokoje
+       }
 inspector-count-exit-one = 1 wyjście
-inspector-count-exits = { $count } wyjść
+inspector-count-exits =
+    { $count ->
+        [one] { $count } wyjście
+        [few] { $count } wyjścia
+        [many] { $count } wyjść
+       *[other] { $count } wyjść
+       }
 inspector-count-label-one = 1 etykieta
-inspector-count-labels = { $count } etykiet
+inspector-count-labels =
+    { $count ->
+        [one] { $count } etykieta
+        [few] { $count } etykiety
+        [many] { $count } etykiet
+       *[other] { $count } etykiet
+       }
 inspector-count-shape-one = 1 kształt
-inspector-count-shapes = { $count } kształtów
+inspector-count-shapes =
+    { $count ->
+        [one] { $count } kształt
+        [few] { $count } kształty
+        [many] { $count } kształtów
+       *[other] { $count } kształtów
+       }
 inspector-count-room-property-one = 1 właściwość pokoju
-inspector-count-room-properties = { $count } właściwości pokoju
+inspector-count-room-properties =
+    { $count ->
+        [one] { $count } właściwość pokój
+        [few] { $count } właściwości pokoju
+        [many] { $count } właściwości pokoju
+       *[other] { $count } właściwości pokoju
+       }
 inspector-count-area-property-one = 1 właściwość obszaru
-inspector-count-area-properties = { $count } właściwości obszaru
+inspector-count-area-properties =
+    { $count ->
+        [one] { $count } właściwość obaszaru
+        [few] { $count } właściwości obszaru
+        [many] { $count } właściwości obszaru
+       *[other] { $count } właściwości obszaru
+       }
 
 # Mapper toolbar, area list, and window
 mapper-tool-select = Zaznacz
