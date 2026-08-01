@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     task::Poll,
     thread::{self},
 };
@@ -43,6 +43,7 @@ mod message_bus;
 pub mod pane;
 mod gmcp;
 mod msdp;
+mod remote_interop;
 mod script_action;
 mod script_engine;
 mod store;
@@ -56,6 +57,7 @@ pub(crate) use input::{
 use line_operation::LineOperation;
 use message_bus::MessageBus;
 pub(crate) use message_bus::SharedMessageBus;
+pub(crate) use remote_interop::SharedRemoteStateRegistry;
 use pane::{PaneKey, PaneRegistry, MAIN_PANE_KEY};
 
 pub use script_action::ScriptAction;
@@ -91,12 +93,12 @@ mod dispatch;
 mod origin;
 
 pub use action::RuntimeAction;
+pub(crate) use action::{ActionQueue, ActionResult, RunAction};
 pub use origin::{
     AutomationBody, AutomationDelta, AutomationEvent, AutomationKind, AutomationSummary, IsolateId,
     Origin,
     SingletonKey, SingletonOrigin, SingletonRegistry,
 };
-pub(crate) use action::{ActionQueue, ActionResult, RunAction};
 
 /// Cap on host-routed delivery recursion (event emit chains and session-store watch chains
 /// alike — the store's watch dispatch deliberately shares the event system's depth cap): a
@@ -143,19 +145,18 @@ pub(crate) type CurrentLocation = Rc<RefCell<Option<(smudgy_cloud::AreaId, Optio
 /// settings value a script reads stays available through an engine rebuild.
 pub(crate) type SettingsSnapshot = Rc<RefCell<crate::models::settings::ScriptSettings>>;
 
-/// The session's pane registry, shared (the same `Rc`) into every isolate's
-/// ops so pane ops mutate it synchronously in the op (get-or-create is
-/// race-free locally, and `const p = pane.split(...); line.redirect(p)` works
-/// within one trigger body). Preserved across script reloads exactly like
-/// [`RecentLines`], which is what makes "panes survive script reloads" true.
-pub(crate) type SharedPaneRegistry = Rc<RefCell<PaneRegistry>>;
+/// The session's data-only pane registry. It is lock-protected so same-server
+/// runtimes can resolve foreign pane handles synchronously without moving any
+/// V8 state across threads. UI mutations still travel through the owning
+/// runtime's ordered action queue.
+pub(crate) type SharedPaneRegistry = Arc<Mutex<PaneRegistry>>;
 
 /// The pane-size mirror (`docs/panes.md` placement read-back), shared into
 /// every isolate's ops like the input mirror: read synchronously by
 /// `pane.size`, written by the `PaneDisplayChanged` dispatch arm, interest
 /// flagged by the first read or a `pane:resize` subscription. Session-scoped
 /// (survives reload) like the registry itself.
-pub(crate) type SharedPaneSizeMirror = Rc<RefCell<pane::PaneSizeMirror>>;
+pub(crate) type SharedPaneSizeMirror = Arc<Mutex<pane::PaneSizeMirror>>;
 
 /// Per-line suppression/routing state, cleared per line event. Transforms
 /// (insert/replace/highlight/remove) stay in `pending_line_operations`;
@@ -252,6 +253,21 @@ pub struct Runtime {
     /// Per-session runtime-catalogue broadcast (`docs/interop.md` §10); the
     /// automations window's store tab subscribes via [`Runtime::subscribe_catalogue`].
     pub catalogue_tx: broadcast::Sender<CatalogueEvent>,
+    /// Transport state read by script-visible `Session.connected` handles.
+    pub connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Latest committed immutable store roots for same-server directed reads.
+    pub published_store: Arc<RwLock<store::PublishedStore>>,
+    /// Cross-session, data-only script surfaces. These contain no V8 handles;
+    /// foreign callers use them for exact synchronous resolution/readback and
+    /// route effects through `tx` below.
+    pub(crate) pane_registry: SharedPaneRegistry,
+    pub(crate) input_mirror: SharedInputMirror,
+    pub(crate) pane_size_mirror: SharedPaneSizeMirror,
+    pub(crate) input_word_sets: SharedInputWordSets,
+    pub(crate) pane_input_callbacks: SharedPaneInputCallbacks,
+    /// The worker waits on this one-shot gate until the fully-constructed
+    /// runtime has been inserted into the global session registry.
+    start_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 static RUNTIME_THREADS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
@@ -330,7 +346,38 @@ impl Runtime {
         let (catalogue_tx, _) = broadcast::channel::<CatalogueEvent>(CATALOGUE_BROADCAST_CAPACITY);
         let local_catalogue_tx = catalogue_tx.clone();
 
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let local_connected = Arc::clone(&connected);
+        let published_store = Arc::new(RwLock::new(store::PublishedStore::default()));
+        let local_published_store = Arc::clone(&published_store);
+
+        // These registries are data-only and deliberately shared outside the
+        // session thread. Foreign Session/Pane/Input handles can therefore
+        // resolve and read the owning session's live state synchronously;
+        // effects continue to enter through that runtime's ordered queue.
+        let pane_registry: SharedPaneRegistry = Arc::new(Mutex::new(PaneRegistry::new()));
+        let input_mirror: SharedInputMirror = Arc::new(Mutex::new(InputMirror::default()));
+        let pane_size_mirror: SharedPaneSizeMirror =
+            Arc::new(Mutex::new(pane::PaneSizeMirror::default()));
+        let input_word_sets: SharedInputWordSets =
+            Arc::new(Mutex::new(input::InputWordSets::default()));
+        let pane_input_callbacks: SharedPaneInputCallbacks =
+            Arc::new(Mutex::new(input::PaneInputCallbacks::default()));
+        let local_pane_registry = Arc::clone(&pane_registry);
+        let local_input_mirror = Arc::clone(&input_mirror);
+        let local_pane_size_mirror = Arc::clone(&pane_size_mirror);
+        let local_input_word_sets = Arc::clone(&input_word_sets);
+        let local_pane_input_callbacks = Arc::clone(&pane_input_callbacks);
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+
         let thread = thread::spawn(move || {
+            // `Runtime::new` must spawn before it can return the registry
+            // handle, but script top-level code may consult that registry.
+            // Do not construct/evaluate the engine until registration opens
+            // this gate.
+            if start_rx.recv().is_err() {
+                return;
+            }
             let pending_line_operations = Rc::new(RefCell::new(Vec::new()));
 
             // We start at 1 because the first line ("Loading session...") is already emitted
@@ -346,9 +393,7 @@ impl Runtime {
             // and read back by `getCurrentLocation`. Preserved across reload (cloned below).
             let current_location: CurrentLocation = Rc::new(RefCell::new(None));
 
-            // The pane registry: pane ops mutate it synchronously via `OpState`; preserved
-            // across reload (like `recent_lines`) so panes survive an engine rebuild.
-            let pane_registry: SharedPaneRegistry = Rc::new(RefCell::new(PaneRegistry::new()));
+            let pane_registry = local_pane_registry;
 
             // Per-line routing state (gag/redirect/copy), cleared per line event; shared into
             // every isolate's ops beside `pending_line_operations`.
@@ -357,14 +402,13 @@ impl Runtime {
             // The input mirror (`docs/input.md` §3.3): read synchronously by every
             // isolate's input ops, written by the `InputStateChanged` dispatch arm. Session-
             // scoped (survives reload) like the pane registry — interest is a session fact.
-            let input_mirror: SharedInputMirror = Rc::new(RefCell::new(InputMirror::default()));
+            let input_mirror = local_input_mirror;
 
             // The pane-size mirror (panes.md placement read-back): read synchronously by
             // every isolate's `pane.size` op, written by the `PaneDisplayChanged` dispatch
             // arm. Session-scoped (survives reload) like the input mirror — interest is a
             // session fact.
-            let pane_size_mirror: SharedPaneSizeMirror =
-                Rc::new(RefCell::new(pane::PaneSizeMirror::default()));
+            let pane_size_mirror = local_pane_size_mirror;
 
             // The in-flight typed submission `sys:input` handlers act on: installed by the
             // `SubmitInput` dispatch arm, mutated by the submission ops, consumed by the
@@ -378,15 +422,13 @@ impl Runtime {
             // synchronously by every isolate's registry ops, merged and pushed to the UI by
             // the `InputWordSetsChanged` dispatch arm. Session-scoped cell, engine-scoped
             // contents — the reload path below resets the contributions like hotkeys.
-            let input_word_sets: SharedInputWordSets =
-                Rc::new(RefCell::new(input::InputWordSets::default()));
+            let input_word_sets = local_input_word_sets;
 
             // The pane-input onSubmit registry (`docs/input.md` §3.7): written by
             // the registration op, resolved by the `PaneInputSubmit` dispatch arm. Session-
             // scoped cell, engine-scoped contents — handlers name functions of the engine
             // that registered them, so the reload path below resets it like the word sets.
-            let pane_input_callbacks: SharedPaneInputCallbacks =
-                Rc::new(RefCell::new(input::PaneInputCallbacks::default()));
+            let pane_input_callbacks = local_pane_input_callbacks;
 
             // The session store (`docs/interop.md`): the same `Rc` is bound into
             // every isolate's ops (writes journal here) and held by `Inner` (the run loop
@@ -530,6 +572,8 @@ impl Runtime {
                 input_word_sets: input_word_sets.clone(),
                 pane_input_callbacks: pane_input_callbacks.clone(),
                 session_store: session_store.clone(),
+                published_store: Arc::clone(&local_published_store),
+                connected: Arc::clone(&local_connected),
                 catalogue: catalogue.clone(),
                 gmcp: gmcp::GmcpProducer::new(gmcp_enabled.clone()),
                 msdp: msdp::MsdpProducer::new(),
@@ -644,13 +688,30 @@ impl Runtime {
                 // each, queued BEHIND the rebuild below, so the UI's merged copy is
                 // refreshed: re-registered words go out merged, an unclaimed input
                 // goes out empty.
-                let word_set_resyncs = input_word_sets.borrow_mut().reset_engine_state();
+                let word_set_resyncs = input_word_sets
+                    .lock()
+                    .unwrap()
+                    .reset_engine_state(session_id);
 
                 // Pane-input onSubmit handlers are engine facts too: their function ids
                 // index the disposed isolates' registries. Drop them all; the reloading
                 // scripts re-register theirs beside their re-claiming splits, and a pane
                 // nobody re-claims is closed by the sweep queued below anyway.
-                pane_input_callbacks.borrow_mut().reset_engine_state();
+                pane_input_callbacks
+                    .lock()
+                    .unwrap()
+                    .reset_engine_state(session_id);
+                for other in registry::get_runtimes_for_server(local_server_name.as_str()) {
+                    if other.session_id != session_id {
+                        for key in input::purge_session_input_interop(
+                            &other.input_word_sets,
+                            &other.pane_input_callbacks,
+                            session_id,
+                        ) {
+                            let _ = other.tx.send(RuntimeAction::InputWordSetsChanged { key });
+                        }
+                    }
+                }
 
                 // Drop the store's engine-scoped state (watchers hold function ids into the
                 // disposed isolates; any unflushed journal belongs to the dead run) while the
@@ -688,7 +749,7 @@ impl Runtime {
                 // queued below then closes whatever nothing re-claimed (e.g.
                 // a disabled package's leftover panel). Placement of the
                 // survivors is untouched — existence is the only thing swept.
-                pane_registry.borrow_mut().begin_claim_epoch();
+                pane_registry.lock().unwrap().begin_claim_epoch();
 
                 let new_script_engine = ScriptEngine::new(ScriptEngineParams {
                     session_id,
@@ -791,6 +852,8 @@ impl Runtime {
                     input_word_sets: input_word_sets.clone(), // Contributions reset above; the cell itself is session-scoped
                     pane_input_callbacks: pane_input_callbacks.clone(), // Handlers reset above; the cell itself is session-scoped
                     session_store: session_store.clone(), // Committed store state survives reload
+                    published_store: Arc::clone(&local_published_store),
+                    connected: Arc::clone(&local_connected),
                     catalogue: catalogue.clone(),         // Samples are session history
                     gmcp: old_gmcp, // Session-scoped: enabled tracks the surviving connection
                     msdp: old_msdp, // Same: server facts, no engine facts
@@ -846,6 +909,21 @@ impl Runtime {
             tx: session_runtime_tx,
             automation_tx,
             catalogue_tx,
+            connected,
+            published_store,
+            pane_registry,
+            input_mirror,
+            pane_size_mirror,
+            input_word_sets,
+            pane_input_callbacks,
+            start_tx: Mutex::new(Some(start_tx)),
+        }
+    }
+
+    /// Allow the worker to begin engine construction after registry insertion.
+    pub(crate) fn start(&self) {
+        if let Some(start_tx) = self.start_tx.lock().unwrap().take() {
+            let _ = start_tx.send(());
         }
     }
 
@@ -962,6 +1040,8 @@ struct Inner<'a> {
     /// the ops; [`Self::flush_session_store`] commits the journal once per turn and queues the
     /// coalesced watch deliveries. The committed tree survives reloads (like `recent_lines`).
     session_store: SharedSessionStore,
+    published_store: Arc<RwLock<store::PublishedStore>>,
+    connected: Arc<std::sync::atomic::AtomicBool>,
     /// The runtime catalogue (`docs/interop.md` §10), shared into every isolate's
     /// ops (emit/post sampling) and snapshotted by [`Self::sync_catalogue_broadcast`]. (The
     /// message bus is engine-wired only — the run loop never touches it, so `Inner` doesn't
@@ -1138,7 +1218,7 @@ impl Inner<'_> {
     /// the UI trust `AppendTo` keys; a dangling redirect fails open to main rather than
     /// destroying the line.
     fn resolve_sinks(&self, routing: &LineRouting) -> (bool, Vec<PaneKey>) {
-        let registry = self.pane_registry.borrow();
+        let registry = self.pane_registry.lock().unwrap();
 
         let mut redirect = routing.redirect;
         let mut redirected_to_main = false;
@@ -1232,7 +1312,7 @@ impl Inner<'_> {
             // panes it is dead weight — skip the per-fragment deep copy
             // (`StyledLine::append`) entirely. A stale accumulator can't be
             // consumed (sinks require live panes) and is cleared at completion.
-            if self.pane_registry.borrow().has_non_main_panes() {
+            if self.pane_registry.lock().unwrap().has_non_main_panes() {
                 self.open_line = Some(match self.open_line.take() {
                     Some(prev) => Arc::new(prev.append(&processed)),
                     None => processed.clone(),
@@ -1463,6 +1543,30 @@ impl Inner<'_> {
         for action in self.session_store.borrow_mut().flush() {
             if self.session_runtime_tx.send(action).is_err() {
                 warn!("Dropping session-store watch delivery: runtime channel closed");
+            }
+        }
+        let (published, writes) = {
+            let store = self.session_store.borrow();
+            (
+                Arc::new(store.published()),
+                Arc::new(store.last_published_writes()),
+            )
+        };
+        *self.published_store.write().unwrap() = published.as_ref().clone();
+        for runtime in registry::get_runtimes_for_server(self.server_name.as_str()) {
+            if runtime
+                .tx
+                .send(RuntimeAction::RemoteStoreFlushed {
+                    source: self.session_id,
+                    published: Arc::clone(&published),
+                    writes: Arc::clone(&writes),
+                })
+                .is_err()
+            {
+                warn!(
+                    "Dropping directed state flush for session {}",
+                    runtime.session_id
+                );
             }
         }
         // The committed tree changed; a subscribed store tab needs a fresh snapshot at the

@@ -848,7 +848,7 @@ pub struct SmudgyCapabilities {
     pub send_direct: bool,
     /// `session: ["echo"]` — write text to the user's screen.
     pub echo: bool,
-    /// `session: ["reach-others"]` — enumerate + act on the user's *other* connected sessions.
+    /// `session: ["reach-others"]` — enumerate + act on other sessions using the same server entry.
     pub reach_others: bool,
     /// `display: ["change"]` — gag/insert/replace/highlight/remove game text (the deception risk).
     pub change_display: bool,
@@ -864,6 +864,9 @@ pub struct SmudgyCapabilities {
     /// `interop: ["write"]` — produce on the cross-package interop surface: publish session-store
     /// state and emit events (own namespace only).
     pub interop_write: bool,
+    /// `interop: ["broadcast"]` - construct/use the standard BroadcastChannel
+    /// surface, scoped to this configured server entry.
+    pub interop_broadcast: bool,
     /// `panes: ["create"]` — create/close/write session output panes and route lines into them.
     pub panes: bool,
     /// `gmcp: ["send"]` — send GMCP messages to the game and manage GMCP modules
@@ -896,6 +899,7 @@ impl SmudgyCapabilities {
             widgets: true,
             interop_read: true,
             interop_write: true,
+            interop_broadcast: true,
             panes: true,
             gmcp_send: true,
             input: true,
@@ -925,6 +929,7 @@ impl SmudgyCapabilities {
         self.widgets |= other.widgets;
         self.interop_read |= other.interop_read;
         self.interop_write |= other.interop_write;
+        self.interop_broadcast |= other.interop_broadcast;
         self.panes |= other.panes;
         self.gmcp_send |= other.gmcp_send;
         self.input |= other.input;
@@ -951,6 +956,7 @@ impl SmudgyCapabilities {
             && (!self.widgets || ceiling.widgets)
             && (!self.interop_read || ceiling.interop_read)
             && (!self.interop_write || ceiling.interop_write)
+            && (!self.interop_broadcast || ceiling.interop_broadcast)
             && (!self.panes || ceiling.panes)
             && (!self.gmcp_send || ceiling.gmcp_send)
             && (!self.input || ceiling.input)
@@ -975,6 +981,7 @@ impl SmudgyCapabilities {
             widgets: self.widgets && !baseline.widgets,
             interop_read: self.interop_read && !baseline.interop_read,
             interop_write: self.interop_write && !baseline.interop_write,
+            interop_broadcast: self.interop_broadcast && !baseline.interop_broadcast,
             panes: self.panes && !baseline.panes,
             gmcp_send: self.gmcp_send && !baseline.gmcp_send,
             input: self.input && !baseline.input,
@@ -1031,6 +1038,7 @@ impl From<SmudgyCapabilitiesWire> for SmudgyCapabilities {
             widgets: has_token(&wire.widgets, "create"),
             interop_read: has_token(&wire.interop, "read"),
             interop_write: has_token(&wire.interop, "write"),
+            interop_broadcast: has_token(&wire.interop, "broadcast"),
             panes: has_token(&wire.panes, "create"),
             gmcp_send: has_token(&wire.gmcp, "send"),
             input: has_token(&wire.input, "access"),
@@ -1081,6 +1089,9 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
         }
         if caps.interop_write {
             interop.push("write".to_string());
+        }
+        if caps.interop_broadcast {
+            interop.push("broadcast".to_string());
         }
         let mut panes = Vec::new();
         if caps.panes {
@@ -1736,6 +1747,7 @@ pub(crate) fn load_core_module(url: &ModuleSpecifier) -> Result<ModuleSource, Mo
          export const buffer = __api.buffer;\n\
          export const submission = __api.submission;\n\
          export const vars = __api.vars;\n\
+         export const byId = __api.byId;\n\
          export const byName = __api.byName;\n\
          export const getSessions = __api.getSessions;\n\
          export const getProfile = __api.getProfile;\n\
@@ -1897,12 +1909,12 @@ pub(crate) struct KindSchemeRef {
 }
 
 /// Single-segment kind-scheme paths reserved for the platform (interop.md §4). `sys`/`map`/
-/// `input`/`pane` are the host event catalogs; `gmcp` is the host GMCP producer (state +
+/// `input`/`pane`/`sessions` are host event catalogs; `gmcp` is the host GMCP producer (state +
 /// readiness events, `docs/gmcp.md`); `user` is reserved unpublished (main-isolate code
 /// shares user handles by ordinary import). Reservation is unconditional, so a package owner
 /// who happens to take one of these nicknames stays unaddressable through the schemes rather
 /// than shadowing the platform.
-const PLATFORM_PRODUCERS: [&str; 7] = ["sys", "map", "gmcp", "msdp", "user", "input", "pane"];
+const PLATFORM_PRODUCERS: [&str; 8] = ["sys", "map", "gmcp", "msdp", "user", "input", "pane", "sessions"];
 
 /// The host event catalog of a platform producer: `(export name, event name)`, where the
 /// event name is the canonical kind's suffix (`("receive", "receive")` ⇒ `sys:receive`).
@@ -1912,7 +1924,8 @@ const PLATFORM_PRODUCERS: [&str; 7] = ["sys", "map", "gmcp", "msdp", "user", "in
 /// `sys:receive`, resolved on the export side this time — the kind names what happened,
 /// the export keeps the catalog's bare-verb style).
 /// Mirrored by the `declare module "smudgy:events/sys"` / `"smudgy:events/map"` /
-/// `"smudgy:events/gmcp"` / `"smudgy:events/msdp"` / `"smudgy:events/input"` blocks in
+/// `"smudgy:events/gmcp"` / `"smudgy:events/msdp"` / `"smudgy:events/input"` /
+/// `"smudgy:events/sessions"` blocks in
 /// `smudgy-core.d.ts` (drift-checked by a test in core's `script_typings.rs`).
 #[must_use]
 pub fn platform_event_catalog(producer: &str) -> &'static [(&'static str, &'static str)] {
@@ -1933,6 +1946,12 @@ pub fn platform_event_catalog(producer: &str) -> &'static [(&'static str, &'stat
         // subscribing requires the `panes` capability, enforced at `on()`
         // (`pane:resize` additionally flags size-mirror interest there).
         "pane" => &[("visibility", "visibility"), ("resize", "resize")],
+        "sessions" => &[
+            ("created", "created"),
+            ("connected", "connected"),
+            ("disconnected", "disconnected"),
+            ("destroyed", "destroyed"),
+        ],
         _ => &[],
     }
 }
@@ -3016,7 +3035,7 @@ mod tests {
         // The convenience surface is delivered as named exports too.
         for name in [
             "send", "sendRaw", "echo", "style", "link", "reload", "capture", "fallthrough",
-            "line", "buffer", "submission", "vars", "byName",
+            "line", "buffer", "submission", "vars", "byId", "byName",
         ] {
             assert!(
                 code.contains(&format!("export const {name} = __api.{name};")),
@@ -3911,12 +3930,20 @@ mod tests {
 
     #[test]
     fn smudgy_interop_tokens_parse_and_round_trip() {
-        let caps = perms_with_smudgy(r#"{ "interop": ["read", "write"] }"#).smudgy;
-        assert!(caps.interop_read && caps.interop_write);
+        let caps = perms_with_smudgy(r#"{ "interop": ["read", "write", "broadcast"] }"#).smudgy;
+        assert!(caps.interop_read && caps.interop_write && caps.interop_broadcast);
         let read_only = perms_with_smudgy(r#"{ "interop": ["read"] }"#).smudgy;
-        assert!(read_only.interop_read && !read_only.interop_write);
+        assert!(read_only.interop_read && !read_only.interop_write && !read_only.interop_broadcast);
+        let broadcast_only = perms_with_smudgy(r#"{ "interop": ["broadcast"] }"#).smudgy;
+        assert!(
+            broadcast_only.interop_broadcast
+                && !broadcast_only.interop_read
+                && !broadcast_only.interop_write,
+            "broadcast is an independent grant"
+        );
         let json = serde_json::to_string(&caps).expect("serialize");
         assert!(json.contains(r#""interop""#), "{json}");
+        assert!(json.contains(r#""broadcast""#), "{json}");
         assert!(!json.contains(r#""events""#), "{json}");
         let back: SmudgyCapabilities = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, caps, "interop capabilities round-trip");

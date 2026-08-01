@@ -961,7 +961,7 @@ export interface VitalData { hp: number }
 /** The current vitals reading. */
 export const vitals = createState<VitalData>();
 export const prompt = createEvent<{ raw: string }>();
-export const refresh = createProcedure((args: { full: boolean }, sender: string) => { void args; void sender; });
+export const refresh = createProcedure((args: { full: boolean }, caller) => { void args; void caller.origin; void caller.session; });
 export const hpPct = createDerived(vitals as any, (v: any) => v.hp);
 const pinned = createState<VitalData>('Pinned');
 export { pinned };
@@ -1095,7 +1095,7 @@ export function make() { return createEvent('dynamic'); }
              export interface PromptData { hp: number; maxhp: number }\n\
              const promptState = createState<PromptData>('promptState');\n\
              const prompt = createEvent<PromptData>('prompt');\n\
-             const refreshRequest = createProcedure('refreshRequest', (payload: { full: boolean }, sender) => { const f: boolean = payload.full; void f; const who: string = sender; void who; });\n\
+             const refreshRequest = createProcedure('refreshRequest', (payload: { full: boolean }, caller) => { const f: boolean = payload.full; void f; const who: string = caller.origin; const sourceId: number = caller.session.id; void who; void sourceId; });\n\
              export type PromptState = typeof promptState;\n\
              export type PromptEvent = typeof prompt;\n\
              export type RefreshRequest = typeof refreshRequest;\n\
@@ -1164,7 +1164,14 @@ export function make() { return createEvent('dynamic'); }
                // The non-event surface: named session/mapper exports, getSessions(), the\n\
                // createHotkey signature, a typed Line, and the mapper's AreaId pair.\n\
                const sid: number = session.id; void sid;\n\
-               for (const s of getSessions()) { s.send(\"x\"); }\n\
+               for (const s of getSessions()) {\n\
+                 s.send(\"x\");\n\
+                 const connected: boolean = s.connected; void connected;\n\
+                 prompt.from(s).on((p, source) => { void p.hp; const id: number = source.id; void id; });\n\
+                 prompt.fromAll({ includeSelf: false }).once((p, source) => { void p.hp; void source.profile; });\n\
+                 promptState.from(s).watch((next) => { void next?.hp; });\n\
+                 refreshRequest.to(s).post({ full: false });\n\
+               }\n\
                createHotkey({ key: \"F1\", modifiers: [\"ctrl\"] }, () => {}).delete();\n\
                const t: string = line.text; void t;\n\
                const a = mapper.areas[0];\n\
@@ -1306,7 +1313,7 @@ export function make() { return createEvent('dynamic'); }
                 "smudgy:state/{producer} missing from smudgy-core.d.ts"
             );
         }
-        for producer in ["sys", "map", "gmcp", "msdp", "input"] {
+        for producer in ["sys", "map", "gmcp", "msdp", "input", "sessions"] {
             let catalog = smudgy_script::platform_event_catalog(producer);
             assert!(!catalog.is_empty(), "platform catalog {producer} is empty");
             let header = format!("declare module \"smudgy:events/{producer}\"");

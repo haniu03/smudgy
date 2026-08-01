@@ -430,6 +430,24 @@ impl SmudgyWindow {
         }
     }
 
+    /// The script-swap sibling of [`Self::repair_active_session`]: keep the
+    /// toolbar's active session valid after a pane payload exchange without
+    /// requesting keyboard focus. A layout-only script operation must not
+    /// pull focus into a main input merely because that session became the
+    /// deterministic fallback in this window.
+    pub fn repair_active_session_without_focus(&mut self) {
+        if self
+            .active_session_id
+            .is_some_and(|active| self.hosts_session(active))
+        {
+            return;
+        }
+        self.active_session_id = self
+            .previous_active_session_id
+            .filter(|id| self.hosts_session(*id))
+            .or_else(|| self.hosted_sessions().into_iter().min());
+    }
+
     /// Create session context information for the toolbar
     fn create_session_context(&self, sessions: &SessionStore) -> toolbar::SessionContext {
         if let Some(active_id) = self.active_session_id {
@@ -586,6 +604,27 @@ impl SmudgyWindow {
     /// Whether this window's layout currently marks `slot` hidden.
     pub fn pane_hidden(&self, slot: PaneRef) -> bool {
         self.hidden_panes.contains(&slot)
+    }
+
+    /// Exchange two live leaves in this window without changing the split
+    /// tree. Used by the script `Pane.swap` path as well as native center-drop
+    /// semantics; hidden state belongs to the pane identity and needs no move
+    /// while both panes remain in this window.
+    pub fn swap_pane_slots(&mut self, x: PaneRef, y: PaneRef) {
+        self.layout.swap(x, y);
+        self.rebuild_grid();
+    }
+
+    /// Replace a leaf payload in place, preserving destination geometry.
+    /// Hidden membership for `old` is removed; the daemon seeds `new` from
+    /// its source window after both halves of a cross-window swap land.
+    pub fn replace_pane_slot(&mut self, old: PaneRef, new: PaneRef) -> bool {
+        if !self.layout.replace(old, new) {
+            return false;
+        }
+        self.hidden_panes.remove(&old);
+        self.rebuild_grid();
+        true
     }
 
     /// Apply a script `pane.resize` (panes.md placement commands): write the

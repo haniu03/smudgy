@@ -1172,3 +1172,66 @@ async fn sandboxed_package_with_no_permissions_denies_run_ffi_sys() {
         "a zero-permission package must not read system info; transcript:\n{lines:#?}"
     );
 }
+
+/// `node:worker_threads` imports its `BroadcastChannel` constructor directly
+/// from `deno_web`, bypassing a replacement of `globalThis.BroadcastChannel`.
+/// A sandbox without `interop:broadcast` therefore needs an isolate-private
+/// backend as the host-side enforcement boundary.
+#[tokio::test]
+async fn worker_threads_broadcast_channel_cannot_bypass_interop_capability() {
+    let server = "pi_enf_broadcast_node";
+    let server_dir = prepare_server(server);
+    std::fs::write(
+        server_dir.join("modules").join("broadcast.ts"),
+        r#"
+        import { echo } from "smudgy:core";
+        const channel = new BroadcastChannel("capability-boundary");
+        channel.onmessage = (event) => echo("MAIN_LEAK:" + event.data);
+        setTimeout(() => channel.postMessage("from-main"), 100);
+        setTimeout(() => { channel.close(); echo("MAIN_DONE"); }, 300);
+        "#,
+    )
+    .unwrap();
+
+    let pkg = make_package(
+        "wbk",
+        "broadcast-denied",
+        "1.0.0",
+        "",
+        r#"
+        import { echo } from "smudgy:core";
+        import { BroadcastChannel as NodeBroadcastChannel } from "node:worker_threads";
+
+        try {
+          new globalThis.BroadcastChannel("capability-boundary");
+          echo("GLOBAL_LEAK");
+        } catch (error) {
+          echo("GLOBAL_DENIED:" + String(error).includes("interop:broadcast"));
+        }
+
+        const channel = new NodeBroadcastChannel("capability-boundary");
+        channel.unref();
+        channel.onmessage = (event) => echo("NODE_LEAK:" + event.data);
+        echo("NODE_READY");
+        setTimeout(() => channel.postMessage("from-sandbox"), 50);
+        setTimeout(() => channel.close(), 250);
+        "#,
+    );
+    let lines = collect_session_lines_with_consent(
+        9433,
+        server,
+        &[("smudgy://wbk/broadcast-denied", Some(PackagePermissions::default()))],
+        factory_for(vec![pkg]),
+    )
+    .await;
+
+    assert!(has_line(&lines, "GLOBAL_DENIED:true"), "transcript:\n{lines:#?}");
+    assert!(has_line(&lines, "NODE_READY"), "transcript:\n{lines:#?}");
+    assert!(has_line(&lines, "MAIN_DONE"), "transcript:\n{lines:#?}");
+    assert!(
+        !has_line(&lines, "GLOBAL_LEAK")
+            && !has_line(&lines, "MAIN_LEAK:")
+            && !has_line(&lines, "NODE_LEAK:"),
+        "a denied sandbox reached the server-scoped BroadcastChannel backend; transcript:\n{lines:#?}"
+    );
+}

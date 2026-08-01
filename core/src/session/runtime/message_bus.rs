@@ -37,10 +37,11 @@ pub struct MessageReceiver {
 }
 
 /// A post buffered while its message had no registered receiver, awaiting the drain at
-/// registration. `payload` is the JSON text as posted; `sender` is the host-stamped origin.
+/// registration. Caller identity is entirely host-stamped.
 pub struct PendingPost {
     pub payload: String,
-    pub sender: String,
+    pub origin: String,
+    pub session: String,
 }
 
 /// Most pending posts buffered per message name; the oldest is dropped (with a log) on
@@ -120,11 +121,19 @@ mod tests {
         let mut bus = MessageBus::new();
         bus.push_pending(
             "user#req".into(),
-            PendingPost { payload: "1".into(), sender: "user".into() },
+            PendingPost {
+                payload: "1".into(),
+                origin: "user".into(),
+                session: "{}".into(),
+            },
         );
         bus.push_pending(
             "user#req".into(),
-            PendingPost { payload: "2".into(), sender: "user".into() },
+            PendingPost {
+                payload: "2".into(),
+                origin: "user".into(),
+                session: "{}".into(),
+            },
         );
         let drained = bus.subscribe("user#req".into(), receiver(0));
         assert_eq!(
@@ -144,7 +153,11 @@ mod tests {
         for i in 0..=PENDING_POST_CAP {
             let dropped = bus.push_pending(
                 "user#req".into(),
-                PendingPost { payload: i.to_string(), sender: "user".into() },
+                PendingPost {
+                    payload: i.to_string(),
+                    origin: "user".into(),
+                    session: "{}".into(),
+                },
             );
             assert_eq!(dropped, i == PENDING_POST_CAP, "only the overflowing push drops");
         }
@@ -159,7 +172,11 @@ mod tests {
         bus.subscribe("user#req".into(), receiver(0));
         bus.push_pending(
             "user#req".into(),
-            PendingPost { payload: "1".into(), sender: "user".into() },
+            PendingPost {
+                payload: "1".into(),
+                origin: "user".into(),
+                session: "{}".into(),
+            },
         );
         bus.reset_engine_state();
         let drained = bus.subscribe("user#req".into(), receiver(1));

@@ -10624,6 +10624,7 @@ dependencies = [
  "deno_resolver",
  "deno_runtime",
  "deno_semver",
+ "deno_web",
  "log",
  "node_resolver",
  "reqwest",

@@ -64,6 +64,7 @@ fn restricted_runtime(
         tokio: tokio.clone(),
         package_provider: None,
         permissions: Some(container),
+        broadcast_channel: None,
     })?;
     Ok((tokio, runtime))
 }

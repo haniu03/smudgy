@@ -3,7 +3,10 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use deno_core::{serde_v8, FastString, ModuleSpecifier, PollEventLoopOptions};
-use smudgy_script::{ImportPolicy, InspectorConfig, ModulePolicy, ScriptRuntime, ScriptRuntimeOptions};
+use smudgy_script::{
+    ImportPolicy, InMemoryBroadcastChannel, InspectorConfig, ModulePolicy, ScriptRuntime,
+    ScriptRuntimeOptions,
+};
 
 fn tokio_runtime() -> Rc<tokio::runtime::Runtime> {
     Rc::new(
@@ -14,7 +17,34 @@ fn tokio_runtime() -> Rc<tokio::runtime::Runtime> {
     )
 }
 
+/// Multi-runtime tests share one thread, so each V8 operation must temporarily
+/// make its runtime's isolate current (the production ScriptEngine does the same).
+struct EnteredIsolate(*mut deno_core::v8::OwnedIsolate);
+
+impl EnteredIsolate {
+    fn enter(runtime: &mut ScriptRuntime) -> Self {
+        let isolate = runtime.deno_runtime().v8_isolate();
+        // SAFETY: the runtime owns this live isolate; Drop balances this enter.
+        unsafe { (*isolate).enter() };
+        Self(isolate)
+    }
+}
+
+impl Drop for EnteredIsolate {
+    fn drop(&mut self) {
+        // SAFETY: balanced with enter; no other isolate operation is interleaved.
+        unsafe { (*self.0).exit() };
+    }
+}
+
 fn script_runtime(data_dir: &Path) -> Result<(Rc<tokio::runtime::Runtime>, ScriptRuntime)> {
+    script_runtime_with_broadcast(data_dir, None)
+}
+
+fn script_runtime_with_broadcast(
+    data_dir: &Path,
+    broadcast_channel: Option<InMemoryBroadcastChannel>,
+) -> Result<(Rc<tokio::runtime::Runtime>, ScriptRuntime)> {
     let tokio = tokio_runtime();
     let runtime = ScriptRuntime::new(ScriptRuntimeOptions {
         extensions: Vec::new(),
@@ -25,8 +55,74 @@ fn script_runtime(data_dir: &Path) -> Result<(Rc<tokio::runtime::Runtime>, Scrip
         tokio: tokio.clone(),
         package_provider: None,
         permissions: None,
+        broadcast_channel,
     })?;
     Ok((tokio, runtime))
+}
+
+#[test]
+fn broadcast_channel_backend_is_shared_only_when_explicitly_reused() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let shared = InMemoryBroadcastChannel::default();
+    let (sender_tokio, mut sender) =
+        script_runtime_with_broadcast(temp.path(), Some(shared.clone()))?;
+    let (receiver_tokio, mut receiver) =
+        script_runtime_with_broadcast(temp.path(), Some(shared))?;
+    let (isolated_tokio, mut isolated) = script_runtime_with_broadcast(
+        temp.path(),
+        Some(InMemoryBroadcastChannel::default()),
+    )?;
+
+    assert!(eval_bool_in_tokio(
+        &receiver_tokio,
+        &mut receiver,
+        r#"
+        globalThis.__sharedChannel = new BroadcastChannel("smudgy-test");
+        globalThis.__sharedMessage = new Promise((resolve) => {
+          __sharedChannel.onmessage = (event) => resolve(event.data);
+        });
+        true
+        "#,
+    )?);
+    assert!(eval_bool_in_tokio(
+        &isolated_tokio,
+        &mut isolated,
+        r#"
+        globalThis.__isolatedChannel = new BroadcastChannel("smudgy-test");
+        globalThis.__isolatedMessage = new Promise((resolve) => {
+          __isolatedChannel.onmessage = () => resolve(false);
+          setTimeout(() => resolve(true), 10);
+        });
+        true
+        "#,
+    )?);
+    assert!(eval_bool_in_tokio(
+        &sender_tokio,
+        &mut sender,
+        r#"
+        globalThis.__senderChannel = new BroadcastChannel("smudgy-test");
+        __senderChannel.postMessage({ answer: 42 });
+        true
+        "#,
+    )?);
+    assert!(eval_async_bool(
+        &sender_tokio,
+        &mut sender,
+        "new Promise((resolve) => setTimeout(() => resolve(true), 1))",
+    )?);
+
+    assert!(eval_async_bool(
+        &receiver_tokio,
+        &mut receiver,
+        "__sharedMessage.then((message) => message.answer === 42)",
+    )?);
+    assert!(eval_async_bool(
+        &isolated_tokio,
+        &mut isolated,
+        "__isolatedMessage",
+    )?);
+
+    Ok(())
 }
 
 fn inspector_script_runtime(
@@ -44,11 +140,13 @@ fn inspector_script_runtime(
         tokio: tokio.clone(),
         package_provider: None,
         permissions: None,
+        broadcast_channel: None,
     })?;
     Ok((tokio, runtime))
 }
 
 fn eval_bool(rt: &mut ScriptRuntime, source: &str) -> Result<bool> {
+    let _entered = EnteredIsolate::enter(rt);
     let value = rt
         .deno_runtime()
         .execute_script("<test>", FastString::from(source.to_string()))?;
@@ -57,11 +155,20 @@ fn eval_bool(rt: &mut ScriptRuntime, source: &str) -> Result<bool> {
     Ok(serde_v8::from_v8(scope, local)?)
 }
 
+fn eval_bool_in_tokio(
+    tokio: &tokio::runtime::Runtime,
+    rt: &mut ScriptRuntime,
+    source: &str,
+) -> Result<bool> {
+    tokio.block_on(async { eval_bool(rt, source) })
+}
+
 fn eval_async_bool(
     tokio: &tokio::runtime::Runtime,
     rt: &mut ScriptRuntime,
     source: &str,
 ) -> Result<bool> {
+    let _entered = EnteredIsolate::enter(rt);
     tokio.block_on(async {
         let value = rt
             .deno_runtime()
@@ -82,6 +189,7 @@ fn eval_module_bool(
     rt: &mut ScriptRuntime,
     specifier: &ModuleSpecifier,
 ) -> Result<bool> {
+    let _entered = EnteredIsolate::enter(rt);
     tokio.block_on(async {
         let module_id = rt.deno_runtime().load_main_es_module(specifier).await?;
         let receiver = rt.deno_runtime().mod_evaluate(module_id);

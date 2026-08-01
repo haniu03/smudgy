@@ -196,6 +196,7 @@ pub enum Cap {
     Widgets,
     InteropRead,
     InteropWrite,
+    InteropBroadcast,
     Panes,
     GmcpSend,
     Input,
@@ -763,6 +764,7 @@ fn set_cap(caps: &mut SmudgyCapabilities, cap: Cap, on: bool) {
         Cap::Widgets => caps.widgets = on,
         Cap::InteropRead => caps.interop_read = on,
         Cap::InteropWrite => caps.interop_write = on,
+        Cap::InteropBroadcast => caps.interop_broadcast = on,
         Cap::Panes => caps.panes = on,
         Cap::GmcpSend => caps.gmcp_send = on,
         Cap::Input => caps.input = on,
@@ -1519,6 +1521,9 @@ fn granted_cap_labels(caps: SmudgyCapabilities) -> Vec<String> {
     if caps.interop_read {
         out.push(cap_summary("on / get / watch", "manifest-cap-interop-read"));
     }
+    if caps.interop_broadcast {
+        out.push(cap_summary("BroadcastChannel", "manifest-cap-interop-broadcast"));
+    }
     if caps.panes {
         out.push(cap_summary("pane", "manifest-cap-panes"));
     }
@@ -1952,6 +1957,7 @@ fn granted_cap_count(caps: SmudgyCapabilities) -> usize {
         caps.widgets,
         caps.interop_read,
         caps.interop_write,
+        caps.interop_broadcast,
         caps.panes,
         caps.gmcp_send,
     ]
@@ -2337,6 +2343,7 @@ fn manifest_capabilities<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
         cap_group(crate::i18n::ts!("manifest-cap-group-interop"), vec![
             cap_check("emit / set", crate::i18n::ts!("manifest-cap-interop-write"), caps.interop_write, Cap::InteropWrite),
             cap_check("on / get / watch", crate::i18n::ts!("manifest-cap-interop-read"), caps.interop_read, Cap::InteropRead),
+            cap_check("BroadcastChannel", crate::i18n::ts!("manifest-cap-interop-broadcast"), caps.interop_broadcast, Cap::InteropBroadcast),
         ]),
         cap_group(crate::i18n::ts!("manifest-cap-group-panes"), vec![
             cap_check("pane",  crate::i18n::ts!("manifest-cap-panes"), caps.panes, Cap::Panes),

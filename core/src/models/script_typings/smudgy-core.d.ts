@@ -311,6 +311,28 @@ declare module "smudgy:core" {
       options?: BindOptions<StateAt<T, P>>,
     ): Binding<StateAt<T, P>>;
     bind(path: string, options?: BindOptions): Binding<any>;
+    /** Read this state from one specific live session on the same server. */
+    from(session: Session): BoundStateConsumer<T>;
+  }
+
+  /** A terminal state consumer directed at one session. */
+  export interface BoundStateConsumer<T = unknown> {
+    readonly value: Readonly<T> | undefined;
+    readonly previousValue: Readonly<T> | undefined;
+    watch(handler: (snapshot: Readonly<T> | undefined) => void): EventSubscription;
+    watch<P extends StatePath<T> & string>(
+      path: P,
+      handler: (snapshot: Readonly<StateAt<T, P>> | undefined) => void,
+    ): EventSubscription;
+    watch(path: string, handler: (snapshot: unknown) => void): EventSubscription;
+    onWrite(handler: (path: string, snapshot: unknown) => void): EventSubscription;
+    onWrite(path: string, handler: (path: string, snapshot: unknown) => void): EventSubscription;
+    bind(): Binding<T>;
+    bind<P extends StatePath<T> & string>(
+      path: P,
+      options?: BindOptions<StateAt<T, P>>,
+    ): Binding<StateAt<T, P>>;
+    bind(path: string, options?: BindOptions): Binding<any>;
   }
 
   /**
@@ -319,8 +341,10 @@ declare module "smudgy:core" {
    * `smudgy:events/sys` / `smudgy:events/map`) gives you.
    */
   export interface EventConsumer<T = unknown> {
-    /** Runs a handler on every occurrence. Payloads arrive read-only. */
-    on(handler: (payload: Readonly<T>) => void): EventSubscription;
+    /** Runs a handler on every matching occurrence. Package and ordinary
+     * platform events default to the current session; the second argument
+     * identifies the source session. Payloads arrive read-only. */
+    on(handler: (payload: Readonly<T>, source: Session) => void): EventSubscription;
     /**
      * Returns a promise that resolves with the next occurrence:
      * `const first = await prompt.once()`. An `await` on it suspends only
@@ -329,7 +353,18 @@ declare module "smudgy:core" {
      */
     once(): Promise<Readonly<T>>;
     /** Like {@link EventConsumer.on}, but the handler fires at most once. */
-    once(handler: (payload: Readonly<T>) => void): EventSubscription;
+    once(handler: (payload: Readonly<T>, source: Session) => void): EventSubscription;
+    /** Listen only to one session. The returned consumer is terminal. */
+    from(session: Session): BoundEventConsumer<T>;
+    /** Listen to all current and future same-server sessions, without replay. */
+    fromAll(options?: { includeSelf?: boolean }): BoundEventConsumer<T>;
+  }
+
+  /** A terminal event consumer with a fixed source route. */
+  export interface BoundEventConsumer<T = unknown> {
+    on(handler: (payload: Readonly<T>, source: Session) => void): EventSubscription;
+    once(): Promise<Readonly<T>>;
+    once(handler: (payload: Readonly<T>, source: Session) => void): EventSubscription;
   }
 
   /**
@@ -359,9 +394,25 @@ declare module "smudgy:core" {
      * Answers, when a procedure has any, come back as state the producer
      * publishes or an event it emits.
      */
+    /** Posts to the implementation in the current session. */
     post(args: A): void;
+    /** Direct posts to one session. The returned consumer is terminal. */
+    to(session: Session): BoundProcedureConsumer<A, R>;
     /** Type carrier only; no runtime member exists. */
     readonly __smudgyProcedure?: (args: A) => R;
+  }
+
+  export interface BoundProcedureConsumer<A = unknown, R = void> {
+    post(args: A): void;
+    readonly __smudgyProcedure?: (args: A) => R;
+  }
+
+  /** Host-stamped identity passed to a procedure implementation. */
+  export interface ProcedureCaller {
+    /** `user` for main-isolate code, or a sandboxed caller package's `smudgy://owner/name` spec. */
+    readonly origin: string;
+    /** The session in which the caller posted. */
+    readonly session: Session;
   }
 
   /**
@@ -423,18 +474,24 @@ declare module "smudgy:core" {
     ? Readonly<T>
     : H extends StateConsumer<infer T>
       ? Readonly<T>
-      : H extends EventHandle<infer T>
+      : H extends BoundStateConsumer<infer T>
         ? Readonly<T>
-        : H extends EventConsumer<infer T>
+        : H extends EventHandle<infer T>
           ? Readonly<T>
-          : H extends DerivedHandle<infer U>
-            ? Readonly<U>
-            : // Last for the same structural reason as in ConsumerOf.
-              H extends ProcedureHandle<infer A, any>
-              ? A
-              : H extends ProcedureConsumer<infer A, any>
-                ? A
-                : never;
+          : H extends EventConsumer<infer T>
+            ? Readonly<T>
+            : H extends BoundEventConsumer<infer T>
+              ? Readonly<T>
+              : H extends DerivedHandle<infer U>
+                ? Readonly<U>
+                : // Last for the same structural reason as in ConsumerOf.
+                  H extends ProcedureHandle<infer A, any>
+                  ? A
+                  : H extends ProcedureConsumer<infer A, any>
+                    ? A
+                    : H extends BoundProcedureConsumer<infer A, any>
+                      ? A
+                      : never;
 
   /**
    * Creates a shared state object. Like {@link createEvent}, the export
@@ -495,17 +552,17 @@ declare module "smudgy:core" {
    * ```ts
    * import { createProcedure } from "smudgy:core";
    *
-   * export const refresh = createProcedure((args: { full: boolean }, sender) => {
-   *   console.log(`refresh requested by ${sender}`, args.full);
+   * export const refresh = createProcedure((args: { full: boolean }, caller) => {
+   *   console.log(`refresh requested by ${caller.origin}`, caller.session.profile.name, args.full);
    * });
    * ```
    */
   export function createProcedure<A = unknown, R = void>(
-    impl: (args: A, sender: string) => R | Promise<R>,
+    impl: (args: A, caller: ProcedureCaller) => R | Promise<R>,
   ): ProcedureHandle<A, R>;
   export function createProcedure<A = unknown, R = void>(
     name: string,
-    impl: (args: A, sender: string) => R | Promise<R>,
+    impl: (args: A, caller: ProcedureCaller) => R | Promise<R>,
   ): ProcedureHandle<A, R>;
 
   /**
@@ -941,9 +998,9 @@ declare module "smudgy:core" {
     /** Give the pane its own input line (see {@link PaneInputSpec}). Part of
      *  what the pane is, like `terminal`: `split()` naming an existing pane
      *  that has no input while asking for one throws (close it first). Works
-     *  on either pane kind; usable on your own session only. Re-splitting
-     *  with the same spec re-registers `onSubmit`, which is also how a
-     *  handler comes back after your script reloads. */
+     *  on either pane kind, including a same-server session reached through
+     *  `sessions`. Re-splitting with the same spec re-registers `onSubmit`,
+     *  which is also how a handler comes back after your script reloads. */
     input?: PaneInputSpec;
   }
 
@@ -1021,7 +1078,7 @@ declare module "smudgy:core" {
     /** The eyeball's toggle state — never effective visibility: a hidden
      *  pane still renders, veiled, while the toolbar is expanded, and a
      *  window whose every pane is hidden shows them all rather than go
-     *  blank. Reads are live; your own session only. */
+     *  blank. Reads are live, including through foreign session handles. */
     readonly isHidden: boolean;
     /** Set (or with `null` clear) this pane's terminal font override in px
      *  (8–40; out of range throws). Scrollback text only — input lines stay
@@ -1030,7 +1087,7 @@ declare module "smudgy:core" {
      *  `change-display` capability. */
     setFontSize(px: number | null): void;
     /** This pane's font override in px, or `undefined` while following the
-     *  global setting. Your own session only. */
+     *  global setting. */
     readonly fontSize: number | undefined;
     /** Resize this pane in px. Each given dimension adjusts the nearest
      *  divider on that axis, which becomes script-owned until the user drags
@@ -1039,8 +1096,7 @@ declare module "smudgy:core" {
      *  there. Throws on main (resize the sibling script pane instead). */
     resize(size: { width?: number; height?: number }): void;
     /** The pane's last laid-out size in logical px, or `undefined` before
-     *  the first layout report. A hidden pane keeps its last laid-out size.
-     *  Your own session only. */
+     *  the first layout report. A hidden pane keeps its last laid-out size. */
     readonly size: { width: number; height: number } | undefined;
     /** Move this pane next to `reference` (default: the session's main
      *  pane). The direction reads exactly like `split`'s — where this pane
@@ -1061,13 +1117,18 @@ declare module "smudgy:core" {
      *  window (floored by the window minimum); omitted dimensions follow the
      *  pane's current size. Throws on main. */
     tearOut(opts?: { width?: number; height?: number }): void;
+    /** Exchange this pane's position with another pane. Works across
+     *  same-server sessions and windows; destination split geometry stays,
+     *  pane state travels with pane identity, and no window activation or
+     *  input focus is requested. */
+    swap(otherPane: Pane): void;
   }
 
   /**
-   * A session's pane registry: `get`/`list`/`exists` cover your own panes
-   * (plus the main pane), and dot access reaches any name
-   * (`session.panes.chat`). On another session, only `split`, `close`, and a
-   * pane's `echo`/`clear` may be used; lookups work on your own session only.
+   * A session's pane registry: `get`/`list`/`exists` cover panes in the
+   * caller's namespace (plus main), and dot access reaches any name
+   * (`session.panes.chat`). The same lookup surface works on a same-server
+   * foreign session handle.
    */
   export interface PaneRegistryMethods {
     get(name: string): Pane | undefined;
@@ -1270,15 +1331,19 @@ declare module "smudgy:core" {
   /**
    * A MUD session. Every method acts on the session the handle names, which
    * need not be the one your script is running in: {@link session} is your
-   * own, and {@link getSessions} / {@link byName} reach any connected one, so
+   * own, and {@link getSessions} / {@link byId} / {@link byName} reach
+   * sessions using the same configured server entry, so
    * `byName("scout")?.send("look")` drives another character.
    *
-   * On a session other than your own, panes can be split, closed, and written
-   * to, but not listed or looked up.
+   * Same-server foreign handles expose the same pane lookup, placement, and
+   * input surface. Sandboxed packages additionally need `reach-others` for
+   * every non-own target.
    */
   export interface Session {
     /** The session's numeric id. */
     readonly id: number;
+    /** Whether this session currently has a connected transport. */
+    readonly connected: boolean;
     /** The session's profile (name + subtext). */
     readonly profile: Profile;
     /** Echo a line into this session's output (local; not sent to the MUD).
@@ -1295,8 +1360,7 @@ declare module "smudgy:core" {
     readonly mainPane: Pane;
     /** This session's pane registry (see {@link PaneRegistry}). */
     readonly panes: PaneRegistry;
-    /** This session's command input (see {@link InputHandle}). Usable on your
-     *  own session only. */
+    /** This session's command input (see {@link InputHandle}). */
     readonly input: InputHandle;
     toString(): string;
   }
@@ -1308,17 +1372,20 @@ declare module "smudgy:core" {
   /** Your session's numeric id. */
   export const id: number;
   /**
-   * All connected sessions.
+   * All live sessions using this session's configured server entry, ordered
+   * by numeric session id.
    *
    * ```ts
    * import { getSessions, createAlias } from "smudgy:core";
-   * // Typing "*<anything>" sends that command to every connected session.
+   * // Typing "*<anything>" sends that command to every same-server session.
    * createAlias(/^\*(?<command>.*)$/, ({ command }) => {
    *   for (const s of getSessions()) s.send(command);
    * });
    * ```
    */
   export function getSessions(): Session[];
+  /** The live same-server session with numeric `id`, or `undefined`. */
+  export function byId(id: number): Session | undefined;
   /** Your session's profile. */
   export function getProfile(): Profile;
   /** The current app settings as set in the preferences window. Read-only. */
@@ -1327,7 +1394,7 @@ declare module "smudgy:core" {
   export function getDataDir(): string;
   /** Manage the saved automations (see {@link UserAutomations}). */
   export const userAutomations: UserAutomations;
-  /** The first connected session whose profile name is `name`.  Returns `undefined` if no match is found. */
+  /** The first same-server session whose profile name is `name`. Returns `undefined` if no match is found. */
   export function byName(name: string): Session | undefined;
 
   // ---- Session output -----------------------------------------------------
@@ -1972,6 +2039,7 @@ declare module "smudgy:core" {
     capture(value: boolean): void;
     fallthrough(value: boolean): void;
     byName(name: string): Session | undefined;
+    byId(id: number): Session | undefined;
     getSessions(): Session[];
     getProfile(): Profile;
     getSettings(): Settings;
@@ -2019,6 +2087,22 @@ declare module "smudgy:core" {
 //  (`platform_event_catalog`); a drift test in models/script_typings.rs checks
 //  these declarations name exactly the synthesized exports.
 // =============================================================================
+
+declare module "smudgy:events/sessions" {
+  import type { EventConsumer, Session } from "smudgy:core";
+
+  /** These lifecycle handles listen to all same-server sessions by default,
+   * including the current session. They are live and do not replay history. */
+
+  /** A runtime was registered and became targetable. */
+  export const created: EventConsumer<Session>;
+  /** A session's transport successfully connected. */
+  export const connected: EventConsumer<Session>;
+  /** A connected session's transport disconnected. */
+  export const disconnected: EventConsumer<Session>;
+  /** A session began teardown. The payload is a readable tombstone. */
+  export const destroyed: EventConsumer<Session>;
+}
 
 declare module "smudgy:events/sys" {
   import type { EventConsumer } from "smudgy:core";

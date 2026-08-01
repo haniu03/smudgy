@@ -66,6 +66,7 @@ fn runtime_with_packages(
         tokio: tokio.clone(),
         package_provider: Some(Rc::new(provider)),
         permissions: None,
+        broadcast_channel: None,
     })?;
     Ok((tokio, runtime))
 }

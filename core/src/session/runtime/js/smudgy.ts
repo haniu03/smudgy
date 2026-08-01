@@ -31,6 +31,7 @@ import * as __smudgy_ops from "ext:core/ops";
 const {
     op_smudgy_get_current_session,
     op_smudgy_get_session_character,
+    op_smudgy_session_connected,
     op_smudgy_get_sessions,
     op_smudgy_create_simple_alias,
     op_smudgy_create_javascript_function_alias,
@@ -61,7 +62,6 @@ const {
     op_smudgy_redirect,
     op_smudgy_copy,
     op_smudgy_pane_split,
-    op_smudgy_pane_input_on_submit,
     op_smudgy_pane_close,
     op_smudgy_pane_set_hidden,
     op_smudgy_pane_set_font_size,
@@ -69,6 +69,7 @@ const {
     op_smudgy_pane_resize,
     op_smudgy_pane_relocate,
     op_smudgy_pane_tear_out,
+    op_smudgy_pane_swap,
     op_smudgy_pane_size,
     op_smudgy_pane_echo,
     op_smudgy_pane_echo_styled,
@@ -137,10 +138,31 @@ const {
     op_smudgy_store_watch,
     op_smudgy_store_unwatch,
     op_smudgy_store_bind,
+    op_smudgy_store_remote_get,
+    op_smudgy_store_remote_get_tagged,
+    op_smudgy_store_remote_keys,
+    op_smudgy_store_remote_watch,
+    op_smudgy_store_remote_unwatch,
+    op_smudgy_store_remote_bind,
     op_smudgy_procedure_on,
     op_smudgy_procedure_post,
     op_smudgy_interop_declare,
+    op_smudgy_broadcast_allowed,
 } = __smudgy_ops as any;
+
+if (!op_smudgy_broadcast_allowed()) {
+    Object.defineProperty(globalThis, "BroadcastChannel", {
+        configurable: true,
+        writable: true,
+        value: class BroadcastChannel {
+            constructor(_name: string) {
+                throw new TypeError(
+                    "smudgy: this package did not request the 'interop:broadcast' capability",
+                );
+            }
+        },
+    });
+}
 
 // ---- Shared types (mirrored by script_typings/smudgy-core.d.ts) -------------
 
@@ -908,7 +930,7 @@ interface PaneInfoWire {
     kind: "terminal" | "widgets";
     isMain: boolean;
     /** The interned per-session name identity (the per-line routing fast
-     *  path); null on a cross-session optimistic handle. */
+     *  path). Kept nullable for wire compatibility. */
     nameId: number | null;
     created: boolean;
     /** Whether the pane hosts its own input line (`pane.input`). */
@@ -1013,7 +1035,7 @@ class Pane {
     /** The eyeball's toggle state -- never effective visibility (a hidden
      *  pane still renders, veiled, while the toolbar is expanded, and an
      *  all-hidden window ignores the toggles rather than go blank). Live per
-     *  access; own-session only. */
+     *  access; works through same-server foreign handles. */
     get isHidden(): boolean {
         return op_smudgy_pane_def_state(this._sessionId, this._name).hidden;
     }
@@ -1031,7 +1053,7 @@ class Pane {
     }
 
     /** This pane's font override in px, or undefined while following the
-     *  global setting. Live per access; own-session only. */
+     *  global setting. Live per access, including foreign handles. */
     get fontSize(): number | undefined {
         const fontSize = op_smudgy_pane_def_state(this._sessionId, this._name).fontSize;
         return fontSize === null ? undefined : fontSize;
@@ -1052,8 +1074,8 @@ class Pane {
     }
 
     /** The pane's last laid-out size in logical px, or undefined before the
-     *  first layout report reaches the mirror. Live per access; own-session
-     *  only. A hidden pane keeps its last laid-out size. */
+     *  first layout report reaches the mirror. Live per access. A hidden
+     *  pane keeps its last laid-out size. */
     get size(): { width: number; height: number } | undefined {
         const size = op_smudgy_pane_size(this._sessionId, this._name);
         return size === null ? undefined : { width: size[0], height: size[1] };
@@ -1116,6 +1138,22 @@ class Pane {
         }
         op_smudgy_pane_tear_out(this._sessionId, this._name, width, height);
     }
+
+    /** Atomically exchange this pane's layout position with another pane.
+     *  The other pane may belong to another same-server session or window;
+     *  each destination keeps its existing split geometry and the operation
+     *  requests no window activation or input focus. */
+    swap(otherPane: Pane): void {
+        if (!(otherPane instanceof Pane)) {
+            throw new TypeError("swap expects a Pane");
+        }
+        op_smudgy_pane_swap(
+            this._sessionId,
+            this._name,
+            otherPane._sessionId,
+            otherPane._name,
+        );
+    }
 }
 
 function __smudgy_pane_split(
@@ -1144,31 +1182,31 @@ function __smudgy_pane_split(
             );
         }
     }
-    const info = op_smudgy_pane_split(sessionId, refName, direction, {
-        name: spec.name,
-        width: typeof spec.width === "number" ? spec.width : null,
-        height: typeof spec.height === "number" ? spec.height : null,
-        terminal: spec.terminal !== undefined ? Boolean(spec.terminal) : null,
-        titleBar: typeof spec.titleBar === "string" ? spec.titleBar : null,
-        hidden: typeof spec.hidden === "boolean" ? spec.hidden : null,
-        fontSize: typeof spec.fontSize === "number" ? spec.fontSize : null,
-        input:
-            spec.input !== undefined
-                ? {
-                      placeholder:
-                          typeof spec.input.placeholder === "string"
-                              ? spec.input.placeholder
-                              : null,
-                  }
-                : null,
-    });
-    // The handler cannot ride the serde spec; register it against the pane the
-    // split just created (or re-claimed). Re-running this on every split is
-    // what re-arms the handler after a reload -- handler registrations die
-    // with their isolate generation, like widget callbacks.
-    if (spec.input !== undefined) {
-        op_smudgy_pane_input_on_submit(sessionId, spec.name, spec.input.onSubmit);
-    }
+    const info = op_smudgy_pane_split(
+        sessionId,
+        refName,
+        direction,
+        {
+            name: spec.name,
+            width: typeof spec.width === "number" ? spec.width : null,
+            height: typeof spec.height === "number" ? spec.height : null,
+            terminal:
+                spec.terminal !== undefined ? Boolean(spec.terminal) : null,
+            titleBar: typeof spec.titleBar === "string" ? spec.titleBar : null,
+            hidden: typeof spec.hidden === "boolean" ? spec.hidden : null,
+            fontSize: typeof spec.fontSize === "number" ? spec.fontSize : null,
+            input:
+                spec.input !== undefined
+                    ? {
+                          placeholder:
+                              typeof spec.input.placeholder === "string"
+                                  ? spec.input.placeholder
+                                  : null,
+                      }
+                    : null,
+        },
+        spec.input?.onSubmit ?? null,
+    );
     return new Pane(sessionId, info, creatorId);
 }
 
@@ -1593,8 +1631,8 @@ function __smudgy_pane_route_arg(pane: Pane | string): [number, string] {
  *
  * A handle: every member routes to the session the handle names, own or foreign.
  * Cross-session calls are gated by the `reach-others` capability for sandboxed
- * packages, and pane introspection (`panes.get`/`list`/`exists`) is own-session
- * only (see `__smudgy_make_pane_registry`); everything else routes by id.
+ * packages. Data-only pane/input reads resolve synchronously from the owning
+ * runtime; effects route by id through its ordered queues.
  */
 class Session {
     _id: number;
@@ -1606,15 +1644,28 @@ class Session {
      *  after construction. A hand-constructed Session carries none, and its
      *  word-set registries teach on use. */
     #creatorId: number | null;
+    #profile: Profile | undefined;
+    #tombstone: boolean;
 
-    constructor(id: number, creatorId: number | null = null) {
+    constructor(
+        id: number,
+        creatorId: number | null = null,
+        cached?: { profile?: Profile; tombstone?: boolean },
+    ) {
         this._id = id;
         this.#creatorId = creatorId;
+        this.#profile = cached?.profile;
+        this.#tombstone = cached?.tombstone === true;
     }
 
     /** The ID of the session. */
     get id(): number {
         return this._id;
+    }
+
+    /** Whether this session currently has a connected transport. */
+    get connected(): boolean {
+        return !this.#tombstone && op_smudgy_session_connected(this.id);
     }
 
     /** Echo a line of text to this session's terminal (local; not sent to the MUD).
@@ -1647,7 +1698,15 @@ class Session {
 
     /** The profile (name + subtext) associated with this session. */
     get profile(): Profile {
-        return op_smudgy_get_session_character(this.id);
+        // Lifecycle/event/procedure handles arrive with host-stamped identity.
+        // Reading that identity must not turn into a second foreign-session op
+        // (and therefore must not require reach-others from the receiver).
+        if (this.#profile !== undefined) return this.#profile;
+        const live = op_smudgy_get_session_character(this.id);
+        if (live && (live.name !== undefined || live.subtext !== undefined)) {
+            this.#profile = live;
+        }
+        return this.#profile ?? live;
     }
 
     /** This session's main (output + input) pane. */
@@ -1669,14 +1728,12 @@ class Session {
         );
     }
 
-    /** This session's pane registry (`get`/`list`/`exists` + dot access).
-     *  Introspection is own-session only; a foreign session's `get`/`list`/
-     *  `exists` throw (pane mutations still route by name). */
+    /** This session's pane registry (`get`/`list`/`exists` + dot access). */
     get panes(): PaneRegistry {
         return __smudgy_make_pane_registry(this.id, this.#creatorId);
     }
 
-    /** This session's main command input. Own-session only. */
+    /** This session's main command input. */
     get input(): InputHandle {
         return __smudgy_make_input_handle(this.id, "main", this.#creatorId);
     }
@@ -1786,12 +1843,21 @@ class Trigger {
 const getCurrentSession = (creatorId: number | null = null): Session =>
     new Session(op_smudgy_get_current_session(), creatorId);
 
-/** All of the user's connected sessions. The set changes as sessions connect/disconnect,
- *  so this is a function (read live), not a snapshot value. For sandboxed packages the
+/** All live sessions using this session's configured server entry, ordered by numeric
+ *  session id. The set changes as sessions are created and destroyed, so this is a
+ *  function (read live), not a snapshot value. For sandboxed packages the
  *  enumeration itself is the `reach-others` capability (see the Session class doc).
  *  `creatorId` binds the handles like {@link getCurrentSession}'s. */
 const getSessions = (creatorId: number | null = null): Session[] =>
     op_smudgy_get_sessions().map((id: number) => new Session(id, creatorId));
+
+/** Look up a same-server live session by its numeric id. */
+const byId = (id: number, creatorId: number | null = null): Session | undefined => {
+    if (typeof id !== "number" || !Number.isInteger(id) || id < 0) {
+        throw new TypeError("byId expects a non-negative integer session id");
+    }
+    return getSessions(creatorId).find((s) => s.id === id);
+};
 
 /** The current session's profile (name + subtext), read live. */
 const getProfile = (): Profile => getCurrentSession().profile;
@@ -1804,7 +1870,7 @@ const getSettings = (): Settings => op_smudgy_get_settings();
  *  here). Ungated. */
 const getDataDir = (): string => op_smudgy_data_dir();
 
-/** Look a session up by its profile name. Returns the first match, or undefined.
+/** Look up a same-server session by profile name. Returns the first match, or undefined.
  *  `creatorId` binds the handle like {@link getCurrentSession}'s. */
 const byName = (name: string, creatorId: number | null = null): Session | undefined =>
     getSessions(creatorId).find((s) => {
@@ -3037,12 +3103,30 @@ interface StateConsumer<T> {
     onWrite(handler: (path: string, snapshot: unknown) => void): EventSubscription;
     onWrite(path: string, handler: (path: string, snapshot: unknown) => void): EventSubscription;
     bind(path?: string, opts?: { fallback?: unknown; format?: string }): Binding<any>;
+    from(source: Session): BoundStateConsumer<T>;
 }
 
+interface BoundStateConsumer<T> {
+    readonly value: Readonly<T> | undefined;
+    readonly previousValue: Readonly<T> | undefined;
+    watch(handler: (snapshot: Readonly<T> | undefined) => void): EventSubscription;
+    watch(path: string, handler: (snapshot: unknown) => void): EventSubscription;
+    onWrite(handler: (path: string, snapshot: unknown) => void): EventSubscription;
+    onWrite(path: string, handler: (path: string, snapshot: unknown) => void): EventSubscription;
+    bind(path?: string, opts?: { fallback?: unknown; format?: string }): Binding<any>;
+}
 interface EventConsumer<T> {
-    on(handler: (payload: Readonly<T>) => void): EventSubscription;
+    on(handler: (payload: Readonly<T>, source: Session) => void): EventSubscription;
     once(): Promise<Readonly<T>>;
-    once(handler: (payload: Readonly<T>) => void): EventSubscription;
+    once(handler: (payload: Readonly<T>, source: Session) => void): EventSubscription;
+    from(source: Session): BoundEventConsumer<T>;
+    fromAll(options?: { includeSelf?: boolean }): BoundEventConsumer<T>;
+}
+
+interface BoundEventConsumer<T> {
+    on(handler: (payload: Readonly<T>, source: Session) => void): EventSubscription;
+    once(): Promise<Readonly<T>>;
+    once(handler: (payload: Readonly<T>, source: Session) => void): EventSubscription;
 }
 
 /** The consumer's view of a procedure: post (fire-and-forget), never implement. The
@@ -3050,7 +3134,18 @@ interface EventConsumer<T> {
  *  return type ready for it. */
 interface ProcedureConsumer<A, R = void> {
     post(args: A): void;
+    to(target: Session): BoundProcedureConsumer<A, R>;
     readonly __smudgyProcedure?: (args: A) => R;
+}
+
+interface BoundProcedureConsumer<A, R = void> {
+    post(args: A): void;
+    readonly __smudgyProcedure?: (args: A) => R;
+}
+
+interface ProcedureCaller {
+    readonly origin: string;
+    readonly session: Session;
 }
 
 /** What createDerived() returns (interop.md 4b): a bindable, watch-stoppable published computation. */
@@ -3189,6 +3284,24 @@ function __smudgy_previous_root_ref(baseId: () => number, denied?: () => never):
         keys: (path: string) => store.previousKeysAt(prevId(), path),
         snapshot: (path: string) => store.previousGetAt(prevId(), path),
         denied,
+    };
+}
+
+/** A read-only root over another live session's latest committed publication. */
+function __smudgy_remote_root_ref(source: number, baseId: () => number, previous: boolean): StoreRootRef {
+    return {
+        read: (path: string) => {
+            const tagged = op_smudgy_store_remote_get_tagged(source, baseId(), path, previous);
+            return tagged === null || tagged === undefined ? undefined : tagged;
+        },
+        keys: (path: string) => {
+            const keys = op_smudgy_store_remote_keys(source, baseId(), path, previous);
+            return keys === null || keys === undefined ? undefined : JSON.parse(keys);
+        },
+        snapshot: (path: string) => {
+            const snapshot = op_smudgy_store_remote_get(source, baseId(), path, previous);
+            return snapshot === null || snapshot === undefined ? undefined : JSON.parse(snapshot);
+        },
     };
 }
 
@@ -3365,7 +3478,7 @@ function __smudgy_canonical_event(spec: string, name: string): string {
     // Platform producers key their events `producer:name` -- the form the host's
     // `host_emit` registers and emits ("sys:receive", "gmcp:ready", "input:change");
     // package events use the meatball form.
-    return spec === "sys" || spec === "map" || spec === "gmcp" || spec === "msdp" || spec === "input"
+    return spec === "sys" || spec === "map" || spec === "gmcp" || spec === "msdp" || spec === "input" || spec === "pane" || spec === "sessions"
         ? `${spec}:${name}`
         : `${spec}#${name}`;
 }
@@ -3500,15 +3613,24 @@ function __smudgy_make_event_producer<T>(creatorId: number, name: string): Event
 function __smudgy_register_procedure_impl(
     creatorId: number,
     name: string,
-    impl: (args: any, sender: string) => unknown,
+    impl: (args: any, caller: ProcedureCaller) => unknown,
 ): void {
     op_smudgy_procedure_on(
         creatorId,
         name,
-        (m: { payload: string; sender: string }) => {
+        (m: { payload: string; origin: string; session: string }) => {
             let args: any = null;
             try { args = JSON.parse(m.payload); } catch { args = null; }
-            const result = impl(args, m.sender);
+            let meta: any = {};
+            try { meta = JSON.parse(m.session); } catch { meta = {}; }
+            const caller = Object.freeze({
+                origin: m.origin,
+                session: new Session(Number(meta.id), null, {
+                    profile: meta.profile,
+                    tombstone: meta.tombstone === true,
+                }),
+            });
+            const result = impl(args, caller);
             if (result !== null && typeof result === "object" && typeof (result as any).then === "function") {
                 (result as Promise<unknown>).then(undefined, (e: unknown) => {
                     console.error(`smudgy: procedure ${JSON.stringify(name)} implementation rejected:`, e);
@@ -3518,17 +3640,29 @@ function __smudgy_register_procedure_impl(
     );
 }
 
-function __smudgy_make_procedure_consumer<A>(spec: string, name: string): ProcedureConsumer<A> {
+function __smudgy_make_procedure_consumer<A>(
+    spec: string,
+    name: string,
+    target?: Session,
+): ProcedureConsumer<A> | BoundProcedureConsumer<A> {
     // The target root resolves lazily (memoized) at the first post, so an unaddressable
     // spec fails at the post -- where it always failed -- not at scheme import time.
-    return Object.freeze({
+    const consumer: any = {
         post: (args: A): void =>
             op_smudgy_procedure_post(
                 __smudgy_consumer_root_id(spec, ""),
                 name,
                 JSON.stringify(args ?? null),
+                target?.id ?? op_smudgy_get_current_session(),
             ),
-    });
+    };
+    if (target === undefined) {
+        consumer.to = (session: Session): BoundProcedureConsumer<A> => {
+            if (!(session instanceof Session)) throw new TypeError("to() expects a Session");
+            return __smudgy_make_procedure_consumer<A>(spec, name, session) as BoundProcedureConsumer<A>;
+        };
+    }
+    return Object.freeze(consumer) as ProcedureConsumer<A> | BoundProcedureConsumer<A>;
 }
 
 /** Handle constructors receive their name from the declaration: a top-level
@@ -3607,10 +3741,93 @@ function __smudgy_make_state_consumer<T>(spec: string, name: string): StateConsu
         },
         bind: (path?: string, opts?: { fallback?: unknown; format?: string }) =>
             __smudgy_make_binding(spec, root, path, opts),
+        from(source: Session): BoundStateConsumer<T> {
+            if (!(source instanceof Session)) throw new TypeError("from() expects a Session");
+            return __smudgy_make_bound_state_consumer<T>(spec, name, source);
+        },
     }) as unknown as StateConsumer<T>;
 }
 
-function __smudgy_make_event_consumer<T>(canonical: string, name: string): EventConsumer<T> {
+function __smudgy_make_bound_state_consumer<T>(
+    spec: string,
+    name: string,
+    source: Session,
+): BoundStateConsumer<T> {
+    const root = __smudgy_name_as_path(name);
+    const rootId = () => __smudgy_consumer_root_id(spec, root);
+    const head = __smudgy_remote_root_ref(source.id, rootId, false);
+    const previous = __smudgy_remote_root_ref(source.id, rootId, true);
+    const scoped = (verb: string, pathOrHandler: unknown, maybeHandler: unknown) => {
+        if (typeof pathOrHandler === "string") {
+            __smudgy_require_callback(verb, "state", name, maybeHandler);
+            return { target: __smudgy_join_path(root, pathOrHandler), handler: maybeHandler as Function };
+        }
+        __smudgy_require_callback(verb, "state", name, pathOrHandler);
+        return { target: root, handler: pathOrHandler as Function };
+    };
+    return Object.freeze({
+        get value(): Readonly<T> | undefined {
+            return __smudgy_read_hop(head, "") as Readonly<T> | undefined;
+        },
+        get previousValue(): Readonly<T> | undefined {
+            return __smudgy_read_hop(previous, "") as Readonly<T> | undefined;
+        },
+        watch(pathOrHandler: unknown, maybeHandler?: unknown): EventSubscription {
+            const { target, handler } = scoped("watch", pathOrHandler, maybeHandler);
+            const token = op_smudgy_store_remote_watch(
+                source.id,
+                spec,
+                target,
+                (m: { snapshot: string; present?: string }) => {
+                    let snapshot: unknown = undefined;
+                    if (m.present !== "false") {
+                        try { snapshot = JSON.parse(m.snapshot); } catch { snapshot = undefined; }
+                    }
+                    handler(__smudgy_freeze_snapshot(snapshot));
+                },
+                false,
+            );
+            return { off: () => op_smudgy_store_remote_unwatch(token) };
+        },
+        onWrite(pathOrHandler: unknown, maybeHandler?: unknown): EventSubscription {
+            const { target, handler } = scoped("onWrite", pathOrHandler, maybeHandler);
+            const token = op_smudgy_store_remote_watch(
+                source.id,
+                spec,
+                target,
+                (m: { path: string; snapshot: string }) => {
+                    let snapshot: unknown = null;
+                    try { snapshot = JSON.parse(m.snapshot); } catch { snapshot = null; }
+                    handler(__smudgy_relative_path(root, m.path), __smudgy_freeze_snapshot(snapshot));
+                },
+                true,
+            );
+            return { off: () => op_smudgy_store_remote_unwatch(token) };
+        },
+        bind(path?: string, opts?: { fallback?: unknown; format?: string }): Binding<any> {
+            const target = path === undefined || path === null || path === ""
+                ? root
+                : __smudgy_join_path(root, String(path));
+            const token: { __smudgyStoreBinding: number; fallback?: string; format?: string } = {
+                __smudgyStoreBinding: op_smudgy_store_remote_bind(source.id, spec, target),
+            };
+            if (opts && opts.fallback !== undefined) token.fallback = JSON.stringify(opts.fallback);
+            if (opts && typeof opts.format === "string") token.format = opts.format;
+            return Object.freeze(token);
+        },
+    }) as BoundStateConsumer<T>;
+}
+function __smudgy_make_event_consumer<T>(canonical: string, name: string): EventConsumer<T>;
+function __smudgy_make_event_consumer<T>(
+    canonical: string,
+    name: string,
+    route: { source: number; includeSelf: boolean; terminal: true },
+): BoundEventConsumer<T>;
+function __smudgy_make_event_consumer<T>(
+    canonical: string,
+    name: string,
+    route?: { source: number; includeSelf: boolean; terminal: boolean },
+): EventConsumer<T> | BoundEventConsumer<T> {
     // Payloads are delivered deep-frozen (occurrences are facts, not shared mutables) so
     // the Readonly consumer types tell the truth at runtime too (interop.md 4/11).
     const parse_frozen = (raw: string): any => {
@@ -3620,28 +3837,61 @@ function __smudgy_make_event_consumer<T>(canonical: string, name: string): Event
     };
     // A `sys:input` delivery binds the ambient `submission` to the handler call
     // it was made for; every other event invokes the handler plainly.
-    const invoke: (handler: (payload: Readonly<T>) => void, payload: Readonly<T>) => void =
+    const invoke = (
+        handler: (payload: Readonly<T>, source: Session) => void,
+        payload: Readonly<T>,
+        source: Session,
+    ): void =>
         canonical === "sys:input"
-            ? __smudgy_deliver_submission_event
-            : (handler, payload) => handler(payload);
-    const subscribe_once = (handler: (payload: Readonly<T>) => void): EventSubscription => {
+            ? __smudgy_deliver_submission_event(() => handler(payload, source), payload)
+            : handler(payload, source);
+    const defaultSource = canonical.startsWith("sessions:") ? -2 : -1;
+    const sourceFilter = route?.source ?? defaultSource;
+    const includeSelf = route?.includeSelf ?? true;
+    const sourceKind = sourceFilter === -1 ? 0 : sourceFilter === -2 ? 2 : 1;
+    const sourceId = sourceKind === 1 ? sourceFilter : 0;
+    const source_session = (raw: string): Session => {
+        let meta: any = {};
+        try { meta = JSON.parse(raw); } catch { meta = {}; }
+        return new Session(Number(meta.id), null, {
+            profile: meta.profile,
+            tombstone: meta.tombstone === true,
+        });
+    };
+    const subscribe_once = (
+        handler: (payload: Readonly<T>, source: Session) => void,
+    ): EventSubscription => {
         let fired = false;
         let id = -1;
         const off = () => op_smudgy_off(canonical, id);
-        id = op_smudgy_on(canonical, (m: { event: string; payload: string }) => {
+        id = op_smudgy_on(canonical, (m: { event: string; payload: string; source: string }) => {
             if (fired) return;
             fired = true;
             off();
-            invoke(handler, parse_frozen(m.payload));
-        });
+            const source = source_session(canonical.startsWith("sessions:") ? m.payload : m.source);
+            const payload = canonical.startsWith("sessions:")
+                ? source as unknown as Readonly<T>
+                : parse_frozen(m.payload);
+            invoke(handler, payload, source);
+        }, sourceKind, sourceId, includeSelf);
         return { off };
     };
-    return Object.freeze({
-        on(handler: (payload: Readonly<T>) => void): EventSubscription {
+    const consumer: any = {
+        on(handler: (payload: Readonly<T>, source: Session) => void): EventSubscription {
             __smudgy_require_callback("on", "event", name, handler);
-            const id = op_smudgy_on(canonical, (m: { event: string; payload: string }) => {
-                invoke(handler, parse_frozen(m.payload));
-            });
+            const id = op_smudgy_on(
+                canonical,
+                (m: { event: string; payload: string; source: string }) => {
+                    const source = source_session(canonical.startsWith("sessions:") ? m.payload : m.source);
+                    const payload = canonical.startsWith("sessions:")
+                        ? source as unknown as Readonly<T>
+                        : parse_frozen(m.payload);
+                    invoke(handler, payload, source);
+                },
+                sourceKind,
+                sourceId,
+                includeSelf,
+            );
             return { off: () => op_smudgy_off(canonical, id) };
         },
         // Argless once() resolves on the next occurrence -- for flows and startup
@@ -3650,16 +3900,33 @@ function __smudgy_make_event_consumer<T>(canonical: string, name: string): Event
         // undefined check: `once(maybeMissingCallback)` where the variable is undefined is
         // the mistake the callback guard exists to catch, and must stay an immediate error
         // rather than silently becoming an ignored promise.
-        once(handler?: (payload: Readonly<T>) => void): EventSubscription | Promise<Readonly<T>> {
+        once(handler?: (payload: Readonly<T>, source: Session) => void): EventSubscription | Promise<Readonly<T>> {
             if (arguments.length === 0) {
                 return new Promise<Readonly<T>>((resolve) => {
                     subscribe_once(resolve);
                 });
             }
             __smudgy_require_callback("once", "event", name, handler);
-            return subscribe_once(handler as (payload: Readonly<T>) => void);
+            return subscribe_once(handler as (payload: Readonly<T>, source: Session) => void);
         },
-    }) as unknown as EventConsumer<T>;
+    };
+    if (!route?.terminal) {
+        consumer.from = (source: Session): BoundEventConsumer<T> => {
+            if (!(source instanceof Session)) throw new TypeError("from() expects a Session");
+            return __smudgy_make_event_consumer<T>(canonical, name, {
+                source: source.id,
+                includeSelf: true,
+                terminal: true,
+            }) as BoundEventConsumer<T>;
+        };
+        consumer.fromAll = (options?: { includeSelf?: boolean }): BoundEventConsumer<T> =>
+            __smudgy_make_event_consumer<T>(canonical, name, {
+                source: -2,
+                includeSelf: options?.includeSelf !== false,
+                terminal: true,
+            }) as BoundEventConsumer<T>;
+    }
+    return Object.freeze(consumer) as EventConsumer<T> | BoundEventConsumer<T>;
 }
 
 /**
@@ -3747,6 +4014,7 @@ function __smudgy_make_api(creator: { kind: string }) {
         // module-level functions themselves: exposing the creator-id parameter would
         // let a caller name another creator's contribution set.
         byName: (name: string): Session | undefined => byName(String(name), creatorId),
+        byId: (id: number): Session | undefined => byId(id, creatorId),
         getSessions: (): Session[] => getSessions(creatorId),
         getProfile,
         getSettings,
@@ -3788,8 +4056,8 @@ function __smudgy_make_api(creator: { kind: string }) {
         // -- and the handle carries no verbs. Consumers import from smudgy:procedures/...
         // and `.post()` (fire-and-forget today; `.call` is the deferred correlated ask).
         createProcedure: <A = unknown, R = void>(
-            nameOrImpl?: string | ((args: A, sender: string) => R | Promise<R>),
-            maybeImpl?: (args: A, sender: string) => R | Promise<R>,
+            nameOrImpl?: string | ((args: A, caller: ProcedureCaller) => R | Promise<R>),
+            maybeImpl?: (args: A, caller: ProcedureCaller) => R | Promise<R>,
         ): ProcedureHandle<A, R> => {
             // Two author-facing shapes, like createDerived: `createProcedure(impl)` (the
             // name arrives by transpile-time injection) and the explicit
@@ -3798,7 +4066,7 @@ function __smudgy_make_api(creator: { kind: string }) {
             const impl = maybeImpl;
             if (typeof impl !== "function") {
                 throw new TypeError(
-                    "createProcedure() expects the implementation function: createProcedure((args, sender) => { ... })",
+                    "createProcedure() expects the implementation function: createProcedure((args, caller) => { ... })",
                 );
             }
             const spec = __smudgy_producer_spec(creator as any);
@@ -4087,9 +4355,12 @@ Object.defineProperty(globalThis, "__smudgy_interop_consumer", {
             state: (name: string): StateConsumer<unknown> =>
                 __smudgy_make_state_consumer(folded, String(name)),
             event: (name: string): EventConsumer<unknown> =>
-                __smudgy_make_event_consumer(__smudgy_canonical_event(folded, String(name)), String(name)),
+                __smudgy_make_event_consumer(
+                    __smudgy_canonical_event(folded, String(name)),
+                    String(name),
+                ) as EventConsumer<unknown>,
             procedure: (name: string): ProcedureConsumer<unknown> =>
-                __smudgy_make_procedure_consumer(folded, String(name)),
+                __smudgy_make_procedure_consumer(folded, String(name)) as ProcedureConsumer<unknown>,
         });
     },
 });

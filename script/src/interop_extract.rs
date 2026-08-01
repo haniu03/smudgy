@@ -903,7 +903,7 @@ export const vitals = createState<{ hp: number }>();
 export const prompt = createEvent(  );
 const roster = createState({ persist: true });
 export const hpPct = createDerived(vitals, (v) => v.hp);
-const refresh = createProcedure((args, sender) => {});
+const refresh = createProcedure((args, caller) => {});
 const explicit = createState<{ x: number }>('pinned');
 "#;
         let out = inject_inferred_handle_names(&spec, source).expect("injects");
@@ -912,7 +912,7 @@ const explicit = createState<{ x: number }>('pinned');
         assert!(out.contains(r#"createState("roster", { persist: true })"#), "{out}");
         assert!(out.contains(r#"createDerived("hpPct", vitals, (v) => v.hp)"#), "{out}");
         assert!(
-            out.contains(r#"createProcedure("refresh", (args, sender) => {})"#),
+            out.contains(r#"createProcedure("refresh", (args, caller) => {})"#),
             "{out}"
         );
         assert!(out.contains("createState<{ x: number }>('pinned')"), "explicit name untouched: {out}");
@@ -1089,7 +1089,7 @@ export const vitals = makeState();
             r#"
             import { createState, createProcedure } from "smudgy:core";
             export interface RefreshRequest { full: boolean }
-            const refresh = createProcedure<RefreshRequest>('refreshRequest', (args, sender) => {});
+            const refresh = createProcedure<RefreshRequest>('refreshRequest', (args, caller) => {});
             export type Refresh = typeof refresh;
             const inline = createState<{ hp: number }>('inline');
             const imported = createState<SomewhereElse>('imported');

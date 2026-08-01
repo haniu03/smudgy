@@ -741,7 +741,7 @@ async fn consumer_previous_anchor_ignores_the_producers_open_journal() {
 /// procedure through `smudgy:procedures/…`. The post happens at main's load — before the
 /// producer's isolate has evaluated — so it exercises the queue-briefly buffer: the
 /// producer's implementation registration (at construction) drains it, with the
-/// host-stamped `user` sender.
+/// host-stamped `user` origin and calling session.
 #[tokio::test]
 async fn per_write_watch_and_procedures_cross_isolates() {
     let server = "ss_phase4";
@@ -758,8 +758,8 @@ async fn per_write_watch_and_procedures_cross_isolates() {
     let tracker_src = r#"
         import { createState, createProcedure, echo } from "smudgy:core";
         const vitals = createState("vitals");
-        export const refresh = createProcedure((payload, sender) => {
-            echo("PKG_GOT:" + payload.n + ":" + sender);
+        export const refresh = createProcedure((payload, caller) => {
+            echo("PKG_GOT:" + payload.n + ":" + caller.origin + ":" + caller.session.profile.name);
             // Answer by publishing state: two value-identical writes in one turn, which the
             // consumer's per-write watch must see as two occurrences.
             vitals.set("hp", 1);
@@ -798,8 +798,8 @@ async fn per_write_watch_and_procedures_cross_isolates() {
 
     assert!(has_line(&lines, "PRODUCER_READY"), "transcript:\n{lines:#?}");
     assert!(
-        has_line(&lines, "PKG_GOT:7:user"),
-        "the early post must drain to the producer at registration with the host-stamped sender; transcript:\n{lines:#?}"
+        has_line(&lines, "PKG_GOT:7:user:test"),
+        "the early post must drain to the producer at registration with the host-stamped origin and session; transcript:\n{lines:#?}"
     );
     assert!(
         has_line(&lines, "SEAT:has-post/clean"),
@@ -812,6 +812,180 @@ async fn per_write_watch_and_procedures_cross_isolates() {
     assert!(
         !has_line(&lines, "OW3:"),
         "exactly two per-write deliveries; transcript:\n{lines:#?}"
+    );
+}
+
+/// Two real session threads on one server: main directs a package-state view and a
+/// procedure post at the other session. The target implementation sees a host-stamped
+/// caller, and its write returns through both remote watch cadences with previousValue intact.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn state_and_procedure_handles_direct_to_another_same_server_session() {
+    let server = "ss_directed_sessions";
+    prepare_server(server);
+    shared_packages::install_package(server, "smudgy://wbk/tracker", UpdateMode::Auto, true)
+        .unwrap();
+    shared_packages::record_consent(
+        server,
+        "smudgy://wbk/tracker",
+        &consent_with(|s| s.interop_write = true),
+    )
+    .unwrap();
+
+    let tracker_src = r#"
+        import { createProcedure, createState, session } from "smudgy:core";
+
+        export const vitals = createState("vitals");
+        vitals.set({ hp: session.profile.name === "Beta" ? 2 : 1 });
+
+        export const refresh = createProcedure((payload, caller) => {
+            session.echo(`REMOTE_PROC:${caller.session.profile.name}:${caller.origin}:${payload.n}`);
+            vitals.set("hp", 3);
+        });
+    "#;
+
+    write_main_module(
+        server,
+        "directed.ts",
+        r#"
+        import {
+            byName,
+            createAlias,
+            createProcedure,
+            createState,
+            echo,
+            session,
+        } from "smudgy:core";
+        import { vitals } from "smudgy:state/wbk/tracker";
+        import { refresh } from "smudgy:procedures/wbk/tracker";
+
+        const userConsumer = (globalThis as any).__smudgy_interop_consumer("user");
+        const orderedState = createState<{ answer: number }>("orderedProcedureState");
+        const orderedConsumer = userConsumer.state("orderedProcedureState");
+        const observeOrderedState = createProcedure((_payload, caller) => {
+            const source = orderedConsumer.from(caller.session);
+            echo("REMOTE_ORDERED:" + source.value?.answer);
+        });
+        const orderedPoster = userConsumer.procedure("observeOrderedState");
+
+        if (session.profile.name === "Alpha") {
+            createAlias("^remote-call$", () => {
+                const beta = byName("Beta");
+                if (!beta) {
+                    echo("REMOTE_MISSING");
+                    return;
+                }
+                const remote = vitals.from(beta);
+                echo("REMOTE_VALUE:" + remote.value?.hp);
+                remote.watch((snapshot) => {
+                    echo("REMOTE_WATCH:" + snapshot?.hp);
+                    echo("REMOTE_PREVIOUS:" + remote.previousValue?.hp);
+                });
+                remote.onWrite((path, snapshot) => {
+                    echo("REMOTE_WRITE:" + path + "=" + snapshot);
+                });
+                const directed = refresh.to(beta);
+                echo("REMOTE_TERMINAL:" + (!("from" in remote) && !("to" in directed)));
+                directed.post({ n: 7 });
+                orderedState.set({ answer: 42 });
+                orderedPoster.to(beta).post({});
+            });
+        }
+        "#,
+    );
+
+    let factory = factory_for(vec![make_package("wbk", "tracker", "1.0.0", tracker_src)]);
+    let params = |id, name: &str| {
+        Arc::new(SessionParams {
+            session_id: SessionId::from(id),
+            server_name: Arc::new(server.to_string()),
+            profile_name: Arc::new(name.to_string()),
+            profile_subtext: Arc::new(String::new()),
+            mapper: None,
+            package_client: None,
+            extra_script_extensions: Arc::new(Vec::new),
+            on_engine_rebuild: None,
+        })
+    };
+
+    let mut alpha_events = Box::pin(spawn_with_package_provider(params(9710, "Alpha"), factory.clone()));
+    let alpha_tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), alpha_events.next())
+            .await
+            .expect("timed out waiting for Alpha RuntimeReady")
+            .expect("Alpha event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
+    let mut beta_events = Box::pin(spawn_with_package_provider(params(9711, "Beta"), factory));
+    let beta_tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), beta_events.next())
+            .await
+            .expect("timed out waiting for Beta RuntimeReady")
+            .expect("Beta event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
+
+    alpha_tx
+        .send(RuntimeAction::Send(Arc::new("remote-call".to_string())))
+        .unwrap();
+    let mut alpha_lines = Vec::new();
+    let mut beta_lines = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline
+        && !(has_line(&alpha_lines, "REMOTE_VALUE:2")
+            && has_line(&alpha_lines, "REMOTE_WATCH:3")
+            && has_line(&alpha_lines, "REMOTE_PREVIOUS:2")
+            && has_line(&alpha_lines, "REMOTE_WRITE:hp=3")
+            && has_line(&alpha_lines, "REMOTE_TERMINAL:true")
+            && has_line(&beta_lines, "REMOTE_PROC:Alpha:user:7")
+            && has_line(&beta_lines, "REMOTE_ORDERED:42"))
+    {
+        tokio::select! {
+            event = alpha_events.next() => {
+                if let Some(event) = event
+                    && let SessionEvent::UpdateBuffer(updates) = event.event
+                {
+                    collect(&updates, &mut alpha_lines);
+                }
+            }
+            event = beta_events.next() => {
+                if let Some(event) = event
+                    && let SessionEvent::UpdateBuffer(updates) = event.event
+                {
+                    collect(&updates, &mut beta_lines);
+                }
+            }
+            () = tokio::time::sleep(QUIET_PERIOD) => {}
+        }
+    }
+    alpha_tx.send(RuntimeAction::Shutdown).ok();
+    beta_tx.send(RuntimeAction::Shutdown).ok();
+
+    let transcript = format!(
+        "Alpha:\n{}\nBeta:\n{}",
+        alpha_lines.join("\n"),
+        beta_lines.join("\n")
+    );
+    for expected in [
+        "REMOTE_VALUE:2",
+        "REMOTE_WATCH:3",
+        "REMOTE_PREVIOUS:2",
+        "REMOTE_WRITE:hp=3",
+        "REMOTE_TERMINAL:true",
+    ] {
+        assert!(has_line(&alpha_lines, expected), "missing {expected}; {transcript}");
+    }
+    assert!(
+        has_line(&beta_lines, "REMOTE_PROC:Alpha:user:7"),
+        "remote procedure did not receive its host-stamped caller; {transcript}"
+    );
+    assert!(
+        has_line(&beta_lines, "REMOTE_ORDERED:42"),
+        "remote procedure overtook the caller's state publication; {transcript}"
     );
 }
 
@@ -870,7 +1044,7 @@ async fn importable_false_blocks_code_import_but_not_interop_consumption() {
         "#,
     );
 
-    let lines = run_session(9706, server, factory_for(vec![lib, app])).await;
+    let lines = run_session(9708, server, factory_for(vec![lib, app])).await;
 
     assert!(has_line(&lines, "LIB_RAN") && has_line(&lines, "APP_RAN"), "both must load; transcript:\n{lines:#?}");
     assert!(

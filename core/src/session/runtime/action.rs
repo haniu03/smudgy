@@ -20,15 +20,63 @@ use crate::session::{HotkeyId, SessionId};
 use super::input::{InputOp, InputSnapshot, InputSource};
 use super::line_operation::LineOperation;
 use super::origin::{IsolateId, Origin};
-use super::pane::{
-    DefStateSpec, PaneDef, PaneKey, PaneKind, PaneNamespace, PanePlacement, SplitDirection,
-};
+use super::pane::{PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection};
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
+use super::store::{PublishedStore, PublishedWrite};
 use super::trigger::MatchCapture;
 
 #[derive(Clone, Debug)]
 pub enum RuntimeAction {
+    /// A same-server source committed one state turn. The receiving engine
+    /// resolves only its own directed watchers and binding cells.
+    RemoteStoreFlushed {
+        source: SessionId,
+        published: Arc<PublishedStore>,
+        writes: Arc<Vec<PublishedWrite>>,
+    },
+    /// A script event waiting on its source runtime's queue. The source
+    /// dispatches this only after the current turn's store journal has been
+    /// flushed, then fans out [`Self::InteropEvent`] to same-server runtimes.
+    FanOutInteropEvent {
+        canonical: Arc<str>,
+        stamped: Arc<str>,
+        payload: Arc<str>,
+        source: crate::session::registry::SessionSnapshot,
+        depth: u32,
+    },
+    /// A same-server event. The receiver resolves its own engine-local
+    /// subscriptions, so no foreign V8 handle or `FunctionId` crosses threads.
+    InteropEvent {
+        canonical: Arc<str>,
+        stamped: Arc<str>,
+        payload: Arc<str>,
+        source: crate::session::registry::SessionSnapshot,
+        depth: u32,
+    },
+    /// A directed procedure post. The target resolves its own receiver.
+    ProcedurePost {
+        canonical: Arc<str>,
+        producer: Arc<str>,
+        name: Arc<str>,
+        payload: Arc<str>,
+        caller_origin: Arc<str>,
+        caller_session: crate::session::registry::SessionSnapshot,
+        depth: u32,
+    },
+    /// A directed procedure post waiting on the caller runtime's queue. Like
+    /// script-event fan-out, forwarding happens after the caller's store
+    /// journal is flushed so the target observes preceding state writes.
+    ForwardProcedurePost {
+        target: SessionId,
+        canonical: Arc<str>,
+        producer: Arc<str>,
+        name: Arc<str>,
+        payload: Arc<str>,
+        caller_origin: Arc<str>,
+        caller_session: crate::session::registry::SessionSnapshot,
+        depth: u32,
+    },
     Connect {
         host: Arc<String>,
         port: u16,
@@ -275,6 +323,10 @@ pub enum RuntimeAction {
     PaneOpened {
         def: PaneDef,
         placement: PanePlacement,
+        /// Foreign splits mutate the owner's shared registry from another
+        /// runtime. Reconcile those opens when the owner drains its queue;
+        /// own-runtime opens must preserve their historical open/close order.
+        reconcile_registry: bool,
     },
     /// Emit `SessionEvent::PaneClosed` for a pane the close op already
     /// retired from the registry. The dispatch handler flushes buffered
@@ -298,29 +350,16 @@ pub enum RuntimeAction {
     /// so load-time deliveries to a doomed pane still land before its
     /// `PaneClosed` (the dispatch arm also flushes buffered updates first).
     PaneReloadSweep,
-    /// Cross-session pane create (`reach-others`): carries names, not keys —
-    /// the target registry lives on another session's thread — and resolves
-    /// at dispatch on the owning runtime (last-writer-wins in queue order).
-    PaneSplitRemote {
-        namespace: PaneNamespace,
-        name: Arc<str>,
-        kind: PaneKind,
-        def_state: DefStateSpec,
-        reference: Option<Arc<str>>,
-        direction: SplitDirection,
-        size_px: Option<f32>,
-    },
-    /// Cross-session pane close, by name (see [`RuntimeAction::PaneSplitRemote`]).
-    /// A name that is not live is a silent no-op (idempotent, best-effort).
+    /// Cross-session pane close, by name. A name that is not live is a
+    /// silent no-op (idempotent, best-effort).
     PaneCloseRemote {
         namespace: PaneNamespace,
         name: Arc<str>,
     },
-    /// Cross-session `hide()`/`show()`, by name (see
-    /// [`RuntimeAction::PaneSplitRemote`] for the resolution rules). Own-session
-    /// calls never ride an action for the mutation itself — the op writes the
-    /// registry synchronously and queues [`RuntimeAction::PaneUpdated`] to
-    /// mirror it.
+    /// Cross-session `hide()`/`show()`, resolved by name on the target.
+    /// Own-session calls never ride an action for the mutation itself — the
+    /// op writes the registry synchronously and queues
+    /// [`RuntimeAction::PaneUpdated`] to mirror it.
     PaneSetHiddenRemote {
         namespace: PaneNamespace,
         name: Arc<str>,
@@ -342,16 +381,16 @@ pub enum RuntimeAction {
         hidden: bool,
     },
     /// Forward `pane.resize` to the UI as `SessionEvent::PaneResize`
-    /// (panes.md placement commands). Own-session only; the op resolved
-    /// `key` synchronously against the live registry. Placement carries no
-    /// core state — the daemon applies it to the cluster model.
+    /// (panes.md placement commands). The op resolved `key` synchronously
+    /// against the owning runtime's live registry. Placement carries no core
+    /// state — the daemon applies it to the cluster model.
     PaneResize {
         key: PaneKey,
         width: Option<f32>,
         height: Option<f32>,
     },
     /// Forward `pane.relocate` to the UI as `SessionEvent::PaneRelocate`.
-    /// Both keys were resolved synchronously by the op (same session).
+    /// Both keys were resolved synchronously by the op on the target session.
     PaneRelocate {
         key: PaneKey,
         reference: PaneKey,
@@ -363,6 +402,13 @@ pub enum RuntimeAction {
         key: PaneKey,
         width: Option<f32>,
         height: Option<f32>,
+    },
+    /// Atomically exchange two pane leaves in the UI's global window layout.
+    /// The second pane may belong to another same-server session.
+    PaneSwap {
+        key: PaneKey,
+        other_session: SessionId,
+        other_key: PaneKey,
     },
     /// Echo `text` into the named pane as whole lines (split on `\n`).
     /// Name-carrying so it is routable cross-session; resolved at dispatch.
@@ -423,6 +469,16 @@ pub enum RuntimeAction {
     /// warn-and-drop, like [`Self::InvokeLinkCallback`].
     PaneInputSubmit {
         key: PaneKey,
+        text: Arc<String>,
+        /// One queue-briefly retry covers the cross-session split race where
+        /// the owning UI can submit between PaneOpened and callback seating.
+        retry: bool,
+    },
+    /// Cross-session half of a pane-input submission. The pane-owning runtime
+    /// resolves the data-only callback address, then routes this action home;
+    /// only the home runtime ever dereferences the FunctionId in V8.
+    InvokePaneInputSubmit {
+        callback: super::input::PaneInputCallback,
         text: Arc<String>,
     },
     /// The session thread's first input-mirror read: tell the UI to start

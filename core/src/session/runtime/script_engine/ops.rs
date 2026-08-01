@@ -33,6 +33,7 @@ deno_core::extension!(
   ops = [
     op_smudgy_get_current_session,
     op_smudgy_get_session_character,
+    op_smudgy_session_connected,
     op_smudgy_get_sessions,
     op_smudgy_session_echo,
     op_smudgy_session_echo_styled,
@@ -69,7 +70,6 @@ deno_core::extension!(
     op_smudgy_redirect,
     op_smudgy_copy,
     op_smudgy_pane_split,
-    op_smudgy_pane_input_on_submit,
     op_smudgy_pane_close,
     op_smudgy_pane_set_hidden,
     op_smudgy_pane_set_font_size,
@@ -77,6 +77,7 @@ deno_core::extension!(
     op_smudgy_pane_resize,
     op_smudgy_pane_relocate,
     op_smudgy_pane_tear_out,
+    op_smudgy_pane_swap,
     op_smudgy_pane_size,
     op_smudgy_pane_echo,
     op_smudgy_pane_echo_styled,
@@ -140,10 +141,17 @@ deno_core::extension!(
     op_smudgy_store_watch,
     op_smudgy_store_unwatch,
     op_smudgy_store_bind,
+    op_smudgy_store_remote_get,
+    op_smudgy_store_remote_get_tagged,
+    op_smudgy_store_remote_keys,
+    op_smudgy_store_remote_watch,
+    op_smudgy_store_remote_unwatch,
+    op_smudgy_store_remote_bind,
     op_smudgy_procedure_on,
     op_smudgy_procedure_post,
     op_smudgy_interop_declare,
     op_smudgy_data_dir,
+    op_smudgy_broadcast_allowed,
     ],
   esm_entry_point = "ext:smudgy_ops/smudgy.ts",
   esm = [ dir "src/session/runtime/js", "smudgy.ts" ],
@@ -228,6 +236,9 @@ deno_core::extension!(
     // The session store (`docs/interop.md`): the SAME `Rc` for every isolate. Writes
     // journal into it synchronously; the runtime flushes the journal per turn.
     session_store: crate::session::runtime::SharedSessionStore,
+    // Receiving-engine registry for directed state watches and bindings. It
+    // holds only this engine's function ids and cells.
+    remote_state_registry: crate::session::runtime::SharedRemoteStateRegistry,
     // The message bus (`docs/interop.md` §6): the SAME `Rc` for every isolate, so a
     // consumer's `post` in one isolate reaches the producer's receiver in another through the
     // host action queue (like the event bus above).
@@ -294,6 +305,7 @@ deno_core::extension!(
     state.put::<WidgetsEnabled>(WidgetsEnabled(options.smudgy_grants.widgets));
     state.put::<EventRegistry>(options.event_registry);
     state.put::<crate::session::runtime::SharedSessionStore>(options.session_store);
+    state.put::<crate::session::runtime::SharedRemoteStateRegistry>(options.remote_state_registry);
     state.put::<crate::session::runtime::SharedMessageBus>(options.message_bus);
     state.put::<crate::session::runtime::SharedCatalogue>(options.catalogue);
     state.put::<crate::session::runtime::store::HomeRegistry>(options.home_registry);
@@ -466,6 +478,7 @@ pub struct SmudgyGrants {
     /// `interop: ["write"]` — publish session-store state + emit events on the package's own
     /// namespace.
     pub interop_write: bool,
+    pub interop_broadcast: bool,
     /// `panes: ["create"]` — create/close/write session panes and route lines into them.
     pub panes: bool,
     /// `gmcp: ["send"]` — outbound GMCP: `gmcp.send`, module enable/disable, merge keys
@@ -496,6 +509,7 @@ impl SmudgyGrants {
             widgets: true,
             interop_read: true,
             interop_write: true,
+            interop_broadcast: true,
             panes: true,
             gmcp_send: true,
             input: true,
@@ -519,6 +533,7 @@ impl SmudgyGrants {
             widgets: caps.widgets,
             interop_read: caps.interop_read,
             interop_write: caps.interop_write,
+            interop_broadcast: caps.interop_broadcast,
             panes: caps.panes,
             gmcp_send: caps.gmcp_send,
             input: caps.input,
@@ -1054,6 +1069,30 @@ pub struct EventDepth(pub u32);
 pub struct EventSubscriber {
     pub isolate: IsolateId,
     pub function_id: FunctionId,
+    pub source: EventSourceFilter,
+}
+
+#[op2(fast)]
+fn op_smudgy_broadcast_allowed(state: &OpState) -> bool {
+    grants(state).interop_broadcast
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventSourceFilter {
+    Own,
+    Exact(SessionId),
+    All { include_self: bool },
+}
+
+impl EventSourceFilter {
+    #[must_use]
+    pub fn accepts(self, own: SessionId, source: SessionId) -> bool {
+        match self {
+            Self::Own => own == source,
+            Self::Exact(expected) => expected == source,
+            Self::All { include_self } => include_self || own != source,
+        }
+    }
 }
 
 /// Session-global event bus: canonical event name -> subscribers. The SAME `Rc` is handed to every
@@ -1092,6 +1131,9 @@ fn op_smudgy_on<'s>(
     state: &mut OpState,
     #[string] event: &str,
     f: v8::Local<'s, v8::Function>,
+    source_kind: u32,
+    source_session: u32,
+    include_self: bool,
 ) -> Result<u32, NotCapable> {
     ensure(grants(state).interop_read, "interop:read")?;
     match fold_name(event).as_ref() {
@@ -1101,7 +1143,7 @@ fn op_smudgy_on<'s>(
             let mirror = state
                 .borrow::<crate::session::runtime::SharedInputMirror>()
                 .clone();
-            let flipped = mirror.borrow_mut().flag_interest();
+            let flipped = mirror.lock().unwrap().flag_interest();
             if flipped {
                 queue_own_action(state, RuntimeAction::InputMirrorInterest);
             }
@@ -1118,12 +1160,25 @@ fn op_smudgy_on<'s>(
             let mirror = state
                 .borrow::<crate::session::runtime::SharedPaneSizeMirror>()
                 .clone();
-            let flipped = mirror.borrow_mut().flag_interest();
+            let flipped = mirror.lock().unwrap().flag_interest();
             if flipped {
                 queue_own_action(state, RuntimeAction::PaneMirrorInterest);
             }
         }
         _ => {}
+    }
+    let source = match source_kind {
+        1 => EventSourceFilter::Exact(SessionId(source_session)),
+        2 => EventSourceFilter::All { include_self },
+        _ => EventSourceFilter::Own,
+    };
+    let reaches_other = match source {
+        EventSourceFilter::Own => false,
+        EventSourceFilter::Exact(id) => id != *state.borrow::<SessionId>(),
+        EventSourceFilter::All { .. } => true,
+    };
+    if reaches_other {
+        ensure(grants(state).reach_others, "reach-others")?;
     }
     let f = v8::Global::new(scope, f);
     let function_id = {
@@ -1143,6 +1198,7 @@ fn op_smudgy_on<'s>(
         .push(EventSubscriber {
             isolate,
             function_id,
+            source,
         });
     // The function index doubles as the subscription token. An isolate will never register
     // `u32::MAX` functions in a session (it would exhaust memory first), so the saturating
@@ -1230,41 +1286,27 @@ fn op_smudgy_emit(
     }
     // Clone the subscriber list out so the registry borrow is released before queueing (the queue
     // drain + a subscriber's handler may both touch the registry).
-    let subscribers: Vec<EventSubscriber> = state
-        .borrow::<EventRegistry>()
-        .borrow()
-        .get(&event.canonical)
-        .map_or_else(Vec::new, Clone::clone);
-    if subscribers.is_empty() {
+    let source_id = *state.borrow::<SessionId>();
+    let Some(source) = registry::snapshot(source_id) else {
         return Ok(());
-    }
-    // One capture list shared across the whole fan-out: the captures are identical for
-    // every subscriber (only the target isolate/function differ), so the stamped-name and
-    // payload copies are made once per emit, never once per subscriber. Handlers receive
-    // the ORIGINAL stamped spelling — a script that branches on the event name must see the
-    // name as emitted, not the lowercased routing key.
-    let matches = Arc::new(vec![
-        MatchCapture {
-            name: Some(std::borrow::Cow::Borrowed("event")),
-            value: event.stamped.clone(),
+    };
+    let canonical: Arc<str> = Arc::from(event.canonical.as_str());
+    let stamped: Arc<str> = Arc::from(event.stamped.as_str());
+    let payload: Arc<str> = Arc::from(payload_json);
+    // Queue fan-out at home rather than sending foreign actions here. The
+    // runtime flushes this turn's store journal before dispatching the action,
+    // so `state.set(...); event.emit(...)` is observed in that order by every
+    // same-server target.
+    queue_own_action(
+        state,
+        RuntimeAction::FanOutInteropEvent {
+            canonical,
+            stamped,
+            payload,
+            source,
+            depth: depth + 1,
         },
-        MatchCapture {
-            name: Some(std::borrow::Cow::Borrowed("payload")),
-            value: payload_json.to_string(),
-        },
-    ]);
-    for sub in subscribers {
-        queue_own_action(
-            state,
-            RuntimeAction::CallJavascriptFunction {
-                isolate: sub.isolate,
-                id: sub.function_id,
-                matches: Arc::clone(&matches),
-                depth: depth + 1,
-                is_captured: None,
-            },
-        );
-    }
+    );
     Ok(())
 }
 
@@ -2123,6 +2165,173 @@ fn op_smudgy_store_unwatch(state: &mut OpState, token: u32) -> Result<(), StoreO
     Ok(())
 }
 
+fn directed_state_runtime(
+    state: &OpState,
+    source: SessionId,
+) -> Result<Option<Arc<crate::session::runtime::Runtime>>, StoreOpError> {
+    ensure(grants(state).interop_read, "interop:read")?;
+    if source != *state.borrow::<SessionId>() {
+        ensure(grants(state).reach_others, "reach-others")?;
+    }
+    let Some(runtime) = registry::get_runtime(source) else {
+        return Ok(None);
+    };
+    let server = state.borrow::<ServerName>().0.clone();
+    if runtime.server_name.as_str() != server.as_str() {
+        return Err(StoreOpError(
+            "smudgy: directed interop cannot cross configured server entries".to_string(),
+        ));
+    }
+    Ok(Some(runtime))
+}
+
+fn remote_store_root(
+    state: &mut OpState,
+    root_id: u32,
+    subpath: &str,
+) -> Result<(store::ProducerKey, store::StorePath), StoreOpError> {
+    let root = interned_root(state, root_id)?;
+    Ok((root.producer.clone(), resolve_root_path(&root, subpath)?))
+}
+
+#[op2]
+#[string]
+fn op_smudgy_store_remote_get(
+    state: &mut OpState,
+    source: u32,
+    root_id: u32,
+    #[string] subpath: &str,
+    previous: bool,
+) -> Result<Option<String>, StoreOpError> {
+    let source = SessionId::from(source);
+    let runtime = directed_state_runtime(state, source)?;
+    let (producer, path) = remote_store_root(state, root_id, subpath)?;
+    Ok(runtime.and_then(|runtime| {
+        runtime
+            .published_store
+            .read()
+            .unwrap()
+            .get_json(&producer, &path, previous)
+    }))
+}
+
+#[op2]
+#[string]
+fn op_smudgy_store_remote_get_tagged(
+    state: &mut OpState,
+    source: u32,
+    root_id: u32,
+    #[string] subpath: &str,
+    previous: bool,
+) -> Result<Option<String>, StoreOpError> {
+    let source = SessionId::from(source);
+    let runtime = directed_state_runtime(state, source)?;
+    let (producer, path) = remote_store_root(state, root_id, subpath)?;
+    Ok(runtime.and_then(|runtime| {
+        runtime
+            .published_store
+            .read()
+            .unwrap()
+            .get_tagged(&producer, &path, previous)
+            .map(tagged_wire)
+    }))
+}
+
+#[op2]
+#[string]
+fn op_smudgy_store_remote_keys(
+    state: &mut OpState,
+    source: u32,
+    root_id: u32,
+    #[string] subpath: &str,
+    previous: bool,
+) -> Result<Option<String>, StoreOpError> {
+    let source = SessionId::from(source);
+    let runtime = directed_state_runtime(state, source)?;
+    let (producer, path) = remote_store_root(state, root_id, subpath)?;
+    Ok(runtime.and_then(|runtime| {
+        runtime
+            .published_store
+            .read()
+            .unwrap()
+            .keys(&producer, &path, previous)
+            .map(|keys| serde_json::to_string(&keys).expect("borrowed strings serialize"))
+    }))
+}
+
+#[op2(fast)]
+fn op_smudgy_store_remote_watch<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &mut OpState,
+    source: u32,
+    #[string] producer: &str,
+    #[string] path: &str,
+    f: v8::Local<'s, v8::Function>,
+    per_write: bool,
+) -> Result<u32, StoreOpError> {
+    let source = SessionId::from(source);
+    let _ = directed_state_runtime(state, source)?;
+    let producer = parse_producer(producer)?;
+    let path = parse_path(path)?;
+    let function_id = {
+        let mut functions = state
+            .borrow::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>()
+            .borrow_mut();
+        let id = FunctionId(functions.len());
+        functions.push(v8::Global::new(scope, f));
+        id
+    };
+    let cadence = if per_write {
+        store::WatchCadence::PerWrite
+    } else {
+        store::WatchCadence::Coalesced
+    };
+    Ok(state
+        .borrow::<crate::session::runtime::SharedRemoteStateRegistry>()
+        .borrow_mut()
+        .watch(
+            source,
+            producer,
+            path,
+            current_isolate(state),
+            function_id,
+            cadence,
+        ))
+}
+
+#[op2(fast)]
+fn op_smudgy_store_remote_unwatch(state: &mut OpState, token: u32) -> Result<(), StoreOpError> {
+    ensure(grants(state).interop_read, "interop:read")?;
+    let isolate = current_isolate(state);
+    state
+        .borrow::<crate::session::runtime::SharedRemoteStateRegistry>()
+        .borrow_mut()
+        .unwatch(token, &isolate);
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_smudgy_store_remote_bind(
+    state: &mut OpState,
+    source: u32,
+    #[string] producer: &str,
+    #[string] path: &str,
+) -> Result<u32, StoreOpError> {
+    let source = SessionId::from(source);
+    let runtime = directed_state_runtime(state, source)?;
+    let producer = parse_producer(producer)?;
+    let path = parse_path(path)?;
+    let registry = state
+        .borrow::<crate::session::runtime::SharedRemoteStateRegistry>()
+        .clone();
+    let published = runtime
+        .as_ref()
+        .map(|runtime| runtime.published_store.read().unwrap());
+    Ok(registry
+        .borrow_mut()
+        .bind(source, producer, path, published.as_deref()))
+}
+
 // ============================================================================
 // Procedures (`docs/interop.md` §6): directed, fire-and-forget delivery of asks to a
 // package's home instance. Receipt (registering the implementation) is an interop write
@@ -2195,8 +2404,12 @@ fn op_smudgy_procedure_on<'s>(
                     value: post.payload,
                 },
                 MatchCapture {
-                    name: Some(std::borrow::Cow::Borrowed("sender")),
-                    value: post.sender,
+                    name: Some(std::borrow::Cow::Borrowed("origin")),
+                    value: post.origin,
+                },
+                MatchCapture {
+                    name: Some(std::borrow::Cow::Borrowed("session")),
+                    value: post.session,
                 },
             ]);
             queue_own_action(
@@ -2215,7 +2428,7 @@ fn op_smudgy_procedure_on<'s>(
 }
 
 /// `procedurePost(rootId, name, argsJson)` — post a directed, fire-and-forget ask to the
-/// interned root's producer's procedure `name`. The sender the implementation sees is
+/// interned root's producer's procedure `name`. The caller origin the implementation sees is
 /// derived from the calling *isolate* host-side — `"user"` for main (user scripts, local
 /// modules, and trusted packages share it, the accepted §1 residual), the package's own
 /// spec for a sandbox — so a sandboxed package can never pose as another. Depth-capped like
@@ -2224,16 +2437,18 @@ fn op_smudgy_procedure_on<'s>(
 /// addressable check is deliberately per-call — it inspects the TARGET producer's home, not
 /// the caller's cached verdict.
 #[op2(fast)]
+#[allow(clippy::too_many_lines)]
 fn op_smudgy_procedure_post(
     state: &mut OpState,
     root_id: u32,
     #[string] name: &str,
     #[string] payload_json: &str,
+    target_session: u32,
 ) -> Result<(), StoreOpError> {
     ensure(grants(state).interop_write, "interop:write")?;
     let root = interned_root(state, root_id)?;
     let isolate = current_isolate(state);
-    let sender = match &isolate {
+    let caller_origin = match &isolate {
         IsolateId::Main => "user".to_string(),
         IsolateId::Package { owner, name, .. } => {
             format!(
@@ -2243,7 +2458,12 @@ fn op_smudgy_procedure_post(
             )
         }
     };
-    // Tier-2 catalogue sample at the post choke point; the sender is the poster, the
+    let caller_id = *state.borrow::<SessionId>();
+    let caller = registry::snapshot(caller_id).ok_or_else(|| {
+        StoreOpError("smudgy: procedure caller session is no longer live".to_string())
+    })?;
+    let caller_json = caller.to_json(false);
+    // Tier-2 catalogue sample at the post choke point; the caller origin is the poster, the
     // producer key is shared from the interned root, and the genuinely dynamic name is
     // folded per call.
     state
@@ -2253,7 +2473,7 @@ fn op_smudgy_procedure_post(
             &root.producer_spec,
             crate::session::runtime::catalogue::CatalogueKind::Procedure,
             name,
-            &sender,
+            &caller_origin,
             payload_json,
         );
     let depth = state.try_borrow::<EventDepth>().map_or(0, |d| d.0);
@@ -2265,6 +2485,33 @@ fn op_smudgy_procedure_post(
         return Ok(());
     }
     let canonical = canonical_procedure(&root.producer, name);
+    let target = SessionId::from(target_session);
+    if target != caller_id {
+        ensure(grants(state).reach_others, "reach-others")?;
+        let Some(runtime) = registry::get_runtime(target) else {
+            return Ok(());
+        };
+        if runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+            return Err(StoreOpError(
+                "smudgy: directed interop cannot cross configured server entries".to_string(),
+            ));
+        }
+        // Forward from the caller runtime after its current turn flushes. This
+        // gives directed procedures the same write-before-notify ordering as
+        // events and local procedure deliveries.
+        let action = RuntimeAction::ForwardProcedurePost {
+            target,
+            canonical: Arc::from(canonical),
+            producer: Arc::clone(&root.producer_spec),
+            name: Arc::from(name),
+            payload: Arc::from(payload_json),
+            caller_origin: Arc::from(caller_origin),
+            caller_session: caller,
+            depth: depth + 1,
+        };
+        queue_own_action(state, action);
+        return Ok(());
+    }
     let receivers = state
         .borrow::<crate::session::runtime::SharedMessageBus>()
         .borrow()
@@ -2273,16 +2520,10 @@ fn op_smudgy_procedure_post(
         // Queue-briefly (D1): only for a producer that can ever receive — one with a home
         // (`user` always has one). A post to an uninstalled producer can never deliver, so
         // buffering it would just hoard garbage.
-        let addressable = match &root.producer {
-            store::ProducerKey::User => true,
-            // Platform producers never receive procedures (the host is not a procedure
-            // implementer); buffering a post to one would hoard garbage.
-            store::ProducerKey::Platform(_) => false,
-            store::ProducerKey::Package { owner, name } => state
-                .borrow::<store::HomeRegistry>()
-                .borrow()
-                .contains_key(&(owner.clone(), name.clone())),
-        };
+        let addressable = store::is_addressable(
+            state.borrow::<store::HomeRegistry>(),
+            &root.producer,
+        );
         if addressable {
             let dropped_oldest = state
                 .borrow::<crate::session::runtime::SharedMessageBus>()
@@ -2291,7 +2532,8 @@ fn op_smudgy_procedure_post(
                     canonical,
                     crate::session::runtime::message_bus::PendingPost {
                         payload: payload_json.to_string(),
-                        sender,
+                        origin: caller_origin,
+                        session: caller_json,
                     },
                 );
             if dropped_oldest {
@@ -2316,8 +2558,12 @@ fn op_smudgy_procedure_post(
             value: payload_json.to_string(),
         },
         MatchCapture {
-            name: Some(std::borrow::Cow::Borrowed("sender")),
-            value: sender,
+            name: Some(std::borrow::Cow::Borrowed("origin")),
+            value: caller_origin,
+        },
+        MatchCapture {
+            name: Some(std::borrow::Cow::Borrowed("session")),
+            value: caller_json,
         },
     ]);
     for receiver in receivers {
@@ -2419,6 +2665,10 @@ fn route_session_action(state: &mut OpState, session_id: SessionId, action: Runt
     if *state.borrow::<SessionId>() == session_id {
         queue_own_action(state, action);
     } else if let Some(runtime) = registry::get_runtime(session_id) {
+        if runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+            log::warn!("Dropping cross-server action for session {session_id}");
+            return;
+        }
         if runtime.tx.send(action).is_err() {
             log::warn!("Dropping action for session {session_id}: runtime has shut down");
         }
@@ -2439,7 +2689,8 @@ fn op_smudgy_get_sessions<'s>(
 ) -> Result<v8::Local<'s, v8::Array>, NotCapable> {
     // Enumerating the user's other sessions is the `reach-others` capability.
     ensure(grants(state).reach_others, "reach-others")?;
-    let session_ids = registry::get_all_session_ids();
+    let server = state.borrow::<ServerName>().0.clone();
+    let session_ids = registry::get_session_ids_for_server(server.as_str());
 
     let sessions: Vec<v8::Local<v8::Value>> = session_ids
         .iter()
@@ -2471,6 +2722,9 @@ fn op_smudgy_get_session_character<'s>(
         Some(runtime) => runtime,
         None => return Ok(v8::Object::new(scope)), // Return empty object if session not found
     };
+    if runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+        return Ok(v8::Object::new(scope));
+    }
 
     // Create the return object
     let ret = v8::Object::new(scope);
@@ -2489,6 +2743,19 @@ fn op_smudgy_get_session_character<'s>(
     ret.create_data_property(scope, subtext_k, subtext_v);
 
     Ok(ret)
+}
+
+#[op2(fast)]
+fn op_smudgy_session_connected(state: &mut OpState, session_id: u32) -> Result<bool, NotCapable> {
+    let session_id = SessionId::from(session_id);
+    if session_id != *state.borrow::<SessionId>() {
+        ensure(grants(state).reach_others, "reach-others")?;
+    }
+    let server = state.borrow::<ServerName>().0.clone();
+    Ok(registry::get_runtime(session_id).is_some_and(|runtime| {
+        runtime.server_name.as_str() == server.as_str()
+            && runtime.connected.load(std::sync::atomic::Ordering::Acquire)
+    }))
 }
 
 #[op2(fast)]
@@ -4152,11 +4419,27 @@ fn pane_registry(state: &OpState) -> crate::session::runtime::SharedPaneRegistry
         .clone()
 }
 
+/// Resolve the data-only pane registry for an own or same-server foreign
+/// session. Public ops perform their capability checks before calling this.
+fn target_pane_registry(
+    state: &OpState,
+    target: SessionId,
+) -> Result<crate::session::runtime::SharedPaneRegistry, PaneCallError> {
+    if target == *state.borrow::<SessionId>() {
+        return Ok(pane_registry(state));
+    }
+    let runtime = registry::get_runtime(target)
+        .ok_or_else(|| PaneOpError(format!("no live session with id {}", u32::from(target))))?;
+    if runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+        return Err(PaneOpError("cross-server session access is not supported".to_string()).into());
+    }
+    Ok(Arc::clone(&runtime.pane_registry))
+}
+
 /// The own-session half of a terminal-pane delivery op: resolve (and kind-check) the
 /// pane synchronously and return its key, so a delivery issued before a `close()` in
-/// the same script body still lands on that incarnation. Cross-session targets return
-/// `None` — the registry lives on another thread, so the name resolves at dispatch on
-/// the owning runtime instead.
+/// the same script body still lands on that incarnation. Cross-session deliveries keep
+/// their existing name-routed target-queue semantics and therefore return `None` here.
 fn resolve_own_terminal_pane(
     state: &OpState,
     target: SessionId,
@@ -4167,7 +4450,7 @@ fn resolve_own_terminal_pane(
         return Ok(None);
     }
     let registry = pane_registry(state);
-    let registry = registry.borrow();
+    let registry = registry.lock().unwrap();
     let def = registry
         .resolve(namespace, name)
         .ok_or_else(|| PaneOpError(format!("no pane named '{name}'")))?;
@@ -4179,8 +4462,8 @@ fn resolve_own_terminal_pane(
 
 /// The wire shape of one pane handed back to JS (`Pane` handles are built
 /// from this in the facade). `name_id` is the interned per-session name
-/// identity the per-line fast path uses; `None` on a cross-session optimistic
-/// handle (a foreign registry's ids are meaningless here).
+/// identity the per-line fast path uses. It remains optional on the wire for
+/// compatibility, but live own- and cross-session lookups now populate it.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneInfo {
@@ -4212,58 +4495,127 @@ impl PaneInfo {
 
 // ============================================================================
 // The command input (`docs/input.md`): reads against the
-// session-thread mirror, writes as operations forwarded to the UI widget.
-// Inputs are addressed like pane deliveries — by name in the caller's
-// namespace — and every input op is own-session only: the mirror lives on this
-// thread, and a foreign session's input is not addressable.
+// owning session's shared data-only mirror, writes as operations forwarded to
+// the owning UI widget. Inputs are addressed like pane deliveries — by name in
+// the caller's namespace — and same-server foreign targets require
+// `reach-others`.
 // ============================================================================
 
-/// The shared back half of resolving the caller's own pane input by name:
+/// The shared back half of resolving a pane input by name:
 /// resolution in the caller's namespace, the `panes` capability (the pane is
 /// the caller's own surface — namespacing already isolates cross-package
 /// access), and the pane-hosts-an-input rule. A pane without an input —
 /// either kind — is refused here; the UI's warn-and-drop on a key with no
-/// input is defense in depth behind this check. The own-session rule and the
-/// `main` fork stay at the call sites (the input surface admits main under
+/// input is defense in depth behind this check. The session-target rule and
+/// the `main` fork stay at the call sites (the input surface admits main under
 /// the `input` capability; the registration op refuses it outright).
-fn resolve_own_pane_input(state: &mut OpState, name: &str) -> Result<pane::PaneKey, PaneCallError> {
+fn resolve_pane_input(
+    state: &mut OpState,
+    target: SessionId,
+    name: &str,
+) -> Result<pane::PaneKey, PaneCallError> {
     let namespace = pane_namespace(state);
-    let registry = pane_registry(state);
-    let registry = registry.borrow();
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    let registry = target_pane_registry(state, target)?;
+    let registry = registry.lock().unwrap();
     let def = registry
         .resolve(&namespace, name)
         .ok_or_else(|| PaneOpError(format!("no pane named '{name}'")))?;
-    ensure(grants(state).panes, "panes")?;
     if def.input.is_none() {
         return Err(PaneOpError(format!("pane '{name}' has no input")).into());
     }
     Ok(def.key)
 }
 
-/// The shared front half of every input op: the own-session rule, name→key
+/// The shared front half of every input op: session validation, name→key
 /// resolution, and a capability gate that depends on the target
 /// (`docs/input.md` §3.6). The MAIN input is the session-global
 /// surface a package can read and rewrite the user's typing through, so it
 /// requires the `input` capability; a pane input rides
-/// [`resolve_own_pane_input`]'s `panes` gate.
+/// [`resolve_pane_input`]'s `panes` gate. Any foreign target additionally
+/// requires `reach-others` through [`ensure_session_target`].
 fn resolve_input_target(
     state: &mut OpState,
     session_id: u32,
     name: &str,
-) -> Result<pane::PaneKey, PaneCallError> {
+) -> Result<(SessionId, pane::PaneKey), PaneCallError> {
     let target = SessionId::from(session_id);
-    if target != *state.borrow::<SessionId>() {
-        return Err(PaneOpError(
-            "input handles are own-session only (another session's input is not addressable)"
-                .to_string(),
-        )
-        .into());
-    }
     if pane::is_main_pane_name(name) {
-        ensure(grants(state).input, "input")?;
-        return Ok(pane::MAIN_PANE_KEY);
+        ensure_session_target(state, target, grants(state).input, "input")?;
+        if target != *state.borrow::<SessionId>() {
+            let _ = target_pane_registry(state, target)?;
+        }
+        return Ok((target, pane::MAIN_PANE_KEY));
     }
-    resolve_own_pane_input(state, name)
+    Ok((target, resolve_pane_input(state, target, name)?))
+}
+
+fn target_input_mirror(
+    state: &OpState,
+    target: SessionId,
+) -> Result<crate::session::runtime::SharedInputMirror, PaneCallError> {
+    if target == *state.borrow::<SessionId>() {
+        return Ok(state
+            .borrow::<crate::session::runtime::SharedInputMirror>()
+            .clone());
+    }
+    let runtime = registry::get_runtime(target)
+        .ok_or_else(|| PaneOpError(format!("no live session with id {}", u32::from(target))))?;
+    if runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+        return Err(PaneOpError("cross-server session access is not supported".to_string()).into());
+    }
+    Ok(Arc::clone(&runtime.input_mirror))
+}
+
+fn target_input_word_sets(
+    state: &OpState,
+    target: SessionId,
+) -> Result<crate::session::runtime::SharedInputWordSets, PaneCallError> {
+    if target == *state.borrow::<SessionId>() {
+        return Ok(state
+            .borrow::<crate::session::runtime::SharedInputWordSets>()
+            .clone());
+    }
+    let runtime = registry::get_runtime(target)
+        .ok_or_else(|| PaneOpError(format!("no live session with id {}", u32::from(target))))?;
+    if runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+        return Err(PaneOpError("cross-server session access is not supported".to_string()).into());
+    }
+    Ok(Arc::clone(&runtime.input_word_sets))
+}
+
+fn target_pane_input_callbacks(
+    state: &OpState,
+    target: SessionId,
+) -> Result<crate::session::runtime::SharedPaneInputCallbacks, PaneCallError> {
+    if target == *state.borrow::<SessionId>() {
+        return Ok(state
+            .borrow::<crate::session::runtime::SharedPaneInputCallbacks>()
+            .clone());
+    }
+    let runtime = registry::get_runtime(target)
+        .ok_or_else(|| PaneOpError(format!("no live session with id {}", u32::from(target))))?;
+    if runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+        return Err(PaneOpError("cross-server session access is not supported".to_string()).into());
+    }
+    Ok(Arc::clone(&runtime.pane_input_callbacks))
+}
+
+fn target_pane_size_mirror(
+    state: &OpState,
+    target: SessionId,
+) -> Result<crate::session::runtime::SharedPaneSizeMirror, PaneCallError> {
+    if target == *state.borrow::<SessionId>() {
+        return Ok(state
+            .borrow::<crate::session::runtime::SharedPaneSizeMirror>()
+            .clone());
+    }
+    let runtime = registry::get_runtime(target)
+        .ok_or_else(|| PaneOpError(format!("no live session with id {}", u32::from(target))))?;
+    if runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+        return Err(PaneOpError("cross-server session access is not supported".to_string()).into());
+    }
+    Ok(Arc::clone(&runtime.pane_size_mirror))
 }
 
 /// Read one input's mirrored state. Eventually consistent: reads reflect the
@@ -4282,15 +4634,13 @@ fn op_smudgy_input_get(
     session_id: u32,
     #[string] name: &str,
 ) -> Result<crate::session::runtime::input::InputSnapshot, PaneCallError> {
-    let key = resolve_input_target(state, session_id, name)?;
-    let mirror = state
-        .borrow::<crate::session::runtime::SharedInputMirror>()
-        .clone();
-    let flipped = mirror.borrow_mut().flag_interest();
+    let (target, key) = resolve_input_target(state, session_id, name)?;
+    let mirror = target_input_mirror(state, target)?;
+    let flipped = mirror.lock().unwrap().flag_interest();
     if flipped {
-        queue_own_action(state, RuntimeAction::InputMirrorInterest);
+        route_session_action(state, target, RuntimeAction::InputMirrorInterest);
     }
-    let snapshot = mirror.borrow().snapshot(key);
+    let snapshot = mirror.lock().unwrap().snapshot(key);
     Ok(snapshot)
 }
 
@@ -4343,8 +4693,8 @@ fn op_smudgy_input_apply(
     #[string] name: &str,
     #[serde] op: InputApplyWire,
 ) -> Result<(), PaneCallError> {
-    let key = resolve_input_target(state, session_id, name)?;
-    queue_own_action(state, RuntimeAction::InputApply { key, op: op.into() });
+    let (target, key) = resolve_input_target(state, session_id, name)?;
+    route_session_action(state, target, RuntimeAction::InputApply { key, op: op.into() });
     Ok(())
 }
 
@@ -4477,8 +4827,8 @@ enum WordSetQueryWire {
 }
 
 /// Errors a word-set registry op can throw: anything the shared input-target
-/// gate refuses (own-session only; the `input` capability for the main
-/// input, the `panes` capability for the caller's own pane input; a pane
+/// gate refuses (the `input` capability for the main input, the `panes`
+/// capability for the caller's pane input, `reach-others` when foreign; a pane
 /// without an input), a creator-identity failure (unreachable in practice —
 /// the ids are host-minted), a rejected word, or a full set.
 #[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
@@ -4535,7 +4885,11 @@ fn word_set_creator(
     state: &OpState,
     creator_id: u32,
 ) -> Result<crate::session::runtime::input::WordSetCreator, StoreOpError> {
-    Ok((current_isolate(state), creator_origin(state, creator_id)?))
+    Ok((
+        *state.borrow::<SessionId>(),
+        current_isolate(state),
+        creator_origin(state, creator_id)?,
+    ))
 }
 
 /// Mutate the caller's contribution to one input's suggestion set or
@@ -4556,33 +4910,32 @@ fn op_smudgy_input_words_mutate(
     creator_id: u32,
     #[serde] op: WordSetMutateWire,
 ) -> Result<serde_json::Value, WordSetCallError> {
-    let key = resolve_input_target(state, session_id, name)?;
+    let (target, key) = resolve_input_target(state, session_id, name)?;
     let creator = word_set_creator(state, creator_id)?;
-    let sets = state
-        .borrow::<crate::session::runtime::SharedInputWordSets>()
-        .clone();
+    let sets = target_input_word_sets(state, target)?;
     let (changed, verdict) = match op {
         WordSetMutateWire::Add { set, words } => {
             for word in &words {
                 validate_word_set_word(word)?;
             }
             let changed = sets
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .add(key, set, &creator, &words)
                 .map_err(|_| WordSetCallError::SetFull)?;
             (changed, serde_json::Value::Null)
         }
         WordSetMutateWire::Delete { set, word } => {
-            let hit = sets.borrow_mut().delete(key, set, &creator, &word);
+            let hit = sets.lock().unwrap().delete(key, set, &creator, &word);
             (hit, serde_json::Value::Bool(hit))
         }
         WordSetMutateWire::Clear { set } => {
-            let changed = sets.borrow_mut().clear(key, set, &creator);
+            let changed = sets.lock().unwrap().clear(key, set, &creator);
             (changed, serde_json::Value::Null)
         }
     };
-    if changed && sets.borrow_mut().flag_push(key) {
-        queue_own_action(state, RuntimeAction::InputWordSetsChanged { key });
+    if changed && sets.lock().unwrap().flag_push(key) {
+        route_session_action(state, target, RuntimeAction::InputWordSetsChanged { key });
     }
     Ok(verdict)
 }
@@ -4601,12 +4954,10 @@ fn op_smudgy_input_words_query(
     creator_id: u32,
     #[serde] op: WordSetQueryWire,
 ) -> Result<serde_json::Value, WordSetCallError> {
-    let key = resolve_input_target(state, session_id, name)?;
+    let (target, key) = resolve_input_target(state, session_id, name)?;
     let creator = word_set_creator(state, creator_id)?;
-    let sets = state
-        .borrow::<crate::session::runtime::SharedInputWordSets>()
-        .clone();
-    let sets = sets.borrow();
+    let sets = target_input_word_sets(state, target)?;
+    let sets = sets.lock().unwrap();
     Ok(match op {
         WordSetQueryWire::Has { set, word } => {
             serde_json::Value::Bool(sets.has(key, set, &creator, &word))
@@ -4634,8 +4985,8 @@ enum InputHistoryMutateWire {
 }
 
 /// Errors a history op can throw: anything the shared input-target gate
-/// refuses (own-session only; the `input` capability for the main input,
-/// the `panes` capability for the caller's own pane input; a pane without
+/// refuses (the `input` capability for the main input, the `panes` capability
+/// for the caller's pane input, `reach-others` when foreign; a pane without
 /// an input), or a rejected entry.
 #[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
 pub enum InputHistoryCallError {
@@ -4680,7 +5031,7 @@ fn op_smudgy_input_history_mutate(
     #[serde] op: InputHistoryMutateWire,
 ) -> Result<(), InputHistoryCallError> {
     use crate::session::runtime::input::InputOp;
-    let key = resolve_input_target(state, session_id, name)?;
+    let (target, key) = resolve_input_target(state, session_id, name)?;
     let op = match op {
         InputHistoryMutateWire::Push { text } => {
             validate_history_entry(&text)?;
@@ -4688,7 +5039,7 @@ fn op_smudgy_input_history_mutate(
         }
         InputHistoryMutateWire::Clear => InputOp::HistoryClear,
     };
-    queue_own_action(state, RuntimeAction::InputApply { key, op });
+    route_session_action(state, target, RuntimeAction::InputApply { key, op });
     Ok(())
 }
 
@@ -4704,11 +5055,9 @@ fn op_smudgy_input_history_list(
     session_id: u32,
     #[string] name: &str,
 ) -> Result<Vec<String>, PaneCallError> {
-    let key = resolve_input_target(state, session_id, name)?;
-    let mirror = state
-        .borrow::<crate::session::runtime::SharedInputMirror>()
-        .clone();
-    let entries = mirror.borrow().history(key);
+    let (target, key) = resolve_input_target(state, session_id, name)?;
+    let mirror = target_input_mirror(state, target)?;
+    let entries = mirror.lock().unwrap().history(key);
     Ok(entries
         .iter()
         .map(|entry| entry.as_str().to_string())
@@ -4716,9 +5065,8 @@ fn op_smudgy_input_history_list(
 }
 
 /// The display half of a `PaneSpec.input` (`docs/input.md` §3.7).
-/// The `onSubmit` handler itself never rides the serde spec — the facade
-/// registers it through [`op_smudgy_pane_input_on_submit`] right after the
-/// split, since a v8 function cannot cross a serde boundary.
+/// The `onSubmit` handler itself rides beside this serde spec as a direct v8
+/// argument, allowing the split op to seat it before publishing `PaneOpened`.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneInputSpecJs {
@@ -4749,13 +5097,13 @@ pub struct PaneSpecJs {
     /// setting. Reverting an existing override is `setFontSize(null)`, not a
     /// spec field.
     font_size: Option<f64>,
-    /// The pane's own input line. Own-session only: the `onSubmit` handler
-    /// runs in the creating isolate, which a cross-session split cannot name.
+    /// The pane's own input line. A same-server foreign split stores the
+    /// handler address on the target and routes submissions back to the
+    /// creating runtime before dereferencing V8 state.
     input: Option<PaneInputSpecJs>,
 }
 
-/// Parse the split spec's kind + def-state trio — the shape shared verbatim
-/// between the own-session and cross-session (`PaneSplitRemote`) paths.
+/// Parse the split spec's kind + def-state trio.
 fn parse_split_def_state(
     spec: &PaneSpecJs,
 ) -> Result<(pane::PaneKind, pane::DefStateSpec), PaneCallError> {
@@ -4785,21 +5133,23 @@ fn parse_split_def_state(
 }
 
 /// Get-or-create a pane and (on creation) place it by splitting off `ref_name`
-/// toward `direction`. Own-session calls mutate the registry synchronously and
-/// return the real pane; cross-session calls (`reach-others`) queue a
-/// name-carrying action to the owning runtime (last-writer-wins) and return an
-/// optimistic handle with no `name_id`.
+/// toward `direction`. Own- and same-server cross-session calls mutate the
+/// owning registry synchronously and return the real pane; the UI effect is
+/// queued on that owning runtime.
 #[op2]
 #[serde]
-fn op_smudgy_pane_split(
+fn op_smudgy_pane_split<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     state: &mut OpState,
     session_id: u32,
     #[string] ref_name: &str,
     #[string] direction: &str,
     #[serde] spec: PaneSpecJs,
+    on_submit: v8::Local<'s, v8::Value>,
 ) -> Result<PaneInfo, PaneCallError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
+    let reconcile_registry = target != *state.borrow::<SessionId>();
 
     let direction = pane::SplitDirection::parse(direction)
         .ok_or_else(|| PaneOpError(format!("invalid split direction '{direction}'")))?;
@@ -4823,22 +5173,32 @@ fn op_smudgy_pane_split(
         ensure(grants(state).change_display, "change-display")?;
     }
 
+    let register_input = spec.input.is_some();
     let input = spec.input.map(|input| pane::PaneInputDef {
         placeholder: input.placeholder.map(Arc::from),
     });
 
-    if target == *state.borrow::<SessionId>() {
-        let registry = pane_registry(state);
+    {
+        let registry = target_pane_registry(state, target)?;
         let outcome = registry
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .split(&namespace, &spec.name, kind, def_state, input)?;
+        if register_input {
+            let callback = v8::Local::<v8::Function>::try_from(on_submit).map_err(|_| {
+                PaneOpError("input.onSubmit must be a function".to_string())
+            })?;
+            register_pane_input_callback(scope, state, target, outcome.def.key, callback)?;
+        }
         if outcome.created {
             let reference = registry
-                .borrow()
+                .lock()
+                .unwrap()
                 .resolve(&namespace, ref_name)
                 .map_or(pane::MAIN_PANE_KEY, |def| def.key);
-            queue_own_action(
+            route_session_action(
                 state,
+                target,
                 RuntimeAction::PaneOpened {
                     def: outcome.def.clone(),
                     placement: pane::PanePlacement {
@@ -4846,11 +5206,13 @@ fn op_smudgy_pane_split(
                         direction,
                         size_px,
                     },
+                    reconcile_registry,
                 },
             );
         } else if outcome.def_changed {
-            queue_own_action(
+            route_session_action(
                 state,
+                target,
                 RuntimeAction::PaneUpdated {
                     def: outcome.def.clone(),
                     announce_visibility: outcome.hidden_changed,
@@ -4858,85 +5220,16 @@ fn op_smudgy_pane_split(
             );
         }
         Ok(PaneInfo::from_def(&outcome.def, outcome.created))
-    } else {
-        // A pane input's onSubmit runs in the CREATING isolate, which lives on
-        // this session's thread — a foreign session's pane could never deliver
-        // to it, so the spec is refused rather than silently dropped.
-        if input.is_some() {
-            return Err(PaneOpError(
-                "pane inputs are own-session only (another session's pane cannot deliver \
-                 submissions to your onSubmit handler)"
-                    .to_string(),
-            )
-            .into());
-        }
-        route_session_action(
-            state,
-            target,
-            RuntimeAction::PaneSplitRemote {
-                namespace,
-                name: Arc::from(spec.name.as_str()),
-                kind,
-                def_state,
-                reference: Some(Arc::from(ref_name)),
-                direction,
-                size_px,
-            },
-        );
-        Ok(PaneInfo {
-            kind: match kind {
-                pane::PaneKind::Terminal => "terminal",
-                pane::PaneKind::Widgets => "widgets",
-            },
-            name: spec.name,
-            is_main: false,
-            name_id: None,
-            created: false,
-            has_input: false,
-        })
     }
 }
 
-/// Register (or replace) the `onSubmit` handler for a pane input
-/// (`docs/input.md` §3.7). The facade calls this right after the
-/// split that carried `input` in its spec — a v8 function cannot ride the
-/// serde spec — and again on every re-claiming split, which is what brings a
-/// handler back after a reload (handler addresses are engine facts and die
-/// with their isolate generation, like widget callbacks). Own-session only,
-/// gated by `panes` like the split itself: the pane is the caller's own
-/// surface, in its own namespace. `main` is refused with the split's
-/// [`pane::PaneError::MainInput`] teaching — its fused input is
-/// `session.input`, and typed submissions are intercepted through
-/// `sys:input`, never an `onSubmit`.
-#[op2(fast)]
-fn op_smudgy_pane_input_on_submit<'s>(
+fn register_pane_input_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     state: &mut OpState,
-    session_id: u32,
-    #[string] name: &str,
+    target: SessionId,
+    key: pane::PaneKey,
     f: v8::Local<'s, v8::Function>,
 ) -> Result<(), PaneCallError> {
-    ensure(grants(state).panes, "panes")?;
-    let target = SessionId::from(session_id);
-    if target != *state.borrow::<SessionId>() {
-        return Err(PaneOpError(
-            "pane inputs are own-session only (another session's pane cannot deliver \
-             submissions to your onSubmit handler)"
-                .to_string(),
-        )
-        .into());
-    }
-    if pane::is_main_pane_name(name) {
-        return Err(PaneOpError(format!(
-            "{}; intercept typed submissions with the sys:input event instead",
-            pane::PaneError::MainInput
-        ))
-        .into());
-    }
-    let key = resolve_own_pane_input(state, name)?;
-    // The handler lives in this isolate's `script_functions` registry (append-only,
-    // reclaimed with the engine), like event subscribers; only its address crosses
-    // to the session-side registry the dispatch arm resolves through.
     let f = v8::Global::new(scope, f);
     let function_id = {
         let mut script_functions = state
@@ -4947,13 +5240,14 @@ fn op_smudgy_pane_input_on_submit<'s>(
         id
     };
     let callback = crate::session::runtime::input::PaneInputCallback {
+        home_session: *state.borrow::<SessionId>(),
         isolate: current_isolate(state),
         instance: state.borrow::<IsolateInstance>().0,
         function_id,
     };
-    state
-        .borrow::<crate::session::runtime::SharedPaneInputCallbacks>()
-        .borrow_mut()
+    target_pane_input_callbacks(state, target)?
+        .lock()
+        .unwrap()
         .register(key, callback);
     Ok(())
 }
@@ -4971,7 +5265,7 @@ fn op_smudgy_pane_close(
     let namespace = pane_namespace(state);
 
     if target == *state.borrow::<SessionId>() {
-        let closed = pane_registry(state).borrow_mut().close(&namespace, name);
+        let closed = pane_registry(state).lock().unwrap().close(&namespace, name);
         match closed {
             Ok(key) => {
                 // The closed pane's input state — mirror, word sets, onSubmit
@@ -5021,7 +5315,8 @@ fn op_smudgy_pane_set_hidden(
 
     if target == *state.borrow::<SessionId>() {
         if let Some(def) = pane_registry(state)
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .set_hidden(&namespace, name, hidden)?
         {
             queue_own_action(
@@ -5076,7 +5371,8 @@ fn op_smudgy_pane_set_font_size(
 
     if target == *state.borrow::<SessionId>() {
         if let Some(def) = pane_registry(state)
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .set_font_size(&namespace, name, font_size)?
         {
             queue_own_action(
@@ -5104,9 +5400,8 @@ fn op_smudgy_pane_set_font_size(
 
 /// The mutable def-state half of a pane read (`isHidden`/`fontSize` getters):
 /// live registry state, read per access so a handle never staleness-drifts.
-/// Own-session only, like [`op_smudgy_pane_list`] — mirroring another
-/// session's display state into every runtime is the imprudent half of
-/// cross-session panes. A closed pane throws, like the routing ops.
+/// Same-server foreign reads consult the target's shared data-only registry.
+/// A closed pane throws, like the routing ops.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneDefState {
@@ -5123,16 +5418,9 @@ fn op_smudgy_pane_def_state(
 ) -> Result<PaneDefState, PaneCallError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
-    if target != *state.borrow::<SessionId>() {
-        return Err(PaneOpError(
-            "cross-session pane introspection is not supported (isHidden/fontSize are own-session only)"
-                .to_string(),
-        )
-        .into());
-    }
     let namespace = pane_namespace(state);
-    let registry = pane_registry(state);
-    let registry = registry.borrow();
+    let registry = target_pane_registry(state, target)?;
+    let registry = registry.lock().unwrap();
     let def = registry
         .resolve(&namespace, name)
         .ok_or_else(|| PaneOpError(format!("no pane named '{name}'")))?;
@@ -5143,8 +5431,8 @@ fn op_smudgy_pane_def_state(
 }
 
 /// `pane.size`: the pane's last laid-out pixel size from the UI-fed mirror,
-/// or null before the first mirrored layout. Own-session only, like the
-/// def-state read. Reads — and only reads — flag mirror interest (plus a
+/// or null before the first mirrored layout. Same-server foreign reads use
+/// the target's shared mirror. Reads — and only reads — flag mirror interest (plus a
 /// `pane:resize` subscription, whose emit site derives from the same feed);
 /// the one-time interest notification for the UI is queued on the flip.
 #[op2]
@@ -5156,57 +5444,42 @@ fn op_smudgy_pane_size(
 ) -> Result<Option<(f32, f32)>, PaneCallError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
-    if target != *state.borrow::<SessionId>() {
-        return Err(PaneOpError(
-            "cross-session pane introspection is not supported (size is own-session only)"
-                .to_string(),
-        )
-        .into());
-    }
     let namespace = pane_namespace(state);
     let key = {
-        let registry = pane_registry(state);
-        let registry = registry.borrow();
+        let registry = target_pane_registry(state, target)?;
+        let registry = registry.lock().unwrap();
         registry
             .resolve(&namespace, name)
             .map(|def| def.key)
             .ok_or_else(|| PaneOpError(format!("no pane named '{name}'")))?
     };
-    let mirror = state
-        .borrow::<crate::session::runtime::SharedPaneSizeMirror>()
-        .clone();
-    let flipped = mirror.borrow_mut().flag_interest();
+    let mirror = target_pane_size_mirror(state, target)?;
+    let flipped = mirror.lock().unwrap().flag_interest();
     if flipped {
-        queue_own_action(state, RuntimeAction::PaneMirrorInterest);
+        route_session_action(state, target, RuntimeAction::PaneMirrorInterest);
     }
     Ok(mirror
-        .borrow()
+        .lock()
+        .unwrap()
         .get(key)
         .map(|size| (size.width, size.height)))
 }
 
-/// Resolve a placement-command target: the caller's own live pane, never
-/// main. Placement commands are own-session-only in v1 — they span daemon
-/// windows and carry keys, which a foreign registry could never validate —
-/// so a cross-session `session_id` throws rather than silently degrading.
-fn resolve_own_placement_pane(
+/// Resolve a placement-command target: a live pane in the target runtime,
+/// never main. The caller has already passed the `panes`/`reach-others`
+/// session gate.
+fn resolve_placement_pane(
     state: &OpState,
     target: SessionId,
     name: &str,
     main_error: pane::PaneError,
 ) -> Result<pane::PaneKey, PaneCallError> {
-    if target != *state.borrow::<SessionId>() {
-        return Err(PaneOpError(
-            "pane placement commands (resize/relocate/tearOut) are own-session only".to_string(),
-        )
-        .into());
-    }
     if pane::is_main_pane_name(name) {
         return Err(main_error.into());
     }
     let namespace = pane_namespace(state);
-    let registry = pane_registry(state);
-    let registry = registry.borrow();
+    let registry = target_pane_registry(state, target)?;
+    let registry = registry.lock().unwrap();
     let def = registry
         .resolve(&namespace, name)
         .ok_or_else(|| PaneOpError(format!("no pane named '{name}'")))?;
@@ -5236,12 +5509,12 @@ fn op_smudgy_pane_resize(
 ) -> Result<(), PaneCallError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
-    let key = resolve_own_placement_pane(state, target, name, pane::PaneError::ResizeMain)?;
+    let key = resolve_placement_pane(state, target, name, pane::PaneError::ResizeMain)?;
     let (width, height) = (placement_px(width), placement_px(height));
     if width.is_none() && height.is_none() {
         return Ok(());
     }
-    queue_own_action(state, RuntimeAction::PaneResize { key, width, height });
+    route_session_action(state, target, RuntimeAction::PaneResize { key, width, height });
     Ok(())
 }
 
@@ -5263,11 +5536,11 @@ fn op_smudgy_pane_relocate(
     ensure_session_target(state, target, grants(state).panes, "panes")?;
     let direction = pane::SplitDirection::parse(direction)
         .ok_or_else(|| PaneOpError(format!("invalid relocate direction '{direction}'")))?;
-    let key = resolve_own_placement_pane(state, target, name, pane::PaneError::RelocateMain)?;
+    let key = resolve_placement_pane(state, target, name, pane::PaneError::RelocateMain)?;
     let reference = {
         let namespace = pane_namespace(state);
-        let registry = pane_registry(state);
-        let registry = registry.borrow();
+        let registry = target_pane_registry(state, target)?;
+        let registry = registry.lock().unwrap();
         registry
             .resolve(&namespace, ref_name)
             .map(|def| def.key)
@@ -5276,8 +5549,9 @@ fn op_smudgy_pane_relocate(
     if reference == key {
         return Err(PaneOpError("cannot relocate a pane relative to itself".to_string()).into());
     }
-    queue_own_action(
+    route_session_action(
         state,
+        target,
         RuntimeAction::PaneRelocate {
             key,
             reference,
@@ -5303,13 +5577,59 @@ fn op_smudgy_pane_tear_out(
 ) -> Result<(), PaneCallError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
-    let key = resolve_own_placement_pane(state, target, name, pane::PaneError::TearOutMain)?;
-    queue_own_action(
+    let key = resolve_placement_pane(state, target, name, pane::PaneError::TearOutMain)?;
+    route_session_action(
         state,
+        target,
         RuntimeAction::PaneTearOut {
             key,
             width: placement_px(width),
             height: placement_px(height),
+        },
+    );
+    Ok(())
+}
+
+/// `pane.swap(otherPane)`: atomically exchange two live layout leaves. Both
+/// panes may be main panes and may belong to different same-server sessions;
+/// only their leaf payloads move, so each destination keeps its split sizing.
+#[op2(fast)]
+fn op_smudgy_pane_swap(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    other_session_id: u32,
+    #[string] other_name: &str,
+) -> Result<(), PaneCallError> {
+    let target = SessionId::from(session_id);
+    let other_target = SessionId::from(other_session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    ensure_session_target(state, other_target, grants(state).panes, "panes")?;
+    let namespace = pane_namespace(state);
+    let registry = target_pane_registry(state, target)?;
+    let key = registry
+        .lock()
+        .unwrap()
+        .resolve(&namespace, name)
+        .map(|def| def.key)
+        .ok_or_else(|| PaneOpError(format!("no pane named '{name}'")))?;
+    let other_registry = target_pane_registry(state, other_target)?;
+    let other_key = other_registry
+        .lock()
+        .unwrap()
+        .resolve(&namespace, other_name)
+        .map(|def| def.key)
+        .ok_or_else(|| PaneOpError(format!("no pane named '{other_name}'")))?;
+    if target == other_target && key == other_key {
+        return Ok(());
+    }
+    route_session_action(
+        state,
+        target,
+        RuntimeAction::PaneSwap {
+            key,
+            other_session: other_target,
+            other_key,
         },
     );
     Ok(())
@@ -5397,8 +5717,9 @@ fn op_smudgy_pane_clear(
     Ok(())
 }
 
-/// List the live panes visible to the caller's namespace (its own panes plus
-/// main). Own-session only: a foreign registry lives on another thread.
+/// List the target session's live panes visible to the caller's namespace
+/// (its own panes plus main). Same-server foreign registries are data-only and
+/// synchronously readable after the session gate.
 #[op2]
 #[serde]
 fn op_smudgy_pane_list(
@@ -5407,16 +5728,10 @@ fn op_smudgy_pane_list(
 ) -> Result<Vec<PaneInfo>, PaneCallError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
-    if target != *state.borrow::<SessionId>() {
-        return Err(PaneOpError(
-            "cross-session pane introspection is not supported (panes.list/get/exists are own-session only)"
-                .to_string(),
-        )
-        .into());
-    }
     let namespace = pane_namespace(state);
-    Ok(pane_registry(state)
-        .borrow()
+    Ok(target_pane_registry(state, target)?
+        .lock()
+        .unwrap()
         .list(&namespace)
         .iter()
         .map(|def| PaneInfo::from_def(def, false))
@@ -5426,7 +5741,7 @@ fn op_smudgy_pane_list(
 /// Resolve a name to its live pane in the caller's namespace, or null. Backs
 /// `panes.get`/`panes.exists` and the `createWidget` `pane`-option mount check
 /// (any pane kind is a valid widget target, so that check is existence only).
-/// Own-session only, like [`op_smudgy_pane_list`].
+/// Same-server foreign lookups follow [`op_smudgy_pane_list`].
 #[op2]
 #[serde]
 fn op_smudgy_pane_resolve(
@@ -5436,16 +5751,10 @@ fn op_smudgy_pane_resolve(
 ) -> Result<Option<PaneInfo>, PaneCallError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
-    if target != *state.borrow::<SessionId>() {
-        return Err(PaneOpError(
-            "cross-session pane introspection is not supported (panes.list/get/exists are own-session only)"
-                .to_string(),
-        )
-        .into());
-    }
     let namespace = pane_namespace(state);
-    Ok(pane_registry(state)
-        .borrow()
+    Ok(target_pane_registry(state, target)?
+        .lock()
+        .unwrap()
         .resolve(&namespace, name)
         .map(|def| PaneInfo::from_def(def, false)))
 }
@@ -5462,7 +5771,7 @@ fn resolve_routing_target(
 ) -> Result<pane::PaneKey, PaneCallError> {
     let namespace = pane_namespace(state);
     let registry = pane_registry(state);
-    let registry = registry.borrow();
+    let registry = registry.lock().unwrap();
     let def = if name_id >= 0 {
         #[allow(clippy::cast_sign_loss)]
         registry.live_by_name_id(pane::PaneNameId::from_u32(name_id as u32))
@@ -5894,7 +6203,7 @@ fn op_smudgy_fallthrough(state: &mut OpState, value: bool) -> Result<(), Fallthr
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsiColor, Color, ECHO_DEFAULT_STYLE, IsolateId, LinkContext, SessionId,
+        AnsiColor, Color, ECHO_DEFAULT_STYLE, EventSourceFilter, IsolateId, LinkContext, SessionId,
         canonical_procedure, fold_name, packed_echo_lines, packed_validate, param_read_allowed,
     };
     use crate::session::runtime::store::ProducerKey;
@@ -6155,5 +6464,18 @@ mod tests {
             canonical_procedure(&producer, "Refresh"),
             "smudgy://wbk/tracker#refresh"
         );
+    }
+
+    #[test]
+    fn event_source_filters_distinguish_own_exact_and_all_routes() {
+        let own = SessionId::from(7);
+        let other = SessionId::from(9);
+        assert!(EventSourceFilter::Own.accepts(own, own));
+        assert!(!EventSourceFilter::Own.accepts(own, other));
+        assert!(EventSourceFilter::Exact(other).accepts(own, other));
+        assert!(!EventSourceFilter::Exact(other).accepts(own, own));
+        assert!(EventSourceFilter::All { include_self: true }.accepts(own, own));
+        assert!(EventSourceFilter::All { include_self: false }.accepts(own, other));
+        assert!(!EventSourceFilter::All { include_self: false }.accepts(own, own));
     }
 }

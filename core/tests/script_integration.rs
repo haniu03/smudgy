@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use smudgy_core::session::runtime::RuntimeAction;
+use smudgy_core::session::runtime::input::{InputSnapshot, InputSource};
+use smudgy_core::session::runtime::pane::MAIN_PANE_KEY;
 use smudgy_core::session::{BufferUpdate, HotkeyId, SessionEvent, SessionId, SessionParams, spawn};
 
 const QUIET_PERIOD: Duration = Duration::from_millis(900);
@@ -680,4 +682,384 @@ async fn script_automation_names_match_ui_rules() {
         "name-first createAlias/createTrigger/createTimer/createHotkey calls must all throw \
          TypeError in 0.5.\nTranscript:\n{transcript}"
     );
+}
+
+const CROSS_SESSION_TS: &str = r#"
+import {
+  byId,
+  byName,
+  createAlias,
+  createEvent,
+  createState,
+  echo,
+  events,
+  getSessions,
+  session,
+} from "smudgy:core";
+import {
+  connected,
+  created,
+  destroyed,
+  disconnected,
+} from "smudgy:events/sessions";
+
+const crossSession = createEvent("crossSession");
+const orderedState = createState<{ answer: number }>("orderedState");
+const orderedConsumer = (globalThis as any).__smudgy_interop_consumer("user").state("orderedState");
+const channel = new BroadcastChannel("smudgy-cross-session-test");
+
+echo(`BOOT_SESSION:${getSessions().some(peer => peer.id === session.id)}`);
+
+const remoteEvents = events.lookup("user", "crossSession")
+  .fromAll({ includeSelf: false });
+remoteEvents.on((payload, source) => {
+    echo(`EVENT:${source.profile.name}:${payload.answer}`);
+    echo(`ORDERED_STATE:${orderedConsumer.from(source).value?.answer}`);
+});
+remoteEvents.once().then((payload) => {
+  echo(`ONCE_PAYLOAD:${payload.answer}:${Array.isArray(payload)}`);
+});
+
+channel.onmessage = (event) => {
+  echo(`BROADCAST:${event.data.from}:${event.data.answer}`);
+};
+
+created.on((affected, source) => {
+  if (affected.profile.name === "Beta") {
+    echo(`CREATED:${source.profile.name}:${affected.connected}`);
+  }
+});
+connected.on((affected, source) => {
+  if (affected.profile.name === "Beta") {
+    echo(`CONNECTED:${source.profile.name}`);
+  }
+});
+disconnected.on((affected, source) => {
+  if (affected.profile.name === "Beta") {
+    echo(`DISCONNECTED:${source.profile.name}:${affected.connected}`);
+  }
+});
+destroyed.on((affected, source) => {
+  if (affected.profile.name === "Beta") {
+    echo(`DESTROYED:${source.profile.name}:${affected.connected}`);
+  }
+});
+
+createAlias("^fire-cross-session$", () => {
+  const peers = getSessions();
+  echo(`ENUM:${peers.length}:${byName("Alpha")?.id !== undefined}:${byName("Gamma") === undefined}:${peers.map(peer => peer.id).join(",")}`);
+  const alpha = byName("Alpha")!;
+  const seededValue = alpha.input.value;
+  const seededHistory = alpha.input.history.list()[0];
+  alpha.input.propose("remote draft");
+  alpha.input.focus();
+  alpha.input.history.push("remote history");
+  alpha.input.completion.add("remoteWord");
+  const remote = alpha.mainPane.split("right", {
+    name: "Remote",
+    width: 240,
+    input: { onSubmit: (text) => echo(`PANE_SUBMIT:${text}`) },
+  });
+  echo(`SURFACE:${byId(alpha.id)?.profile.name}:${alpha.panes.exists("remote")}:${alpha.panes.list().length}:${remote.input !== undefined}:${alpha.input.completion.has("remoteword")}:${seededValue}:${seededHistory}`);
+  remote.swap(session.mainPane);
+  orderedState.set({ answer: 42 });
+  crossSession.emit({ answer: 42 });
+  channel.postMessage({ from: session.profile.name, answer: 42 });
+});
+"#;
+
+/// The public cross-session surface is exercised through two real session threads:
+/// lifecycle events are live/non-replaying, event filters name their source, enumeration
+/// is server-scoped, and Deno's standard `BroadcastChannel` crosses the shared backend.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_channel() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let home_path = smudgy_core::get_smudgy_home().expect("smudgy home");
+
+    let server = "CrossSessionInterop";
+    let modules_dir = home_path.join(server).join("modules");
+    std::fs::create_dir_all(&modules_dir).unwrap();
+    std::fs::create_dir_all(home_path.join(server).join("logs")).unwrap();
+    std::fs::write(modules_dir.join("cross-session.ts"), CROSS_SESSION_TS).unwrap();
+    let other_server = "CrossSessionInteropOther";
+    std::fs::create_dir_all(home_path.join(other_server).join("modules")).unwrap();
+    std::fs::create_dir_all(home_path.join(other_server).join("logs")).unwrap();
+
+    let params = |id, name: &str| {
+        Arc::new(SessionParams {
+            session_id: SessionId::from(id),
+            server_name: Arc::new(server.to_string()),
+            profile_name: Arc::new(name.to_string()),
+            profile_subtext: Arc::new(String::new()),
+            mapper: None,
+            package_client: None,
+            extra_script_extensions: Arc::new(Vec::new),
+            on_engine_rebuild: None,
+        })
+    };
+
+    // Alpha is fully ready before Beta is registered, pinning `created` as a future,
+    // non-replayed occurrence rather than a startup snapshot.
+    let mut alpha_lines = Vec::new();
+    let mut alpha_events = Box::pin(spawn(params(7090, "Alpha")));
+    let alpha_tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), alpha_events.next())
+            .await
+            .expect("timed out waiting for Alpha RuntimeReady")
+            .expect("Alpha event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => {
+                for update in updates.iter() {
+                    if let BufferUpdate::Append(line) = update {
+                        alpha_lines.push(line.text.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+
+    let mut beta_lines = Vec::new();
+    let mut beta_events = Box::pin(spawn(params(7091, "Beta")));
+    let beta_tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), beta_events.next())
+            .await
+            .expect("timed out waiting for Beta RuntimeReady")
+            .expect("Beta event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => {
+                for update in updates.iter() {
+                    if let BufferUpdate::Append(line) = update {
+                        beta_lines.push(line.text.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+
+    // A simultaneously-live session on another configured server entry must be
+    // absent from Alpha/Beta enumeration and routing.
+    let mut gamma_events = Box::pin(spawn(Arc::new(SessionParams {
+        session_id: SessionId::from(7092),
+        server_name: Arc::new(other_server.to_string()),
+        profile_name: Arc::new("Gamma".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    })));
+    let gamma_tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), gamma_events.next())
+            .await
+            .expect("timed out waiting for Gamma RuntimeReady")
+            .expect("Gamma event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
+
+    let mut remote_input_key = None;
+    let mut saw_remote_input_ops = 0;
+    let mut saw_cross_session_swap = false;
+
+    // Seed Alpha's UI-authoritative mirrors, then use an ordered UI event as
+    // the barrier proving both updates landed before Beta reads them.
+    alpha_tx
+        .send(RuntimeAction::InputStateChanged {
+            key: MAIN_PANE_KEY,
+            snapshot: InputSnapshot {
+                value: Arc::new("seeded-alpha".to_string()),
+                cursor: 12,
+                selection: None,
+                focused: false,
+                masked: false,
+            },
+            source: InputSource::User,
+        })
+        .unwrap();
+    alpha_tx
+        .send(RuntimeAction::InputHistoryChanged {
+            key: MAIN_PANE_KEY,
+            entries: Arc::new(vec![Arc::new("seeded history".to_string())]),
+        })
+        .unwrap();
+    alpha_tx.send(RuntimeAction::InputMirrorInterest).unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), alpha_events.next())
+            .await
+            .expect("timed out waiting for Alpha input-mirror barrier")
+            .expect("Alpha event stream ended before input-mirror barrier");
+        match event.event {
+            SessionEvent::InputMirrorInterest => break,
+            SessionEvent::UpdateBuffer(updates) => {
+                for update in updates.iter() {
+                    if let BufferUpdate::Append(line) = update {
+                        alpha_lines.push(line.text.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    beta_tx.send(RuntimeAction::Connected).unwrap();
+    let connected_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < connected_deadline
+        && !alpha_lines.iter().any(|line| line == "CONNECTED:Beta")
+    {
+        if let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, alpha_events.next()).await
+            && let SessionEvent::UpdateBuffer(updates) = event.event
+        {
+            for update in updates.iter() {
+                if let BufferUpdate::Append(line) = update {
+                    alpha_lines.push(line.text.clone());
+                }
+            }
+        }
+    }
+
+    beta_tx.send(RuntimeAction::Disconnected).unwrap();
+    beta_tx
+        .send(RuntimeAction::Send(Arc::new("fire-cross-session".to_string())))
+        .unwrap();
+
+    let delivery_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < delivery_deadline
+        && !(alpha_lines.iter().any(|line| line == "EVENT:Beta:42")
+            && alpha_lines
+                .iter()
+                .any(|line| line == "ORDERED_STATE:42")
+            && alpha_lines
+                .iter()
+                .any(|line| line == "BROADCAST:Beta:42")
+            && alpha_lines
+                .iter()
+                .any(|line| line == "ONCE_PAYLOAD:42:false")
+            && beta_lines
+                .iter()
+                .any(|line| line == "ENUM:2:true:true:7090,7091")
+            && beta_lines
+                .iter()
+                .any(|line| line == "SURFACE:Alpha:true:2:true:true:seeded-alpha:seeded history")
+            && beta_lines
+                .iter()
+                .any(|line| line == "PANE_SUBMIT:from-alpha-ui")
+            && saw_remote_input_ops >= 3
+            && saw_cross_session_swap)
+    {
+        tokio::select! {
+            event = alpha_events.next() => {
+                if let Some(event) = event {
+                    match event.event {
+                        SessionEvent::UpdateBuffer(updates) => {
+                            for update in updates.iter() {
+                                if let BufferUpdate::Append(line) = update {
+                                    alpha_lines.push(line.text.clone());
+                                }
+                            }
+                        }
+                        SessionEvent::InputOp { key, .. } if key == smudgy_core::session::runtime::pane::MAIN_PANE_KEY => {
+                            saw_remote_input_ops += 1;
+                        }
+                        SessionEvent::PaneOpened { def, .. } if def.name.as_ref() == "Remote" => {
+                            remote_input_key = Some(def.key);
+                            alpha_tx.send(RuntimeAction::PaneInputSubmit {
+                                key: def.key,
+                                text: Arc::new("from-alpha-ui".to_string()),
+                                retry: false,
+                            }).unwrap();
+                        }
+                        SessionEvent::PaneSwap { other_session, .. } if other_session == SessionId::from(7091) => {
+                            saw_cross_session_swap = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            event = beta_events.next() => {
+                if let Some(event) = event
+                    && let SessionEvent::UpdateBuffer(updates) = event.event
+                {
+                    for update in updates.iter() {
+                        if let BufferUpdate::Append(line) = update {
+                            beta_lines.push(line.text.clone());
+                        }
+                    }
+                }
+            }
+            () = tokio::time::sleep(QUIET_PERIOD) => {}
+        }
+    }
+
+    beta_tx.send(RuntimeAction::Shutdown).ok();
+    let destroyed_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < destroyed_deadline
+        && !alpha_lines
+            .iter()
+            .any(|line| line == "DESTROYED:Beta:false")
+    {
+        if let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, alpha_events.next()).await
+            && let SessionEvent::UpdateBuffer(updates) = event.event
+        {
+            for update in updates.iter() {
+                if let BufferUpdate::Append(line) = update {
+                    alpha_lines.push(line.text.clone());
+                }
+            }
+        }
+    }
+    alpha_tx.send(RuntimeAction::Shutdown).ok();
+    gamma_tx.send(RuntimeAction::Shutdown).ok();
+
+    let alpha_transcript = alpha_lines.join("\n");
+    let beta_transcript = beta_lines.join("\n");
+    for expected in [
+        "CREATED:Beta:false",
+        "CONNECTED:Beta",
+        "DISCONNECTED:Beta:false",
+        "EVENT:Beta:42",
+        "ORDERED_STATE:42",
+        "ONCE_PAYLOAD:42:false",
+        "BROADCAST:Beta:42",
+        "DESTROYED:Beta:false",
+    ] {
+        assert!(
+            alpha_lines.iter().any(|line| line == expected),
+            "missing {expected:?} from Alpha transcript:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
+        );
+    }
+    assert!(
+        alpha_lines
+            .iter()
+            .any(|line| line == "BOOT_SESSION:true")
+            && beta_lines
+                .iter()
+                .any(|line| line == "BOOT_SESSION:true"),
+        "top-level enumeration must include the already-registered current session.\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
+    );
+    assert!(
+        beta_lines
+            .iter()
+            .any(|line| line == "ENUM:2:true:true:7090,7091"),
+        "same-server enumeration/byName failed.\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
+    );
+    assert!(
+        beta_lines
+            .iter()
+            .any(|line| line == "SURFACE:Alpha:true:2:true:true:seeded-alpha:seeded history"),
+        "cross-session pane/input lookup and completion registry failed.\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
+    );
+    assert!(
+        beta_lines.iter().any(|line| line == "PANE_SUBMIT:from-alpha-ui"),
+        "a foreign pane input must route onSubmit back to its creating runtime (key={remote_input_key:?}, ops={saw_remote_input_ops}, swap={saw_cross_session_swap}).\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
+    );
+    assert!(remote_input_key.is_some() && saw_remote_input_ops >= 3 && saw_cross_session_swap);
 }

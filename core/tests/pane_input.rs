@@ -211,6 +211,7 @@ async fn pane_submissions_deliver_to_on_submit_only_and_survive_reload() {
     tx.send(RuntimeAction::PaneInputSubmit {
         key,
         text: Arc::new("hello pane".to_string()),
+        retry: false,
     })
     .unwrap();
     drain_quiet(&mut events, &mut recording).await;
@@ -261,6 +262,7 @@ async fn pane_submissions_deliver_to_on_submit_only_and_survive_reload() {
     tx.send(RuntimeAction::PaneInputSubmit {
         key,
         text: Arc::new("after reload".to_string()),
+        retry: false,
     })
     .unwrap();
     drain_quiet(&mut events, &mut recording).await;
@@ -610,6 +612,7 @@ async fn panes_capability_covers_own_pane_input_but_not_main() {
     tx.send(RuntimeAction::PaneInputSubmit {
         key,
         text: Arc::new("from the wire".to_string()),
+        retry: false,
     })
     .unwrap();
     drain_quiet(&mut events, &mut recording).await;

@@ -121,6 +121,7 @@ pub fn generate_declarations(
         tokio,
         package_provider: None,
         permissions: None,
+        broadcast_channel: None,
     })
     .context("construct dts generator runtime")?;
 
