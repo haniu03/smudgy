@@ -150,6 +150,67 @@ impl Inner<'_> {
         action: RuntimeAction,
     ) -> Result<ActionResult, anyhow::Error> {
         match action {
+            RuntimeAction::RemoteStoreFlushed { source, writes } => {
+                let (actions, bindings_changed) =
+                    self.script_engine.remote_store_flushed(source, &writes);
+                if bindings_changed
+                    && let Err(error) = self.ui_tx.try_send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::StoreBindingsChanged,
+                    })
+                    && !error.is_full()
+                {
+                    warn!("Failed to send directed store-bindings wake: {error:?}");
+                }
+                Ok(ActionResult::Run(actions))
+            }
+            RuntimeAction::InteropEvent {
+                canonical,
+                stamped,
+                payload,
+                source,
+                depth,
+            } => {
+                let mut actions = Vec::new();
+                if canonical.as_ref() == "sessions:destroyed" {
+                    let (invalidation, bindings_changed) =
+                        self.script_engine.remote_session_destroyed(source.id);
+                    actions.extend(invalidation);
+                    if bindings_changed
+                        && let Err(error) = self.ui_tx.try_send(TaggedSessionEvent {
+                            session_id: self.session_id,
+                            event: SessionEvent::StoreBindingsChanged,
+                        })
+                        && !error.is_full()
+                    {
+                        warn!("Failed to send destroyed-session binding wake: {error:?}");
+                    }
+                }
+                actions.extend(
+                    self.script_engine
+                        .deliver_interop_event(&canonical, &stamped, &payload, &source, depth),
+                );
+                Ok(ActionResult::Run(actions))
+            }
+            RuntimeAction::ProcedurePost {
+                canonical,
+                producer,
+                name,
+                payload,
+                caller_origin,
+                caller_session,
+                depth,
+            } => Ok(ActionResult::Run(
+                self.script_engine.deliver_procedure_post(
+                    canonical,
+                    producer,
+                    name,
+                    payload,
+                    caller_origin,
+                    &caller_session,
+                    depth,
+                ),
+            )),
             RuntimeAction::Connect {
                 host,
                 port,
@@ -868,6 +929,18 @@ impl Inner<'_> {
                 Ok(ActionResult::None)
             }
             RuntimeAction::Connected => {
+                if !self
+                    .connected
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+                    && let Some(snapshot) = crate::session::registry::snapshot(self.session_id)
+                {
+                    crate::session::registry::broadcast_lifecycle(
+                        self.server_name.as_str(),
+                        "connected",
+                        &snapshot,
+                        false,
+                    );
+                }
                 self.ui_tx
                     .send(TaggedSessionEvent {
                         session_id: self.session_id,
@@ -877,6 +950,19 @@ impl Inner<'_> {
                 Ok(self.run_host_event("sys:connect", "{}"))
             }
             RuntimeAction::Disconnected => {
+                if self
+                    .connected
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                    && let Some(mut snapshot) = crate::session::registry::snapshot(self.session_id)
+                {
+                    snapshot.connected = false;
+                    crate::session::registry::broadcast_lifecycle(
+                        self.server_name.as_str(),
+                        "disconnected",
+                        &snapshot,
+                        false,
+                    );
+                }
                 // The tail of the session log is what users read after a
                 // drop; don't leave it sitting in the BufWriter.
                 self.flush_log();

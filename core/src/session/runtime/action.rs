@@ -25,10 +25,36 @@ use super::pane::{
 };
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
+use super::store::PublishedWrite;
 use super::trigger::MatchCapture;
 
 #[derive(Clone, Debug)]
 pub enum RuntimeAction {
+    /// A same-server source committed one state turn. The receiving engine
+    /// resolves only its own directed watchers and binding cells.
+    RemoteStoreFlushed {
+        source: SessionId,
+        writes: Arc<Vec<PublishedWrite>>,
+    },
+    /// A same-server event. The receiver resolves its own engine-local
+    /// subscriptions, so no foreign V8 handle or `FunctionId` crosses threads.
+    InteropEvent {
+        canonical: Arc<str>,
+        stamped: Arc<str>,
+        payload: Arc<str>,
+        source: crate::session::registry::SessionSnapshot,
+        depth: u32,
+    },
+    /// A directed procedure post. The target resolves its own receiver.
+    ProcedurePost {
+        canonical: Arc<str>,
+        producer: Arc<str>,
+        name: Arc<str>,
+        payload: Arc<str>,
+        caller_origin: Arc<str>,
+        caller_session: crate::session::registry::SessionSnapshot,
+        depth: u32,
+    },
     Connect {
         host: Arc<String>,
         port: u16,

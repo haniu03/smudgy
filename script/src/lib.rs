@@ -34,6 +34,7 @@ use deno_runtime::deno_inspector_server::{
     create_inspector_server, InspectPublishUid, InspectorServer,
 };
 use deno_runtime::worker::{MainWorker, WorkerOptions, WorkerServiceOptions};
+pub use deno_web::InMemoryBroadcastChannel;
 use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
 use npm_resolver::SmudgyNpmServices;
 use sys_traits::impls::RealSys;
@@ -117,6 +118,9 @@ pub struct ScriptRuntimeOptions {
     /// `Permissions::from_options` from the package's manifest-union — to sandbox a
     /// sandboxed-package isolate's net/fs/env/run/ffi/sys.
     pub permissions: Option<PermissionsContainer>,
+    /// Server-entry scoped BroadcastChannel backend. `None` creates an
+    /// isolated backend (primarily for standalone runtime tests).
+    pub broadcast_channel: Option<InMemoryBroadcastChannel>,
 }
 
 pub struct ScriptRuntime {
@@ -277,7 +281,7 @@ impl ScriptRuntime {
         let services =
             WorkerServiceOptions::<DenoInNpmPackageChecker, NpmResolver<RealSys>, RealSys> {
             blob_store: Default::default(),
-            broadcast_channel: Default::default(),
+            broadcast_channel: options.broadcast_channel.unwrap_or_default(),
             deno_rt_native_addon_loader: None,
             feature_checker: Default::default(),
             fs,

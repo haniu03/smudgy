@@ -1279,6 +1279,15 @@ fn smudgy_can_lines(caps: &SmudgyCapabilities) -> Vec<PermissionLine> {
     if caps.widgets {
         out.push(cap_line(crate::i18n::ts!("permission-can-widgets")));
     }
+    if caps.interop_write {
+        out.push(cap_line(crate::i18n::ts!("permission-can-interop-write")));
+    }
+    if caps.interop_read {
+        out.push(cap_line(crate::i18n::ts!("permission-can-interop-read")));
+    }
+    if caps.interop_broadcast {
+        out.push(cap_line(crate::i18n::ts!("permission-can-interop-broadcast")));
+    }
     if caps.panes {
         out.push(cap_line(crate::i18n::ts!("permission-can-panes")));
     }
@@ -1355,6 +1364,9 @@ fn smudgy_cannot_lines(caps: &SmudgyCapabilities) -> Vec<String> {
     }
     if !caps.interop_read {
         out.push(crate::i18n::t!("permission-cannot-interop-read"));
+    }
+    if !caps.interop_broadcast {
+        out.push(crate::i18n::t!("permission-cannot-interop-broadcast"));
     }
     if !caps.gmcp_send {
         out.push(crate::i18n::t!("permission-cannot-gmcp"));

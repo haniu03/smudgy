@@ -33,6 +33,7 @@ deno_core::extension!(
   ops = [
     op_smudgy_get_current_session,
     op_smudgy_get_session_character,
+    op_smudgy_session_connected,
     op_smudgy_get_sessions,
     op_smudgy_session_echo,
     op_smudgy_session_echo_styled,
@@ -140,10 +141,17 @@ deno_core::extension!(
     op_smudgy_store_watch,
     op_smudgy_store_unwatch,
     op_smudgy_store_bind,
+    op_smudgy_store_remote_get,
+    op_smudgy_store_remote_get_tagged,
+    op_smudgy_store_remote_keys,
+    op_smudgy_store_remote_watch,
+    op_smudgy_store_remote_unwatch,
+    op_smudgy_store_remote_bind,
     op_smudgy_procedure_on,
     op_smudgy_procedure_post,
     op_smudgy_interop_declare,
     op_smudgy_data_dir,
+    op_smudgy_broadcast_allowed,
     ],
   esm_entry_point = "ext:smudgy_ops/smudgy.ts",
   esm = [ dir "src/session/runtime/js", "smudgy.ts" ],
@@ -228,6 +236,9 @@ deno_core::extension!(
     // The session store (`docs/interop.md`): the SAME `Rc` for every isolate. Writes
     // journal into it synchronously; the runtime flushes the journal per turn.
     session_store: crate::session::runtime::SharedSessionStore,
+    // Receiving-engine registry for directed state watches and bindings. It
+    // holds only this engine's function ids and cells.
+    remote_state_registry: crate::session::runtime::SharedRemoteStateRegistry,
     // The message bus (`docs/interop.md` §6): the SAME `Rc` for every isolate, so a
     // consumer's `post` in one isolate reaches the producer's receiver in another through the
     // host action queue (like the event bus above).
@@ -294,6 +305,7 @@ deno_core::extension!(
     state.put::<WidgetsEnabled>(WidgetsEnabled(options.smudgy_grants.widgets));
     state.put::<EventRegistry>(options.event_registry);
     state.put::<crate::session::runtime::SharedSessionStore>(options.session_store);
+    state.put::<crate::session::runtime::SharedRemoteStateRegistry>(options.remote_state_registry);
     state.put::<crate::session::runtime::SharedMessageBus>(options.message_bus);
     state.put::<crate::session::runtime::SharedCatalogue>(options.catalogue);
     state.put::<crate::session::runtime::store::HomeRegistry>(options.home_registry);
@@ -466,6 +478,7 @@ pub struct SmudgyGrants {
     /// `interop: ["write"]` — publish session-store state + emit events on the package's own
     /// namespace.
     pub interop_write: bool,
+    pub interop_broadcast: bool,
     /// `panes: ["create"]` — create/close/write session panes and route lines into them.
     pub panes: bool,
     /// `gmcp: ["send"]` — outbound GMCP: `gmcp.send`, module enable/disable, merge keys
@@ -496,6 +509,7 @@ impl SmudgyGrants {
             widgets: true,
             interop_read: true,
             interop_write: true,
+            interop_broadcast: true,
             panes: true,
             gmcp_send: true,
             input: true,
@@ -519,6 +533,7 @@ impl SmudgyGrants {
             widgets: caps.widgets,
             interop_read: caps.interop_read,
             interop_write: caps.interop_write,
+            interop_broadcast: caps.interop_broadcast,
             panes: caps.panes,
             gmcp_send: caps.gmcp_send,
             input: caps.input,
@@ -1054,6 +1069,30 @@ pub struct EventDepth(pub u32);
 pub struct EventSubscriber {
     pub isolate: IsolateId,
     pub function_id: FunctionId,
+    pub source: EventSourceFilter,
+}
+
+#[op2(fast)]
+fn op_smudgy_broadcast_allowed(state: &OpState) -> bool {
+    grants(state).interop_broadcast
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventSourceFilter {
+    Own,
+    Exact(SessionId),
+    All { include_self: bool },
+}
+
+impl EventSourceFilter {
+    #[must_use]
+    pub fn accepts(self, own: SessionId, source: SessionId) -> bool {
+        match self {
+            Self::Own => own == source,
+            Self::Exact(expected) => expected == source,
+            Self::All { include_self } => include_self || own != source,
+        }
+    }
 }
 
 /// Session-global event bus: canonical event name -> subscribers. The SAME `Rc` is handed to every
@@ -1092,6 +1131,9 @@ fn op_smudgy_on<'s>(
     state: &mut OpState,
     #[string] event: &str,
     f: v8::Local<'s, v8::Function>,
+    source_kind: u32,
+    source_session: u32,
+    include_self: bool,
 ) -> Result<u32, NotCapable> {
     ensure(grants(state).interop_read, "interop:read")?;
     match fold_name(event).as_ref() {
@@ -1125,6 +1167,19 @@ fn op_smudgy_on<'s>(
         }
         _ => {}
     }
+    let source = match source_kind {
+        1 => EventSourceFilter::Exact(SessionId(source_session)),
+        2 => EventSourceFilter::All { include_self },
+        _ => EventSourceFilter::Own,
+    };
+    let reaches_other = match source {
+        EventSourceFilter::Own => false,
+        EventSourceFilter::Exact(id) => id != *state.borrow::<SessionId>(),
+        EventSourceFilter::All { .. } => true,
+    };
+    if reaches_other {
+        ensure(grants(state).reach_others, "reach-others")?;
+    }
     let f = v8::Global::new(scope, f);
     let function_id = {
         let mut script_functions = state
@@ -1143,6 +1198,7 @@ fn op_smudgy_on<'s>(
         .push(EventSubscriber {
             isolate,
             function_id,
+            source,
         });
     // The function index doubles as the subscription token. An isolate will never register
     // `u32::MAX` functions in a session (it would exhaust memory first), so the saturating
@@ -1230,40 +1286,27 @@ fn op_smudgy_emit(
     }
     // Clone the subscriber list out so the registry borrow is released before queueing (the queue
     // drain + a subscriber's handler may both touch the registry).
-    let subscribers: Vec<EventSubscriber> = state
-        .borrow::<EventRegistry>()
-        .borrow()
-        .get(&event.canonical)
-        .map_or_else(Vec::new, Clone::clone);
-    if subscribers.is_empty() {
+    let source_id = *state.borrow::<SessionId>();
+    let Some(source) = registry::snapshot(source_id) else {
         return Ok(());
-    }
-    // One capture list shared across the whole fan-out: the captures are identical for
-    // every subscriber (only the target isolate/function differ), so the stamped-name and
-    // payload copies are made once per emit, never once per subscriber. Handlers receive
-    // the ORIGINAL stamped spelling — a script that branches on the event name must see the
-    // name as emitted, not the lowercased routing key.
-    let matches = Arc::new(vec![
-        MatchCapture {
-            name: Some(std::borrow::Cow::Borrowed("event")),
-            value: event.stamped.clone(),
-        },
-        MatchCapture {
-            name: Some(std::borrow::Cow::Borrowed("payload")),
-            value: payload_json.to_string(),
-        },
-    ]);
-    for sub in subscribers {
-        queue_own_action(
-            state,
-            RuntimeAction::CallJavascriptFunction {
-                isolate: sub.isolate,
-                id: sub.function_id,
-                matches: Arc::clone(&matches),
-                depth: depth + 1,
-                is_captured: None,
-            },
-        );
+    };
+    let canonical: Arc<str> = Arc::from(event.canonical.as_str());
+    let stamped: Arc<str> = Arc::from(event.stamped.as_str());
+    let payload: Arc<str> = Arc::from(payload_json);
+    let server = state.borrow::<ServerName>().0.clone();
+    for runtime in registry::get_runtimes_for_server(server.as_str()) {
+        let action = RuntimeAction::InteropEvent {
+            canonical: Arc::clone(&canonical),
+            stamped: Arc::clone(&stamped),
+            payload: Arc::clone(&payload),
+            source: source.clone(),
+            depth: depth + 1,
+        };
+        if runtime.session_id == source_id {
+            queue_own_action(state, action);
+        } else if runtime.tx.send(action).is_err() {
+            log::warn!("Dropping interop event for session {}", runtime.session_id);
+        }
     }
     Ok(())
 }
@@ -2123,6 +2166,173 @@ fn op_smudgy_store_unwatch(state: &mut OpState, token: u32) -> Result<(), StoreO
     Ok(())
 }
 
+fn directed_state_runtime(
+    state: &OpState,
+    source: SessionId,
+) -> Result<Option<Arc<crate::session::runtime::Runtime>>, StoreOpError> {
+    ensure(grants(state).interop_read, "interop:read")?;
+    if source != *state.borrow::<SessionId>() {
+        ensure(grants(state).reach_others, "reach-others")?;
+    }
+    let Some(runtime) = registry::get_runtime(source) else {
+        return Ok(None);
+    };
+    let server = state.borrow::<ServerName>().0.clone();
+    if runtime.server_name.as_str() != server.as_str() {
+        return Err(StoreOpError(
+            "smudgy: directed interop cannot cross configured server entries".to_string(),
+        ));
+    }
+    Ok(Some(runtime))
+}
+
+fn remote_store_root(
+    state: &mut OpState,
+    root_id: u32,
+    subpath: &str,
+) -> Result<(store::ProducerKey, store::StorePath), StoreOpError> {
+    let root = interned_root(state, root_id)?;
+    Ok((root.producer.clone(), resolve_root_path(&root, subpath)?))
+}
+
+#[op2]
+#[string]
+fn op_smudgy_store_remote_get(
+    state: &mut OpState,
+    source: u32,
+    root_id: u32,
+    #[string] subpath: &str,
+    previous: bool,
+) -> Result<Option<String>, StoreOpError> {
+    let source = SessionId::from(source);
+    let runtime = directed_state_runtime(state, source)?;
+    let (producer, path) = remote_store_root(state, root_id, subpath)?;
+    Ok(runtime.and_then(|runtime| {
+        runtime
+            .published_store
+            .read()
+            .unwrap()
+            .get_json(&producer, &path, previous)
+    }))
+}
+
+#[op2]
+#[string]
+fn op_smudgy_store_remote_get_tagged(
+    state: &mut OpState,
+    source: u32,
+    root_id: u32,
+    #[string] subpath: &str,
+    previous: bool,
+) -> Result<Option<String>, StoreOpError> {
+    let source = SessionId::from(source);
+    let runtime = directed_state_runtime(state, source)?;
+    let (producer, path) = remote_store_root(state, root_id, subpath)?;
+    Ok(runtime.and_then(|runtime| {
+        runtime
+            .published_store
+            .read()
+            .unwrap()
+            .get_tagged(&producer, &path, previous)
+            .map(tagged_wire)
+    }))
+}
+
+#[op2]
+#[string]
+fn op_smudgy_store_remote_keys(
+    state: &mut OpState,
+    source: u32,
+    root_id: u32,
+    #[string] subpath: &str,
+    previous: bool,
+) -> Result<Option<String>, StoreOpError> {
+    let source = SessionId::from(source);
+    let runtime = directed_state_runtime(state, source)?;
+    let (producer, path) = remote_store_root(state, root_id, subpath)?;
+    Ok(runtime.and_then(|runtime| {
+        runtime
+            .published_store
+            .read()
+            .unwrap()
+            .keys(&producer, &path, previous)
+            .map(|keys| serde_json::to_string(&keys).expect("borrowed strings serialize"))
+    }))
+}
+
+#[op2(fast)]
+fn op_smudgy_store_remote_watch<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &mut OpState,
+    source: u32,
+    #[string] producer: &str,
+    #[string] path: &str,
+    f: v8::Local<'s, v8::Function>,
+    per_write: bool,
+) -> Result<u32, StoreOpError> {
+    let source = SessionId::from(source);
+    let _ = directed_state_runtime(state, source)?;
+    let producer = parse_producer(producer)?;
+    let path = parse_path(path)?;
+    let function_id = {
+        let mut functions = state
+            .borrow::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>()
+            .borrow_mut();
+        let id = FunctionId(functions.len());
+        functions.push(v8::Global::new(scope, f));
+        id
+    };
+    let cadence = if per_write {
+        store::WatchCadence::PerWrite
+    } else {
+        store::WatchCadence::Coalesced
+    };
+    Ok(state
+        .borrow::<crate::session::runtime::SharedRemoteStateRegistry>()
+        .borrow_mut()
+        .watch(
+            source,
+            producer,
+            path,
+            current_isolate(state),
+            function_id,
+            cadence,
+        ))
+}
+
+#[op2(fast)]
+fn op_smudgy_store_remote_unwatch(state: &mut OpState, token: u32) -> Result<(), StoreOpError> {
+    ensure(grants(state).interop_read, "interop:read")?;
+    let isolate = current_isolate(state);
+    state
+        .borrow::<crate::session::runtime::SharedRemoteStateRegistry>()
+        .borrow_mut()
+        .unwatch(token, &isolate);
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_smudgy_store_remote_bind(
+    state: &mut OpState,
+    source: u32,
+    #[string] producer: &str,
+    #[string] path: &str,
+) -> Result<u32, StoreOpError> {
+    let source = SessionId::from(source);
+    let runtime = directed_state_runtime(state, source)?;
+    let producer = parse_producer(producer)?;
+    let path = parse_path(path)?;
+    let registry = state
+        .borrow::<crate::session::runtime::SharedRemoteStateRegistry>()
+        .clone();
+    let published = runtime
+        .as_ref()
+        .map(|runtime| runtime.published_store.read().unwrap());
+    Ok(registry
+        .borrow_mut()
+        .bind(source, producer, path, published.as_deref()))
+}
+
 // ============================================================================
 // Procedures (`docs/interop.md` §6): directed, fire-and-forget delivery of asks to a
 // package's home instance. Receipt (registering the implementation) is an interop write
@@ -2195,8 +2405,12 @@ fn op_smudgy_procedure_on<'s>(
                     value: post.payload,
                 },
                 MatchCapture {
-                    name: Some(std::borrow::Cow::Borrowed("sender")),
-                    value: post.sender,
+                    name: Some(std::borrow::Cow::Borrowed("origin")),
+                    value: post.origin,
+                },
+                MatchCapture {
+                    name: Some(std::borrow::Cow::Borrowed("session")),
+                    value: post.session,
                 },
             ]);
             queue_own_action(
@@ -2215,7 +2429,7 @@ fn op_smudgy_procedure_on<'s>(
 }
 
 /// `procedurePost(rootId, name, argsJson)` — post a directed, fire-and-forget ask to the
-/// interned root's producer's procedure `name`. The sender the implementation sees is
+/// interned root's producer's procedure `name`. The caller origin the implementation sees is
 /// derived from the calling *isolate* host-side — `"user"` for main (user scripts, local
 /// modules, and trusted packages share it, the accepted §1 residual), the package's own
 /// spec for a sandbox — so a sandboxed package can never pose as another. Depth-capped like
@@ -2224,16 +2438,18 @@ fn op_smudgy_procedure_on<'s>(
 /// addressable check is deliberately per-call — it inspects the TARGET producer's home, not
 /// the caller's cached verdict.
 #[op2(fast)]
+#[allow(clippy::too_many_lines)]
 fn op_smudgy_procedure_post(
     state: &mut OpState,
     root_id: u32,
     #[string] name: &str,
     #[string] payload_json: &str,
+    target_session: u32,
 ) -> Result<(), StoreOpError> {
     ensure(grants(state).interop_write, "interop:write")?;
     let root = interned_root(state, root_id)?;
     let isolate = current_isolate(state);
-    let sender = match &isolate {
+    let caller_origin = match &isolate {
         IsolateId::Main => "user".to_string(),
         IsolateId::Package { owner, name, .. } => {
             format!(
@@ -2243,7 +2459,12 @@ fn op_smudgy_procedure_post(
             )
         }
     };
-    // Tier-2 catalogue sample at the post choke point; the sender is the poster, the
+    let caller_id = *state.borrow::<SessionId>();
+    let caller = registry::snapshot(caller_id).ok_or_else(|| {
+        StoreOpError("smudgy: procedure caller session is no longer live".to_string())
+    })?;
+    let caller_json = caller.to_json(false);
+    // Tier-2 catalogue sample at the post choke point; the caller origin is the poster, the
     // producer key is shared from the interned root, and the genuinely dynamic name is
     // folded per call.
     state
@@ -2253,7 +2474,7 @@ fn op_smudgy_procedure_post(
             &root.producer_spec,
             crate::session::runtime::catalogue::CatalogueKind::Procedure,
             name,
-            &sender,
+            &caller_origin,
             payload_json,
         );
     let depth = state.try_borrow::<EventDepth>().map_or(0, |d| d.0);
@@ -2265,6 +2486,31 @@ fn op_smudgy_procedure_post(
         return Ok(());
     }
     let canonical = canonical_procedure(&root.producer, name);
+    let target = SessionId::from(target_session);
+    if target != caller_id {
+        ensure(grants(state).reach_others, "reach-others")?;
+        let Some(runtime) = registry::get_runtime(target) else {
+            return Ok(());
+        };
+        if runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+            return Err(StoreOpError(
+                "smudgy: directed interop cannot cross configured server entries".to_string(),
+            ));
+        }
+        let action = RuntimeAction::ProcedurePost {
+            canonical: Arc::from(canonical),
+            producer: Arc::clone(&root.producer_spec),
+            name: Arc::from(name),
+            payload: Arc::from(payload_json),
+            caller_origin: Arc::from(caller_origin),
+            caller_session: caller,
+            depth: depth + 1,
+        };
+        if runtime.tx.send(action).is_err() {
+            log::warn!("Dropping procedure post for session {target}");
+        }
+        return Ok(());
+    }
     let receivers = state
         .borrow::<crate::session::runtime::SharedMessageBus>()
         .borrow()
@@ -2291,7 +2537,8 @@ fn op_smudgy_procedure_post(
                     canonical,
                     crate::session::runtime::message_bus::PendingPost {
                         payload: payload_json.to_string(),
-                        sender,
+                        origin: caller_origin,
+                        session: caller_json,
                     },
                 );
             if dropped_oldest {
@@ -2316,8 +2563,12 @@ fn op_smudgy_procedure_post(
             value: payload_json.to_string(),
         },
         MatchCapture {
-            name: Some(std::borrow::Cow::Borrowed("sender")),
-            value: sender,
+            name: Some(std::borrow::Cow::Borrowed("origin")),
+            value: caller_origin,
+        },
+        MatchCapture {
+            name: Some(std::borrow::Cow::Borrowed("session")),
+            value: caller_json,
         },
     ]);
     for receiver in receivers {
@@ -2419,6 +2670,10 @@ fn route_session_action(state: &mut OpState, session_id: SessionId, action: Runt
     if *state.borrow::<SessionId>() == session_id {
         queue_own_action(state, action);
     } else if let Some(runtime) = registry::get_runtime(session_id) {
+        if runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+            log::warn!("Dropping cross-server action for session {session_id}");
+            return;
+        }
         if runtime.tx.send(action).is_err() {
             log::warn!("Dropping action for session {session_id}: runtime has shut down");
         }
@@ -2439,7 +2694,8 @@ fn op_smudgy_get_sessions<'s>(
 ) -> Result<v8::Local<'s, v8::Array>, NotCapable> {
     // Enumerating the user's other sessions is the `reach-others` capability.
     ensure(grants(state).reach_others, "reach-others")?;
-    let session_ids = registry::get_all_session_ids();
+    let server = state.borrow::<ServerName>().0.clone();
+    let session_ids = registry::get_session_ids_for_server(server.as_str());
 
     let sessions: Vec<v8::Local<v8::Value>> = session_ids
         .iter()
@@ -2471,6 +2727,9 @@ fn op_smudgy_get_session_character<'s>(
         Some(runtime) => runtime,
         None => return Ok(v8::Object::new(scope)), // Return empty object if session not found
     };
+    if runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+        return Ok(v8::Object::new(scope));
+    }
 
     // Create the return object
     let ret = v8::Object::new(scope);
@@ -2489,6 +2748,19 @@ fn op_smudgy_get_session_character<'s>(
     ret.create_data_property(scope, subtext_k, subtext_v);
 
     Ok(ret)
+}
+
+#[op2(fast)]
+fn op_smudgy_session_connected(state: &mut OpState, session_id: u32) -> Result<bool, NotCapable> {
+    let session_id = SessionId::from(session_id);
+    if session_id != *state.borrow::<SessionId>() {
+        ensure(grants(state).reach_others, "reach-others")?;
+    }
+    let server = state.borrow::<ServerName>().0.clone();
+    Ok(registry::get_runtime(session_id).is_some_and(|runtime| {
+        runtime.server_name.as_str() == server.as_str()
+            && runtime.connected.load(std::sync::atomic::Ordering::Acquire)
+    }))
 }
 
 #[op2(fast)]
@@ -5894,7 +6166,7 @@ fn op_smudgy_fallthrough(state: &mut OpState, value: bool) -> Result<(), Fallthr
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsiColor, Color, ECHO_DEFAULT_STYLE, IsolateId, LinkContext, SessionId,
+        AnsiColor, Color, ECHO_DEFAULT_STYLE, EventSourceFilter, IsolateId, LinkContext, SessionId,
         canonical_procedure, fold_name, packed_echo_lines, packed_validate, param_read_allowed,
     };
     use crate::session::runtime::store::ProducerKey;
@@ -6155,5 +6427,18 @@ mod tests {
             canonical_procedure(&producer, "Refresh"),
             "smudgy://wbk/tracker#refresh"
         );
+    }
+
+    #[test]
+    fn event_source_filters_distinguish_own_exact_and_all_routes() {
+        let own = SessionId::from(7);
+        let other = SessionId::from(9);
+        assert!(EventSourceFilter::Own.accepts(own, own));
+        assert!(!EventSourceFilter::Own.accepts(own, other));
+        assert!(EventSourceFilter::Exact(other).accepts(own, other));
+        assert!(!EventSourceFilter::Exact(other).accepts(own, own));
+        assert!(EventSourceFilter::All { include_self: true }.accepts(own, own));
+        assert!(EventSourceFilter::All { include_self: false }.accepts(own, other));
+        assert!(!EventSourceFilter::All { include_self: false }.accepts(own, own));
     }
 }

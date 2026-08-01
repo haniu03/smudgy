@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
@@ -58,6 +59,7 @@ impl StoreBindingCell {
 #[derive(Clone, Debug, Default)]
 pub struct StoreBindings {
     cells: Arc<RwLock<HashMap<u32, Arc<StoreBindingCell>>>>,
+    next_id: Arc<AtomicU32>,
 }
 
 impl StoreBindings {
@@ -70,6 +72,15 @@ impl StoreBindings {
         self.cells.write().insert(id, cell);
     }
 
+    /// Mint an engine-scoped binding id and install its cell. The allocator is
+    /// shared by local and directed-state bindings, keeping their opaque token
+    /// namespace collision-free.
+    pub fn allocate(&self, cell: Arc<StoreBindingCell>) -> u32 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.insert(id, cell);
+        id
+    }
+
     /// The cell a binding token addresses, or `None` for a stale/unknown id (a token minted
     /// by a previous engine generation).
     #[must_use]
@@ -79,6 +90,7 @@ impl StoreBindings {
 
     pub fn clear(&self) {
         self.cells.write().clear();
+        self.next_id.store(0, Ordering::Relaxed);
     }
 }
 

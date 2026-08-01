@@ -58,6 +58,87 @@ use super::{IsolateId, MAX_EVENT_DEPTH, Origin, RuntimeAction};
 /// flush points — legal because all isolates live on the one session thread.
 pub(crate) type SharedSessionStore = Rc<std::cell::RefCell<SessionStore>>;
 
+/// Immutable committed state published for same-server directed readers. A
+/// clone is shallow because every [`Node`] container is structurally shared.
+#[derive(Clone, Debug, Default)]
+pub struct PublishedStore {
+    roots: HashMap<ProducerKey, Node>,
+    previous: HashMap<ProducerKey, Node>,
+}
+
+impl PublishedStore {
+    fn at<'a>(
+        roots: &'a HashMap<ProducerKey, Node>,
+        producer: &ProducerKey,
+        path: &StorePath,
+    ) -> Option<&'a Node> {
+        roots.get(producer)?.extract(path.segments())
+    }
+
+    #[must_use]
+    pub fn get_json(
+        &self,
+        producer: &ProducerKey,
+        path: &StorePath,
+        previous: bool,
+    ) -> Option<String> {
+        let roots = if previous {
+            &self.previous
+        } else {
+            &self.roots
+        };
+        Self::at(roots, producer, path).map(Node::to_json)
+    }
+
+    #[must_use]
+    pub fn get_tagged(
+        &self,
+        producer: &ProducerKey,
+        path: &StorePath,
+        previous: bool,
+    ) -> Option<TaggedSnapshot> {
+        let roots = if previous {
+            &self.previous
+        } else {
+            &self.roots
+        };
+        Self::at(roots, producer, path).map(classify_node)
+    }
+
+    #[must_use]
+    pub fn keys(
+        &self,
+        producer: &ProducerKey,
+        path: &StorePath,
+        previous: bool,
+    ) -> Option<Vec<&str>> {
+        let roots = if previous {
+            &self.previous
+        } else {
+            &self.roots
+        };
+        match Self::at(roots, producer, path) {
+            Some(Node::Object(object)) => Some(object.keys().collect()),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn node(&self, producer: &ProducerKey, path: &StorePath) -> Option<Node> {
+        Self::at(&self.roots, producer, path).cloned()
+    }
+}
+
+/// One write from the source turn whose commit produced a directed-state
+/// notification. It is data-only and safe to carry across runtime threads.
+#[derive(Clone, Debug)]
+pub struct PublishedWrite {
+    pub producer: ProducerKey,
+    pub path: StorePath,
+    pub value: Node,
+    pub depth: u32,
+}
+
 /// Which isolate is a package's interop **home** — the loader-known installed/trusted load whose
 /// writes the store accepts (`docs/interop.md` §3). Version-blind on purpose: the
 /// registry is rebuilt per engine from the lockfile *before* versions resolve, so top-level
@@ -613,7 +694,7 @@ pub struct SessionStore {
     /// Engine-scoped watcher registry; the index is the watch token, `None` = unwatched.
     watchers: Vec<Option<Watcher>>,
     /// Engine-scoped widget bindings; the index is the binding id carried by script tokens.
-    bindings: Vec<HostBinding>,
+    bindings: HashMap<u32, HostBinding>,
     /// Dedup: ASCII-folded `(producer, path)` → existing binding id, so re-running a widget
     /// build (every remount re-calls `bind`) reuses one cell instead of accreting them.
     binding_ids: HashMap<(ProducerKey, Vec<String>), u32>,
@@ -629,6 +710,9 @@ pub struct SessionStore {
     collapse_warned: HashSet<ProducerKey>,
     /// (producer, isolate) pairs already given the non-home write diagnostic this engine run.
     non_home_warned: HashSet<(ProducerKey, IsolateId)>,
+    /// Data-only copy of the journal most recently committed, consumed by the
+    /// runtime when it announces that flush to directed readers.
+    last_published_writes: Vec<PublishedWrite>,
 }
 
 impl SessionStore {
@@ -648,7 +732,7 @@ impl SessionStore {
             pending_usage: HashMap::new(),
             turn_heads: HashMap::new(),
             watchers: Vec::new(),
-            bindings: Vec::new(),
+            bindings: HashMap::new(),
             binding_ids: HashMap::new(),
             binding_trie: HashMap::new(),
             shared_bindings: StoreBindings::new(),
@@ -656,6 +740,7 @@ impl SessionStore {
             budgets,
             collapse_warned: HashSet::new(),
             non_home_warned: HashSet::new(),
+            last_published_writes: Vec::new(),
         }
     }
 
@@ -676,6 +761,7 @@ impl SessionStore {
         self.turn_heads.clear();
         self.collapse_warned.clear();
         self.non_home_warned.clear();
+        self.last_published_writes.clear();
     }
 
     /// The shared id → cell registry (the same handle for the session's whole life), seeded
@@ -1043,19 +1129,18 @@ impl SessionStore {
         if let Some(id) = self.binding_ids.get(&key) {
             return *id;
         }
-        let id = u32::try_from(self.bindings.len()).unwrap_or(u32::MAX);
         let seed = self
             .committed(&producer, &path)
             .cloned()
             .unwrap_or(Node::Null);
         let cell = Arc::new(StoreBindingCell::new(seed));
+        let id = self.shared_bindings.allocate(cell.clone());
         let mut node = self.binding_trie.entry(producer.clone()).or_default();
         for segment in folded {
             node = node.children.entry(segment).or_default();
         }
         node.ids.push(id);
-        self.shared_bindings.insert(id, cell.clone());
-        self.bindings.push(HostBinding {
+        self.bindings.insert(id, HostBinding {
             producer,
             path,
             cell,
@@ -1104,11 +1189,21 @@ impl SessionStore {
     /// Commit the journal to the tree and produce one coalesced delivery per watcher whose
     /// path is comparable to any written path — the final-state-this-turn snapshot, queued by
     /// the caller at the back of the action queue (delivery on the next pump, like events).
+    #[allow(clippy::too_many_lines)]
     pub fn flush(&mut self) -> Vec<RuntimeAction> {
         if self.journal.is_empty() {
             return Vec::new();
         }
         let journal = std::mem::take(&mut self.journal);
+        self.last_published_writes = journal
+            .iter()
+            .map(|entry| PublishedWrite {
+                producer: entry.producer.clone(),
+                path: entry.path.clone(),
+                value: entry.value.clone(),
+                depth: entry.depth,
+            })
+            .collect();
         // Freeze the turn heads: each head already carries the journal's net effect (writes
         // applied as they arrived), so committing a producer is one map move — no replay.
         // The displaced root becomes the producer's retained previous generation (an `Arc`
@@ -1226,6 +1321,21 @@ impl SessionStore {
         deliveries
     }
 
+    /// Shallow committed snapshot for the cross-session publication slot.
+    #[must_use]
+    pub fn published(&self) -> PublishedStore {
+        PublishedStore {
+            roots: self.roots.clone(),
+            previous: self.previous.clone(),
+        }
+    }
+
+    /// The source journal corresponding to the most recent successful flush.
+    #[must_use]
+    pub fn last_published_writes(&self) -> Vec<PublishedWrite> {
+        self.last_published_writes.clone()
+    }
+
     /// Binding invalidation at flush: walk each written path through its producer's trie
     /// collecting ancestor-or-equal bindings en route and the whole bound subtree at the end,
     /// then write every dirty cell's committed snapshot. Write-triggered like `watch` (no
@@ -1252,10 +1362,7 @@ impl SessionStore {
             }
         }
         for id in &dirty {
-            let Ok(index) = usize::try_from(*id) else {
-                continue;
-            };
-            if let Some(binding) = self.bindings.get(index) {
+            if let Some(binding) = self.bindings.get(id) {
                 // A shallow clone: the cell pins the committed subtree by `Arc`, sharing its
                 // structure — writes since only ever diverge the spines they touch.
                 let snapshot = self

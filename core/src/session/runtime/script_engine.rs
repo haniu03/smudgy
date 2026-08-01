@@ -291,6 +291,8 @@ pub struct ScriptEngine<'a> {
     /// The session-global event bus (`PACKAGE-EVENTS.md`), kept so the host can deliver `sys:`/`map:`
     /// events to subscribers (the same `Rc` cloned into every isolate's ops).
     event_registry: ops::EventRegistry,
+    remote_state_registry: super::SharedRemoteStateRegistry,
+    message_bus: super::SharedMessageBus,
     /// The runtime catalogue (`docs/interop.md` §10), kept so [`Self::host_emit`]
     /// can sample platform events at its choke point (the same `Rc` cloned into every
     /// isolate's ops, where package emits/posts sample).
@@ -949,6 +951,8 @@ impl<'a> ScriptEngine<'a> {
         // below borrows *these* rather than `params`, whose fields move into `Self`.
         let session_id = params.session_id;
         let server_name = Arc::clone(params.server_name);
+        let broadcast_channel =
+            crate::session::registry::broadcast_channel_for_server(server_name.as_str());
         let spawned_actions = params.spawned_actions.clone();
         let pending_ops = params.pending_line_operations.clone();
         let emitted_line_count = params.emitted_line_count.clone();
@@ -992,6 +996,10 @@ impl<'a> ScriptEngine<'a> {
         // The session store, shared (same `Rc`) into every isolate's ops; owned by the runtime,
         // which flushes it per turn (`docs/interop.md` §2).
         let session_store = params.session_store.clone();
+        let store_bindings = session_store.borrow().bindings();
+        let remote_state_registry: super::SharedRemoteStateRegistry = Rc::new(RefCell::new(
+            super::remote_interop::RemoteStateRegistry::new(store_bindings.clone()),
+        ));
         // The message bus + runtime catalogue, likewise session-owned and shared into every
         // isolate's ops (D1 routing; §10 sampling/declaration).
         let message_bus = params.message_bus.clone();
@@ -1123,6 +1131,7 @@ impl<'a> ScriptEngine<'a> {
                     // Same `Rc` for every isolate: the session store is session-wide; writes
                     // journal here and the runtime flushes per turn.
                     session_store.clone(),
+                    remote_state_registry.clone(),
                     // Same `Rc` for every isolate: the message bus routes posts to the
                     // producer's home instance across isolates (`interop.md` §6).
                     message_bus.clone(),
@@ -1134,7 +1143,7 @@ impl<'a> ScriptEngine<'a> {
                     home_registry.clone(),
                     // The store's widget-binding cell registry (interop.md §7), parked in `OpState`
                     // for the leaf `smudgy_widgets` build ops to resolve binding tokens.
-                    session_store.borrow().bindings(),
+                    store_bindings.clone(),
                     // This isolate's `$DATA` dir, exposed to the script as `getDataDir()`.
                     data_dir,
                     // This isolate's image-source policy, read by the leaf `smudgy_widgets`
@@ -1293,6 +1302,7 @@ impl<'a> ScriptEngine<'a> {
             None,
             ImportPolicy::Any,
             params.tokio_runtime.clone(),
+            broadcast_channel.clone(),
         )
         .expect("Failed to create JS runtime");
         // Surface the v8 inspector endpoint (main only) so it can be debugged via the bundled
@@ -1615,6 +1625,7 @@ impl<'a> ScriptEngine<'a> {
                     // level (`None` = smudgy:// only, `Registries` = + npm/jsr, `Any` = + the web).
                     effective.import,
                     params.tokio_runtime.clone(),
+                    broadcast_channel.clone(),
                 ) {
                     Ok(runtime) => runtime,
                     Err(e) => {
@@ -1907,6 +1918,8 @@ impl<'a> ScriptEngine<'a> {
             session_id: params.session_id,
             isolates,
             event_registry,
+            remote_state_registry,
+            message_bus,
             catalogue,
             platform_event_keys: RefCell::new(HashMap::new()),
             server_name: params.server_name,
@@ -1968,27 +1981,137 @@ impl<'a> ScriptEngine<'a> {
         // while `on()` registrations folded to a different key — the case-insensitive matching
         // `PACKAGE-EVENTS.md` promises. Today's host names are all lowercase, so this is a
         // forward guard; the delivered `event` keeps its original spelling either way.
+        let Some(source) = crate::session::registry::snapshot(self.session_id) else {
+            return Vec::new();
+        };
+        self.deliver_interop_event(event, event, payload_json, &source, 0)
+    }
+
+    /// Resolve one routed event through this engine's source filters.
+    #[must_use]
+    pub fn deliver_interop_event(
+        &self,
+        canonical: &str,
+        stamped: &str,
+        payload_json: &str,
+        source: &crate::session::registry::SessionSnapshot,
+        depth: u32,
+    ) -> Vec<super::RuntimeAction> {
         let subscribers = self
             .event_registry
             .borrow()
-            .get(ops::fold_name(event).as_ref())
+            .get(ops::fold_name(canonical).as_ref())
             .map_or_else(Vec::new, Clone::clone);
+        let source_json = source.to_json(false);
         subscribers
             .into_iter()
-            .map(|sub| super::RuntimeAction::CallJavascriptFunction {
-                isolate: sub.isolate,
-                id: sub.function_id,
+            .filter(|subscriber| subscriber.source.accepts(self.session_id, source.id))
+            .map(|subscriber| super::RuntimeAction::CallJavascriptFunction {
+                isolate: subscriber.isolate,
+                id: subscriber.function_id,
                 matches: Arc::new(vec![
                     MatchCapture {
                         name: Some(std::borrow::Cow::Borrowed("event")),
-                        value: event.to_string(),
+                        value: stamped.to_string(),
                     },
                     MatchCapture {
                         name: Some(std::borrow::Cow::Borrowed("payload")),
                         value: payload_json.to_string(),
                     },
+                    MatchCapture {
+                        name: Some(std::borrow::Cow::Borrowed("source")),
+                        value: source_json.clone(),
+                    },
                 ]),
-                depth: 0,
+                depth,
+                is_captured: None,
+            })
+            .collect()
+    }
+
+    /// Resolve a source session's committed-state notice through this engine's
+    /// own directed watchers and binding cells.
+    pub fn remote_store_flushed(
+        &self,
+        source: SessionId,
+        writes: &[super::store::PublishedWrite],
+    ) -> (Vec<super::RuntimeAction>, bool) {
+        let Some(runtime) = crate::session::registry::get_runtime(source) else {
+            return (Vec::new(), false);
+        };
+        if runtime.server_name.as_str() != self.server_name.as_str() {
+            return (Vec::new(), false);
+        }
+        let published = runtime.published_store.read().unwrap();
+        self.remote_state_registry
+            .borrow_mut()
+            .deliver(source, &published, writes)
+    }
+
+    /// Make all directed state views of a destroyed source absent.
+    pub fn remote_session_destroyed(&self, source: SessionId) -> (Vec<super::RuntimeAction>, bool) {
+        self.remote_state_registry
+            .borrow_mut()
+            .source_destroyed(source)
+    }
+
+    /// Resolve a directed procedure post through this engine's local receiver.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn deliver_procedure_post(
+        &self,
+        canonical: Arc<str>,
+        producer: Arc<str>,
+        name: Arc<str>,
+        payload: Arc<str>,
+        caller_origin: Arc<str>,
+        caller_session: &crate::session::registry::SessionSnapshot,
+        depth: u32,
+    ) -> Vec<super::RuntimeAction> {
+        self.catalogue.borrow_mut().sample_dynamic(
+            &producer,
+            super::catalogue::CatalogueKind::Procedure,
+            &name,
+            &caller_origin,
+            &payload,
+        );
+        let receivers = self.message_bus.borrow().receivers(&canonical);
+        let session = caller_session.to_json(false);
+        if receivers.is_empty() {
+            let dropped = self.message_bus.borrow_mut().push_pending(
+                canonical.to_string(),
+                super::message_bus::PendingPost {
+                    payload: payload.to_string(),
+                    origin: caller_origin.to_string(),
+                    session,
+                },
+            );
+            if dropped {
+                log::warn!("smudgy: directed procedure pending buffer overflowed for {canonical}");
+            }
+            return Vec::new();
+        }
+        let matches = Arc::new(vec![
+            MatchCapture {
+                name: Some(std::borrow::Cow::Borrowed("payload")),
+                value: payload.to_string(),
+            },
+            MatchCapture {
+                name: Some(std::borrow::Cow::Borrowed("origin")),
+                value: caller_origin.to_string(),
+            },
+            MatchCapture {
+                name: Some(std::borrow::Cow::Borrowed("session")),
+                value: session,
+            },
+        ]);
+        receivers
+            .into_iter()
+            .map(|receiver| super::RuntimeAction::CallJavascriptFunction {
+                isolate: receiver.isolate,
+                id: receiver.function_id,
+                matches: Arc::clone(&matches),
+                depth,
                 is_captured: None,
             })
             .collect()
@@ -2672,6 +2795,7 @@ fn build_script_runtime(
     permissions: Option<PermissionsContainer>,
     import_policy: ImportPolicy,
     tokio_runtime: Rc<tokio::runtime::Runtime>,
+    broadcast_channel: smudgy_script::InMemoryBroadcastChannel,
 ) -> Result<ScriptRuntime> {
     let mut runtime = ScriptRuntime::new(ScriptRuntimeOptions {
         extensions,
@@ -2687,6 +2811,7 @@ fn build_script_runtime(
         permissions,
         data_dir,
         webstorage_dir,
+        broadcast_channel: Some(broadcast_channel),
     })?;
     // rusty_v8 enters the isolate when its `OwnedIsolate` is constructed and leaves it current.
     // With an isolate *set* on one thread that would make every isolate but the last "current"

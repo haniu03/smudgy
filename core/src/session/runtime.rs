@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     task::Poll,
     thread::{self},
 };
@@ -43,6 +43,7 @@ mod message_bus;
 pub mod pane;
 mod gmcp;
 mod msdp;
+mod remote_interop;
 mod script_action;
 mod script_engine;
 mod store;
@@ -56,6 +57,7 @@ pub(crate) use input::{
 use line_operation::LineOperation;
 use message_bus::MessageBus;
 pub(crate) use message_bus::SharedMessageBus;
+pub(crate) use remote_interop::SharedRemoteStateRegistry;
 use pane::{PaneKey, PaneRegistry, MAIN_PANE_KEY};
 
 pub use script_action::ScriptAction;
@@ -91,12 +93,12 @@ mod dispatch;
 mod origin;
 
 pub use action::RuntimeAction;
+pub(crate) use action::{ActionQueue, ActionResult, RunAction};
 pub use origin::{
     AutomationBody, AutomationDelta, AutomationEvent, AutomationKind, AutomationSummary, IsolateId,
     Origin,
     SingletonKey, SingletonOrigin, SingletonRegistry,
 };
-pub(crate) use action::{ActionQueue, ActionResult, RunAction};
 
 /// Cap on host-routed delivery recursion (event emit chains and session-store watch chains
 /// alike — the store's watch dispatch deliberately shares the event system's depth cap): a
@@ -252,6 +254,10 @@ pub struct Runtime {
     /// Per-session runtime-catalogue broadcast (`docs/interop.md` §10); the
     /// automations window's store tab subscribes via [`Runtime::subscribe_catalogue`].
     pub catalogue_tx: broadcast::Sender<CatalogueEvent>,
+    /// Transport state read by script-visible `Session.connected` handles.
+    pub connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Latest committed immutable store roots for same-server directed reads.
+    pub published_store: Arc<RwLock<store::PublishedStore>>,
 }
 
 static RUNTIME_THREADS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
@@ -329,6 +335,11 @@ impl Runtime {
         let local_automation_tx = automation_tx.clone();
         let (catalogue_tx, _) = broadcast::channel::<CatalogueEvent>(CATALOGUE_BROADCAST_CAPACITY);
         let local_catalogue_tx = catalogue_tx.clone();
+
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let local_connected = Arc::clone(&connected);
+        let published_store = Arc::new(RwLock::new(store::PublishedStore::default()));
+        let local_published_store = Arc::clone(&published_store);
 
         let thread = thread::spawn(move || {
             let pending_line_operations = Rc::new(RefCell::new(Vec::new()));
@@ -530,6 +541,8 @@ impl Runtime {
                 input_word_sets: input_word_sets.clone(),
                 pane_input_callbacks: pane_input_callbacks.clone(),
                 session_store: session_store.clone(),
+                published_store: Arc::clone(&local_published_store),
+                connected: Arc::clone(&local_connected),
                 catalogue: catalogue.clone(),
                 gmcp: gmcp::GmcpProducer::new(gmcp_enabled.clone()),
                 msdp: msdp::MsdpProducer::new(),
@@ -791,6 +804,8 @@ impl Runtime {
                     input_word_sets: input_word_sets.clone(), // Contributions reset above; the cell itself is session-scoped
                     pane_input_callbacks: pane_input_callbacks.clone(), // Handlers reset above; the cell itself is session-scoped
                     session_store: session_store.clone(), // Committed store state survives reload
+                    published_store: Arc::clone(&local_published_store),
+                    connected: Arc::clone(&local_connected),
                     catalogue: catalogue.clone(),         // Samples are session history
                     gmcp: old_gmcp, // Session-scoped: enabled tracks the surviving connection
                     msdp: old_msdp, // Same: server facts, no engine facts
@@ -846,6 +861,8 @@ impl Runtime {
             tx: session_runtime_tx,
             automation_tx,
             catalogue_tx,
+            connected,
+            published_store,
         }
     }
 
@@ -962,6 +979,8 @@ struct Inner<'a> {
     /// the ops; [`Self::flush_session_store`] commits the journal once per turn and queues the
     /// coalesced watch deliveries. The committed tree survives reloads (like `recent_lines`).
     session_store: SharedSessionStore,
+    published_store: Arc<RwLock<store::PublishedStore>>,
+    connected: Arc<std::sync::atomic::AtomicBool>,
     /// The runtime catalogue (`docs/interop.md` §10), shared into every isolate's
     /// ops (emit/post sampling) and snapshotted by [`Self::sync_catalogue_broadcast`]. (The
     /// message bus is engine-wired only — the run loop never touches it, so `Inner` doesn't
@@ -1463,6 +1482,26 @@ impl Inner<'_> {
         for action in self.session_store.borrow_mut().flush() {
             if self.session_runtime_tx.send(action).is_err() {
                 warn!("Dropping session-store watch delivery: runtime channel closed");
+            }
+        }
+        let (published, writes) = {
+            let store = self.session_store.borrow();
+            (store.published(), Arc::new(store.last_published_writes()))
+        };
+        *self.published_store.write().unwrap() = published;
+        for runtime in registry::get_runtimes_for_server(self.server_name.as_str()) {
+            if runtime
+                .tx
+                .send(RuntimeAction::RemoteStoreFlushed {
+                    source: self.session_id,
+                    writes: Arc::clone(&writes),
+                })
+                .is_err()
+            {
+                warn!(
+                    "Dropping directed state flush for session {}",
+                    runtime.session_id
+                );
             }
         }
         // The committed tree changed; a subscribed store tab needs a fresh snapshot at the
