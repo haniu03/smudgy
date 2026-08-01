@@ -148,6 +148,7 @@ pub const BUNDLED_FONT_FAMILIES: &[&str] = &[
     "Courier Prime",
     "Departure Mono",
     "Fira Mono",
+    "Fixedsys Excelsior",
     "Lilex",
     "VT323",
 ];

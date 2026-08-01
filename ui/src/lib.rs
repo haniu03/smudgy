@@ -433,6 +433,7 @@ pub fn run() -> anyhow::Result<()> {
         .font(assets::fonts::FIRA_MONO_BOLD_BYTES)
         .font(assets::fonts::LILEX_BYTES)
         .font(assets::fonts::VT323_BYTES)
+        .font(assets::fonts::FIXEDSYS_EX_BYTES)
         .default_font(assets::fonts::GEIST_VF)
         .title(|smudgy: &Smudgy, window_id: window::Id| {
             if let Some(window) = smudgy.automations_windows.get(&window_id) {
