@@ -1,14 +1,20 @@
 {
-    "version": "0.0.1",
+    "version": "0.0.6",
     "description": "Type TinTin++ commands at the input line: #alias, #action, #variable, #showme and friends become native smudgy automations.",
     "entry": "index.ts",
     "min_smudgy_version": "0.5.0",
-    "options": [
+    "params": [
         {
             "key": "commandChar",
             "label": "Command character",
             "type": "string",
             "default": "#"
+        },
+        {
+            "key": "speedwalk",
+            "label": "Enable TinTin speedwalks",
+            "type": "bool",
+            "default": false
         }
     ],
     "permissions": {
@@ -18,7 +24,7 @@
             "input": ["access"],
             "interop": ["read"],
             "automations": ["aliases", "triggers"],
-            "session": ["send", "echo", "reach-others"],
+            "session": ["send", "send-direct", "echo", "reach-others"],
             "display": ["change"],
             "panes": ["create"]
         }

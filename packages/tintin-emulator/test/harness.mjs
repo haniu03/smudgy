@@ -3,8 +3,11 @@
 // then push typed lines through the submit handler.
 import { register } from "node:module";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 register("./smudgy-loader.mjs", import.meta.url);
+
+const manifest = JSON.parse(readFileSync(new URL("../smudgy.package.json", import.meta.url), "utf8"));
 
 // A style builder standing in for smudgy's: property access and option calls
 // return the builder; tag application flattens to plain text.
@@ -52,10 +55,16 @@ globalThis.Deno = {
   mkdirSync() {},
 };
 const stub = {
-  vars: {},
-  params: { commandChar: "#" },
+  vars: { __tintin_definitions: { config: { speedwalk: false } } },
+  params: { commandChar: "#", speedwalk: true },
   calls,
   record: (kind, value) => calls.push([kind, value]),
+  requireGrant(group, capability) {
+    assert.ok(
+      manifest.permissions?.smudgy?.[group]?.includes(capability),
+      `package manifest must grant permissions.smudgy.${group} ${capability}`,
+    );
+  },
   textOf,
   style: makeStyleBuilder(),
   input: { completion: { add: (...words) => { stub.completionWords.push(...words); } } },
@@ -124,9 +133,54 @@ function type(text) {
   return cancelled;
 }
 
+/** Submit a line through sys:submit and then Smudgy's priority-ordered aliases. */
+function submitInput(text) {
+  if (type(text)) return;
+  const aliases = created
+    .filter((handle) => handle.kind === "alias" && handle.enabled && !handle.deleted)
+    .sort((left, right) => (right.options?.priority ?? 0) - (left.options?.priority ?? 0));
+  for (const alias of aliases) {
+    const match = new RegExp(alias.patterns).exec(text);
+    if (!match) continue;
+    alias.script(Object.assign(match, match.groups ?? {}));
+    if (alias.options?.fallthrough === false) return;
+  }
+  calls.push(["wire", text]);
+}
+
 function lastCall(kind) {
   return calls.filter(([k]) => k === kind).at(-1)?.[1];
 }
+
+// SPEEDWALK is a load-time smudgy param. The manifest defaults it off; this
+// harness opts in to exercise the lowest-priority native alias it installs.
+assert.equal(manifest.params.find((param) => param.key === "speedwalk")?.default, false);
+assert.ok(
+  manifest.permissions.smudgy.session.includes("send-direct"),
+  "speedwalk's direct sends are explicitly granted",
+);
+const speedwalkAlias = created.filter((handle) =>
+  handle.kind === "alias" && String(handle.name).includes("SPEEDWALK")).at(-1);
+assert.ok(speedwalkAlias, "speedwalk fallback alias created when the param is true");
+assert.equal(speedwalkAlias.options.priority, -1_000_000, "ordinary aliases take precedence");
+calls.length = 0;
+submitInput("ne2s");
+assert.deepEqual(
+  calls.filter(([kind]) => kind === "sendRaw").map(([, value]) => value),
+  ["n", "e", "s", "s"],
+  "expanded steps bypass alias matching instead of recursively matching SPEEDWALK",
+);
+calls.length = 0;
+submitInput("look");
+assert.deepEqual(calls, [["wire", "look"]], "non-speedwalk input reaches the MUD untouched");
+calls.length = 0;
+submitInput("unde");
+assert.deepEqual(
+  calls.filter(([kind]) => kind === "sendRaw").map(([, value]) => value),
+  ["u", "n", "d", "e"],
+  "all valid one-letter direction sequences are speedwalks",
+);
+assert.equal(type("NEWS"), false, "uppercase avoids speedwalking");
 
 // Plain lines pass through untouched.
 assert.equal(type("kill orc"), false);
@@ -143,7 +197,7 @@ assert.equal(lastCall("echo"), "alert done");
 
 // #alias creates a native alias; firing it interprets the body.
 type("#alias {gt} {guildtell %0}");
-const alias = created.find((handle) => handle.kind === "alias");
+const alias = created.find((handle) => handle.kind === "alias" && handle.options.name.includes("{gt}"));
 assert.ok(alias, "alias created");
 assert.equal(alias.patterns, "^gt(?:\\s(.*))?$");
 assert.equal(alias.options.fallthrough, false);
@@ -202,9 +256,13 @@ type("#frobnicate now");
 assert.ok(String(lastCall("echo")).includes("IS NOT A COMMAND"));
 type("#system rm -rf /");
 assert.ok(String(lastCall("echo")).includes("sandboxed"));
+type("#config {speedwalk} {off}");
+assert.ok(String(lastCall("echo")).includes("not supported"), "speedwalk is configured through package params");
+assert.equal(speedwalkAlias.deleted, false);
 
 // Definitions persisted for replay.
 const storedDefs = stub.vars.__tintin_definitions;
+assert.equal(storedDefs.config, undefined, "stale command-side speedwalk state is discarded");
 assert.ok(storedDefs.aliases.gt, "alias persisted");
 assert.ok(storedDefs.actions["%1 tells you %2"], "action persisted");
 
@@ -442,6 +500,16 @@ const pumpSends = (...commands) => {
     for (const handler of stub.eventHandlers.send ?? []) handler({ command });
   }
 };
+type("#path new");
+calls.length = 0;
+speedwalkAlias.script({ 0: "2ne" });
+type("#path describe");
+assert.ok(String(lastCall("echo")).includes("2n;e"), "speedwalk directions are recorded in #PATH");
+assert.equal(
+  calls.filter(([kind]) => kind === "sendRaw").length,
+  3,
+  "recorded speedwalk directions still reach the MUD",
+);
 type("#pathdir {enter} {out}");
 type("#path new");
 pumpSends("n", "n", "e", "look", "enter");
@@ -450,6 +518,7 @@ assert.ok(String(lastCall("echo")).includes("2n;e;enter"));
 calls.length = 0;
 type("#path undo");
 assert.equal(lastCall("send"), "out");
+type("#path goto {start}");
 type("#path run");
 assert.deepEqual(calls.filter(([k]) => k === "send").map(([, v]) => v), ["out", "n", "n", "e"]);
 // The client delivers sys:send AFTER send() returns; the emulator's own
@@ -457,7 +526,7 @@ assert.deepEqual(calls.filter(([k]) => k === "send").map(([, v]) => v), ["out", 
 pumpSends("out", "n", "n", "e");
 type("#path describe");
 assert.ok(String(lastCall("echo")).includes("2n;e"), "route unchanged after replay events");
-assert.ok(!String(lastCall("echo")).includes("4"), "route did not double");
+assert.ok(String(lastCall("echo")).includes("3 steps"), "route did not double");
 type("#path save {forward} {route}");
 assert.equal(stub.vars.route, "n;n;e");
 type("#path save {backward} {retreat}");
@@ -472,6 +541,28 @@ assert.ok(String(lastCall("echo")).includes("3 steps (1 literal command)"));
 type("#path describe");
 assert.ok(String(lastCall("echo")).includes("open"));
 
+// Cursor-aware path operations: map/show, walk, move, get, swap, and
+// save/load of TinTin's forward/backward/delay triples.
+type("#path map");
+assert.ok(String(lastCall("echo")).includes("[open]"));
+calls.length = 0;
+type("#path walk {forward}");
+assert.equal(lastCall("send"), "open");
+type("#path get {position} {pathpos}");
+assert.equal(stub.vars.pathpos, 2);
+type("#path move {1}");
+type("#path get {info} {pathinfo}");
+assert.deepEqual(stub.vars.pathinfo, { length: 3, position: 3, mapping: 0, running: 0 });
+type("#path save {both} {routeboth}");
+assert.equal(stub.vars.routeboth, ";{open}{open}{0};{n}{s}{0};{n}{s}{0}");
+type("#path load {routeboth}");
+type("#path get {length} {pathlen}");
+assert.equal(stub.vars.pathlen, 3);
+type("#path goto {end}");
+type("#path swap");
+type("#path save {forward} {swapped}");
+assert.equal(stub.vars.swapped, "s;s;open");
+
 // #path create clears AND starts tracking.
 type("#path destroy");
 type("#path create");
@@ -484,12 +575,26 @@ type("#path unzip {3n}");
 type("#path run {5}");
 const pacedTimers = created.filter((handle) => handle.kind === "timer" && String(handle.patterns?.name ?? "").startsWith("#path run"));
 assert.equal(pacedTimers.length, 3);
+pacedTimers[0].script();
+assert.equal(lastCall("send"), "n");
+type("#path get {position} {pacedpos}");
+assert.equal(stub.vars.pacedpos, 2);
+type("#path stop");
+const beforeResume = created.length;
+type("#path run {5}");
+const resumedTimers = created.slice(beforeResume)
+  .filter((handle) => handle.kind === "timer" && String(handle.patterns?.name ?? "").startsWith("#path run"));
+assert.equal(resumedTimers.length, 2, "paced run resumes from its cursor");
 type("#path destroy");
 assert.ok(pacedTimers.every((timer) => timer.deleted), "paced run cancelled by destroy");
+assert.ok(resumedTimers.every((timer) => timer.deleted), "resumed run cancelled by destroy");
 
-// Prototype members are not directions; __proto__ is not a pathdir name.
+// Arbitrary forward/backward command pairs are valid path nodes.
+type("#path destroy");
 type("#path insert {toString}");
-assert.ok(String(lastCall("echo")).includes("IS NOT A PATHDIR"));
+type("#path describe");
+assert.ok(String(lastCall("echo")).includes("toString"));
+// __proto__ is still not a storable pathdir name.
 type("#pathdir {__proto__} {x}");
 assert.ok(String(lastCall("echo")).includes("cannot be a pathdir name"));
 type("#path stop");

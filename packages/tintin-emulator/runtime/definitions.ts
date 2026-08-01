@@ -11,7 +11,7 @@
 // and #class kill removes the class's definitions wholesale.
 
 import {
-  createAlias, createTrigger, createTimer, createHotkey, getProfile, line, vars,
+  createAlias, createTrigger, createTimer, createHotkey, getProfile, line, sendRaw, vars,
 } from "smudgy:core";
 import type { Alias, Trigger, Timer, Hotkey, Matches } from "smudgy:core";
 import {
@@ -23,7 +23,7 @@ import { compileTinTinPattern, jsRegexSource } from "../engine/pattern.ts";
 import type { CompiledPattern } from "../engine/pattern.ts";
 import { highlightStyleOptions, occurrenceByteRanges } from "../engine/text.ts";
 import { tinTinKeySpec, supportedKeyNames } from "../engine/keys.ts";
-import { defaultPathDirs } from "../engine/path.ts";
+import { defaultPathDirs, expandLegacySpeedwalk } from "../engine/path.ts";
 import type { PathDir } from "../engine/path.ts";
 import { makeEnv } from "./env.ts";
 import type { ExecutionEnv } from "./env.ts";
@@ -67,13 +67,57 @@ function emptyStore(): StoredDefinitions {
 export function getStored(): StoredDefinitions {
   const record = vars as Record<string, unknown>;
   const stored = record[STORE_KEY] as StoredDefinitions | undefined;
-  return stored ? { ...emptyStore(), ...stored } : emptyStore();
+  if (!stored) return emptyStore();
+  // A pre-param development build briefly persisted SPEEDWALK here. Ignore
+  // that stale command-side setting; the manifest param is now authoritative.
+  const definitions = { ...(stored as StoredDefinitions & { config?: unknown }) };
+  delete definitions.config;
+  return { ...emptyStore(), ...definitions };
 }
 
 function mutateStored(mutate: (stored: StoredDefinitions) => void): void {
   const stored = getStored();
   mutate(stored);
   (vars as Record<string, unknown>)[STORE_KEY] = stored;
+}
+
+let speedwalkHandle: Alias | null = null;
+
+/**
+ * Install SPEEDWALK as a lowest-priority native alias. Real TinTin checks
+ * aliases before speedwalk syntax; the low priority preserves that ordering.
+ */
+export function syncSpeedwalkAutomation(
+  enabled: boolean,
+  onDirection?: (direction: string) => void,
+): void {
+  if (!enabled) {
+    speedwalkHandle?.delete();
+    speedwalkHandle = null;
+    return;
+  }
+  if (speedwalkHandle) return;
+  speedwalkHandle = createAlias(
+    "^(?:\\d{0,3}[neswud])+$",
+    (matches) => {
+      const directions = expandLegacySpeedwalk(matches[0] ?? "");
+      // A normal send would re-enter alias matching and recursively match
+      // SPEEDWALK again. TinTin writes expanded directions straight to the MUD.
+      if (directions) {
+        for (const direction of directions) {
+          // Raw sends intentionally skip sys:send, so tell #PATH about the
+          // movement explicitly before it goes to the wire.
+          onDirection?.(direction);
+          sendRaw(direction);
+        }
+      }
+    },
+    {
+      name: automationName(`${activeCommandChar}SPEEDWALK`),
+      priority: -1_000_000,
+      fallthrough: false,
+    },
+  );
 }
 
 // Live automation handles, keyed the TinTin way (by the pattern/name text).

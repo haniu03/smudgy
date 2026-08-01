@@ -44,7 +44,7 @@ package option.
 | `#math` | Evaluates an expression into a variable. |
 | `#nop` | A comment. |
 | `#parse` | Loops over the characters of a string. |
-| `#path` | new, describe, run, undo, save, zip, unzip. Records as you walk. |
+| `#path` | Full recorded-route cursor: create/load, get/goto/move, map, run/walk, swap, undo, save, zip/unzip. |
 | `#pathdir`, `#unpathdir` | The direction table, each entry with its reverse for backtracking. |
 | `#prompt`, `#unprompt` | Rewrites the prompt; given a row and an open split, parks it there. |
 | `#read` | Loads a `.tin` file from the package's data folder. |
@@ -63,6 +63,13 @@ package option.
 
 Abbreviations resolve the TinTin way (`#ali`, `#sh`, `#var`), semicolons split
 commands outside braces, `\;` stays literal, and braces nest across lines.
+
+Enable **TinTin speedwalks** in the package's options to expand lowercase v1
+speedwalks typed at the input line, such as `2s5w3s3w2nw`. It defaults to off.
+As in TinTin++, input-line speedwalks use one-letter `n/e/s/w/u/d` directions,
+so `2ne` means `n;n;e`. Use `#path unzip` for v2 speedwalks with diagonal or
+custom `#pathdir` names. User aliases get the first chance to match the whole
+input; expanded direction steps then go directly to the MUD.
 
 ## Errata
 

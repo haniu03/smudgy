@@ -16,7 +16,9 @@ import { interpolate, evalExpression, evalCondition, stringifyTinTin } from "../
 import type { Env } from "../engine/eval.ts";
 import { formatTinTin, tinTinStrftime, tinTinListOption } from "../engine/format.ts";
 import { tinTinKeySpec } from "../engine/keys.ts";
-import { defaultPathDirs, zipPath, unzipPath } from "../engine/path.ts";
+import {
+  defaultPathDirs, expandLegacySpeedwalk, zipPath, unzipPath,
+} from "../engine/path.ts";
 
 function fakeEnv(
   variables: Record<string, unknown> = {},
@@ -356,6 +358,19 @@ test("speedwalks zip with counts and unzip in both forms", () => {
   const compact = unzipPath("3n2e", dirs);
   assert.equal(compact.literals.length, 0);
   assert.equal(zipPath(compact.steps), "3n;2e");
+});
+
+test("legacy input speedwalks use TinTin's v1 one-letter grammar", () => {
+  assert.deepEqual(expandLegacySpeedwalk("ssw2n"), ["s", "s", "w", "n", "n"]);
+  assert.deepEqual(expandLegacySpeedwalk("2ne"), ["n", "n", "e"]);
+  assert.deepEqual(expandLegacySpeedwalk("ne2s"), ["n", "e", "s", "s"]);
+  assert.deepEqual(expandLegacySpeedwalk("unde"), ["u", "n", "d", "e"]);
+  assert.equal(expandLegacySpeedwalk("look"), null);
+  assert.deepEqual(expandLegacySpeedwalk("0n2u"), ["u", "u"]);
+  assert.equal(expandLegacySpeedwalk("1234n"), null, "counts stop at three digits");
+  assert.equal(expandLegacySpeedwalk("NEWS"), null, "uppercase avoids speedwalk expansion");
+  assert.equal(expandLegacySpeedwalk("2north"), null);
+  assert.equal(expandLegacySpeedwalk("2n3"), null);
 });
 
 test("compact runs take the longest known direction, not one letter", () => {
