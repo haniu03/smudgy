@@ -1,7 +1,7 @@
 # 語言名稱
 locale-system = 使用系統語言
 locale-english = 英文（美國）
-locale-polish = 拋光
+locale-polish = 波蘭文
 locale-ukrainian = 烏克蘭語
 locale-traditional-chinese = 繁體中文（臺灣）
 
