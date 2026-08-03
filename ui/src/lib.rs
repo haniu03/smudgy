@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::session_store::BindTarget;
 use chrono::{DateTime, Utc};
-use iced::widget::{center, pane_grid, text};
+use iced::widget::{center, text};
 use iced::window;
 use iced::window::settings::PlatformSpecific;
 use iced::{Point, Rectangle, Size, Subscription, Task};
@@ -27,13 +27,18 @@ mod discord_presence;
 mod i18n;
 mod images;
 mod pane_drag;
-mod pane_layout;
+// The tab-group layout model. A few of its operations (tab reorder, detach,
+// tab-level merge targets) are driven only by drag gestures that are not
+// wired yet; the allow covers those until their gestures land.
+#[allow(dead_code)]
+mod pane_groups;
 pub mod prefs;
 mod session_store;
 pub mod terminal_buffer;
 mod update;
 mod widgets;
 mod win_rm;
+pub mod workspace;
 
 pub use smudgy_theme::{self as theme, Element, Theme};
 
@@ -127,21 +132,46 @@ struct Smudgy {
     /// One app-global clipboard shared by every map editor window, so the
     /// two-window merge workflow can copy/paste between them.
     map_editor_clipboard: SharedClipboard,
-    /// Window origins/sizes/scales/cursors + focus MRU, observed from the
-    /// event stream. The cross-window drag layer reconstructs screen-space
-    /// geometry from this (iced has no direct "window under this screen
-    /// point" query).
+    /// Window origins/sizes/scales/cursors + focus MRU + keyboard modifier
+    /// state, observed from the event stream. The drag layer reconstructs
+    /// screen-space geometry from this (iced has no direct "window under
+    /// this screen point" query).
     window_tracker: pane_drag::WindowTracker,
-    /// The pane drag in flight, if any (the DragController's state).
-    /// Recorded at `Picked`; resolved at `Dropped`/`Canceled`; aborted by
-    /// pane/session/source-window death mid-drag.
-    pane_drag: Option<pane_drag::ActiveDrag>,
+    /// The tab drag in flight, if any — the drag controller's single owner
+    /// state. Recorded when a tab press crosses the deadband; consumed by
+    /// exactly one terminal (release, Escape, capture loss) or an abort
+    /// (pane/session/source-window death mid-drag). Windows derive their
+    /// view of it per frame; none keeps a drag flag of its own.
+    tab_drag: Option<pane_drag::TabDrag>,
+    /// A tab press below the deadband, if any. The daemon carries the
+    /// gesture from press to terminal: tracked motion past the deadband
+    /// promotes this to [`Self::tab_drag`] even if the press surface's
+    /// widget state was erased by an async subtree rebuild mid-gesture (the
+    /// widget's own deadband crossing is the fast path). Cleared by the raw
+    /// release (a plain click — selection is the widget's fast path) and by
+    /// every cancel that clears the drag.
+    tab_press: Option<pane_drag::PendingPress>,
     /// Smudgy windows we have asked to close but whose async `CloseWindow`
     /// event has not yet landed. They linger in `smudgy_windows` in the
     /// meantime, so the empty-window sweep must not count them as "remaining"
     /// — otherwise two windows emptied in separate updates can each close and
     /// leave zero windows, exiting the app against the keep-one-alive rule.
     closing_windows: HashSet<window::Id>,
+    /// The live-workspace mirror's scheduling state and runtime↔durable
+    /// identity maps (stable window/slot ids, polled geometry, snapshot
+    /// generations). Windows and sessions raise cheap dirty flags; the
+    /// daemon sweeps them here once per update and the debounce/checkpoint
+    /// ticks turn the flags into the active server's `last-session.json`
+    /// write.
+    workspace: workspace::autosave::Mirror,
+    /// Restoration bookkeeping: eyeball replays owed to runtimes that are
+    /// not ready yet, per-session readiness, and the vacancy ordinal well.
+    restore: workspace::restore::RestoreState,
+    /// The background writer for script-initiated layout saves: capture and
+    /// serialization stay on the update thread (same-cycle consistency),
+    /// while the fsync-bearing write coalesces per layout name off-thread.
+    /// Dropping it at exit flushes what is still pending, best-effort.
+    layout_saver: workspace::layouts::DebouncedSaver,
 }
 
 #[derive(Debug, Clone)]
@@ -209,14 +239,39 @@ enum Message {
         area_id: AreaId,
         result: Result<AreaPref, CloudError>,
     },
-    /// A window-geometry observation (moved/resized/rescaled/focused/cursor)
-    /// for the tracker feeding the cross-window drag layer.
+    /// A window-geometry observation (moved/resized/rescaled/focused/cursor/
+    /// modifiers) for the tracker feeding the drag layer.
     WindowTracking(window::Id, pane_drag::TrackEvent),
+    /// A drag terminal from the drag-gated subscription: the raw left-button
+    /// release (the authoritative terminal — the tab widget's own release is
+    /// a fast path only) or Escape (cancel). Subscribed only while a drag is
+    /// live; a stray arrival with no drag in flight is a no-op.
+    PaneDragTerminal(window::Id, pane_drag::DragTerminal),
     /// The trailing debounce flush of one session's pane-size feed: send the
     /// settled pending sizes to the runtime (`docs/panes.md` placement
     /// read-back). Scheduled by [`report_pane_sizes`], at most one in flight
     /// per session.
     FlushPaneSizes(SessionId),
+    /// One tick of the workspace autosave's trailing debounce (subscribed
+    /// only while the mirror is dirty): a tick with no churn since the
+    /// previous one snapshots the workspace.
+    WorkspaceDebounceTick,
+    /// One tick of the workspace autosave's max-interval checkpoint. Fires
+    /// the unconditional geometry poll — the poll, not event tracking, is
+    /// the geometry dirty signal — and bounds crash loss and write volume
+    /// under sustained churn.
+    WorkspaceCheckpointTick,
+    /// One asynchronous geometry answer for the workspace mirror. `poll`
+    /// ties the answer to the poll that asked (stale answers are ignored);
+    /// `None` is the open-time seed.
+    WorkspaceGeometry {
+        poll: Option<u64>,
+        window: window::Id,
+        sample: workspace::autosave::GeometrySample,
+    },
+    /// The quit path's awaited write completed (or the writer is
+    /// unavailable): the deferred `iced::exit()` may run.
+    WorkspaceQuitFlushed,
 }
 
 /// The application id, matching the Linux desktop-entry / Flatpak app id
@@ -270,8 +325,6 @@ fn secondary_window_settings(min_size: Size) -> window::Settings {
 }
 
 fn init() -> (Smudgy, Task<Message>) {
-    let (_id, open) = window::open(smudgy_window_settings());
-
     // Seed the hot prefs snapshot before any window renders, and load the
     // per-area enable/disable preferences (migrating a legacy disabled-only
     // file) for fan-out to mappers and cross-device reconcile. `load_settings`
@@ -325,12 +378,39 @@ fn init() -> (Smudgy, Task<Message>) {
     let sessions = SessionStore::new(account.handles());
     let discord = DiscordPresence::new(settings.discord_rich_presence);
 
+    // The workspace mirror is disabled entirely under the scripted-matrix
+    // QA hook (debug builds only): the harness drives a synthetic
+    // arrangement against the real data directory, which must neither be
+    // restored from nor written to. Release builds have no hook — the
+    // mirror is always on.
+    #[cfg(debug_assertions)]
+    let workspace_enabled = spike_autosession_count() == 0;
+    #[cfg(not(debug_assertions))]
+    let workspace_enabled = true;
+
+    // The workspace writer (the single-writer worker plus the snapshot cell
+    // the WM_ENDSESSION hook flushes from) exists for the whole run; it
+    // drains to the per-server last-session files as snapshots settle.
+    if workspace_enabled {
+        workspace::writer::init_global();
+    }
+
+    // Startup is always the clean no-active-sessions view: nothing restores
+    // at launch. Each server's last arrangement waits in its own
+    // last-session snapshot, offered per server on the connect surface.
+    let workspace_mirror = workspace::autosave::Mirror::default();
+    let restore_state = workspace::restore::RestoreState::default();
+    let smudgy_windows: BTreeMap<window::Id, SmudgyWindow> = BTreeMap::new();
+    let mut open_tasks: Vec<Task<Message>> = Vec::new();
+    let (_id, open) = window::open(smudgy_window_settings());
+    open_tasks.push(open.map(Message::NewSmudgyWindow));
+
     (
         Smudgy {
             account,
             discord,
             sessions,
-            smudgy_windows: BTreeMap::new(),
+            smudgy_windows,
             automations_windows: BTreeMap::new(),
             map_editor_windows: BTreeMap::new(),
             settings_windows: BTreeMap::new(),
@@ -342,11 +422,15 @@ fn init() -> (Smudgy, Task<Message>) {
                 map_editor_window::commands::EntityClipboard::default(),
             )),
             window_tracker: pane_drag::WindowTracker::default(),
-            pane_drag: None,
+            tab_drag: None,
+            tab_press: None,
             closing_windows: HashSet::new(),
+            workspace: workspace_mirror,
+            restore: restore_state,
+            layout_saver: workspace::layouts::DebouncedSaver::new(),
         },
         Task::batch([
-            open.map(Message::NewSmudgyWindow),
+            Task::batch(open_tasks),
             account_task.map(Message::Account),
             reconcile_task,
             update_check_task,
@@ -496,18 +580,30 @@ fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
         )
         .map(|(id, msg)| Message::AutomationsWindowMessage(id, msg)),
         window::close_events().map(Message::CloseWindow),
-        // Window geometry + cursor tracking for cross-window pane drags.
-        // `listen_with` (not `listen`): pane_grid captures the initiating
-        // press, and captured events must still reach the tracker. The full
-        // filter maps every window move and mouse motion to a message — and
-        // every message rebuilds and repaints all windows — so it runs only
-        // while a drag is in flight; idle windows use the rare-events filter.
-        if smudgy.pane_drag.is_some() {
+        // Window geometry + cursor tracking for pane drags. `listen_with`
+        // (not `listen`): captured events must still reach the tracker. The
+        // full filter maps every window move and mouse motion to a message —
+        // and every message rebuilds and repaints all windows — so it runs
+        // only while a drag is in flight; idle windows use the rare-events
+        // filter.
+        if smudgy.tab_drag.is_some() || smudgy.tab_press.is_some() {
             iced::event::listen_with(window_tracking_event)
         } else {
             iced::event::listen_with(window_tracking_idle_event)
         },
     ];
+
+    if smudgy.tab_drag.is_some() || smudgy.tab_press.is_some() {
+        // Drag termination authority: while a drag is live, the raw
+        // left-button release is the authoritative terminal and Escape is
+        // the cancel — regardless of capture status, so no focused widget
+        // can strand a drag. Below the deadband no drag record exists yet,
+        // and Escape deliberately does nothing (E4b).
+        subs.push(iced::event::listen_with(|event, _status, window_id| {
+            pane_drag::drag_terminal_event(&event)
+                .map(|terminal| Message::PaneDragTerminal(window_id, terminal))
+        }));
+    }
 
     // While signed in, poll /me/area-prefs periodically so cross-device
     // changes and prefs for newly-shared areas reconcile in (login covers the
@@ -531,6 +627,24 @@ fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
         subs.push(iced::time::every(Duration::from_secs(21_600)).map(|_| Message::UpdateCheckTick));
     }
 
+    // Workspace autosave. The checkpoint runs whenever windows exist: its
+    // unconditional geometry poll is the only thing that notices a window
+    // move while idle. The debounce tick exists only while the mirror is
+    // dirty, so an idle workspace costs no timer at all. Both stop once the
+    // quit flush latches the schedule shut.
+    if !smudgy.smudgy_windows.is_empty() && !smudgy.workspace.schedule.is_shutting_down() {
+        subs.push(
+            iced::time::every(workspace::autosave::CHECKPOINT_INTERVAL)
+                .map(|_| Message::WorkspaceCheckpointTick),
+        );
+        if smudgy.workspace.schedule.is_dirty() {
+            subs.push(
+                iced::time::every(workspace::autosave::DEBOUNCE_TICK)
+                    .map(|_| Message::WorkspaceDebounceTick),
+            );
+        }
+    }
+
     Subscription::batch(subs)
 }
 
@@ -539,14 +653,17 @@ fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
 /// drop-target membership is filtered where the tracker is read, not here).
 fn window_tracking_event(
     event: iced::Event,
-    _status: iced::event::Status,
+    status: iced::event::Status,
     window_id: window::Id,
 ) -> Option<Message> {
+    spike_log_raw_event(&event, status, window_id);
     pane_drag::track_event(&event).map(|track| Message::WindowTracking(window_id, track))
 }
 
 /// The no-drag counterpart of [`window_tracking_event`]: tracks only the
-/// rare geometry facts, so window moves and mouse motion cost nothing.
+/// rare geometry facts, so window moves and mouse motion cost nothing. No
+/// forensics either — raw-event logging is gesture-scoped, and this filter
+/// runs exactly while no gesture is armed.
 fn window_tracking_idle_event(
     event: iced::Event,
     _status: iced::event::Status,
@@ -555,34 +672,1078 @@ fn window_tracking_idle_event(
     pane_drag::track_event_idle(&event).map(|track| Message::WindowTracking(window_id, track))
 }
 
+/// QA forensics (debug builds only): logs the low-frequency input events
+/// exactly as the daemon subscription sees them — every `MouseInput`
+/// press/release plus the cursor enter/leave and focus transitions, tagged
+/// with the window that winit surfaced them on. If a release reaches winit
+/// for ANY window of this process, it appears here; if it never appears,
+/// Windows never delivered the `WM_*BUTTONUP` to this thread at all. Called
+/// only from the gesture-gated tracking filter, so idle play (clicks, focus
+/// churn) logs nothing; the scripted drag matrix (`spike-drag-repro.ps1`)
+/// asserts against gesture-time lines only.
+/// Release counterpart of the debug forensics logger: an empty inline body,
+/// so the tracking filter keeps one shape in both profiles and the release
+/// build carries no logging.
+#[cfg(not(debug_assertions))]
+fn spike_log_raw_event(_: &iced::Event, _: iced::event::Status, _: window::Id) {}
+
+#[cfg(debug_assertions)]
+fn spike_log_raw_event(event: &iced::Event, status: iced::event::Status, window_id: window::Id) {
+    use iced::mouse;
+    match event {
+        iced::Event::Mouse(mouse::Event::ButtonPressed(button)) => {
+            log::info!("[pane-drag] raw {window_id:?} ButtonPressed({button:?}) status={status:?}");
+        }
+        iced::Event::Mouse(mouse::Event::ButtonReleased(button)) => {
+            log::info!(
+                "[pane-drag] raw {window_id:?} ButtonReleased({button:?}) status={status:?}"
+            );
+        }
+        iced::Event::Mouse(mouse::Event::CursorEntered) => {
+            log::info!("[pane-drag] raw {window_id:?} CursorEntered");
+        }
+        iced::Event::Mouse(mouse::Event::CursorLeft) => {
+            log::info!("[pane-drag] raw {window_id:?} CursorLeft");
+        }
+        iced::Event::Window(window::Event::Focused) => {
+            log::info!("[pane-drag] raw {window_id:?} Focused");
+        }
+        iced::Event::Window(window::Event::Unfocused) => {
+            log::info!("[pane-drag] raw {window_id:?} Unfocused");
+        }
+        _ => {}
+    }
+}
+
+/// QA forensics (debug builds only): logs transitions of the Win32
+/// mouse-capture owner. `GetCapture` reports the capture window of the
+/// *calling* thread, and the daemon's `update` runs on the winit event-loop
+/// thread that owns every smudgy window, so sampling here (per message,
+/// change-gated) pinpoints when the OS capture was gained, released, or
+/// stolen — the ground truth that window-event logs can only imply.
+#[cfg(all(target_os = "windows", debug_assertions))]
+fn spike_log_capture_owner() {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetCapture() -> isize;
+    }
+    static LAST: AtomicIsize = AtomicIsize::new(0);
+    let current = unsafe { GetCapture() };
+    let last = LAST.swap(current, Ordering::Relaxed);
+    if current != last {
+        log::info!("[pane-drag] GetCapture changed: {last:#x} -> {current:#x}");
+    }
+}
+
+#[cfg(all(not(target_os = "windows"), debug_assertions))]
+fn spike_log_capture_owner() {}
+
+/// Whether the scripted-matrix forensics that are too chatty for normal play
+/// are enabled: tab-bounds announcements re-log per tab on every geometry
+/// change (a stream during divider drags), and only the matrix consumes them
+/// (it aims real input at tab bounds without probing). Keyed off the same
+/// `SMUDGY_SPIKE_AUTOSESSION` hook that arranges the matrix's sessions, so a
+/// harness run gets the lines and every other launch gets none.
+#[cfg(debug_assertions)]
+pub(crate) fn spike_forensics_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| spike_autosession_count() > 0);
+    *ENABLED
+}
+
+/// QA hook (debug builds only): `SMUDGY_SPIKE_AUTOSESSION=<n>` (1 or 2)
+/// makes the first smudgy window open that many offline sessions at startup
+/// (no connect-modal driving needed) and opens a second, empty smudgy
+/// window — the exact arrangement the scripted drag matrix requires.
+#[cfg(debug_assertions)]
+fn spike_autosession_count() -> usize {
+    match std::env::var("SMUDGY_SPIKE_AUTOSESSION") {
+        Ok(value) if value == "1" => 1,
+        Ok(value) if value == "2" => 2,
+        _ => 0,
+    }
+}
+
+/// The autosession runs exactly once — the second window it opens re-enters
+/// the `NewSmudgyWindow` arm.
+#[cfg(debug_assertions)]
+static SPIKE_AUTOSESSION_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The server/profile the autosession opens: `SMUDGY_SPIKE_SERVER` /
+/// `SMUDGY_SPIKE_PROFILE` when set, else "localhost" when configured (a
+/// server that connects nowhere), else the first server, with its first
+/// profile alphabetically.
+#[cfg(debug_assertions)]
+fn spike_autosession_target() -> Option<(String, String)> {
+    let server = std::env::var("SMUDGY_SPIKE_SERVER").ok().or_else(|| {
+        let servers = smudgy_core::models::server::list_servers().ok()?;
+        servers
+            .iter()
+            .find(|s| s.name == "localhost")
+            .or_else(|| servers.first())
+            .map(|s| s.name.clone())
+    })?;
+    let profile = std::env::var("SMUDGY_SPIKE_PROFILE").ok().or_else(|| {
+        let mut profiles = smudgy_core::models::profile::list_profiles(&server).ok()?;
+        profiles.sort_by(|a, b| a.name.cmp(&b.name));
+        profiles.first().map(|p| p.name.clone())
+    })?;
+    Some((server, profile))
+}
+
 fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
+    let task = update_body(smudgy, message);
+    // Structural pane mutations mark their window's grid dirty instead of
+    // rebuilding eagerly; settling them here coalesces every mutation an
+    // update cycle landed into one rebuild per window, re-deriving the
+    // divider→edge map with the grid so no stale target survives into the
+    // next cycle. Runs after the whole message is handled and before iced
+    // paints, so `view` always reads a settled grid.
+    for window in smudgy.smudgy_windows.values_mut() {
+        window.flush_grid_rebuild();
+    }
+    // The workspace-dirty sweep: fold every window's and session's cheap
+    // mutation flag into the autosave schedule (arming the trailing
+    // debounce). This fixed small scan once per update is the entire
+    // aggregation cost; the mutations themselves only stored booleans.
+    let mut workspace_dirty = false;
+    for window in smudgy.smudgy_windows.values_mut() {
+        workspace_dirty |= window.take_workspace_dirty();
+    }
+    workspace_dirty |= smudgy.sessions.take_workspace_dirty();
+    if workspace_dirty {
+        smudgy.workspace.schedule.mark();
+    }
+    task
+}
+
+/// Start one workspace geometry poll over every live smudgy window (three
+/// queries each), superseding any poll still in flight. The final
+/// `WorkspaceGeometry` answer triggers the snapshot when the mirror is
+/// dirty. With no windows to ask there is nothing asynchronous to wait
+/// for, so a dirty mirror snapshots immediately from the cache.
+fn begin_workspace_poll(smudgy: &mut Smudgy) -> Task<Message> {
+    let ids: Vec<window::Id> = smudgy.smudgy_windows.keys().copied().collect();
+    if ids.is_empty() {
+        if smudgy.workspace.schedule.is_dirty() && !smudgy.workspace.schedule.is_shutting_down() {
+            publish_workspace_snapshot(smudgy, None);
+        }
+        return Task::none();
+    }
+    let poll = smudgy.workspace.begin_poll(ids.len() * 3);
+    let mut tasks = Vec::with_capacity(ids.len() * 3);
+    for id in ids {
+        tasks.push(
+            window::position(id).map(move |origin| Message::WorkspaceGeometry {
+                poll: Some(poll),
+                window: id,
+                sample: workspace::autosave::GeometrySample::Position(origin),
+            }),
+        );
+        tasks.push(
+            window::size(id).map(move |size| Message::WorkspaceGeometry {
+                poll: Some(poll),
+                window: id,
+                sample: workspace::autosave::GeometrySample::Size(size),
+            }),
+        );
+        tasks.push(
+            window::scale_factor(id).map(move |scale| Message::WorkspaceGeometry {
+                poll: Some(poll),
+                window: id,
+                sample: workspace::autosave::GeometrySample::Scale(scale),
+            }),
+        );
+    }
+    Task::batch(tasks)
+}
+
+/// The server owning the active session right now: the most recently
+/// focused smudgy window hosting a live active session answers, windows
+/// never yet focused trail in creation order. `None` with no active session
+/// anywhere — the clean connect view, which persists nothing.
+fn active_server_name(smudgy: &Smudgy) -> Option<String> {
+    let of_window = |window_id: &window::Id| {
+        smudgy
+            .smudgy_windows
+            .get(window_id)
+            .and_then(SmudgyWindow::active_session_id)
+            .and_then(|active| smudgy.sessions.get(active))
+            .map(|session| session.server_name.clone())
+    };
+    smudgy
+        .window_tracker
+        .mru_order()
+        .iter()
+        .filter_map(of_window)
+        .next()
+        .or_else(|| smudgy.smudgy_windows.keys().filter_map(of_window).next())
+}
+
+/// Serialize the active session's server's footprint and hand it to the
+/// writer worker as that server's last-session snapshot — how each server
+/// comes to hold the most recent arrangement in which it was active. With
+/// no active session (or nothing captured for it) the snapshot is settled
+/// as taken and nothing is written: the files on disk keep their
+/// arrangements, which is exactly what the clean connect view should leave
+/// behind.
+///
+/// `ack` makes the write awaited (the quit flush); it is always resolved —
+/// on publish, on every skip, and on every failure path — so a waiter can
+/// never hang. Returns whether new bytes were actually published.
+fn publish_workspace_snapshot(smudgy: &mut Smudgy, ack: Option<workspace::writer::Ack>) -> bool {
+    // Snapshots read the layout model at a settled point: flush any rebuild
+    // marks first (idempotent, and cheap when already settled).
+    for window in smudgy.smudgy_windows.values_mut() {
+        window.flush_grid_rebuild();
+    }
+    let force = ack.is_some();
+    let resolve = |ack: Option<workspace::writer::Ack>| {
+        if let Some(ack) = ack {
+            let _ = ack.send(());
+        }
+    };
+    let Some((path, snapshot)) = active_server_name(smudgy).and_then(|server| {
+        let path = workspace::last_session::path(&server)?;
+        let (snapshot, _notes) = capture_server_footprint(smudgy, &server)?;
+        Some((path, snapshot))
+    }) else {
+        // The current model offers nothing to persist; the dirty flag is
+        // settled so the debounce timer can go quiet. Any later mutation
+        // re-marks.
+        smudgy.workspace.schedule.snapshot_taken();
+        resolve(ack);
+        return false;
+    };
+    let bytes: Arc<[u8]> = match serde_json::to_vec_pretty(&snapshot) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            Arc::from(bytes)
+        }
+        Err(err) => {
+            log::warn!("[workspace] failed to serialize the workspace snapshot: {err}");
+            resolve(ack);
+            return false;
+        }
+    };
+    let Some(generation) = smudgy.workspace.adopt_bytes(&bytes, force) else {
+        // Byte-identical to the previous snapshot: nothing to write.
+        resolve(ack);
+        return false;
+    };
+    match workspace::writer::global() {
+        Some(writer) => {
+            writer.publish(generation, path, bytes, ack);
+            true
+        }
+        None => {
+            resolve(ack);
+            false
+        }
+    }
+}
+
+/// Translate one layout tab into durable terms — the shared `describe`
+/// closure body behind both the autosave snapshot and named-layout capture.
+///
+/// A bound tab is described through its live pane definition. An unbound
+/// tab is describable exactly when it stands for a live session's
+/// not-yet-materialized pane: its slot comes from the pending session, its
+/// identity from the stored descriptor, its hidden state from the pending
+/// record — a quit between restore and materialization must not shed script
+/// panes. A placeholder with no pending record is a vacancy and drops out:
+/// closed stays closed by omission. Anything whose session has no slot in
+/// `slot_of` drops out too, which is how a scoped capture excludes panes it
+/// cannot round-trip.
+fn describe_layout_tab(
+    win: &SmudgyWindow,
+    sessions: &SessionStore,
+    slot_of: &HashMap<smudgy_core::session::SessionId, u64>,
+    tab: &pane_groups::Tab<PaneRef>,
+) -> Option<workspace::snapshot::PaneRecord> {
+    use workspace::dto;
+
+    let Some(slot_ref) = tab.binding().copied() else {
+        let (session_id, key, hidden) = win.pending_pane_for_tab(tab.id())?;
+        let slot = *slot_of.get(&session_id)?;
+        return Some(workspace::snapshot::PaneRecord {
+            slot,
+            identity: workspace::restore::identity_from_key(key),
+            hidden,
+        });
+    };
+    let slot = *slot_of.get(&slot_ref.session_id)?;
+    let identity = if slot_ref.key == MAIN_PANE_KEY {
+        dto::PaneIdentity::Main
+    } else {
+        let def = sessions.get(slot_ref.session_id)?.pane_def(slot_ref.key)?;
+        dto::PaneIdentity::Script {
+            namespace: match &def.namespace {
+                smudgy_core::session::runtime::pane::PaneNamespace::User => dto::Namespace::User,
+                smudgy_core::session::runtime::pane::PaneNamespace::Package { owner, name } => {
+                    dto::Namespace::Package {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                    }
+                }
+            },
+            name: smudgy_core::session::runtime::pane::fold(&def.name),
+            display: Some(def.name.to_string()),
+        }
+    };
+    Some(workspace::snapshot::PaneRecord {
+        slot,
+        identity,
+        hidden: win.pane_hidden(slot_ref),
+    })
+}
+
+/// Whether `win` hosts at least one pane of `server` — a bound pane of one
+/// of its sessions, or a placeholder a session of that server still owes.
+/// The footprint predicate for both capture and apply scoping
+/// (`docs/panes.md` §18).
+fn window_hosts_server(win: &SmudgyWindow, sessions: &SessionStore, server: &str) -> bool {
+    let of_server = |session_id: smudgy_core::session::SessionId| {
+        sessions
+            .get(session_id)
+            .is_some_and(|session| session.server_name == server)
+    };
+    win.pane_refs()
+        .into_iter()
+        .any(|slot| of_server(slot.session_id))
+        || win
+            .layout()
+            .panes()
+            .iter()
+            .filter_map(|tab| win.pending_pane_for_tab(tab.id()))
+            .any(|(session_id, _, _)| of_server(session_id))
+}
+
+/// Capture `server`'s window footprint as a named-layout template: every
+/// window hosting at least one pane of `server`, captured completely —
+/// foreign panes sharing those windows included — with fully separate
+/// windows never captured. Only loaded slots enter the template (a pending
+/// placeholder with a live session counts as loaded; a vacancy never does);
+/// the notes say what had to be left out so the caller can annotate the
+/// save. `None` when no window hosts a pane of the server.
+fn capture_server_footprint(
+    smudgy: &mut Smudgy,
+    server: &str,
+) -> Option<(workspace::dto::Workspace, workspace::snapshot::CaptureNotes)> {
+    use workspace::dto;
+
+    let entries: Vec<(window::Id, u64)> = smudgy.workspace.window_entries().collect();
+    let Smudgy {
+        sessions,
+        smudgy_windows,
+        workspace: mirror,
+        ..
+    } = smudgy;
+
+    let captured: Vec<(window::Id, u64)> = entries
+        .into_iter()
+        .filter(|(window_id, _)| {
+            smudgy_windows
+                .get(window_id)
+                .is_some_and(|win| window_hosts_server(win, sessions, server))
+        })
+        .collect();
+    if captured.is_empty() {
+        return None;
+    }
+
+    // Only sessions whose main pane stands inside the captured footprint
+    // can round-trip: everything else is annotated away below.
+    let mut hosted_mains: HashSet<smudgy_core::session::SessionId> = HashSet::new();
+    for (window_id, _) in &captured {
+        if let Some(win) = smudgy_windows.get(window_id) {
+            hosted_mains.extend(win.hosted_main_sessions());
+        }
+    }
+    let mut slots = Vec::new();
+    let mut slot_of: HashMap<smudgy_core::session::SessionId, u64> = HashMap::new();
+    for (session_id, session) in sessions.iter() {
+        if !hosted_mains.contains(&session_id) {
+            continue;
+        }
+        let slot = mirror.slot_id(session_id);
+        slot_of.insert(session_id, slot);
+        slots.push(dto::SessionSlot {
+            id: slot,
+            server: session.server_name.clone(),
+            profile: session.profile_name.clone(),
+            connect: session.connect_intent(),
+        });
+    }
+
+    let mut notes = workspace::snapshot::CaptureNotes::default();
+    let mut windows = Vec::new();
+    for (window_id, stable_id) in captured {
+        let Some(win) = smudgy_windows.get(&window_id) else {
+            continue;
+        };
+        if win.layout().is_empty() {
+            continue;
+        }
+        let mut describe = |tab: &pane_groups::Tab<PaneRef>| {
+            let record = describe_layout_tab(win, sessions, &slot_of, tab);
+            if record.is_none() {
+                if tab.binding().is_some() || win.pending_pane_for_tab(tab.id()).is_some() {
+                    notes.omitted_foreign += 1;
+                } else {
+                    notes.omitted_vacancies += 1;
+                }
+            }
+            record
+        };
+        let clusters = workspace::snapshot::clusters(win.layout(), &mut describe);
+        if clusters.is_empty() {
+            continue;
+        }
+        windows.push(dto::Window {
+            id: stable_id,
+            geometry: mirror.geometry_of(window_id).cloned().unwrap_or_default(),
+            maximized: win.is_maximized(),
+            active_slot: win
+                .active_session_id()
+                .and_then(|active| slot_of.get(&active).copied()),
+            clusters,
+        });
+    }
+    if windows.is_empty() {
+        return None;
+    }
+
+    // Slots no captured window ended up hosting a main for would be
+    // sanitized away on load; write the file in its sanitized form so what
+    // is saved is exactly what will apply.
+    let template = dto::Workspace {
+        version: dto::SCHEMA_VERSION,
+        sessions: slots,
+        windows,
+    }
+    .sanitized();
+    Some((template, notes))
+}
+
+/// The live workspace as the pure apply projection sees it: sessions in
+/// open order, windows in stable-id creation order, each window's bound
+/// panes grouped as its tab groups group them.
+fn build_live_workspace(smudgy: &Smudgy) -> workspace::apply::LiveWorkspace {
+    let mut live = workspace::apply::LiveWorkspace::default();
+    for (session_id, session) in smudgy.sessions.iter() {
+        live.sessions.push(workspace::apply::LiveSessionInfo {
+            id: session_id,
+            server: session.server_name.clone(),
+            profile: session.profile_name.clone(),
+        });
+    }
+    for (window_id, stable_id) in smudgy.workspace.window_entries() {
+        let Some(win) = smudgy.smudgy_windows.get(&window_id) else {
+            continue;
+        };
+        let layout = win.layout();
+        let mut groups = Vec::new();
+        // Visual emptiness counts every tab, bound or placeholder: a
+        // window showing placeholder tabs is showing content and must not
+        // be adopted, even though no bound pane below survives into its
+        // groups.
+        let mut has_tabs = false;
+        for gid in layout.groups_depth_first() {
+            let Some(tabs) = layout.tabs(gid) else {
+                continue;
+            };
+            has_tabs |= !tabs.is_empty();
+            let mut group = Vec::with_capacity(tabs.len());
+            for tab in tabs {
+                let Some(&pane) = tab.binding() else {
+                    continue;
+                };
+                let descriptor = if pane.key == MAIN_PANE_KEY {
+                    None
+                } else {
+                    smudgy
+                        .sessions
+                        .get(pane.session_id)
+                        .and_then(|session| session.pane_def(pane.key))
+                        .map(|def| workspace::restore::descriptor_key(&def.namespace, &def.name))
+                };
+                group.push(workspace::apply::LivePane {
+                    pane,
+                    descriptor,
+                    hidden: win.pane_hidden(pane),
+                });
+            }
+            groups.push(group);
+        }
+        live.windows.push(workspace::apply::LiveWindow {
+            stable_id,
+            empty: !has_tabs,
+            groups,
+        });
+    }
+    live
+}
+
+/// Execute a validated apply plan: strip template-claimed panes out of
+/// extra windows, replace each planned window's arrangement wholesale
+/// (vacancy records minted from the shared ordinal well), replay the
+/// planned eyeball states through the normal user-toggle path, close what
+/// the user explicitly answered close for, and — user restores only —
+/// create planned windows, move adopted empty windows to their stored
+/// geometry, and close emptied ones. Model mutation plus grid rebuild
+/// only: no disk I/O happens here (the mirror catches up through the
+/// normal debounce).
+fn execute_layout_apply(smudgy: &mut Smudgy, plan: &workspace::apply::ApplyPlan) -> Task<Message> {
+    use workspace::apply::WindowTarget;
+
+    debug_assert!(plan.is_executable(), "unanswered plans must not execute");
+
+    let stable_to_window: HashMap<u64, window::Id> = smudgy
+        .workspace
+        .window_entries()
+        .map(|(window_id, stable_id)| (stable_id, window_id))
+        .collect();
+
+    // Every window the plan mutates. An in-flight drag or press anchored in
+    // one of them is stale identity the moment the rebuild re-mints the
+    // grid, so it stands down before anything moves — same terminal the
+    // purge paths use.
+    let mut mutated: HashSet<window::Id> = HashSet::new();
+    for planned in &plan.windows {
+        if let WindowTarget::Existing { stable_id } | WindowTarget::Adopted { stable_id, .. } =
+            &planned.target
+            && let Some(window_id) = stable_to_window.get(stable_id)
+        {
+            mutated.insert(*window_id);
+        }
+    }
+    for (stable_id, _) in &plan.removals {
+        if let Some(window_id) = stable_to_window.get(stable_id) {
+            mutated.insert(*window_id);
+        }
+    }
+    if smudgy.tab_drag.as_ref().is_some_and(|drag| {
+        mutated.contains(&drag.source_window) || plan.close_sessions.contains(&drag.slot.session_id)
+    }) {
+        cancel_tab_drag(smudgy, "layout applied");
+    }
+    if smudgy
+        .tab_press
+        .is_some_and(|press| mutated.contains(&press.window))
+    {
+        smudgy.tab_press = None;
+    }
+
+    // Strip claimed panes out of extra in-scope windows (they keep the rest
+    // of their arrangement).
+    let mut emptied: Vec<window::Id> = Vec::new();
+    for (stable_id, pane) in &plan.removals {
+        let Some(window_id) = stable_to_window.get(stable_id) else {
+            continue;
+        };
+        if let Some(win) = smudgy.smudgy_windows.get_mut(window_id)
+            && win.remove_pane_slot(pane.session_id, pane.key)
+        {
+            emptied.push(*window_id);
+        }
+    }
+
+    let mut tasks: Vec<Task<Message>> = Vec::new();
+    let mut replays: Vec<(smudgy_core::session::SessionId, PaneKey, bool)> = Vec::new();
+    for planned in &plan.windows {
+        let realized = workspace::apply::realize_window(planned, &plan.vacancies);
+        if realized.clusters.is_empty() {
+            log::info!("[layouts] a planned window realized empty; leaving its live window as-is");
+            continue;
+        }
+        let vacancies: Vec<workspace::restore::SessionVacancy> = realized
+            .vacancies
+            .into_iter()
+            .map(|vacancy| workspace::restore::SessionVacancy {
+                server: vacancy.server,
+                profile: vacancy.profile,
+                ordinal: smudgy.restore.next_vacancy_ordinal(),
+                main_tab: vacancy.main_tab,
+                panes: vacancy.panes,
+            })
+            .collect();
+        replays.extend(realized.replays.iter().copied());
+        match &planned.target {
+            WindowTarget::Existing { stable_id } | WindowTarget::Adopted { stable_id, .. } => {
+                let Some(window_id) = stable_to_window.get(stable_id) else {
+                    log::info!(
+                        "[layouts] planned window {stable_id} is gone; skipping its install"
+                    );
+                    continue;
+                };
+                let Some(win) = smudgy.smudgy_windows.get_mut(window_id) else {
+                    continue;
+                };
+                win.install_applied_layout(
+                    pane_groups::GroupLayout::from_blueprint(realized.clusters),
+                    realized.pending,
+                    vacancies,
+                    realized.hidden,
+                    realized.active,
+                );
+                // An adopted empty window takes the template window's
+                // stored geometry, exactly as a created window would.
+                if let WindowTarget::Adopted {
+                    geometry,
+                    maximized,
+                    ..
+                } = &planned.target
+                {
+                    debug_assert!(!plan.script_scoped, "script applies never adopt OS windows");
+                    let bounds = workspace::restore::virtual_screen_bounds();
+                    let (position, size) = workspace::restore::clamp_geometry(
+                        geometry,
+                        bounds,
+                        Size::new(640.0, 400.0),
+                    );
+                    tasks.push(window::resize(*window_id, size));
+                    if let Some(point) = position {
+                        tasks.push(window::move_to(*window_id, point));
+                    }
+                    if *maximized {
+                        tasks.push(window::maximize(*window_id, true));
+                    }
+                }
+            }
+            WindowTarget::New {
+                geometry,
+                maximized,
+            } => {
+                debug_assert!(
+                    !plan.script_scoped,
+                    "script applies never create OS windows"
+                );
+                let bounds = workspace::restore::virtual_screen_bounds();
+                let (position, size) =
+                    workspace::restore::clamp_geometry(geometry, bounds, Size::new(640.0, 400.0));
+                let mut settings = smudgy_window_settings();
+                settings.size = size;
+                if let Some(point) = position {
+                    settings.position = window::Position::Specific(point);
+                }
+                let (id, open) = window::open(settings);
+                let mut fresh = SmudgyWindow::new(id, smudgy.account.handles());
+                fresh.install_applied_layout(
+                    pane_groups::GroupLayout::from_blueprint(realized.clusters),
+                    realized.pending,
+                    vacancies,
+                    realized.hidden,
+                    realized.active,
+                );
+                smudgy.smudgy_windows.insert(id, fresh);
+                smudgy.workspace.register_window(id);
+                if *maximized {
+                    tasks.push(window::maximize(id, true));
+                }
+                tasks.push(open.map(Message::NewSmudgyWindow));
+            }
+        }
+    }
+
+    // The planned eyeball states go through the same report path a click
+    // takes, so core's registry stays the source of truth; runtimes that
+    // are not ready yet are owed the replay instead.
+    for (session, key, hidden) in replays {
+        if smudgy.restore.is_ready(session) {
+            if let Some(store_session) = smudgy.sessions.get(session) {
+                store_session.report_user_hidden(key, hidden);
+            }
+        } else {
+            smudgy.restore.owe_hidden(session, key, hidden);
+        }
+    }
+
+    // Closing is never silent: every id here carries an explicit answer.
+    for &session in &plan.close_sessions {
+        let close = close_session(smudgy, session);
+        tasks.push(close);
+    }
+
+    // A stripped-empty extra window closes for a user restore; a script
+    // apply never closes an OS window, so it stays open on its empty
+    // connect state.
+    if !plan.script_scoped {
+        tasks.push(close_emptied_windows(smudgy, emptied));
+    } else if !emptied.is_empty() {
+        log::info!(
+            "[layouts] a script apply emptied {} window(s); leaving them open",
+            emptied.len()
+        );
+    }
+
+    tasks.push(report_pane_sizes(smudgy));
+    Task::batch(tasks)
+}
+
+/// Capture the acting server's footprint and save it under `name`,
+/// reporting the outcome — including how much the capture had to leave out
+/// — back into the initiating window's Layouts modal.
+///
+/// Unlike the script path, the write here is synchronous: a user save is
+/// explicit and rare, and the modal's saved/failed status line reports the
+/// write's real outcome, which a deferred best-effort write could not.
+fn save_named_layout(
+    smudgy: &mut Smudgy,
+    window_id: window::Id,
+    server: &str,
+    name: &str,
+) -> Task<Message> {
+    let outcome = match capture_server_footprint(smudgy, server) {
+        Some((template, notes)) => match workspace::layouts::save(server, name, &template) {
+            Ok(()) => {
+                if notes.is_partial() {
+                    log::info!(
+                        "[layouts] capture of '{name}' for {server} was partial: \
+                         {} vacancy tab(s), {} foreign pane(s) omitted",
+                        notes.omitted_vacancies,
+                        notes.omitted_foreign
+                    );
+                }
+                components::modal::layouts::SaveOutcome::Saved {
+                    name: name.to_string(),
+                    omitted: notes.omitted_vacancies + notes.omitted_foreign,
+                }
+            }
+            Err(error) => components::modal::layouts::SaveOutcome::Failed {
+                error: error.to_string(),
+            },
+        },
+        None => components::modal::layouts::SaveOutcome::Failed {
+            error: workspace::apply::ApplyError::NoLiveFootprint.to_string(),
+        },
+    };
+    Task::done(Message::SmudgyWindowMessage(
+        window_id,
+        windows::smudgy_window::Message::LayoutSaveOutcome(outcome),
+    ))
+}
+
+/// Apply a stored template of `server`'s — a named layout or the server's
+/// last-session snapshot — as a user restore: project the plan, route
+/// unanswered keep-or-close questions back to the initiating window, spawn
+/// missing slots per their stored intent, re-run the projection over the
+/// workspace as it now stands, and execute only a revalidated plan.
+fn apply_workspace_template(
+    smudgy: &mut Smudgy,
+    window_id: window::Id,
+    server: &str,
+    source: &workspace::TemplateSource,
+    answers: &HashMap<SessionId, workspace::apply::OmittedAnswer>,
+) -> Task<Message> {
+    if smudgy.workspace.schedule.is_shutting_down() {
+        return Task::none();
+    }
+    let template = match source {
+        workspace::TemplateSource::Named(name) => match workspace::layouts::load(server, name) {
+            Ok(template) => template,
+            Err(error) => {
+                log::info!("[layouts] cannot apply {source} for {server}: {error}");
+                return Task::none();
+            }
+        },
+        workspace::TemplateSource::LastSession => {
+            match workspace::last_session::read(server) {
+                Some(template) => template,
+                None => {
+                    // The affordance is offered only while the file parses,
+                    // so this is a rare race with a concurrent rewrite.
+                    log::info!("[layouts] {server} has no usable last-session snapshot");
+                    return Task::none();
+                }
+            }
+        }
+    };
+    // The initiating window, by stable id: when it is visually empty —
+    // a fresh window whose connect surface drove the restore — the plan
+    // adopts it first, so the restore lands in it instead of beside it.
+    let mode = workspace::apply::ApplyMode::User {
+        initiating: smudgy
+            .workspace
+            .window_entries()
+            .find_map(|(id, stable_id)| (id == window_id).then_some(stable_id)),
+    };
+    let live = build_live_workspace(smudgy);
+    let plan = match workspace::apply::plan_apply(&template, &live, mode, answers) {
+        Ok(plan) => plan,
+        Err(error) => {
+            log::info!("[layouts] cannot apply {source} for {server}: {error}");
+            return Task::none();
+        }
+    };
+    if !plan.questions.is_empty() {
+        // Keep-or-close is asynchronous: ask, and re-project with the
+        // answers once they arrive (the workspace may drift meanwhile).
+        let rows: Vec<components::modal::layouts::OmittedRow> = plan
+            .questions
+            .iter()
+            .filter_map(|&session_id| {
+                let session = smudgy.sessions.get(session_id)?;
+                Some(components::modal::layouts::OmittedRow {
+                    session: session_id,
+                    label: format!("{} @ {}", session.profile_name, session.server_name),
+                    close: false,
+                })
+            })
+            .collect();
+        return Task::done(Message::SmudgyWindowMessage(
+            window_id,
+            windows::smudgy_window::Message::PromptLayoutAnswers {
+                server: server.to_string(),
+                source: source.clone(),
+                rows,
+            },
+        ));
+    }
+    let plan = if plan.spawns.is_empty() {
+        plan
+    } else {
+        // Spawn through the normal open path with each slot's stored
+        // intent (an online slot reconnects exactly as the Connect button
+        // would), then re-project so the fresh sessions bind and the plan
+        // is validated against the workspace actually being mutated.
+        for spawn in &plan.spawns {
+            let session_id = smudgy.sessions.open_session(
+                spawn.server.clone(),
+                spawn.profile.clone(),
+                spawn.connect,
+            );
+            log::info!(
+                "[layouts] spawned {} ({}/{}) for {source}",
+                session_id,
+                spawn.server,
+                spawn.profile
+            );
+        }
+        let live = build_live_workspace(smudgy);
+        match workspace::apply::plan_apply(&template, &live, mode, answers) {
+            Ok(plan) => plan,
+            Err(error) => {
+                log::info!("[layouts] replan of {source} failed after spawning: {error}");
+                return Task::none();
+            }
+        }
+    };
+    if !plan.is_executable() {
+        log::info!("[layouts] plan for {source} did not settle; not applying");
+        return Task::none();
+    }
+    let live = build_live_workspace(smudgy);
+    if let Err(error) = workspace::apply::validate_conservation(&template, &live, mode, &plan) {
+        log::info!("[layouts] conservation check refused {source}: {error}");
+        return Task::none();
+    }
+    execute_layout_apply(smudgy, &plan)
+}
+
+/// The Reset action: release `session_id`'s retained slot geometry — its
+/// pending placeholders and every vacancy matching its server/profile —
+/// then re-place its script panes from their current definitions through
+/// the normal placement chain (beside the session's main, at split
+/// defaults), with each def's hidden state re-asserted. The escape hatch
+/// for persisted geometry shadowing script changes.
+fn reset_session_layout(smudgy: &mut Smudgy, session_id: SessionId) -> Task<Message> {
+    let Some((server, profile)) = smudgy
+        .sessions
+        .get(session_id)
+        .map(|session| (session.server_name.clone(), session.profile_name.clone()))
+    else {
+        return Task::none();
+    };
+    // A drag anchored in geometry about to be re-placed is stale identity.
+    if smudgy
+        .tab_drag
+        .as_ref()
+        .is_some_and(|drag| drag.slot.session_id == session_id)
+    {
+        cancel_tab_drag(smudgy, "layout reset");
+    }
+
+    let mut emptied: Vec<window::Id> = Vec::new();
+    let mut script_panes: Vec<PaneRef> = Vec::new();
+    for (id, win) in smudgy.smudgy_windows.iter_mut() {
+        let reaped = win.reap_session_placeholders(session_id);
+        let released = win.release_vacancies(&server, &profile);
+        if reaped || released {
+            emptied.push(*id);
+        }
+        script_panes.extend(
+            win.pane_refs()
+                .into_iter()
+                .filter(|slot| slot.session_id == session_id && slot.key != MAIN_PANE_KEY),
+        );
+    }
+    let mut removal_emptied: Vec<window::Id> = Vec::new();
+    for pane in &script_panes {
+        for (id, win) in smudgy.smudgy_windows.iter_mut() {
+            if win.remove_pane_slot(pane.session_id, pane.key) {
+                removal_emptied.push(*id);
+            }
+        }
+    }
+    emptied.extend(removal_emptied);
+    for pane in &script_panes {
+        place_pane_in_windows(
+            smudgy,
+            session_id,
+            pane.key,
+            PanePlacement {
+                reference: MAIN_PANE_KEY,
+                direction: SplitDirection::Right,
+                size_px: None,
+            },
+        );
+        // The def's own hidden state is the truth being re-asserted.
+        let hidden = smudgy
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.pane_def(pane.key))
+            .is_some_and(|def| def.hidden);
+        sync_pane_hidden(smudgy, *pane, hidden);
+    }
+    log::info!(
+        "[layouts] reset session {session_id} ({server}/{profile}): re-placed {} pane(s)",
+        script_panes.len()
+    );
+    let close = close_emptied_windows(smudgy, emptied);
+    let report = report_pane_sizes(smudgy);
+    Task::batch([close, report])
+}
+
+/// Latch the autosave schedule shut and publish the final pre-teardown
+/// snapshot with an awaited ack. Returns the task that completes the quit
+/// (`WorkspaceQuitFlushed` → `iced::exit`), or `None` when the flush was
+/// already taken by an earlier quit path.
+fn begin_workspace_quit_flush(smudgy: &mut Smudgy) -> Option<Task<Message>> {
+    // The latch must be tested-and-set before building: after it, no
+    // teardown event can mark the schedule or mint a newer generation, so
+    // the flush below is guaranteed to stay the newest snapshot.
+    if !smudgy.workspace.schedule.begin_shutdown() {
+        return None;
+    }
+    let (ack, done) = tokio::sync::oneshot::channel();
+    // `publish_workspace_snapshot` resolves the ack on every path, so the
+    // awaited task below always completes — and the await is bounded
+    // besides, so a wedged disk write cannot hold the exit hostage (the
+    // last completed write stands; the atomic replace cannot tear).
+    let _ = publish_workspace_snapshot(smudgy, Some(ack));
+    Some(Task::perform(
+        workspace::writer::await_ack_bounded(done, workspace::writer::QUIT_FLUSH_TIMEOUT),
+        |()| Message::WorkspaceQuitFlushed,
+    ))
+}
+
+fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
+    // QA forensics (debug builds only): change-gated OS capture-owner
+    // sampling. Runs for every message; during a drag the motion message
+    // stream gives it per-sample resolution.
+    #[cfg(debug_assertions)]
+    spike_log_capture_owner();
     match message {
         Message::WindowTracking(id, event) => {
             smudgy.window_tracker.apply(id, event);
-            // The first cursor position tracked for the source window is the
-            // drag's deadband reference: tracking starts with the drag, so
-            // the pick itself is never observed.
-            if let pane_drag::TrackEvent::CursorMoved(position) = event
-                && let Some(drag) = &mut smudgy.pane_drag
-                && drag.source_window == id
-                && drag.pick_cursor.is_none()
-            {
-                drag.pick_cursor = Some(position);
+            // Every motion sample drives the hover classification the
+            // overlay renders; tracking only runs mid-drag.
+            if let pane_drag::TrackEvent::CursorMoved(position) = event {
+                track_drag_motion(smudgy, id, position);
             }
             Task::none()
         }
+        Message::PaneDragTerminal(window_id, terminal) => match terminal {
+            pane_drag::DragTerminal::Released => {
+                // A release always settles the pending press: below the
+                // deadband the gesture was a click, and selection is the
+                // press surface's fast path (its release event).
+                smudgy.tab_press = None;
+                if smudgy.tab_drag.is_some() {
+                    // The authoritative terminal: resolve against the last
+                    // tracked cursor sample of the source window. No sample
+                    // means no honest release point — cancel (E10), never a
+                    // fabricated origin.
+                    log::info!(
+                        "[pane-drag] raw ButtonReleased via {window_id:?} — authoritative terminal"
+                    );
+                    let point = smudgy
+                        .tab_drag
+                        .as_ref()
+                        .and_then(|drag| smudgy.window_tracker.get(drag.source_window))
+                        .and_then(|track| track.cursor);
+                    finish_tab_drag(smudgy, point)
+                } else {
+                    Task::none()
+                }
+            }
+            pane_drag::DragTerminal::Escape => {
+                // Escape cancels a live drag (E4). Below the deadband it
+                // deliberately does nothing: the press continues and the
+                // release still classifies as a click (E4b).
+                cancel_tab_drag(smudgy, "escape");
+                Task::none()
+            }
+            pane_drag::DragTerminal::Unfocused => {
+                // The gesture's source window losing focus is the daemon's
+                // capture-loss terminal (Win+L, UAC, WM_CANCELMODE): the raw
+                // release will never arrive, so an armed gesture must stand
+                // down here — an orphaned press would keep full-rate
+                // tracking subscribed forever and promote into a buttonless
+                // drag on the next cursor pass over the source window. The
+                // widget's own CaptureLost is the fast path; this terminal
+                // survives a press surface wiped by a subtree rebuild.
+                match pane_drag::unfocus_stand_down(
+                    window_id,
+                    smudgy.tab_press.map(|press| press.window),
+                    smudgy.tab_drag.as_ref().map(|drag| drag.source_window),
+                ) {
+                    Some(pane_drag::StandDown::Press) => {
+                        log::info!("[pane-drag] press stood down (source {window_id:?} unfocused)");
+                        smudgy.tab_press = None;
+                    }
+                    Some(pane_drag::StandDown::Drag) => {
+                        smudgy.tab_press = None;
+                        cancel_tab_drag(smudgy, "source window unfocused");
+                    }
+                    None => {}
+                }
+                Task::none()
+            }
+        },
         Message::CloseWindow(id) => {
             smudgy.window_tracker.remove(id);
             smudgy.closing_windows.remove(&id);
-            // The source window dying mid-drag ends the drag: its grid is
-            // gone, so no terminal DragEvent will ever arrive for this pick.
+            // The source window dying mid-drag ends the drag: its model is
+            // gone, so the drag identity can never re-resolve (E6). A press
+            // candidate in the dying window dies with it.
             if smudgy
-                .pane_drag
+                .tab_drag
+                .as_ref()
                 .is_some_and(|drag| drag.source_window == id)
             {
-                smudgy.pane_drag = None;
+                cancel_tab_drag(smudgy, "source window closed");
             }
+            if smudgy.tab_press.is_some_and(|press| press.window == id) {
+                smudgy.tab_press = None;
+            }
+            // Closing the LAST smudgy window is quit, and the final snapshot
+            // must capture the workspace as it stood — this window, its
+            // sessions, everything — before any teardown empties it. Taken
+            // here, ahead of the removal below; the teardown that follows can
+            // no longer mark or build (the schedule latches shut), so no
+            // emptied state can overwrite the flush.
+            let quit_flush =
+                if smudgy.smudgy_windows.len() == 1 && smudgy.smudgy_windows.contains_key(&id) {
+                    begin_workspace_quit_flush(smudgy)
+                } else {
+                    None
+                };
             if let Some(window) = smudgy.smudgy_windows.remove(&id) {
+                smudgy.workspace.forget_window(id);
                 // Window-close cascade: closing a window closes every session
                 // whose MAIN pane lived in it. The store entries are shut
                 // down and removed *before* any grid cleanup so events still
@@ -623,8 +1784,16 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     for editor in smudgy.map_editor_windows.values() {
                         editor.prepare_to_close();
                     }
-                    Task::batch([purge_task, iced::exit()])
+                    // Quit defers `iced::exit()` behind the write-complete
+                    // message so the final flush finishes before loop
+                    // teardown — the one documented place the fire-and-
+                    // forget write shape is replaced by an awaited one.
+                    let exit_task = quit_flush.unwrap_or_else(iced::exit);
+                    Task::batch([purge_task, exit_task])
                 } else {
+                    // Closing one of several windows is a workspace
+                    // mutation and persists through the normal debounce.
+                    smudgy.workspace.schedule.mark();
                     purge_task
                 }
             } else if smudgy.automations_windows.contains_key(&id) {
@@ -682,23 +1851,38 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 Some(SmudgyWindowEvent::CloseSession(session_id)) => {
                     Task::batch([task, close_session(smudgy, session_id)])
                 }
-                Some(SmudgyWindowEvent::PaneDragPicked { pane, slot }) => {
-                    // A fresh pick also supersedes any stale record from a
-                    // drag that ended without a terminal event (cursor
-                    // unavailable at release).
-                    smudgy.pane_drag = Some(pane_drag::ActiveDrag {
-                        source_window: id,
-                        grid_pane: pane,
+                Some(SmudgyWindowEvent::TabDragPressed {
+                    tab,
+                    slot,
+                    group,
+                    point,
+                }) => {
+                    // Not yet a drag, but the gesture is daemon-owned from
+                    // here: tracked motion past the deadband promotes this
+                    // press even if the press surface's widget state is
+                    // erased by an async subtree rebuild mid-gesture. Also
+                    // refresh every candidate window's origin *and* scale
+                    // factor so a drag that follows hit-tests fresh
+                    // geometry: origins go stale while idle (`Moved` is
+                    // only tracked mid-drag), and scale is only otherwise
+                    // learned from `Rescaled`, which never fires for a
+                    // window that opened at its final DPI. The answers race
+                    // the drag, but a human drag outlasts a task round-trip
+                    // by orders of magnitude.
+                    log::info!(
+                        "[pane-drag] press {}/{} window={id:?} local=({:.1}, {:.1})",
+                        slot.session_id,
+                        slot.key,
+                        point.x,
+                        point.y,
+                    );
+                    smudgy.tab_press = Some(pane_drag::PendingPress {
+                        window: id,
+                        tab,
                         slot,
-                        // Seeded by the first cursor position tracked during
-                        // the drag (cursor tracking only runs mid-drag).
-                        pick_cursor: None,
+                        group,
+                        press: point,
                     });
-                    // Origins go stale while idle (`Moved` is only tracked
-                    // mid-drag): re-query every candidate window's position
-                    // for the release hit-test. The answers race the drag,
-                    // but a human drag outlasts a task round-trip by orders
-                    // of magnitude.
                     let mut tasks = vec![task];
                     for &window_id in smudgy.smudgy_windows.keys() {
                         tasks.push(window::position(window_id).map(move |origin| {
@@ -707,15 +1891,76 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                                 pane_drag::TrackEvent::Origin(origin),
                             )
                         }));
+                        tasks.push(window::scale_factor(window_id).map(move |scale| {
+                            Message::WindowTracking(
+                                window_id,
+                                pane_drag::TrackEvent::Rescaled(scale),
+                            )
+                        }));
                     }
                     Task::batch(tasks)
                 }
-                Some(SmudgyWindowEvent::PaneDragEnded) => {
-                    smudgy.pane_drag = None;
+                Some(SmudgyWindowEvent::TabDragStarted {
+                    tab,
+                    slot,
+                    group,
+                    press,
+                    point,
+                }) => {
+                    // The widget's own deadband crossing — the fast path.
+                    // The daemon may already have promoted the pending press
+                    // from tracked motion; a second start for the same tab
+                    // is a no-op.
+                    if smudgy.tab_drag.as_ref().is_some_and(|drag| drag.tab == tab) {
+                        return Task::batch([task, report_pane_sizes(smudgy)]);
+                    }
+                    smudgy.tab_press = None;
+                    log::info!(
+                        "[pane-drag] drag started: tab {tab:?} ({}/{}) from {id:?}, press=({:.1}, {:.1})",
+                        slot.session_id,
+                        slot.key,
+                        press.x,
+                        press.y,
+                    );
+                    // A fresh start supersedes any stale record (a drag that
+                    // somehow ended without a terminal).
+                    smudgy.tab_drag = Some(pane_drag::TabDrag {
+                        source_window: id,
+                        tab,
+                        slot,
+                        source_group: group,
+                        press,
+                        hover: None,
+                    });
+                    // Classify the starting point immediately so the first
+                    // overlay frame agrees with the cursor.
+                    track_drag_motion(smudgy, id, point);
                     task
                 }
-                Some(SmudgyWindowEvent::PaneDragCanceled(pane)) => {
-                    Task::batch([task, finish_drag_canceled(smudgy, id, pane)])
+                Some(SmudgyWindowEvent::TabDragReleased { point }) => {
+                    // The widget's release is evidence, never resolution:
+                    // the strip's scrollable reports the cursor to children
+                    // as unavailable outside its viewport (most of any
+                    // drag) and scroll-translated inside it, so this point
+                    // is absent or content-space exactly when it matters.
+                    // The authoritative raw-release terminal fires from the
+                    // same OS event and resolves with the window-space
+                    // tracked sample; a drag that started has at least one
+                    // sample, so nothing is lost by deferring (and a drag
+                    // with no sample at all cancels there — E10).
+                    log::info!(
+                        "[pane-drag] widget release observed (point {}) — deferring to the raw terminal",
+                        if point.is_some() {
+                            "present"
+                        } else {
+                            "unavailable"
+                        },
+                    );
+                    task
+                }
+                Some(SmudgyWindowEvent::TabDragCanceled { reason }) => {
+                    cancel_tab_drag(smudgy, reason);
+                    task
                 }
                 Some(SmudgyWindowEvent::OpenSettingsWindow) => {
                     Task::batch([task, Task::done(Message::CreateSettingsWindow)])
@@ -748,6 +1993,51 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     }
                     task
                 }
+                Some(SmudgyWindowEvent::SaveLayout { server, name }) => {
+                    let save = save_named_layout(smudgy, id, &server, &name);
+                    Task::batch([task, save])
+                }
+                Some(SmudgyWindowEvent::ApplyLayout { server, name }) => {
+                    let apply = apply_workspace_template(
+                        smudgy,
+                        id,
+                        &server,
+                        &workspace::TemplateSource::Named(name),
+                        &HashMap::new(),
+                    );
+                    Task::batch([task, apply])
+                }
+                Some(SmudgyWindowEvent::RestoreLastSession { server }) => {
+                    let apply = apply_workspace_template(
+                        smudgy,
+                        id,
+                        &server,
+                        &workspace::TemplateSource::LastSession,
+                        &HashMap::new(),
+                    );
+                    Task::batch([task, apply])
+                }
+                Some(SmudgyWindowEvent::ApplyLayoutWithAnswers {
+                    server,
+                    source,
+                    close,
+                    keep,
+                }) => {
+                    let mut answers: HashMap<SessionId, workspace::apply::OmittedAnswer> =
+                        HashMap::new();
+                    for session in keep {
+                        answers.insert(session, workspace::apply::OmittedAnswer::Keep);
+                    }
+                    for session in close {
+                        answers.insert(session, workspace::apply::OmittedAnswer::Close);
+                    }
+                    let apply = apply_workspace_template(smudgy, id, &server, &source, &answers);
+                    Task::batch([task, apply])
+                }
+                Some(SmudgyWindowEvent::ResetSessionLayout(session_id)) => {
+                    let reset = reset_session_layout(smudgy, session_id);
+                    Task::batch([task, reset])
+                }
                 None => task,
             };
             // Any window update may have moved pane geometry (divider drags,
@@ -761,6 +2051,46 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 session.flush_pane_sizes();
             }
             Task::none()
+        }
+        Message::WorkspaceDebounceTick => {
+            if smudgy.workspace.schedule.debounce_settled() {
+                // The churn settled: snapshot at a fresh geometry poll, so
+                // the write carries current placement too.
+                begin_workspace_poll(smudgy)
+            } else {
+                Task::none()
+            }
+        }
+        Message::WorkspaceCheckpointTick => {
+            if smudgy.workspace.schedule.is_shutting_down() {
+                Task::none()
+            } else {
+                // Unconditional: the poll's change detection is what
+                // notices window moves (idle tracking deliberately drops
+                // them), and a dirty mirror writes at most once per
+                // checkpoint under sustained churn.
+                begin_workspace_poll(smudgy)
+            }
+        }
+        Message::WorkspaceGeometry {
+            poll,
+            window,
+            sample,
+        } => {
+            let outcome = smudgy.workspace.record_sample(poll, window, sample);
+            if outcome.poll_complete
+                && smudgy.workspace.schedule.is_dirty()
+                && !smudgy.workspace.schedule.is_shutting_down()
+            {
+                publish_workspace_snapshot(smudgy, None);
+            }
+            Task::none()
+        }
+        Message::WorkspaceQuitFlushed => {
+            // The final snapshot is durable — or the writer is gone, or the
+            // bounded wait expired, and waiting longer cannot help either
+            // way: finish the deferred quit.
+            iced::exit()
         }
         Message::SessionEvent(TaggedSessionEvent { session_id, event }) => {
             // Connection edges re-derive the Discord activity — after the
@@ -826,12 +2156,42 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     other_key: *other_key,
                 }),
                 SessionEvent::PaneMirrorInterest => Some(PaneFollowUp::MirrorInterest),
+                SessionEvent::LayoutSave { name } => Some(PaneFollowUp::LayoutSave(name.clone())),
+                SessionEvent::LayoutApply { name } => Some(PaneFollowUp::LayoutApply(name.clone())),
                 _ => None,
             };
+            let runtime_ready = matches!(event, SessionEvent::RuntimeReady(_));
             if let Some(session) = smudgy.sessions.get_mut(session_id) {
                 let task = session
                     .update(session_store::Message::SessionEvent(event))
                     .map(move |msg| Message::SessionAction(session_id, msg));
+                if runtime_ready {
+                    // The runtime can accept reports now (the session just
+                    // adopted its channel): flush the owed eyeball replays —
+                    // once per restored pane, through the same path a click
+                    // takes — and reap the placeholders whose panes never
+                    // materialized (missing, renamed, unauthorized). Both
+                    // are loud no-ops on reload-triggered readiness.
+                    for (key, hidden) in smudgy.restore.mark_ready(session_id) {
+                        if let Some(session) = smudgy.sessions.get(session_id) {
+                            session.report_user_hidden(key, hidden);
+                        }
+                    }
+                    let mut emptied = Vec::new();
+                    for (window_id, window) in smudgy.smudgy_windows.iter_mut() {
+                        if window.reap_session_placeholders(session_id) {
+                            emptied.push(*window_id);
+                        }
+                    }
+                    if !emptied.is_empty() {
+                        let close = close_emptied_windows(smudgy, emptied);
+                        let follow = Task::batch([task, close]);
+                        if presence_edge {
+                            refresh_discord_presence(smudgy);
+                        }
+                        return follow;
+                    }
+                }
                 let pane_task = match pane_follow_up {
                     Some(PaneFollowUp::Opened {
                         key,
@@ -894,6 +2254,13 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         }
                         report
                     }
+                    Some(PaneFollowUp::LayoutSave(name)) => {
+                        script_save_layout(smudgy, session_id, &name);
+                        Task::none()
+                    }
+                    Some(PaneFollowUp::LayoutApply(name)) => {
+                        script_apply_layout(smudgy, session_id, &name)
+                    }
                     None => Task::none(),
                 };
                 if presence_edge {
@@ -909,12 +2276,6 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             }
         }
         Message::SessionAction(session_id, msg) => {
-            // A close routes through the daemon teardown (store + grids +
-            // empty-window rule) rather than the session itself; checking
-            // before the store lookup makes a repeated close a clean no-op.
-            if matches!(msg, session_store::Message::Close) {
-                return close_session(smudgy, session_id);
-            }
             // The session's own map widgets update below; the standalone map
             // editor windows track the current location too, and a sustained
             // locate streak is the passive bind-on-use signal (daemon-owned).
@@ -950,11 +2311,69 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             smudgy.smudgy_windows.entry(id).or_insert_with(|| {
                 windows::smudgy_window::SmudgyWindow::new(id, smudgy.account.handles())
             });
+            // Mint the window's stable workspace id (creation order is the
+            // durable ordinal) and note the change for the mirror.
+            smudgy.workspace.register_window(id);
+            smudgy.workspace.schedule.mark();
+            // QA hook (debug builds only): the first window under
+            // SMUDGY_SPIKE_AUTOSESSION=<n> gets n offline sessions and
+            // spawns the second (empty) window, so the scripted drag matrix
+            // needs no GUI driving. Once-guarded: the second window
+            // re-enters this arm.
+            #[cfg(not(debug_assertions))]
+            let spike_task = Task::none();
+            #[cfg(debug_assertions)]
+            let autosession_count = spike_autosession_count();
+            #[cfg(debug_assertions)]
+            let spike_task = if autosession_count > 0
+                && !SPIKE_AUTOSESSION_DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                match spike_autosession_target() {
+                    Some((server, profile)) => {
+                        log::info!(
+                            "[pane-drag] autosession: opening {autosession_count} offline {profile} on {server} in {id:?} + second window"
+                        );
+                        let window = smudgy
+                            .smudgy_windows
+                            .get_mut(&id)
+                            .expect("window inserted above");
+                        let mut tasks = Vec::new();
+                        for _ in 0..autosession_count {
+                            tasks.push(
+                                window
+                                    .autosession_open_offline_session(
+                                        server.clone(),
+                                        profile.clone(),
+                                        &mut smudgy.sessions,
+                                    )
+                                    .map(move |msg| Message::SmudgyWindowMessage(id, msg)),
+                            );
+                        }
+                        let (_, open_second) = window::open(smudgy_window_settings());
+                        tasks.push(open_second.map(Message::NewSmudgyWindow));
+                        Task::batch(tasks)
+                    }
+                    None => {
+                        log::warn!("[pane-drag] autosession: no server/profile found");
+                        Task::none()
+                    }
+                }
+            } else {
+                Task::none()
+            };
             Task::batch([
+                spike_task,
                 // Install the Restart Manager shutdown hook on this window's
                 // HWND so the installer can close smudgy for an in-place
                 // upgrade.
-                window::raw_id::<Message>(id).map(Message::HookWindowForShutdown),
+                window::raw_id::<Message>(id).map(move |raw| {
+                    // QA forensics (debug builds only): announce the HWND so
+                    // the scripted drag matrix and GetCapture logs can be
+                    // correlated to iced window ids.
+                    #[cfg(debug_assertions)]
+                    log::info!("[pane-drag] window {id:?} hwnd={raw:#x}");
+                    Message::HookWindowForShutdown(raw)
+                }),
                 // Seed the tracker: the window's `Opened` event may have
                 // fired before the daemon subscription was polled (true for
                 // the first window at startup).
@@ -966,6 +2385,24 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 }),
                 window::scale_factor(id).map(move |scale| {
                     Message::WindowTracking(id, pane_drag::TrackEvent::Rescaled(scale))
+                }),
+                // Seed the workspace geometry cache too, so a snapshot taken
+                // before the first checkpoint poll (an early quit included)
+                // still carries real placement for this window.
+                window::position(id).map(move |origin| Message::WorkspaceGeometry {
+                    poll: None,
+                    window: id,
+                    sample: workspace::autosave::GeometrySample::Position(origin),
+                }),
+                window::size(id).map(move |size| Message::WorkspaceGeometry {
+                    poll: None,
+                    window: id,
+                    sample: workspace::autosave::GeometrySample::Size(size),
+                }),
+                window::scale_factor(id).map(move |scale| Message::WorkspaceGeometry {
+                    poll: None,
+                    window: id,
+                    sample: workspace::autosave::GeometrySample::Scale(scale),
                 }),
             ])
         }
@@ -1322,18 +2759,82 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
     }
 }
 
-/// Close one session: shut its runtime down and remove it from the store
-/// *first* — so events still in flight for the id are dropped at the daemon —
-/// then clean its panes out of every window's grid and apply the empty-window
-/// rule. A repeat close (double-clicked ✕, a late queued task) is a no-op.
+/// Close one session (the user's explicit ✕): shut its runtime down and
+/// remove it from the store *first* — so events still in flight for the id
+/// are dropped at the daemon — then **vacate** its slot rather than delete
+/// it: the session's tabs stay in place as unbound placeholders (geometry
+/// retained for the run) and the window hosting its main pane records the
+/// vacancy a later open there adopts. A repeat close (double-clicked ✕, a
+/// late queued task) is a no-op. Vacancies are runtime-only: the next
+/// snapshot simply omits the unbound tabs, so closed stays closed across
+/// restarts by omission.
 fn close_session(smudgy: &mut Smudgy, session_id: SessionId) -> Task<Message> {
+    // The vacancy's descriptors must be captured while the store entry (the
+    // only holder of the session's pane defs) still exists.
+    let vacate = smudgy.sessions.get(session_id).map(|session| {
+        let mut descriptors = HashMap::new();
+        for window in smudgy.smudgy_windows.values() {
+            for slot in window.pane_refs() {
+                if slot.session_id != session_id || slot.key == MAIN_PANE_KEY {
+                    continue;
+                }
+                if let Some(def) = session.pane_def(slot.key) {
+                    descriptors.insert(
+                        slot.key,
+                        workspace::restore::descriptor_key(&def.namespace, &def.name),
+                    );
+                }
+            }
+        }
+        (
+            session.server_name.clone(),
+            session.profile_name.clone(),
+            descriptors,
+        )
+    });
     if !smudgy.sessions.shutdown_and_remove(session_id) {
         return Task::none();
     }
     log::info!("Closed session {session_id}");
+    smudgy.restore.forget_session(session_id);
+    smudgy.workspace.forget_session(session_id);
     // A session closed while still connected never sees a Disconnected event.
     refresh_discord_presence(smudgy);
-    purge_sessions_from_windows(smudgy, &[session_id])
+    let Some((server, profile, descriptors)) = vacate else {
+        // Already gone: nothing to vacate, just sweep like a cascade close.
+        return purge_sessions_from_windows(smudgy, &[session_id]);
+    };
+    // The dying panes cancel gestures exactly like a purge would.
+    if smudgy
+        .tab_drag
+        .as_ref()
+        .is_some_and(|drag| drag.slot.session_id == session_id)
+    {
+        cancel_tab_drag(smudgy, "session closed mid-drag");
+    }
+    if smudgy
+        .tab_press
+        .is_some_and(|press| press.slot.session_id == session_id)
+    {
+        smudgy.tab_press = None;
+    }
+    let ordinal = smudgy.restore.next_vacancy_ordinal();
+    let mut emptied: Vec<window::Id> = Vec::new();
+    for (window_id, window) in smudgy.smudgy_windows.iter_mut() {
+        let vacated_empty =
+            window.vacate_session(session_id, &server, &profile, &descriptors, ordinal);
+        // Placeholders the dead session still owed (a restore it never
+        // finished) can no longer materialize.
+        let reaped_empty = window.reap_session_placeholders(session_id);
+        if vacated_empty || reaped_empty {
+            emptied.push(*window_id);
+        }
+    }
+    // A window this emptied hosted nothing but the dead session's doomed
+    // tabs (torn-out script panes whose main lived elsewhere, or
+    // placeholders it still owed): it closes like any other emptied window,
+    // keep-one-alive included.
+    close_emptied_windows(smudgy, emptied)
 }
 
 /// Re-derives the Discord presence from the session store and hands it to
@@ -1366,17 +2867,29 @@ fn refresh_discord_presence(smudgy: &mut Smudgy) {
 /// always keeping at least one smudgy window alive (the last one stays open
 /// showing the empty connect state).
 fn purge_sessions_from_windows(smudgy: &mut Smudgy, dead: &[SessionId]) -> Task<Message> {
-    // A dragged pane whose session died mid-drag must never transplant.
+    // A dragged pane whose session died mid-drag must never drop (E5), and
+    // a pressed one must never promote.
     if smudgy
-        .pane_drag
+        .tab_drag
+        .as_ref()
         .is_some_and(|drag| dead.contains(&drag.slot.session_id))
     {
-        smudgy.pane_drag = None;
+        cancel_tab_drag(smudgy, "session closed mid-drag");
+    }
+    if smudgy
+        .tab_press
+        .is_some_and(|press| dead.contains(&press.slot.session_id))
+    {
+        smudgy.tab_press = None;
     }
 
     let mut tasks: Vec<Task<Message>> = Vec::new();
     let mut emptied: Vec<window::Id> = Vec::new();
 
+    for &session_id in dead {
+        smudgy.restore.forget_session(session_id);
+        smudgy.workspace.forget_session(session_id);
+    }
     for (window_id, window) in smudgy.smudgy_windows.iter_mut() {
         for &session_id in dead {
             let (task, now_empty) = window.handle_session_removed(session_id, &smudgy.sessions);
@@ -1394,6 +2907,14 @@ fn purge_sessions_from_windows(smudgy: &mut Smudgy, dead: &[SessionId]) -> Task<
 
 /// Close each emptied window, always keeping at least one smudgy window
 /// alive (the last one stays open showing the empty connect state).
+///
+/// "Emptied" is visual: callers report windows left with no bound or
+/// pending tab, which includes windows still holding invisible vacancy
+/// tabs. Closing such a secondary window drops its vacancy records —
+/// acceptable by design, since adoption is window-local and a record in a
+/// closed window could never be adopted again. The kept-alive last window
+/// retains its vacancies invisibly behind the connect view, where a later
+/// open adopts them.
 ///
 /// "Remaining" excludes windows already told to close but still lingering in
 /// the map (their `CloseWindow` event is in flight): counting them would let
@@ -1459,6 +2980,93 @@ enum PaneFollowUp {
         other_key: PaneKey,
     },
     MirrorInterest,
+    /// `layout.save` — capture the calling session's server footprint and
+    /// write its store, on the daemon (the only owner of the live model).
+    LayoutSave(String),
+    /// `layout.apply` — the script-scoped, layout-only apply.
+    LayoutApply(String),
+}
+
+/// The daemon half of a script `layout.save`: capture the calling
+/// session's server footprint and queue it for the store. The capture and
+/// serialization happen here, synchronously — the snapshot must be
+/// consistent with this cycle's model — while the fsync-bearing atomic
+/// write coalesces on the background saver, so a save in a per-line
+/// trigger costs the update thread a serialization, never a disk write.
+fn script_save_layout(smudgy: &mut Smudgy, session_id: SessionId, name: &str) {
+    let Some(server) = smudgy
+        .sessions
+        .get(session_id)
+        .map(|session| session.server_name.clone())
+    else {
+        return;
+    };
+    let Some(dir) = workspace::layouts::layouts_dir(&server) else {
+        log::warn!("[layouts] script save of '{name}' skipped: no resolvable store for {server}");
+        return;
+    };
+    match capture_server_footprint(smudgy, &server) {
+        Some((template, notes)) => match smudgy.layout_saver.submit(dir, name, &template) {
+            Ok(()) => {
+                if notes.is_partial() {
+                    log::info!(
+                        "[layouts] script save of '{name}' for {server} was partial: \
+                         {} vacancy tab(s), {} foreign pane(s) omitted",
+                        notes.omitted_vacancies,
+                        notes.omitted_foreign
+                    );
+                }
+            }
+            Err(error) => {
+                log::warn!("[layouts] script save of '{name}' for {server} failed: {error}");
+            }
+        },
+        None => {
+            log::info!("[layouts] script save of '{name}' skipped: no window hosts a {server} pane")
+        }
+    }
+}
+
+/// The daemon half of a script `layout.apply`: project under Script
+/// scoping — content-scoped to the calling session's server, layout-only —
+/// revalidate conservation against the live workspace, and execute. Never
+/// spawns, closes, prompts, or touches OS windows; rapid repeated applies
+/// are model mutations only, coalescing into the normal autosave debounce.
+fn script_apply_layout(smudgy: &mut Smudgy, session_id: SessionId, name: &str) -> Task<Message> {
+    if smudgy.workspace.schedule.is_shutting_down() {
+        return Task::none();
+    }
+    let Some(server) = smudgy
+        .sessions
+        .get(session_id)
+        .map(|session| session.server_name.clone())
+    else {
+        return Task::none();
+    };
+    let template = match workspace::layouts::load(&server, name) {
+        Ok(template) => template,
+        Err(error) => {
+            log::info!("[layouts] script apply of '{name}' for {server} failed: {error}");
+            return Task::none();
+        }
+    };
+    let live = build_live_workspace(smudgy);
+    let mode = workspace::apply::ApplyMode::Script {
+        calling_server: &server,
+    };
+    let plan = match workspace::apply::plan_apply(&template, &live, mode, &HashMap::new()) {
+        Ok(plan) => plan,
+        Err(error) => {
+            log::info!("[layouts] script apply of '{name}' for {server} failed: {error}");
+            return Task::none();
+        }
+    };
+    if let Err(error) = workspace::apply::validate_conservation(&template, &live, mode, &plan) {
+        log::info!("[layouts] conservation check refused script apply of '{name}': {error}");
+        return Task::none();
+    }
+    log::info!("[layouts] script apply of '{name}' for {server}");
+    execute_layout_apply(smudgy, &plan)
 }
 
 /// Sync one pane's def-owned hidden state into whichever window hosts it —
@@ -1475,12 +3083,18 @@ fn sync_pane_hidden(smudgy: &mut Smudgy, slot: PaneRef, hidden: bool) {
 /// window and report it to its session's feed (change-gated; a no-op for
 /// sessions without mirror interest). Sessions that gained pending entries
 /// get one trailing flush scheduled — the debounce that turns divider-drag
-/// streams into settled reports.
+/// streams into settled reports. Settles each window's pending grid
+/// rebuild first: the mutations of the operation being reported on have
+/// already landed, so the measurements must come from the grid they
+/// produced.
 fn report_pane_sizes(smudgy: &mut Smudgy) -> Task<Message> {
     let measured: Vec<(PaneRef, Size)> = smudgy
         .smudgy_windows
-        .values()
-        .flat_map(windows::smudgy_window::SmudgyWindow::pane_sizes)
+        .values_mut()
+        .flat_map(|window| {
+            window.flush_grid_rebuild();
+            window.pane_sizes()
+        })
         .collect();
     let mut flushes = Vec::new();
     for (slot, size) in measured {
@@ -1504,10 +3118,13 @@ fn report_pane_sizes(smudgy: &mut Smudgy) -> Task<Message> {
 }
 
 /// Apply a script `pane.relocate` (panes.md placement commands): detach the
-/// pane's slot from whichever window holds it and re-attach it beside the
-/// reference — the synthetic manual drop, riding the transplant machinery
-/// when the reference lives in another window. The hidden toggle travels
-/// with the slot; unlike a user drop, focus does not.
+/// pane's tab from whichever window holds it — one tab, preserving the rest
+/// of any group it sat in — and re-attach it as a singleton group split
+/// beside the reference's WHOLE group, riding the transplant machinery when
+/// the reference lives in another window. The tab value carries its stable
+/// id across the move, so a same-window relocation keeps the pane's keyed
+/// widget state, exactly like the equivalent body-edge drop. The hidden
+/// toggle travels with the pane; unlike a user drop, focus does not.
 fn relocate_script_pane(
     smudgy: &mut Smudgy,
     session_id: SessionId,
@@ -1536,28 +3153,42 @@ fn relocate_script_pane(
     };
     if source_id == target_id {
         if let Some(window) = smudgy.smudgy_windows.get_mut(&source_id) {
-            let hidden = window.pane_hidden(slot);
-            // The reference stays behind, so the removal can never empty the
-            // window; the re-insert follows in this same update.
-            window.remove_pane_slot(session_id, key);
-            window.insert_pane_beside(slot, ref_slot, direction, size_px);
-            window.set_pane_hidden(slot, hidden);
+            // The re-attach lands in this same window unconditionally (the
+            // placement chain ends at a fresh cluster), so a transiently
+            // emptied model needs no empty-window handling here.
+            if let Some((tab, hidden, _emptied)) = window.extract_pane_tab(slot) {
+                window.adopt_tab_beside(tab, ref_slot, direction, size_px);
+                window.set_pane_hidden(slot, hidden);
+            }
         }
         return report_pane_sizes(smudgy);
     }
     let Some(source) = smudgy.smudgy_windows.get_mut(&source_id) else {
         return Task::none();
     };
-    let hidden = source.pane_hidden(slot);
-    let emptied = source.remove_pane_slot(session_id, key);
+    let Some((tab, hidden, emptied)) = source.extract_pane_tab(slot) else {
+        return Task::none();
+    };
     let repair = source
         .repair_active_session(&smudgy.sessions)
         .map(move |msg| Message::SmudgyWindowMessage(source_id, msg));
-    if let Some(target) = smudgy.smudgy_windows.get_mut(&target_id) {
-        target.insert_pane_beside(slot, ref_slot, direction, size_px);
-        target.set_pane_hidden(slot, hidden);
-    }
-    let close = if emptied {
+    let landed_in_target = match smudgy.smudgy_windows.get_mut(&target_id) {
+        Some(target) => {
+            target.adopt_tab_beside(tab, ref_slot, direction, size_px);
+            target.set_pane_hidden(slot, hidden);
+            true
+        }
+        None => {
+            // Unreachable (both windows were resolved above in this same
+            // update); re-host in the source rather than strand the tab.
+            if let Some(source) = smudgy.smudgy_windows.get_mut(&source_id) {
+                source.adopt_tab_beside(tab, ref_slot, direction, size_px);
+                source.set_pane_hidden(slot, hidden);
+            }
+            false
+        }
+    };
+    let close = if emptied && landed_in_target {
         close_emptied_windows(smudgy, vec![source_id])
     } else {
         Task::none()
@@ -1566,9 +3197,34 @@ fn relocate_script_pane(
     Task::batch([repair, close, report])
 }
 
-/// Atomically exchange two pane payloads while leaving both destination split
-/// trees untouched. Across windows, hidden state follows each pane identity;
-/// no window can become empty because each loses and gains exactly one leaf.
+/// Apply a pane swap — ONE semantics for script `pane.swap` and drag center
+/// drops alike: a swap exchanges the two panes' hosted positions, leaving
+/// both split trees untouched.
+///
+/// Same-window, that is a tab-slot exchange (`swap_pane_slots`, backed by
+/// the model's `swap_tabs`): the two TabIds travel with their panes, so the
+/// keyed body host re-pairs each subtree with its moved tab and per-window
+/// widget state follows the pane — including same-group pairs, where the
+/// exchange is a strip-slot swap inside one group. Cross-window, it is a
+/// pane BINDING exchange (`replace_pane_slot` on each side): the tabs stay
+/// in their windows and only the pane payloads trade places. The asymmetry
+/// is deliberate and observationally equivalent: a TabId is a runtime-local
+/// continuity key for per-window widget state, which cannot cross window
+/// trees regardless, and tab identities are never persisted (the durable
+/// form records stable pane descriptors), so nothing outlives the exchange
+/// that could tell the shapes apart.
+///
+/// Inactive tabs participate like any others — selection follows the slot,
+/// so a pane swapped away from an unselected tab leaves the destination tab
+/// unselected, and a swap between two off-screen tabs changes nothing on
+/// screen. Activation follows the rendered slot: each involved window is
+/// probed before mutation and settled after both halves (payloads and
+/// hidden state) land, so whatever the user was looking at keeps their
+/// attention, without any focus operation. Hidden state follows each pane
+/// identity. Both leaves are resolved before either model mutates, and a
+/// failed second rebinding rolls the first back — a half-swap can never
+/// escape. No window can become empty: each side loses and gains exactly
+/// one pane.
 fn swap_script_panes(smudgy: &mut Smudgy, first: PaneRef, second: PaneRef) -> Task<Message> {
     if first == second {
         return Task::none();
@@ -1588,28 +3244,56 @@ fn swap_script_panes(smudgy: &mut Smudgy, first: PaneRef, second: PaneRef) -> Ta
 
     if first_window == second_window {
         if let Some(window) = smudgy.smudgy_windows.get_mut(&first_window) {
+            let probe = window.pane_swap_render_probe(first, second);
             window.swap_pane_slots(first, second);
-            window.sync_active_session_after_pane_swap(first, second);
+            window.settle_active_session_after_pane_swap(probe);
         }
         return report_pane_sizes(smudgy);
     }
 
-    // Both leaves were resolved before either model changes. The window map is
-    // exclusively borrowed by this update, so both in-place replacements are
-    // guaranteed to address the leaves just found (never a half-swap).
+    // Both leaves were resolved before either model changes, and the two
+    // rebindings form a remove/restore-safe transaction: if the second
+    // rebinding fails, the first is rolled back before returning, so a
+    // half-swap can never escape this function.
     let first_hidden = smudgy.smudgy_windows[&first_window].pane_hidden(first);
     let second_hidden = smudgy.smudgy_windows[&second_window].pane_hidden(second);
+    // Rendered-slot facts are probed before either model mutates; they are
+    // settled only after the hidden-state transfers below, which feed each
+    // window's post-swap rendered slots.
+    let first_probe = smudgy.smudgy_windows[&first_window].pane_swap_render_probe(first, second);
+    let second_probe = smudgy.smudgy_windows[&second_window].pane_swap_render_probe(first, second);
     let replaced_first = smudgy
         .smudgy_windows
         .get_mut(&first_window)
         .is_some_and(|window| window.replace_pane_slot(first, second));
+    if !replaced_first {
+        // Nothing has mutated: rejecting here is a clean no-op.
+        log::error!("Pane swap failed to rebind its first leaf after resolution");
+        return Task::none();
+    }
     let replaced_second = smudgy
         .smudgy_windows
         .get_mut(&second_window)
         .is_some_and(|window| window.replace_pane_slot(second, first));
-    debug_assert!(replaced_first && replaced_second);
-    if !(replaced_first && replaced_second) {
-        log::error!("Pane swap invariant failed after both leaves were resolved");
+    if !replaced_second {
+        // Roll the first rebinding back so the swap is all-or-nothing. The
+        // undo addresses the binding just written, so it cannot itself fail.
+        debug_assert!(
+            false,
+            "pane swap invariant failed after both leaves were resolved"
+        );
+        let restored = smudgy
+            .smudgy_windows
+            .get_mut(&first_window)
+            .is_some_and(|window| window.replace_pane_slot(second, first));
+        if restored {
+            if let Some(window) = smudgy.smudgy_windows.get_mut(&first_window) {
+                window.set_pane_hidden(first, first_hidden);
+            }
+            log::error!("Pane swap rejected: second leaf failed to rebind; first restored");
+        } else {
+            log::error!("Pane swap rollback failed; first window rebound without its partner");
+        }
         return Task::none();
     }
     if let Some(window) = smudgy.smudgy_windows.get_mut(&first_window) {
@@ -1620,19 +3304,20 @@ fn swap_script_panes(smudgy: &mut Smudgy, first: PaneRef, second: PaneRef) -> Ta
     }
 
     if let Some(window) = smudgy.smudgy_windows.get_mut(&first_window) {
-        window.sync_active_session_after_pane_swap(first, second);
+        window.settle_active_session_after_pane_swap(first_probe);
     }
     if let Some(window) = smudgy.smudgy_windows.get_mut(&second_window) {
-        window.sync_active_session_after_pane_swap(first, second);
+        window.settle_active_session_after_pane_swap(second_probe);
     }
     report_pane_sizes(smudgy)
 }
 
 /// Apply a script `pane.tearOut`: the drag tear-out flow minus the drag —
-/// move the slot into a fresh dedicated window, sized by the request (or
-/// like the pane it carries), positioned by the OS. Windows stay emergent:
-/// no script-facing window identity is minted, and the empty-window rule
-/// closes the window when its last pane leaves.
+/// detach the pane's tab (one tab, preserving the rest of any group it sat
+/// in, its stable id traveling with it) into a fresh dedicated window,
+/// sized by the request (or like the pane it carries), positioned by the
+/// OS. Windows stay emergent: no script-facing window identity is minted,
+/// and the empty-window rule closes the window when its last pane leaves.
 fn tear_out_script_pane(
     smudgy: &mut Smudgy,
     session_id: SessionId,
@@ -1652,9 +3337,12 @@ fn tear_out_script_pane(
     let Some(source) = smudgy.smudgy_windows.get_mut(&source_id) else {
         return Task::none();
     };
-    let hidden = source.pane_hidden(slot);
+    // The size is grid-derived; it must be read before the extraction below
+    // mutates the model.
     let measured = source.pane_size(slot);
-    let emptied = source.remove_pane_slot(session_id, key);
+    let Some((tab, hidden, emptied)) = source.extract_pane_tab(slot) else {
+        return Task::none();
+    };
     let repair = source
         .repair_active_session(&smudgy.sessions)
         .map(move |msg| Message::SmudgyWindowMessage(source_id, msg));
@@ -1675,9 +3363,16 @@ fn tear_out_script_pane(
 
     let (id, open_task) = window::open(settings);
     let mut torn_out = windows::smudgy_window::SmudgyWindow::new(id, smudgy.account.handles());
-    torn_out.adopt_torn_out_pane(slot);
+    torn_out.adopt_torn_out_tab(tab);
     torn_out.set_pane_hidden(slot, hidden);
     smudgy.smudgy_windows.insert(id, torn_out);
+    // The workspace mirror must learn the window in the same update that
+    // inserts it: snapshot capture walks only mirror-registered windows, so
+    // a checkpoint firing before the deferred `NewSmudgyWindow` arm would
+    // otherwise drop the torn-out window (and its pane) from the persisted
+    // workspace. Registration is idempotent — the open task's arm
+    // re-announces harmlessly.
+    smudgy.workspace.register_window(id);
 
     let activate = Task::done(Message::SmudgyWindowMessage(
         id,
@@ -1704,6 +3399,31 @@ fn place_pane_in_windows(
     key: PaneKey,
     placement: PanePlacement,
 ) {
+    // A placeholder staged for this pane (a template restore or an adopted
+    // vacancy) wins over the script's placement request: the pane binds in
+    // place, in its stored position, and its stored eyeball preference
+    // replays once through the normal user-toggle path. Unknown panes fall
+    // through to normal placement.
+    if let Some(descriptor) = smudgy
+        .sessions
+        .get(session_id)
+        .and_then(|session| session.pane_def(key))
+        .map(|def| workspace::restore::descriptor_key(&def.namespace, &def.name))
+    {
+        for window in smudgy.smudgy_windows.values_mut() {
+            let Some(hidden) = window.claim_pending_pane(session_id, &descriptor, key) else {
+                continue;
+            };
+            if smudgy.restore.is_ready(session_id) {
+                if let Some(session) = smudgy.sessions.get(session_id) {
+                    session.report_user_hidden(key, hidden);
+                }
+            } else {
+                smudgy.restore.owe_hidden(session_id, key, hidden);
+            }
+            return;
+        }
+    }
     let target = smudgy
         .smudgy_windows
         .iter()
@@ -1731,12 +3451,20 @@ fn remove_pane_from_windows(
     session_id: SessionId,
     key: PaneKey,
 ) -> Task<Message> {
-    // The dragged pane closing mid-drag (script `pane.close()`) aborts the drag.
+    // The dragged pane closing mid-drag (script `pane.close()`) aborts the
+    // drag with zero mutation (E5); a pressed one must never promote.
     if smudgy
-        .pane_drag
+        .tab_drag
+        .as_ref()
         .is_some_and(|drag| drag.slot.session_id == session_id && drag.slot.key == key)
     {
-        smudgy.pane_drag = None;
+        cancel_tab_drag(smudgy, "dragged pane closed mid-drag");
+    }
+    if smudgy
+        .tab_press
+        .is_some_and(|press| press.slot.session_id == session_id && press.slot.key == key)
+    {
+        smudgy.tab_press = None;
     }
 
     let mut emptied: Vec<window::Id> = Vec::new();
@@ -1753,61 +3481,208 @@ fn remove_pane_from_windows(
 /// minimum-size floor applies on top.
 const TORN_OUT_CHROME_HEIGHT: f32 = 34.0;
 
-/// Resolves a `DragEvent::Canceled` for the drag in flight. pane_grid uses
-/// `Canceled` for several distinct outcomes — a plain click (release within
-/// the pick deadband), a release over the source window itself (the picked
-/// pane, inter-pane spacing, chrome), and a release outside the source
-/// window entirely. Only the last is ours to act on: hit-test the other
-/// smudgy windows (most-recently-focused first — the best-effort stand-in
-/// for z-order) and transplant, or tear the pane out into a new window.
-fn finish_drag_canceled(
-    smudgy: &mut Smudgy,
-    window_id: window::Id,
-    pane: pane_grid::Pane,
-) -> Task<Message> {
-    let Some(drag) = smudgy.pane_drag.take() else {
+/// A concise signature of a drag hover for change-gated logging: the
+/// hovered window, the action kind, and the target group (if any).
+fn hover_signature(
+    hover: Option<&pane_drag::DragHover>,
+) -> Option<(window::Id, &'static str, u64)> {
+    let hover = hover?;
+    let (tag, group) = match hover.target.as_ref().map(|t| &t.action) {
+        None => ("none", 0),
+        Some(pane_drag::DragAction::GridEdge(_)) => ("grid-edge", 0),
+        Some(pane_drag::DragAction::Merge { group, .. }) => ("merge", group.as_u64()),
+        Some(pane_drag::DragAction::Swap { group }) => ("swap", group.as_u64()),
+        Some(pane_drag::DragAction::Split { group, .. }) => ("split", group.as_u64()),
+        Some(pane_drag::DragAction::Vacant) => ("vacant", 0),
+    };
+    Some((hover.window, tag, group))
+}
+
+/// Process one tracked cursor sample while a tab drag is in flight: resolve
+/// the hovered smudgy window (most-recently-focused wins on overlap, exactly
+/// like the release hit-test), classify the target against its live
+/// geometry, and store the hover for the overlay. Hit-test plus overlay
+/// content only — the per-move cost bound.
+fn track_drag_motion(smudgy: &mut Smudgy, id: window::Id, position: Point) {
+    // Daemon-owned deadband: promote a pending press whose tracked motion
+    // crossed the threshold. The widget's own crossing is the fast path;
+    // this one survives a press surface whose state was erased mid-gesture.
+    if smudgy.tab_drag.is_none()
+        && let Some(press) = smudgy.tab_press
+        && id == press.window
+        && position.distance(press.press) > pane_drag::DRAG_DEADBAND
+    {
+        let resolves = smudgy
+            .smudgy_windows
+            .get(&press.window)
+            .is_some_and(|window| window.drag_tab_resolves(press.tab, press.slot, press.group));
+        smudgy.tab_press = None;
+        if resolves {
+            log::info!(
+                "[pane-drag] drag started (daemon deadband): tab {:?} ({}/{}) from {:?}, press=({:.1}, {:.1})",
+                press.tab,
+                press.slot.session_id,
+                press.slot.key,
+                press.window,
+                press.press.x,
+                press.press.y,
+            );
+            smudgy.tab_drag = Some(pane_drag::TabDrag {
+                source_window: press.window,
+                tab: press.tab,
+                slot: press.slot,
+                source_group: press.group,
+                press: press.press,
+                hover: None,
+            });
+        }
+    }
+    let Some(drag) = smudgy.tab_drag.as_ref() else {
+        return;
+    };
+    if id != drag.source_window {
+        // The OS capture routes all mid-drag motion to the source window;
+        // anything else is post-release noise or capture evidence.
+        return;
+    }
+    let Some(track) = smudgy.window_tracker.get(drag.source_window).copied() else {
+        return;
+    };
+    let inside = Rectangle::with_size(track.size).contains(position);
+    let hovered: Option<(window::Id, Point, Size)> = if inside {
+        Some((drag.source_window, position, track.size))
+    } else {
+        track
+            .origin
+            .map(|origin| pane_drag::screen_point(origin, position, track.scale))
+            .and_then(|screen| {
+                smudgy
+                    .window_tracker
+                    .mru_order()
+                    .into_iter()
+                    .filter(|window_id| smudgy.smudgy_windows.contains_key(window_id))
+                    .find_map(|window_id| {
+                        let target = smudgy.window_tracker.get(window_id)?;
+                        let local = pane_drag::window_local(target, screen)?;
+                        Some((window_id, local, target.size))
+                    })
+            })
+    };
+    let hover = hovered.map(|(window_id, local, window_size)| {
+        let target = smudgy
+            .smudgy_windows
+            .get(&window_id)
+            .and_then(|window| window.classify_drag_target(local, window_size, drag));
+        pane_drag::DragHover {
+            window: window_id,
+            target,
+        }
+    });
+
+    let old_signature = hover_signature(drag.hover.as_ref());
+    let new_signature = hover_signature(hover.as_ref());
+    if new_signature != old_signature {
+        match &new_signature {
+            Some((window_id, tag, group)) => log::info!(
+                "[pane-drag] hover {window_id:?}: target={tag}{}",
+                if *group != 0 {
+                    format!(" group={group}")
+                } else {
+                    String::new()
+                }
+            ),
+            None => log::info!("[pane-drag] hover: no smudgy window (tear-out territory)"),
+        }
+    }
+
+    if let Some(drag) = smudgy.tab_drag.as_mut() {
+        drag.hover = hover;
+    }
+}
+
+/// Cancel the drag in flight, if any: zero mutation, feedback cleared on the
+/// next frame (windows derive drag state from the daemon), and the press
+/// surfaces stand down via their `drag_live` diff reset. A cancel is a drag
+/// terminal, so it dumps the (unchanged) layouts — the scripted matrix
+/// asserts zero mutation against exactly this post-cancel evidence.
+fn cancel_tab_drag(smudgy: &mut Smudgy, reason: &str) {
+    if let Some(drag) = smudgy.tab_drag.take() {
+        log::info!(
+            "[pane-drag] cancel ({reason}): tab {:?} ({}/{})",
+            drag.tab,
+            drag.slot.session_id,
+            drag.slot.key,
+        );
+        log_drag_layouts(smudgy);
+    }
+}
+
+/// Log every smudgy window's group/tab structure — the post-state evidence
+/// the scripted drag matrix asserts after each terminal. Drag terminals
+/// only; never a hot path.
+fn log_drag_layouts(smudgy: &Smudgy) {
+    for (id, window) in &smudgy.smudgy_windows {
+        log::info!("[pane-drag] layout {id:?}: {}", window.describe_layout());
+    }
+}
+
+/// Resolve a tab-drag release at `point` (source-window local; `None` =
+/// no honest cursor sample = cancel, E10). Consumes the drag record,
+/// re-resolves every participant against the live model, classifies the
+/// release against live geometry (E8), and applies exactly one terminal
+/// operation — or cancels with zero mutation.
+fn finish_tab_drag(smudgy: &mut Smudgy, point: Option<Point>) -> Task<Message> {
+    let Some(drag) = smudgy.tab_drag.take() else {
         return Task::none();
     };
-    if drag.source_window != window_id || drag.grid_pane != pane {
-        return Task::none();
-    }
-    // Re-validate against the live world before touching any grid: the
-    // session and the slot must both still be where the pick recorded them.
+    // Stale-identity re-resolution (E5/E6/E7): the session lives, the source
+    // window lives, and the dragged pane is still bound to the dragged tab.
     if smudgy.sessions.get(drag.slot.session_id).is_none() {
+        log::info!("[pane-drag] cancel (session gone at release)");
         return Task::none();
     }
-    let Some(source) = smudgy.smudgy_windows.get(&window_id) else {
+    let Some(source) = smudgy.smudgy_windows.get(&drag.source_window) else {
+        log::info!("[pane-drag] cancel (source window gone at release)");
         return Task::none();
     };
-    if source.pane_slot(pane) != Some(drag.slot) {
+    if !source.drag_tab_resolves(drag.tab, drag.slot, drag.source_group) {
+        log::info!("[pane-drag] cancel (stale drag identity at release)");
         return Task::none();
     }
-    let Some(track) = smudgy.window_tracker.get(window_id).copied() else {
+    let Some(point) = point else {
+        log::info!("[pane-drag] cancel (no cursor sample at release)");
         return Task::none();
     };
-    let (Some(release), Some(pick)) = (track.cursor, drag.pick_cursor) else {
+    log::info!(
+        "[pane-drag] release at ({:.1}, {:.1}), {:.1} from press",
+        point.x,
+        point.y,
+        point.distance(drag.press),
+    );
+    let Some(track) = smudgy.window_tracker.get(drag.source_window).copied() else {
+        log::info!("[pane-drag] cancel (source window untracked at release)");
         return Task::none();
     };
-    // Within the pick deadband: a plain title-bar click.
-    if release.distance(pick) <= pane_drag::DRAG_DEADBAND {
-        return Task::none();
-    }
-    // Anywhere over the source window (grid, chrome, spacing): the native
-    // no-op re-dock.
-    if Rectangle::with_size(track.size).contains(release) {
-        return Task::none();
+
+    // Inside the source window: classify window-locally — correct even on
+    // platforms without global window origins (E9's same-window half).
+    if Rectangle::with_size(track.size).contains(point) {
+        let source_window = drag.source_window;
+        let target = source.classify_drag_target(point, track.size, &drag);
+        return apply_drag_action(smudgy, drag, source_window, target);
     }
 
-    // The release in physical screen space — unknown when the source
-    // window's origin is (Wayland has no global positions; cross-window
-    // drops then degrade to tear-out, per the plan).
-    let screen = track
+    // Outside the source window: reconstruct screen space and hit-test the
+    // other smudgy windows, most-recently-focused first. An unknown source
+    // origin (Wayland) cannot resolve any cross-window target, so the drop
+    // degrades to tear-out (E9); a release over no smudgy window tears out
+    // (T12/E8).
+    if let Some(screen) = track
         .origin
-        .map(|origin| pane_drag::screen_point(origin, release, track.scale));
-
-    if let Some(screen) = screen {
+        .map(|origin| pane_drag::screen_point(origin, point, track.scale))
+    {
         for target_id in smudgy.window_tracker.mru_order() {
-            if target_id == window_id || !smudgy.smudgy_windows.contains_key(&target_id) {
+            if !smudgy.smudgy_windows.contains_key(&target_id) {
                 continue;
             }
             let Some(target_track) = smudgy.window_tracker.get(target_id).copied() else {
@@ -1816,62 +3691,269 @@ fn finish_drag_canceled(
             let Some(local) = pane_drag::window_local(&target_track, screen) else {
                 continue;
             };
-            return transplant_pane(smudgy, drag, target_id, local, target_track.size);
+            let target = smudgy
+                .smudgy_windows
+                .get(&target_id)
+                .and_then(|window| window.classify_drag_target(local, target_track.size, &drag));
+            return apply_drag_action(smudgy, drag, target_id, target);
         }
+        return tear_out_dragged_tab(smudgy, drag, Some(screen));
     }
-
-    tear_out_pane(smudgy, drag, screen)
+    tear_out_dragged_tab(smudgy, drag, None)
 }
 
-/// Moves the dragged pane into `target_id`'s grid at the window-local drop
-/// point. Order matters: validate the target exists, remove from the source,
-/// insert into the target — the slot is out of every grid only within this
-/// single update. Moving a pane never touches core: pane existence, buffers,
-/// and routing are window-agnostic.
-fn transplant_pane(
+/// Apply one classified drop. All participants were re-resolved by the
+/// caller; window-local operations re-validate their own participants and
+/// reject (not partially apply) anything that no longer resolves.
+fn apply_drag_action(
     smudgy: &mut Smudgy,
-    drag: pane_drag::ActiveDrag,
+    drag: pane_drag::TabDrag,
+    window_id: window::Id,
+    target: Option<pane_drag::ClassifiedTarget>,
+) -> Task<Message> {
+    let Some(target) = target else {
+        // No drop surface under the release: the no-op re-dock (T9/T11).
+        log::info!("[pane-drag] drop: no target under release — no-op re-dock");
+        return Task::none();
+    };
+    let same_window = window_id == drag.source_window;
+    let task = match target.action {
+        pane_drag::DragAction::Merge { group, slot } if same_window => {
+            let task = smudgy
+                .smudgy_windows
+                .get_mut(&window_id)
+                .and_then(|window| {
+                    window.apply_drag_merge(drag.tab, group, slot, &mut smudgy.sessions)
+                });
+            match task {
+                Some(task) => {
+                    log::info!(
+                        "[pane-drag] drop: merge tab {:?} into group {} at slot {} (same window)",
+                        drag.tab,
+                        group.as_u64(),
+                        slot,
+                    );
+                    task.map(move |msg| Message::SmudgyWindowMessage(window_id, msg))
+                }
+                None => {
+                    log::info!("[pane-drag] drop rejected: merge participants no longer resolve");
+                    Task::none()
+                }
+            }
+        }
+        pane_drag::DragAction::Merge { group, slot } => cross_window_drop(
+            smudgy,
+            drag,
+            window_id,
+            CrossPlacement::Merge { group, slot },
+        ),
+        pane_drag::DragAction::Swap { group } => {
+            // The swap partner is the target group's currently RENDERED tab
+            // — what the user sees is what swaps.
+            let partner = smudgy
+                .smudgy_windows
+                .get(&window_id)
+                .and_then(|window| window.rendered_slot(group));
+            match partner {
+                Some(partner) if partner != drag.slot => {
+                    log::info!(
+                        "[pane-drag] drop: swap {}/{} with rendered {}/{}",
+                        drag.slot.session_id,
+                        drag.slot.key,
+                        partner.session_id,
+                        partner.key,
+                    );
+                    let swap = swap_script_panes(smudgy, drag.slot, partner);
+                    // A cross-window swap lands the dragged pane in the
+                    // window under the release; OS focus follows the drop
+                    // (see `cross_window_drop`), and a same-window swap
+                    // never churns it.
+                    if window_id == drag.source_window {
+                        swap
+                    } else {
+                        Task::batch([swap, window::gain_focus(window_id)])
+                    }
+                }
+                Some(_) => {
+                    log::info!("[pane-drag] drop: swap with itself — no-op");
+                    Task::none()
+                }
+                None => {
+                    log::info!("[pane-drag] drop rejected: swap target renders no pane");
+                    Task::none()
+                }
+            }
+        }
+        pane_drag::DragAction::Split { group, region } if same_window => {
+            let task = smudgy
+                .smudgy_windows
+                .get_mut(&window_id)
+                .and_then(|window| {
+                    window.apply_drag_split(drag.tab, group, region, &mut smudgy.sessions)
+                });
+            match task {
+                Some(task) => {
+                    log::info!(
+                        "[pane-drag] drop: split tab {:?} beside group {} ({region:?})",
+                        drag.tab,
+                        group.as_u64(),
+                    );
+                    task.map(move |msg| Message::SmudgyWindowMessage(window_id, msg))
+                }
+                None => {
+                    log::info!("[pane-drag] drop rejected: split participants no longer resolve");
+                    Task::none()
+                }
+            }
+        }
+        pane_drag::DragAction::Split { group, region } => cross_window_drop(
+            smudgy,
+            drag,
+            window_id,
+            CrossPlacement::Split { group, region },
+        ),
+        pane_drag::DragAction::GridEdge(side) if same_window => {
+            let task = smudgy
+                .smudgy_windows
+                .get_mut(&window_id)
+                .and_then(|window| {
+                    window.apply_drag_grid_edge(drag.tab, side, &mut smudgy.sessions)
+                });
+            match task {
+                Some(task) => {
+                    log::info!("[pane-drag] drop: grid edge {side:?} (same window)");
+                    task.map(move |msg| Message::SmudgyWindowMessage(window_id, msg))
+                }
+                None => {
+                    log::info!("[pane-drag] drop rejected: grid-edge tab no longer resolves");
+                    Task::none()
+                }
+            }
+        }
+        pane_drag::DragAction::GridEdge(side) => {
+            cross_window_drop(smudgy, drag, window_id, CrossPlacement::Edge(side))
+        }
+        pane_drag::DragAction::Vacant => {
+            cross_window_drop(smudgy, drag, window_id, CrossPlacement::Cluster)
+        }
+    };
+    log_drag_layouts(smudgy);
+    Task::batch([task, report_pane_sizes(smudgy)])
+}
+
+/// Where a cross-window drop lands in the destination window.
+enum CrossPlacement {
+    Merge {
+        group: pane_groups::GroupId,
+        slot: usize,
+    },
+    Split {
+        group: pane_groups::GroupId,
+        region: pane_drag::DropRegion,
+    },
+    Edge(pane_drag::GridEdgeSide),
+    Cluster,
+}
+
+/// Move the dragged tab between two windows as a remove/restore-safe
+/// transaction: both windows were validated before the first mutation (the
+/// caller re-resolved the source; the placement was classified against the
+/// destination's live model in this same update), the tab value carries its
+/// stable identity across, and a destination rejection re-hosts the tab as
+/// its own cluster there — a detached tab is never stranded. Attention
+/// moves with the tab: it is selected in the destination and its session
+/// becomes active there (T4/T7/T8).
+fn cross_window_drop(
+    smudgy: &mut Smudgy,
+    drag: pane_drag::TabDrag,
     target_id: window::Id,
-    local: Point,
-    target_size: Size,
+    placement: CrossPlacement,
 ) -> Task<Message> {
     let source_id = drag.source_window;
     if !smudgy.smudgy_windows.contains_key(&target_id) {
+        log::info!("[pane-drag] drop rejected: destination window gone");
         return Task::none();
     }
     let Some(source) = smudgy.smudgy_windows.get_mut(&source_id) else {
         return Task::none();
     };
-    let emptied = source.remove_pane_slot(drag.slot.session_id, drag.slot.key);
+    let Some((tab_value, hidden, emptied)) = source.extract_drag_tab(drag.tab) else {
+        log::info!("[pane-drag] drop rejected: dragged tab no longer resolves");
+        return Task::none();
+    };
     let repair = source
         .repair_active_session(&smudgy.sessions)
         .map(move |msg| Message::SmudgyWindowMessage(source_id, msg));
-    if let Some(target) = smudgy.smudgy_windows.get_mut(&target_id) {
-        target.accept_transplant(drag.slot, local, target_size);
+    let Some(target) = smudgy.smudgy_windows.get_mut(&target_id) else {
+        // Unreachable (checked above; no await separates the check from
+        // here). Restore rather than strand — hidden state included, so the
+        // re-hosted tab keeps exactly what the extraction removed.
+        if let Some(source) = smudgy.smudgy_windows.get_mut(&source_id) {
+            source.adopt_drag_tab_cluster(tab_value);
+            source.set_pane_hidden(drag.slot, hidden);
+        }
+        return repair;
+    };
+    match placement {
+        CrossPlacement::Merge { group, slot } => {
+            log::info!(
+                "[pane-drag] drop: merge tab {:?} into group {} at slot {} (cross-window)",
+                drag.tab,
+                group.as_u64(),
+                slot,
+            );
+            target.adopt_drag_tab_merge(tab_value, group, slot);
+        }
+        CrossPlacement::Split { group, region } => {
+            log::info!(
+                "[pane-drag] drop: split tab {:?} beside group {} ({region:?}, cross-window)",
+                drag.tab,
+                group.as_u64(),
+            );
+            target.adopt_drag_tab_split(tab_value, group, region);
+        }
+        CrossPlacement::Edge(side) => {
+            log::info!("[pane-drag] drop: grid edge {side:?} (cross-window)");
+            target.adopt_drag_tab_edge(tab_value, side);
+        }
+        CrossPlacement::Cluster => {
+            log::info!("[pane-drag] drop: adopt into empty window {target_id:?}");
+            target.adopt_drag_tab_cluster(tab_value);
+        }
     }
-    // The drop also moves the user's attention: activate the pane's session
-    // in the target window (input focus follows only if its main pane is
-    // there, per the activation rules).
-    let activate = Task::done(Message::SmudgyWindowMessage(
-        target_id,
-        windows::smudgy_window::Message::SetActiveSession(drag.slot.session_id),
-    ));
+    target.set_pane_hidden(drag.slot, hidden);
+    let select = target
+        .select_tab(drag.tab, &mut smudgy.sessions)
+        .map(move |msg| Message::SmudgyWindowMessage(target_id, msg));
+    // Selection hands keyboard focus to the landed pane's input, but
+    // keystrokes only reach a window the OS has focused — and the
+    // destination of a cross-window drop need not be (the drag began over
+    // the source window). Bring it forward so typing lands immediately,
+    // exactly as a tear-out's freshly opened window does. Guarded so a
+    // same-window landing never churns OS focus.
+    let focus = if target_id == source_id {
+        Task::none()
+    } else {
+        window::gain_focus(target_id)
+    };
     let close = if emptied {
         close_emptied_windows(smudgy, vec![source_id])
     } else {
         Task::none()
     };
-    Task::batch([repair, activate, close])
+    Task::batch([repair, select, focus, close])
 }
 
-/// Tears the dragged pane out into a new smudgy window at the release point.
-/// The window entry is inserted synchronously (the open task completes
-/// later) so the pane has a grid to live in from this update on;
-/// `NewSmudgyWindow` then finds the entry present and only installs the
-/// shutdown hook and seeds the tracker.
-fn tear_out_pane(
+/// Tear the dragged tab out into a new smudgy window at the release point
+/// (T12) — the terminal for a release outside every smudgy window, and the
+/// documented degradation for cross-window drops without global window
+/// origins (E9). The window is sized like the pane it carries (its last
+/// measured size — the stale-size fallback), the entry is inserted
+/// synchronously so the pane has a grid to live in from this update on, and
+/// attention moves with the tab.
+fn tear_out_dragged_tab(
     smudgy: &mut Smudgy,
-    drag: pane_drag::ActiveDrag,
+    drag: pane_drag::TabDrag,
     screen: Option<Point>,
 ) -> Task<Message> {
     let source_id = drag.source_window;
@@ -1883,7 +3965,15 @@ fn tear_out_pane(
         return Task::none();
     };
     let pane_size = source.pane_size(drag.slot);
-    let emptied = source.remove_pane_slot(drag.slot.session_id, drag.slot.key);
+    let Some((tab_value, hidden, emptied)) = source.extract_drag_tab(drag.tab) else {
+        log::info!("[pane-drag] cancel (tear-out tab no longer resolves)");
+        return Task::none();
+    };
+    log::info!(
+        "[pane-drag] drop: tear out {}/{} into a new window",
+        drag.slot.session_id,
+        drag.slot.key,
+    );
     let repair = source
         .repair_active_session(&smudgy.sessions)
         .map(move |msg| Message::SmudgyWindowMessage(source_id, msg));
@@ -1910,8 +4000,16 @@ fn tear_out_pane(
 
     let (id, open_task) = window::open(settings);
     let mut torn_out = windows::smudgy_window::SmudgyWindow::new(id, smudgy.account.handles());
-    torn_out.adopt_torn_out_pane(drag.slot);
+    torn_out.adopt_torn_out_tab(tab_value);
+    torn_out.set_pane_hidden(drag.slot, hidden);
     smudgy.smudgy_windows.insert(id, torn_out);
+    // The workspace mirror must learn the window in the same update that
+    // inserts it: snapshot capture walks only mirror-registered windows, so
+    // a checkpoint firing before the deferred `NewSmudgyWindow` arm would
+    // otherwise drop the torn-out window (and its pane) from the persisted
+    // workspace. Registration is idempotent — the open task's arm
+    // re-announces harmlessly.
+    smudgy.workspace.register_window(id);
 
     let activate = Task::done(Message::SmudgyWindowMessage(
         id,
@@ -1922,11 +4020,13 @@ fn tear_out_pane(
     } else {
         Task::none()
     };
+    log_drag_layouts(smudgy);
     Task::batch([
         open_task.map(Message::NewSmudgyWindow),
         activate,
         close,
         repair,
+        report_pane_sizes(smudgy),
     ])
 }
 
@@ -2341,9 +4441,23 @@ fn poke_all_mappers(smudgy: &Smudgy) {
 
 fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
     if let Some(window) = smudgy.smudgy_windows.get(&id) {
+        // Each window derives its view of the daemon-owned drag state: the
+        // live flag (temporary header bands, press-surface resets), the
+        // tracked modifier state, and — for the hovered window only — the
+        // classified target its overlay renders.
+        let drag = windows::smudgy_window::DragViewContext {
+            live: smudgy.tab_drag.is_some(),
+            modifiers: smudgy.window_tracker.modifiers(),
+            target: smudgy
+                .tab_drag
+                .as_ref()
+                .and_then(|drag| drag.hover.as_ref())
+                .filter(|hover| hover.window == id)
+                .and_then(|hover| hover.target.as_ref()),
+        };
         center(
             window
-                .view(&smudgy.sessions)
+                .view(&smudgy.sessions, drag)
                 .map(move |message| Message::SmudgyWindowMessage(id, message)),
         )
         .into()

@@ -71,6 +71,38 @@ fn unfocus_target<T: Send + 'static>(target: Id) -> Task<T> {
     iced::advanced::widget::operate(UnfocusTarget { target })
 }
 
+/// An [`Operation`] that gives focus to exactly the widget carrying
+/// `target`'s id, releasing every other focusable it visits (keyboard focus
+/// is exclusive). Unlike the stock `focusable::focus`, a target that already
+/// holds focus is left untouched: a text input's `focus()` moves its caret
+/// to the end, so re-focusing the focus holder would cost the user their
+/// caret position and selection for no state change.
+struct FocusTarget {
+    target: Id,
+}
+
+impl<T> Operation<T> for FocusTarget {
+    fn focusable(&mut self, id: Option<&Id>, _bounds: iced::Rectangle, state: &mut dyn Focusable) {
+        if id == Some(&self.target) {
+            if !state.is_focused() {
+                state.focus();
+            }
+        } else {
+            state.unfocus();
+        }
+    }
+
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<T>)) {
+        operate(self);
+    }
+}
+
+/// A [`Task`] running [`FocusTarget`] against `target` — the caret-friendly
+/// focus transfer for chrome-driven moves (tab selection, activation).
+pub fn focus_target<T: Send + 'static>(target: Id) -> Task<T> {
+    iced::advanced::widget::operate(FocusTarget { target })
+}
+
 /// A component for inputting text in a session with advanced features
 #[derive(Debug, Clone)]
 pub struct SessionInput {
@@ -157,6 +189,15 @@ pub struct SessionInput {
     /// convention). The component only reports the request
     /// ([`Event::FocusMain`]); the parent owns the main input's id.
     escape_to_main: bool,
+    /// One-shot: the next [`Message::FocusLost`] is a tab switch obscuring
+    /// this input (its subtree stays mounted behind another tab), not the
+    /// user abandoning the line, so the clear-on-blur behavior must leave
+    /// the in-progress text alone. Armed by [`Self::note_obscured`];
+    /// consumed by the next `FocusLost` — which the obscured widget defers
+    /// to the moment its tab is re-selected, since only the rendered
+    /// subtree receives events, so one-shot consumption lands on exactly
+    /// the blur the switch inflicted.
+    obscured_blur_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +296,7 @@ impl SessionInput {
             blacklist: Arc::new(HashSet::new()),
             placeholder: String::new(),
             escape_to_main: false,
+            obscured_blur_pending: false,
         }
     }
 
@@ -336,6 +378,17 @@ impl SessionInput {
     pub fn clear(&mut self) {
         self.value.clear();
         self.note_value_edited();
+    }
+
+    /// Mark this input as being obscured by a tab switch: its subtree stays
+    /// mounted behind another tab, and the blur the switch inflicts is an
+    /// obscure, not the user abandoning the line. The next
+    /// [`Message::FocusLost`] consumes the mark and skips the clear-on-blur
+    /// behavior, so the in-progress text is waiting when the tab is
+    /// re-selected. Idempotent across repeated switches while no blur has
+    /// landed.
+    pub fn note_obscured(&mut self) {
+        self.obscured_blur_pending = true;
     }
 
     /// Register a new hotkey with the given ID
@@ -853,12 +906,18 @@ impl SessionInput {
             Message::Submit => self.submit(),
             Message::FocusLost => {
                 self.last_source = InputSource::Other;
+                // A blur inflicted by a tab switch is an obscure, not an
+                // abandon (see `note_obscured`). The mark is consumed
+                // unconditionally so it can never leak into a later,
+                // genuine blur.
+                let obscured = std::mem::take(&mut self.obscured_blur_pending);
                 // Only the default mode wipes the line (sent-and-selected, or
                 // half-typed) when the input loses focus; the others leave
                 // it. Never while masked — clicking the reveal eye blurs the
                 // input for a moment, and that must not cost the user the
                 // secret (or the stash discipline its buffer).
-                if !self.masked
+                if !obscured
+                    && !self.masked
                     && crate::prefs::current().command_input_behavior
                         == CommandInputBehavior::SelectAllClearOnBlur
                 {
@@ -1083,6 +1142,133 @@ mod tests {
             &mut targeted,
         );
         assert!(!targeted.focused, "the target is released");
+    }
+
+    /// The focus-transfer operation focuses the target and releases every
+    /// other focusable it visits (keyboard focus is exclusive). An
+    /// already-focused target is left untouched: a text input's `focus()`
+    /// moves its caret to the end, so handing focus to the widget that
+    /// already holds it must not call it.
+    #[test]
+    fn focus_target_focuses_the_target_without_refocusing_a_holder() {
+        struct FakeFocusable {
+            focused: bool,
+            focus_calls: usize,
+        }
+        impl Focusable for FakeFocusable {
+            fn is_focused(&self) -> bool {
+                self.focused
+            }
+            fn focus(&mut self) {
+                self.focused = true;
+                self.focus_calls += 1;
+            }
+            fn unfocus(&mut self) {
+                self.focused = false;
+            }
+        }
+
+        let target = Id::unique();
+        let other = Id::unique();
+        let mut op = FocusTarget {
+            target: target.clone(),
+        };
+
+        let mut unfocused_target = FakeFocusable {
+            focused: false,
+            focus_calls: 0,
+        };
+        Operation::<()>::focusable(
+            &mut op,
+            Some(&target),
+            iced::Rectangle::default(),
+            &mut unfocused_target,
+        );
+        assert!(unfocused_target.focused, "the target gains focus");
+        assert_eq!(unfocused_target.focus_calls, 1);
+
+        let mut focused_target = FakeFocusable {
+            focused: true,
+            focus_calls: 0,
+        };
+        Operation::<()>::focusable(
+            &mut op,
+            Some(&target),
+            iced::Rectangle::default(),
+            &mut focused_target,
+        );
+        assert!(focused_target.focused, "the target keeps focus");
+        assert_eq!(
+            focused_target.focus_calls, 0,
+            "a focus holder is not re-focused (its caret would move)"
+        );
+
+        let mut holder = FakeFocusable {
+            focused: true,
+            focus_calls: 0,
+        };
+        Operation::<()>::focusable(
+            &mut op,
+            Some(&other),
+            iced::Rectangle::default(),
+            &mut holder,
+        );
+        assert!(!holder.focused, "every other focusable is released");
+    }
+
+    /// Switching tabs must preserve every input's text — TabHost keeps
+    /// inactive subtrees mounted precisely so ephemeral state survives
+    /// (ui/src/widgets/tab_host.rs module docs). The switch's focus
+    /// transfer blurs the obscured tab's input, and the widget publishes
+    /// that blur only once its tab is re-selected (an obscured subtree
+    /// receives no events); under the default `SelectAllClearOnBlur`
+    /// preference a cause-blind `FocusLost` would clear the model-owned
+    /// value. The tab-switch path marks the input as obscured first, and
+    /// the one-shot mark rides exactly that deferred blur.
+    #[test]
+    fn tab_switch_blur_preserves_in_progress_text() {
+        assert_eq!(
+            crate::prefs::current().command_input_behavior,
+            CommandInputBehavior::SelectAllClearOnBlur,
+            "precondition: the default preference is in force"
+        );
+        let mut input = SessionInput::new();
+        let _ = input.update(Message::InputChanged("kill troll with axe".to_string()));
+        // What `select_tab` does before its focus operations reach the
+        // obscured subtree through TabHost::operate.
+        input.note_obscured();
+        // What the obscured input's next update publishes once its tab is
+        // re-selected.
+        let _ = input.update(Message::FocusLost);
+        assert_eq!(
+            input.value(),
+            "kill troll with axe",
+            "a tab switch must not cost the user their in-progress command"
+        );
+
+        // The mark is one-shot: it excuses exactly the blur the switch
+        // inflicted, so the next blur is genuine again.
+        let _ = input.update(Message::FocusLost);
+        assert_eq!(
+            input.value(),
+            "",
+            "the obscure mark must not outlive the blur it excused"
+        );
+    }
+
+    /// A genuine blur — clicking away, with no tab switch marking the input
+    /// — still clears under the default `SelectAllClearOnBlur` preference.
+    #[test]
+    fn genuine_blur_still_clears_under_the_default_preference() {
+        assert_eq!(
+            crate::prefs::current().command_input_behavior,
+            CommandInputBehavior::SelectAllClearOnBlur,
+            "precondition: the default preference is in force"
+        );
+        let mut input = SessionInput::new();
+        let _ = input.update(Message::InputChanged("kill troll with axe".to_string()));
+        let _ = input.update(Message::FocusLost);
+        assert_eq!(input.value(), "", "an unmarked blur clears the line");
     }
 
     #[test]

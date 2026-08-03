@@ -68,6 +68,15 @@ mod imp {
         // close; letting it fall through to DefSubclassProc returns TRUE, which
         // permits the shutdown, and WM_ENDSESSION follows.)
         if msg == WM_ENDSESSION && wparam != 0 {
+            // The event loop is no longer serviced, so the debounced
+            // workspace write can never run: flush the latest completed
+            // snapshot synchronously from the shared cell (a no-op when
+            // disk is already current — losing at most one checkpoint
+            // interval is the accepted bound). The flush holds the write
+            // lock across its check-and-write, so it can neither tear an
+            // in-flight background write nor be overwritten by one, and
+            // repeated deliveries are idempotent no-ops.
+            crate::workspace::writer::end_session_flush();
             std::process::exit(0);
         }
         // SAFETY: forwarding the same window-proc arguments to the next handler in

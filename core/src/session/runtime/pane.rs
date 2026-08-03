@@ -353,7 +353,12 @@ const RESERVED_MEMBER_NAMES: [&str; 4] = ["get", "list", "exists", "then"];
 /// Case-fold a pane name to its identity form. Pane identity is
 /// case-insensitive (chosen now because MXP FRAME names are case-insensitive,
 /// and changing identity later would break get-or-create).
-fn fold(name: &str) -> String {
+///
+/// Public because persisted pane descriptors share this identity: anything
+/// that stores a pane name durably folds it through this same function, so a
+/// stored descriptor and a live registry entry can never disagree on identity.
+#[must_use]
+pub fn fold(name: &str) -> String {
     name.to_lowercase()
 }
 
@@ -365,9 +370,15 @@ pub fn is_main_pane_name(name: &str) -> bool {
     fold(name) == MAIN_PANE_NAME
 }
 
-/// Validate a pane name at `split()` time: non-empty, ≤ 64 chars, printable
-/// (no control characters, which covers newlines).
-fn validate_name(name: &str) -> Result<(), PaneError> {
+/// Validate a pane name: non-empty, ≤ 64 chars, printable (no control
+/// characters, which covers newlines). `split()` enforces this at creation;
+/// consumers of persisted pane descriptors apply the same rule, so a stored
+/// name is valid exactly when the registry would have accepted it.
+///
+/// # Errors
+///
+/// [`PaneError::InvalidName`] naming the violated rule.
+pub fn validate_name(name: &str) -> Result<(), PaneError> {
     if name.is_empty() {
         return Err(PaneError::InvalidName("name is empty".to_string()));
     }

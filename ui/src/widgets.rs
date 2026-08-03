@@ -1,4 +1,8 @@
+pub mod bounds_probe;
+pub mod drag_overlay;
 pub mod hotkey_input;
 pub mod hotkey_matching_input;
 pub mod split_terminal_pane;
+pub mod tab_host;
+pub mod tab_press;
 pub mod wrap_row;

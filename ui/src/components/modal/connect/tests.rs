@@ -330,3 +330,53 @@ fn test_server_created_chains_into_add_profile() {
     assert_eq!(state.profile_form_data.name, "");
     assert!(state.servers.iter().any(|s| s.name == new_server.name));
 }
+
+#[test]
+fn restore_last_session_emits_its_event_with_the_connect_housekeeping() {
+    // The affordance's click is a plain message -> event hand-off; the
+    // daemon owns the actual restore. Any half-open server form drops,
+    // exactly as Connect/Offline do.
+    let mut state = initial_state();
+    state.server_action = Some(ServerCrudAction::Create);
+    state.server_form_data.name = "half-typed".to_string();
+
+    let (_task, event) = update(
+        &mut state,
+        Message::RestoreLastSession("Arctic".to_string()),
+    );
+
+    assert_eq!(event, Some(Event::RestoreLastSession("Arctic".to_string())));
+    assert!(state.server_action.is_none());
+    assert_eq!(state.server_form_data.name, "");
+}
+
+#[test]
+fn the_restore_affordance_derives_from_the_probed_snapshot() {
+    // Headless view-data check: the detail pane offers a restore exactly
+    // when the probe stored profile names, composing the label from them
+    // in slot order.
+    let mut state = initial_state();
+    state.last_sessions.insert("Arctic".to_string(), None);
+    assert!(
+        state
+            .last_sessions
+            .get("Arctic")
+            .and_then(|probed| probed.as_deref())
+            .and_then(crate::workspace::last_session::summary)
+            .is_none(),
+        "a probed server without a snapshot offers nothing"
+    );
+
+    state.last_sessions.insert(
+        "Arctic".to_string(),
+        Some(vec!["Kapusnik".to_string(), "Kapusta".to_string()]),
+    );
+    assert_eq!(
+        state
+            .last_sessions
+            .get("Arctic")
+            .and_then(|probed| probed.as_deref())
+            .and_then(crate::workspace::last_session::summary),
+        Some("Kapusnik, Kapusta".to_string())
+    );
+}
