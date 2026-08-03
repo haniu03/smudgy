@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Panes stack into tabs.** Drop a pane onto another pane's header and
+  they share that spot as a tabbed group — one region, a tab per pane.
+  Tabs carry their controls (connect/reconnect on a session's main tab,
+  close, the hide eye), scroll when the strip fills, and
+  Ctrl+Tab / Ctrl+Shift+Tab cycles a group's visible tabs from the
+  keyboard. Hidden tabs stay reachable in the strip — dimmed, eye and
+  all — so a hidden pane can always be brought back.
+- **One drag for everything.** Rearranging panes is a single gesture
+  wherever it ends: reorder tabs within a strip, merge into another
+  group at an exact insertion point, split against any pane's edge, dock
+  at a window edge, swap with the pane under the cursor, drop into
+  another smudgy window, or release over empty desktop to tear out a new
+  window. A live highlight — with an insertion caret in tab strips —
+  shows exactly what the release will do (the preview and the drop share
+  one geometry, so they can never disagree), and Escape cancels any drag
+  with nothing moved.
+- **Your workspace comes back.** Smudgy now remembers your windows and
+  panes — positions, sizes, splits, tab groups and selections, hidden
+  panes, and which sessions were open — and rebuilds all of it at the
+  next launch. Sessions that were connected reconnect exactly as if you
+  had clicked Connect (your connect commands included); sessions you
+  opened offline stay offline. Script panes hold their exact places as
+  empty frames while scripts load, then fill in without reshuffling.
+  The mirror is continuous and crash-tolerant: even a forced shutdown
+  (an installer closing smudgy, Windows restarting) keeps a snapshot at
+  most a minute old, and an unreadable file means a clean start — never
+  a deleted one. Credentials, terminal contents, and script state are
+  never written.
+- **Named layouts.** The new Layouts button saves the current
+  arrangement of the active session's server under a name and brings it
+  back on demand. Applying runs the full flow: missing sessions spawn
+  per their saved online/offline state, and extra live sessions get an
+  explicit keep-or-close choice (keeping is the default; closing is
+  never silent). Overwrite, rename, and delete sit behind
+  confirmations, and Reset lets a session's script layout win again
+  over remembered geometry. Layouts are stored per server as plain JSON
+  files beside your profiles.
+- **Scripts can switch layouts.** `session.layout` saves, applies, and
+  lists the server's named layouts — `layout.apply("combat")` from a
+  trigger, alias, or keybinding. A script apply only rearranges panes:
+  it never opens or closes sessions, never prompts, and never touches
+  other servers' windows, and it is safe to call at gameplay rates.
+  Requires the `panes` and `session: reach-others` permissions.
  - **The client speaks your language.** Smudgy's interface is now
    localizable, and ships its first translation: 繁體中文（臺灣）
   (Traditional Chinese, Taiwan). Preferences gains a Language picker —
@@ -204,9 +247,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wide), with the line's own color and dash redrawn inside it; cross-
   level links highlight their drawn triangle or fading stub — which are
   now also clickable exactly as drawn.
+- Release builds now default the log level to `info` when `SMUDGY_LOG` is
+  unset, so a production `smudgy.log` carries operational events rather
+  than the debug stream; debug builds keep their `debug` default, and an
+  explicit `SMUDGY_LOG` still overrides either.
 
 ### Fixed
 
+- Dragging a pane divider immediately after the layout changed under it
+  (a pane opened, closed, or moved in the same moment) could apply the
+  resize to the wrong edge; stale divider targets are now rejected and
+  re-derived from the current layout.
 - Connections attached near a room's corner no longer float in the gap
   left by the rounded outline: ports follow the drawn edge around the
   corner, meeting the adjacent wall at the corner's diagonal. Dragging an
