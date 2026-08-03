@@ -1,4 +1,4 @@
-# spike-drag-repro.ps1 — the scripted pane-drag interaction regression matrix.
+# drag-matrix.ps1 — the scripted pane-drag interaction regression matrix.
 #
 # Drives the unified Smudgy-owned drag controller with REAL synthesized mouse
 # input (SetCursorPos + mouse_event — indistinguishable from hardware for
@@ -24,8 +24,8 @@
 #   tear-out         drag B onto the desktop -> new window (T12)
 #   merge-cross      drag B from the torn-out window onto A's header (T4)
 #
-# Usage (from the worktree root):
-#   powershell -ExecutionPolicy Bypass -File .\spike-drag-repro.ps1
+# Usage (from the repo root):
+#   powershell -ExecutionPolicy Bypass -File .\bin\drag-matrix.ps1
 #   powershell ... -KeepOpen              # leave the app running afterwards
 #   powershell ... -SkipBuild             # reuse target\debug\smudgy.exe
 #   powershell ... -Scenario merge-same   # run a single scenario by name
@@ -41,7 +41,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# The repo root: this script lives in bin/.
+$root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $logDir = Join-Path $env:TEMP "smudgy-drag-matrix"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 $stamp = Get-Date -Format "HHmmss"

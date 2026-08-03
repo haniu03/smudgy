@@ -79,7 +79,7 @@ struct State {
 /// cancel, terminal handled elsewhere) the flag drops and a surface still in
 /// `Dragging` stands down on the next diff instead of waiting for a release
 /// that may never arrive. A press below the deadband is deliberately *not*
-/// reset by the flag: Escape while pressed leaves the press running (E4b).
+/// reset by the flag: Escape while pressed leaves the press running.
 pub struct TabPress<'a, Message> {
     content: Element<'a, Message>,
     drag_live: bool,

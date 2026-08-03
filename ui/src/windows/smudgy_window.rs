@@ -1071,7 +1071,7 @@ impl SmudgyWindow {
     /// resolves in this window: the pane is hosted here, bound to exactly
     /// that tab, and the tab still sits in its pick-time group. The
     /// terminal re-resolution every drop runs before mutating — a tab
-    /// re-bound, re-hosted, or re-grouped mid-drag is stale identity (E7).
+    /// re-bound, re-hosted, or re-grouped mid-drag is stale identity.
     pub fn drag_tab_resolves(&self, tab: TabId, slot: PaneRef, group: GroupId) -> bool {
         self.tab_of(slot) == Some(tab) && self.layout.group_of(tab) == Some(group)
     }
@@ -1183,7 +1183,7 @@ impl SmudgyWindow {
     /// state re-pairing: intermediate grids were never rendered — `view`
     /// runs only after the cycle — so the order the next view re-pairs
     /// subtree state against is the final model's visible order either
-    /// way, exactly what the last of the formerly eager rebuilds emitted.
+    /// way.
     pub fn flush_grid_rebuild(&mut self) {
         if self.grid_dirty {
             self.grid_dirty = false;
@@ -2031,9 +2031,9 @@ impl SmudgyWindow {
 
     /// Apply a header drop within this window: move `tab` into `group`'s
     /// strip at `slot` — a reorder when `group` is the tab's own. A reorder
-    /// leaves selection, activation, and the grid untouched (T1/T2); a move
-    /// into another group selects the moved tab there and activates its
-    /// session (T3). `None` when a participant no longer resolves.
+    /// leaves selection, activation, and the grid untouched; a move into
+    /// another group selects the moved tab there and activates its session.
+    /// `None` when a participant no longer resolves.
     pub fn apply_drag_merge(
         &mut self,
         tab: TabId,
@@ -2061,10 +2061,10 @@ impl SmudgyWindow {
     }
 
     /// Apply a body-edge drop within this window: detach `tab` into a new
-    /// singleton group split beside the whole `group` (T7; against its own
-    /// group, the T10 ungroup gesture), select it, and move activation with
-    /// it. `None` when a participant no longer resolves or there is nothing
-    /// to ungroup.
+    /// singleton group split beside the whole `group` (against its own
+    /// group, the ungroup gesture), select it, and move activation with it.
+    /// `None` when a participant no longer resolves or there is nothing to
+    /// ungroup.
     pub fn apply_drag_split(
         &mut self,
         tab: TabId,
@@ -2080,9 +2080,9 @@ impl SmudgyWindow {
     }
 
     /// Apply a whole-grid edge drop within this window: detach `tab` into a
-    /// new singleton top-level placement (T8 — Left: leading cluster,
-    /// Right: trailing cluster, Top/Bottom: wrap the whole layout), select
-    /// it, and move activation with it.
+    /// new singleton top-level placement (Left: leading cluster, Right:
+    /// trailing cluster, Top/Bottom: wrap the whole layout), select it, and
+    /// move activation with it.
     pub fn apply_drag_grid_edge(
         &mut self,
         tab: TabId,
@@ -2425,7 +2425,7 @@ impl SmudgyWindow {
 
     /// QA hook (debug builds only): opens an offline session in this window
     /// without the connect modal — the `SMUDGY_SPIKE_AUTOSESSION` startup
-    /// path the scripted drag matrix drives (`spike-drag-repro.ps1`).
+    /// path the scripted drag matrix drives (`bin/drag-matrix.ps1`).
     #[cfg(debug_assertions)]
     pub fn autosession_open_offline_session(
         &mut self,
@@ -2863,7 +2863,7 @@ impl SmudgyWindow {
             Message::TabStrip(group, event) => match event {
                 tab_strip::Event::Select(tab) => {
                     // A sub-deadband release: a click both selects and
-                    // activates (E1). Logged for the scripted drag matrix.
+                    // activates. Logged for the scripted drag matrix.
                     log::info!("[pane-drag] click-select tab {tab:?}");
                     Update::with_task(self.select_tab(tab, sessions))
                 }
@@ -2891,7 +2891,7 @@ impl SmudgyWindow {
                         })
                     }
                     tab_press::Event::ModifiedPress => {
-                        // Reserved control behavior (E3): never a drag, and
+                        // Reserved control behavior: never a drag, and
                         // never a selection through the drag machinery.
                         log::info!("[pane-drag] modified press on tab {tab:?} — reserved, no-op");
                         Update::none()
@@ -4739,8 +4739,8 @@ mod tests {
         // Closing the last session leaves the window holding only vacancy
         // tabs: the model keeps them (adoption bookkeeping), but no grid
         // builds in ANY visibility mode, so the view falls through to the
-        // no-active-sessions state — the historical post-disconnect
-        // experience.
+        // no-active-sessions state — the same view a window that never
+        // hosted a session shows.
         let mut window = test_window();
         let sessions = SessionStore::new(crate::cloud_account::test_handles());
         let script1 = script_panes_for(1, 1)[0];
@@ -4806,7 +4806,8 @@ mod tests {
         assert_eq!(grid_leaves(&window), 1, "show-all admits no vacancy either");
         assert!(window.placeholder_descriptor(vacated_main).is_none());
 
-        // Adoption reads the invisible record exactly as before.
+        // Visibility mode never gates adoption: the invisible record still
+        // adopts a later open in place.
         assert!(window.adopt_vacancy(SessionId::from(9), "Arctic", "imm"));
         window.flush_grid_rebuild();
         assert_eq!(
@@ -5013,8 +5014,8 @@ mod tests {
                 .map(|descriptor| descriptor.label),
             Some("chat".to_string())
         );
-        // Building the view drives the grid closure for every slot — the
-        // exact resolution that used to assert on the unbound group.
+        // Building the view drives the grid closure for every slot — an
+        // unbound group must resolve to a placeholder body, never panic.
         let _ = window.view(&sessions, DragViewContext::default());
     }
 

@@ -7,17 +7,17 @@
 //! by stable-id creation order — template windows with no realizable
 //! referenced content for the mode are excluded first, so a window the
 //! scoping empties can never claim a live window) and settles every
-//! structural question up front: fewer live windows (script applies fold the excess into the
-//! ordinally-last in-scope window; user restores adopt visually empty live
-//! windows — the initiating window first — and create windows only past
-//! those), more
-//! live windows (the extras keep their arrangement, minus any pane the
-//! template claims), unmatched sessions (user restores ask keep-or-close;
-//! script applies keep silently), unmatched slots (runtime vacancies later
-//! opens adopt), and live panes the template does not know (riders that
-//! follow their group, or re-place within their current window when the
-//! group dissolves — never through the cross-window placement chain, which
-//! could displace an out-of-scope window).
+//! structural question up front: fewer live windows (script applies fold
+//! the excess into the ordinally-last in-scope window; user restores adopt
+//! visually empty live windows — the initiating window first — and create
+//! windows only past those), more live windows (the extras keep their
+//! arrangement, minus any pane the template claims), unmatched sessions
+//! (user restores ask keep-or-close; script applies keep silently),
+//! unmatched slots (runtime vacancies later opens adopt), and live panes
+//! the template does not know (riders that follow their group, or re-place
+//! within their current window when the group dissolves — never through
+//! the cross-window placement chain, which could displace an out-of-scope
+//! window).
 //!
 //! Because the keep-or-close prompt is asynchronous and the workspace
 //! drifts while it is open, a plan with open [`ApplyPlan::questions`] (or
@@ -27,13 +27,12 @@
 //! workspace it will actually mutate — reaches the executor.
 //!
 //! Scope is the footprint predicate of `docs/panes.md` §18: only windows
-//! hosting at least
-//! one pane of a referenced server participate, and for script applies the
-//! referenced set is further cut to the calling session's server, so a
-//! script can never move another server's panes even when the template
-//! names them. [`validate_conservation`] proves the resulting partition:
-//! every in-scope pane lands exactly once, and no out-of-scope pane is
-//! mentioned at all.
+//! hosting at least one pane of a referenced server participate, and for
+//! script applies the referenced set is further cut to the calling
+//! session's server, so a script can never move another server's panes
+//! even when the template names them. [`validate_conservation`] proves the
+//! resulting partition: every in-scope pane lands exactly once, and no
+//! out-of-scope pane is mentioned at all.
 
 use std::collections::{HashMap, HashSet};
 

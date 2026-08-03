@@ -479,7 +479,7 @@ mod tests {
         }
     }
 
-    /// The live-QA crash: an inactive tab's subtree deepens across a rebuild
+    /// Regression: an inactive tab's subtree deepens across a rebuild
     /// while its cached layout (same limits) is reused, and an operation
     /// traversal pairs the live widgets with the frozen node — inside iced's
     /// `Container::operate`, `layout.children().next().unwrap()` panics. The

@@ -27,10 +27,6 @@ mod discord_presence;
 mod i18n;
 mod images;
 mod pane_drag;
-// The tab-group layout model. A few of its operations (tab reorder, detach,
-// tab-level merge targets) are driven only by drag gestures that are not
-// wired yet; the allow covers those until their gestures land.
-#[allow(dead_code)]
 mod pane_groups;
 pub mod prefs;
 mod session_store;
@@ -598,7 +594,7 @@ fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
         // left-button release is the authoritative terminal and Escape is
         // the cancel — regardless of capture status, so no focused widget
         // can strand a drag. Below the deadband no drag record exists yet,
-        // and Escape deliberately does nothing (E4b).
+        // and Escape deliberately does nothing.
         subs.push(iced::event::listen_with(|event, _status, window_id| {
             pane_drag::drag_terminal_event(&event)
                 .map(|terminal| Message::PaneDragTerminal(window_id, terminal))
@@ -679,7 +675,7 @@ fn window_tracking_idle_event(
 /// for ANY window of this process, it appears here; if it never appears,
 /// Windows never delivered the `WM_*BUTTONUP` to this thread at all. Called
 /// only from the gesture-gated tracking filter, so idle play (clicks, focus
-/// churn) logs nothing; the scripted drag matrix (`spike-drag-repro.ps1`)
+/// churn) logs nothing; the scripted drag matrix (`bin/drag-matrix.ps1`)
 /// asserts against gesture-time lines only.
 /// Release counterpart of the debug forensics logger: an empty inline body,
 /// so the tracking filter keeps one shape in both profiles and the release
@@ -1665,7 +1661,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 if smudgy.tab_drag.is_some() {
                     // The authoritative terminal: resolve against the last
                     // tracked cursor sample of the source window. No sample
-                    // means no honest release point — cancel (E10), never a
+                    // means no honest release point — cancel, never a
                     // fabricated origin.
                     log::info!(
                         "[pane-drag] raw ButtonReleased via {window_id:?} — authoritative terminal"
@@ -1681,9 +1677,9 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 }
             }
             pane_drag::DragTerminal::Escape => {
-                // Escape cancels a live drag (E4). Below the deadband it
+                // Escape cancels a live drag. Below the deadband it
                 // deliberately does nothing: the press continues and the
-                // release still classifies as a click (E4b).
+                // release still classifies as a click.
                 cancel_tab_drag(smudgy, "escape");
                 Task::none()
             }
@@ -1718,7 +1714,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             smudgy.window_tracker.remove(id);
             smudgy.closing_windows.remove(&id);
             // The source window dying mid-drag ends the drag: its model is
-            // gone, so the drag identity can never re-resolve (E6). A press
+            // gone, so the drag identity can never re-resolve. A press
             // candidate in the dying window dies with it.
             if smudgy
                 .tab_drag
@@ -1947,7 +1943,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     // same OS event and resolves with the window-space
                     // tracked sample; a drag that started has at least one
                     // sample, so nothing is lost by deferring (and a drag
-                    // with no sample at all cancels there — E10).
+                    // with no sample at all cancels there).
                     log::info!(
                         "[pane-drag] widget release observed (point {}) — deferring to the raw terminal",
                         if point.is_some() {
@@ -2867,8 +2863,8 @@ fn refresh_discord_presence(smudgy: &mut Smudgy) {
 /// always keeping at least one smudgy window alive (the last one stays open
 /// showing the empty connect state).
 fn purge_sessions_from_windows(smudgy: &mut Smudgy, dead: &[SessionId]) -> Task<Message> {
-    // A dragged pane whose session died mid-drag must never drop (E5), and
-    // a pressed one must never promote.
+    // A dragged pane whose session died mid-drag must never drop, and a
+    // pressed one must never promote.
     if smudgy
         .tab_drag
         .as_ref()
@@ -3452,7 +3448,7 @@ fn remove_pane_from_windows(
     key: PaneKey,
 ) -> Task<Message> {
     // The dragged pane closing mid-drag (script `pane.close()`) aborts the
-    // drag with zero mutation (E5); a pressed one must never promote.
+    // drag with zero mutation; a pressed one must never promote.
     if smudgy
         .tab_drag
         .as_ref()
@@ -3626,17 +3622,17 @@ fn log_drag_layouts(smudgy: &Smudgy) {
     }
 }
 
-/// Resolve a tab-drag release at `point` (source-window local; `None` =
-/// no honest cursor sample = cancel, E10). Consumes the drag record,
-/// re-resolves every participant against the live model, classifies the
-/// release against live geometry (E8), and applies exactly one terminal
-/// operation — or cancels with zero mutation.
+/// Resolve a tab-drag release at `point` (source-window local; `None` = no
+/// honest cursor sample = cancel). Consumes the drag record, re-resolves
+/// every participant against the live model, classifies the release against
+/// live geometry, and applies exactly one terminal operation — or cancels
+/// with zero mutation.
 fn finish_tab_drag(smudgy: &mut Smudgy, point: Option<Point>) -> Task<Message> {
     let Some(drag) = smudgy.tab_drag.take() else {
         return Task::none();
     };
-    // Stale-identity re-resolution (E5/E6/E7): the session lives, the source
-    // window lives, and the dragged pane is still bound to the dragged tab.
+    // Stale-identity re-resolution: the session lives, the source window
+    // lives, and the dragged pane is still bound to the dragged tab.
     if smudgy.sessions.get(drag.slot.session_id).is_none() {
         log::info!("[pane-drag] cancel (session gone at release)");
         return Task::none();
@@ -3665,7 +3661,7 @@ fn finish_tab_drag(smudgy: &mut Smudgy, point: Option<Point>) -> Task<Message> {
     };
 
     // Inside the source window: classify window-locally — correct even on
-    // platforms without global window origins (E9's same-window half).
+    // platforms without global window origins.
     if Rectangle::with_size(track.size).contains(point) {
         let source_window = drag.source_window;
         let target = source.classify_drag_target(point, track.size, &drag);
@@ -3675,8 +3671,7 @@ fn finish_tab_drag(smudgy: &mut Smudgy, point: Option<Point>) -> Task<Message> {
     // Outside the source window: reconstruct screen space and hit-test the
     // other smudgy windows, most-recently-focused first. An unknown source
     // origin (Wayland) cannot resolve any cross-window target, so the drop
-    // degrades to tear-out (E9); a release over no smudgy window tears out
-    // (T12/E8).
+    // degrades to tear-out; a release over no smudgy window tears out.
     if let Some(screen) = track
         .origin
         .map(|origin| pane_drag::screen_point(origin, point, track.scale))
@@ -3712,7 +3707,7 @@ fn apply_drag_action(
     target: Option<pane_drag::ClassifiedTarget>,
 ) -> Task<Message> {
     let Some(target) = target else {
-        // No drop surface under the release: the no-op re-dock (T9/T11).
+        // No drop surface under the release: the no-op re-dock.
         log::info!("[pane-drag] drop: no target under release — no-op re-dock");
         return Task::none();
     };
@@ -3862,7 +3857,7 @@ enum CrossPlacement {
 /// stable identity across, and a destination rejection re-hosts the tab as
 /// its own cluster there — a detached tab is never stranded. Attention
 /// moves with the tab: it is selected in the destination and its session
-/// becomes active there (T4/T7/T8).
+/// becomes active there.
 fn cross_window_drop(
     smudgy: &mut Smudgy,
     drag: pane_drag::TabDrag,
@@ -3945,9 +3940,9 @@ fn cross_window_drop(
 }
 
 /// Tear the dragged tab out into a new smudgy window at the release point
-/// (T12) — the terminal for a release outside every smudgy window, and the
+/// — the terminal for a release outside every smudgy window, and the
 /// documented degradation for cross-window drops without global window
-/// origins (E9). The window is sized like the pane it carries (its last
+/// origins. The window is sized like the pane it carries (its last
 /// measured size — the stale-size fallback), the entry is inserted
 /// synchronously so the pane has a grid to live in from this update on, and
 /// attention moves with the tab.

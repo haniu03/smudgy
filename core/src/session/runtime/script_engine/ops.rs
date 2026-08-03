@@ -5770,10 +5770,10 @@ fn op_smudgy_pane_resolve(
 // names never collide across servers. The store itself — capture, apply
 // planning, the atomic write — lives UI-side; save and apply are queued to
 // the daemon as data-only actions, while list reads the store directory
-// synchronously (the persisted-automation precedent). Every layout op
+// synchronously, as persisted-automation listing does. Every layout op
 // requires BOTH `panes` and `reach-others`, unconditionally: layout
 // authority is inherently workspace-wide, so the gate does not vary with
-// the footprint. Main-isolate/trusted scripts remain ungated as with all
+// the footprint. Main-isolate/trusted scripts are ungated, as with all
 // grants.
 // ============================================================================
 

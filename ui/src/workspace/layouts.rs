@@ -692,10 +692,10 @@ mod tests {
         // Names chosen to stress trimming, ASCII case, and the multi-byte
         // lowercasings where naive folds drift apart. The three folds —
         // this store's, core's layout-op fold, and the one
-        // `names_conflict` applies — must be the same function, or an
-        // in-app uniqueness answer and an on-disk collision could
-        // disagree. (Unifying them behind one shared fold is tracked
-        // separately.)
+        // `names_conflict` applies — are independent implementations that
+        // must be the same function, or an in-app uniqueness answer and an
+        // on-disk collision could disagree; this test is what pins their
+        // agreement.
         let tricky = [
             "combat",
             "COMBAT",

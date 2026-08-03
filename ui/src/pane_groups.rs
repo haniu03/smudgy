@@ -1781,12 +1781,12 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Ported behavioral baseline (singleton groups = the old leaf model)
+    // Singleton-group behavior (one tab per group)
     // ------------------------------------------------------------------
 
     #[test]
     fn cluster_placement_is_order_independent() {
-        // Order 1: A's script fires first, then B opens (the "wedged" order).
+        // Order 1: A's script fires before B's session opens.
         let mut first = GroupLayout::new();
         let (a_main, _) = push(&mut first, A_MAIN);
         script_split(&mut first, a_main, A_NOTES);

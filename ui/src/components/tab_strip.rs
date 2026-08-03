@@ -18,8 +18,8 @@
 //!
 //! Overflow: the strip scrolls horizontally, and [`reveal`] keeps a selected
 //! tab in view. The scroll container is an implementation detail of this
-//! module — if scrolling proves unsafe under drag interaction it can be
-//! swapped for clipped tabs plus an overflow menu without touching callers.
+//! module: callers see only descriptors and events, so the overflow strategy
+//! is swappable without touching them.
 //!
 //! [`TabPress`]: crate::widgets::tab_press::TabPress
 

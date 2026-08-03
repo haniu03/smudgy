@@ -4195,17 +4195,11 @@ function __smudgy_make_api(creator: { kind: string }) {
                 op_smudgy_gmcp_merge_keys(names.map((n) => String(n)));
             },
         }),
-        // Named workspace layouts, scoped to the calling session's server.
-        // save/apply are queued to the UI daemon (which owns the live window
-        // model and the per-server store); list reads the store directly.
-        // Both queued halves are asynchronous and best-effort past the
-        // op-side checks: save's disk write is deferred and coalesced per
-        // name (latest snapshot wins), and an apply whose layout vanished
-        // meanwhile does nothing. Every method sits behind the
-        // unconditional panes + reach-others gate in the op layer. Names
-        // validate op-side and fold case-insensitively; apply is
-        // layout-only by contract (no session spawn/close, no prompts, no
-        // OS-window changes).
+        // Named workspace layouts. This shim only coerces names to strings:
+        // scope, validation, gating, and routing (save/apply queue to the
+        // UI daemon, list reads the store directly) live op-side -- see the
+        // named-layouts banner in script_engine/ops.rs. The author-facing
+        // contract is `layout` in smudgy-core.d.ts.
         layout: Object.freeze({
             save(name: string): void {
                 op_smudgy_layout_save(String(name));

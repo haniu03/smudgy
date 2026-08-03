@@ -761,7 +761,7 @@ declare module "smudgy:core" {
   /**
    * Named workspace layouts for the current session's server. A layout is a
    * saved snapshot of the windows that hold at least one of this server's
-   * panes — their splits, tab groups, sizes, and pane positions — stored
+   * panes -- their splits, tab groups, sizes, and pane positions -- stored
    * under the server and addressed by name. Names are case-insensitive:
    * `"Combat"` and `"combat"` are the same layout.
    *
@@ -770,12 +770,12 @@ declare module "smudgy:core" {
    * doesn't mention keep riding with their groups, and slots for panes or
    * sessions that aren't open are held open for them to fill later. It
    * never opens or closes sessions, never prompts, and never creates,
-   * closes, moves, or resizes app windows — those are user actions,
+   * closes, moves, or resizes app windows -- those are user actions,
    * available through the Layouts toolbar menu.
    *
    * Layouts exist so users' saved arrangements win. `split()` sizes and
    * placements are creation *defaults*, while an explicit `pane.resize()`
-   * is imperative intent that overrides the user's saved geometry — exactly
+   * is imperative intent that overrides the user's saved geometry -- exactly
    * as a user divider drag would. So resizing panes at load time is an
    * anti-pattern: it permanently defeats the sizes users saved. Use split
    * defaults at creation and reserve `resize` for genuine runtime
@@ -803,7 +803,7 @@ declare module "smudgy:core" {
      * Throws when no such layout exists. The apply itself is asynchronous
      * and best-effort: a layout that no longer exists by the time it
      * runs, or one that does not reference this server, does nothing.
-     * Safe to call at gameplay rates — switching layouts writes nothing
+     * Safe to call at gameplay rates -- switching layouts writes nothing
      * to disk.
      */
     apply(name: string): void;

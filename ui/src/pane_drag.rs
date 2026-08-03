@@ -46,8 +46,8 @@ pub const DRAG_DEADBAND: f32 = 10.0;
 
 /// Divisor for the whole-grid edge drop bands: the band depth is
 /// `min(width, height) / GRID_EDGE_RATIO`, measured inward from the grid
-/// bounds — pane_grid's native `THICKNESS_RATIO`, so top-level placements
-/// keep their pre-controller precedence and reach.
+/// bounds — pane_grid's native `THICKNESS_RATIO`, giving top-level placements
+/// the same precedence and reach as pane_grid's own edge bands.
 pub const GRID_EDGE_RATIO: f32 = 25.0;
 
 /// Upper bound on the grid-edge band depth. The native proportional depth
@@ -421,19 +421,19 @@ pub enum GridEdgeSide {
 /// that vanished between the two rejects the drop rather than misdirecting.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DragAction {
-    /// Whole-grid edge placement (T8).
+    /// Whole-grid edge placement.
     GridEdge(GridEdgeSide),
     /// Move the dragged tab into `group`'s strip at `slot` (counted with the
     /// strip as it stands, dragged tab included — [`merge_tab`]'s contract).
-    /// With the source group as destination this is a reorder (T1/T2).
+    /// With the source group as destination this is a reorder.
     ///
     /// [`merge_tab`]: crate::pane_groups::GroupLayout::merge_tab
     Merge { group: GroupId, slot: usize },
-    /// Atomic slot swap with `group`'s currently rendered tab (T5/T6).
+    /// Atomic slot swap with `group`'s currently rendered tab.
     Swap { group: GroupId },
     /// Split the dragged tab, as a new singleton, beside the whole `group`
-    /// (T7; against the source group itself, the T10 ungroup gesture).
-    /// `region` is never `Center`.
+    /// (against the source group itself, the ungroup gesture). `region` is
+    /// never `Center`.
     Split { group: GroupId, region: DropRegion },
     /// The hovered window hosts no panes: adopt the tab as its first cluster.
     Vacant,
@@ -545,13 +545,12 @@ fn split_half(bounds: Rectangle, region: DropRegion) -> Rectangle {
 
 /// Classify a grid-local point against live target geometry. `None` means no
 /// drop surface is under the point — outside the grid entirely (window
-/// chrome/toolbar, T11), over the source group's own body center (T9), or an
-/// own-edge gesture with nothing to ungroup — and a release there is a no-op
-/// re-dock.
+/// chrome/toolbar), over the source group's own body center, or an own-edge
+/// gesture with nothing to ungroup — and a release there is a no-op re-dock.
 ///
 /// Precedence: whole-grid edge bands, then the hovered pane's header band,
 /// then its body center/edge thirds. A point on inter-pane spacing resolves
-/// to the nearest pane region (E12) — never a resize.
+/// to the nearest pane region — never a resize.
 ///
 /// `source_group` is the dragged tab's group *when the classified window
 /// hosts it* (self-target rules apply only there); `source_solo` marks a
@@ -615,7 +614,7 @@ pub fn classify_target(
     }
 
     // The hovered pane — containment first, nearest center for points on
-    // inter-pane spacing/dividers (E12).
+    // inter-pane spacing/dividers.
     let pane = panes
         .iter()
         .find(|pane| pane.bounds.contains(point))
@@ -655,7 +654,7 @@ pub fn classify_target(
     };
     let own = source_group == Some(pane.group);
     match region_for(body, point) {
-        DropRegion::Center if own => None, // T9: already hosted here.
+        DropRegion::Center if own => None, // Already hosted here.
         DropRegion::Center => Some(ClassifiedTarget {
             action: DragAction::Swap { group: pane.group },
             highlight: body,
@@ -663,7 +662,7 @@ pub fn classify_target(
         }),
         region => {
             if own && source_solo {
-                // T10 with a singleton source: nothing to ungroup.
+                // Own-edge gesture with a singleton source: nothing to ungroup.
                 return None;
             }
             Some(ClassifiedTarget {
@@ -991,7 +990,7 @@ mod tests {
                 group: left_group()
             }
         );
-        // T9: the dragged tab's own group's center offers nothing.
+        // The dragged tab's own group's center offers nothing.
         assert!(classify((200.0, 160.0), Some(left_group()), false).is_none());
         // The other group's center still swaps for the same source.
         let target = classify((600.0, 160.0), Some(left_group()), false).unwrap();
@@ -1013,7 +1012,7 @@ mod tests {
                 region: DropRegion::Bottom
             }
         );
-        // T10: ungrouping from a multi-tab source group is real...
+        // Ungrouping from a multi-tab source group is real...
         let target = classify((200.0, 280.0), Some(left_group()), false).unwrap();
         assert!(matches!(target.action, DragAction::Split { .. }));
         // ...but a singleton source dragged to its own edge has nothing to
