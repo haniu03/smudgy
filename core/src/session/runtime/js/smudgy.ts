@@ -76,6 +76,9 @@ const {
     op_smudgy_pane_clear,
     op_smudgy_pane_list,
     op_smudgy_pane_resolve,
+    op_smudgy_layout_save,
+    op_smudgy_layout_apply,
+    op_smudgy_layout_list,
     op_smudgy_input_get,
     op_smudgy_input_apply,
     op_smudgy_input_submission_generation,
@@ -4190,6 +4193,28 @@ function __smudgy_make_api(creator: { kind: string }) {
             },
             mergeKeys(...names: string[]): void {
                 op_smudgy_gmcp_merge_keys(names.map((n) => String(n)));
+            },
+        }),
+        // Named workspace layouts, scoped to the calling session's server.
+        // save/apply are queued to the UI daemon (which owns the live window
+        // model and the per-server store); list reads the store directly.
+        // Both queued halves are asynchronous and best-effort past the
+        // op-side checks: save's disk write is deferred and coalesced per
+        // name (latest snapshot wins), and an apply whose layout vanished
+        // meanwhile does nothing. Every method sits behind the
+        // unconditional panes + reach-others gate in the op layer. Names
+        // validate op-side and fold case-insensitively; apply is
+        // layout-only by contract (no session spawn/close, no prompts, no
+        // OS-window changes).
+        layout: Object.freeze({
+            save(name: string): void {
+                op_smudgy_layout_save(String(name));
+            },
+            apply(name: string): void {
+                op_smudgy_layout_apply(String(name));
+            },
+            list(): string[] {
+                return op_smudgy_layout_list() as string[];
             },
         }),
     };

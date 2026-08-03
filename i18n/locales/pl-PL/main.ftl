@@ -195,6 +195,11 @@ session-action-connect = Połącz
 session-action-reconnect = Połącz ponownie
 session-action-disconnect = Rozłącz
 
+# Pane tab strip controls
+pane-tab-close = Zamknij sesję
+pane-tab-hide = Ukryj panel
+pane-tab-show = Pokaż panel
+
 # Server and profile connection manager
 servers-title = Serwery
 servers-loading = Ładowanie serwerów…
@@ -241,6 +246,7 @@ profiles-load-error = Nie udało się załadować profili dla tego serwera.
 profiles-error-load = Błąd podczas ładowania profili dla „{ $server }": { $error }
 profiles-new = + Nowy profil
 profiles-empty = Dodaj profil, aby się połączyć
+profiles-restore-last = Przywróć ostatnią sesję ({ $profiles })
 profile-name = Nazwa profilu
 profile-name-placeholder = Gandalf
 profile-description = Opis (opcjonalnie)
@@ -283,7 +289,29 @@ window-automations = automatyzacje Smudgy — { $server }
 toolbar-connect = Połącz
 toolbar-automations = Automatyzacje
 toolbar-map-editor = Edytor map
+toolbar-layouts = Układy
 toolbar-settings = Ustawienia
+
+# Named layouts menu
+layouts-apply-hint = Kliknij układ, aby go zastosować.
+layouts-empty = Brak zapisanych układów dla { $server }.
+layouts-overwrite = Nadpisz
+layouts-rename = Zmień nazwę
+layouts-save-as = Zapisz bieżący jako...
+layouts-reset = Resetuj układ paneli
+layouts-name-placeholder = Nazwa układu
+layouts-confirm-overwrite = Nadpisać układ "{ $name }" bieżącym rozmieszczeniem?
+layouts-confirm-delete = Usunąć układ "{ $name }"?
+layouts-confirm-reset = Zwolnić zapisaną geometrię paneli tej sesji i rozmieścić je na nowo według bieżących definicji skryptów?
+layouts-saved = Zapisano układ "{ $name }".
+layouts-saved-partial = Zapisano układ "{ $name }" — nie udało się uwzględnić { $count } zachowanych kart-zaślepek.
+layouts-save-failed = Nie udało się zapisać układu: { $error }
+layouts-keep-or-close-intro = Ten układ nie obejmuje tych sesji. Wybierz, co ma się stać z każdą z nich:
+layouts-keep = Zachowaj
+layouts-close = Zamknij
+layouts-keep-chosen = ✓ Zachowaj
+layouts-close-chosen = ✓ Zamknij
+layouts-apply = Zastosuj układ
 shell-no-sessions = Brak aktywnych sesji
 shell-connect-help = Wybierz serwer i profil, aby się połączyć.
 shell-connect-action = Połącz z serwerem
@@ -1370,12 +1398,12 @@ permission-can-send-both = Wysyłać polecenia do gry zarówno tak, jakbyś je w
 permission-can-send-aliases = Wysyłać polecenia do gry tak, jakbyś je wpisał, potencjalnie wyzwalając aliasy
 permission-can-send-direct = Wysyłać polecenia bezpośrednio do gry, pomijając Twoje aliasy
 permission-can-echo = Wyświetlać tekst na ekranie
-permission-can-sessions = Wchodzić w interakcję z innymi otwartymi sesjami
+permission-can-sessions = Wchodzić w interakcję z innymi otwartymi sesjami, w tym przestawiać układ okien tego serwera
 permission-can-display = Ukrywać, zmieniać styl, wstawiać lub zamieniać tekst gry oraz widzieć bieżący wiersz
 permission-can-map-read = Odczytywać Twoje mapy
 permission-can-map-write = Zmieniać Twoje mapy
 permission-can-widgets = Tworzyć i zmieniać widgety na ekranie
-permission-can-panes = Tworzyć panele wyjścia sesji i kierować do nich wiersze gry
+permission-can-panes = Tworzyć panele wyjścia sesji, kierować do nich wiersze gry oraz zapisywać i stosować nazwane układy okien
 permission-can-gmcp = Wysyłać komunikaty GMCP do gry i zarządzać modułami GMCP
 permission-cannot-send = wysyłać poleceń do gry
 permission-cannot-aliases = tworzyć aliasów

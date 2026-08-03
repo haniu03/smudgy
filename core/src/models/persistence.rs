@@ -10,7 +10,17 @@ use tempfile::Builder;
 /// one filesystem. Its contents are synced before the atomic replacement; on
 /// Unix, the parent directory is synced afterward so the replacement survives
 /// a crash once this function returns successfully.
-pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+///
+/// This is the one atomic-replace implementation for every smudgy data file,
+/// in core and UI alike; concurrent writers to the same destination are safe
+/// against torn output because each write goes through its own uniquely named
+/// temporary sibling.
+///
+/// # Errors
+///
+/// Any I/O error from creating, writing, syncing, or renaming the temporary
+/// file; the destination is left untouched.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     write_atomic_with(path, |file| file.write_all(contents))
 }
 

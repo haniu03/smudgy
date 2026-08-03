@@ -2,6 +2,7 @@
 locale-system = Use system language
 locale-english = English (United States)
 locale-polish = Polish
+locale-ukrainian = Ukrainian
 locale-traditional-chinese = Traditional Chinese (Taiwan)
 
 # Shared actions and states
@@ -193,6 +194,11 @@ session-action-connect = Connect
 session-action-reconnect = Reconnect
 session-action-disconnect = Disconnect
 
+# Pane tab strip controls
+pane-tab-close = Close session
+pane-tab-hide = Hide pane
+pane-tab-show = Show pane
+
 # Server and profile connection manager
 servers-title = Servers
 servers-loading = Loading servers…
@@ -239,6 +245,7 @@ profiles-load-error = Couldn't load profiles for this server.
 profiles-error-load = Error loading profiles for '{ $server }': { $error }
 profiles-new = + New Profile
 profiles-empty = Add a profile to connect
+profiles-restore-last = Restore last session ({ $profiles })
 profile-name = Profile name
 profile-name-placeholder = Gandalf
 profile-description = Description (optional)
@@ -281,7 +288,29 @@ window-automations = Smudgy automations — { $server }
 toolbar-connect = Connect
 toolbar-automations = Automations
 toolbar-map-editor = Map Editor
+toolbar-layouts = Layouts
 toolbar-settings = Settings
+
+# Named layouts menu
+layouts-apply-hint = Click a layout to apply it.
+layouts-empty = No saved layouts for { $server } yet.
+layouts-overwrite = Overwrite
+layouts-rename = Rename
+layouts-save-as = Save current as...
+layouts-reset = Reset pane layout
+layouts-name-placeholder = Layout name
+layouts-confirm-overwrite = Overwrite layout "{ $name }" with the current arrangement?
+layouts-confirm-delete = Delete layout "{ $name }"?
+layouts-confirm-reset = Release this session's saved pane geometry and re-place its panes from the current script definitions?
+layouts-saved = Saved layout "{ $name }".
+layouts-saved-partial = Saved layout "{ $name }" — { $count } retained placeholder tab(s) could not be included.
+layouts-save-failed = Could not save the layout: { $error }
+layouts-keep-or-close-intro = This layout does not include these sessions. Choose what happens to each:
+layouts-keep = Keep
+layouts-close = Close
+layouts-keep-chosen = ✓ Keep
+layouts-close-chosen = ✓ Close
+layouts-apply = Apply layout
 shell-no-sessions = No active sessions
 shell-connect-help = Choose a server and profile to connect.
 shell-connect-action = Connect to a server
@@ -1311,12 +1340,12 @@ permission-can-send-both = Send commands to the game both as if you typed them (
 permission-can-send-aliases = Send commands to the game as if you typed them, possibly triggering aliases
 permission-can-send-direct = Send commands straight to the game, bypassing your aliases
 permission-can-echo = Echo text to the screen
-permission-can-sessions = Interact with other open sessions
+permission-can-sessions = Interact with other open sessions, including rearranging this server's window layout
 permission-can-display = Hide, restyle, inject, or replace game text, and see the current line
 permission-can-map-read = Read your maps
 permission-can-map-write = Change your maps
 permission-can-widgets = Create and change on-screen widgets
-permission-can-panes = Create session output panes and route game lines into them
+permission-can-panes = Create session output panes, route game lines into them, and save or apply named window layouts
 permission-can-gmcp = Send GMCP messages to the game and manage GMCP modules
 permission-cannot-send = send commands to the game
 permission-cannot-aliases = create aliases

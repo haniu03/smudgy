@@ -52,6 +52,8 @@ pub(crate) mod package_cache;
 mod package_provider;
 mod package_solver;
 
+pub use ops::layout_fold;
+
 use package_provider::build_package_provider;
 
 /// Bind a v8 inspector in dev builds, or whenever `SMUDGY_SCRIPT_INSPECTOR` is set,

@@ -1739,6 +1739,24 @@ impl Inner<'_> {
                     .await?;
                 Ok(ActionResult::None)
             }
+            RuntimeAction::LayoutSave { name } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::LayoutSave { name },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::LayoutApply { name } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::LayoutApply { name },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
             RuntimeAction::PaneDisplayChanged { key, width, height } => {
                 // The UI's coalesced pane-size update: write the mirror the
                 // `pane.size` read op consults; the `pane:resize` host event

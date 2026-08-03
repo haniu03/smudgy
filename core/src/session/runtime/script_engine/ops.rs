@@ -84,6 +84,9 @@ deno_core::extension!(
     op_smudgy_pane_clear,
     op_smudgy_pane_list,
     op_smudgy_pane_resolve,
+    op_smudgy_layout_save,
+    op_smudgy_layout_apply,
+    op_smudgy_layout_list,
     op_smudgy_input_get,
     op_smudgy_input_apply,
     op_smudgy_input_submission_generation,
@@ -5757,6 +5760,155 @@ fn op_smudgy_pane_resolve(
         .unwrap()
         .resolve(&namespace, name)
         .map(|def| PaneInfo::from_def(def, false)))
+}
+
+// ============================================================================
+// Named layouts (`layout.save` / `layout.apply` / `layout.list`)
+//
+// The owning scope of every layout op is the CALLING session's server: names
+// resolve against `<server>/layouts/` and nothing else, so conventional
+// names never collide across servers. The store itself — capture, apply
+// planning, the atomic write — lives UI-side; save and apply are queued to
+// the daemon as data-only actions, while list reads the store directory
+// synchronously (the persisted-automation precedent). Every layout op
+// requires BOTH `panes` and `reach-others`, unconditionally: layout
+// authority is inherently workspace-wide, so the gate does not vary with
+// the footprint. Main-isolate/trusted scripts remain ungated as with all
+// grants.
+// ============================================================================
+
+/// The error a layout op throws: a rejected name, an unknown layout, or a
+/// store directory that cannot be resolved.
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+#[class(generic)]
+#[error("smudgy: {0}")]
+pub struct LayoutOpError(String);
+
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+pub enum LayoutCallError {
+    #[class(inherit)]
+    #[error(transparent)]
+    NotCapable(#[from] NotCapable),
+    #[class(inherit)]
+    #[error(transparent)]
+    Layout(#[from] LayoutOpError),
+}
+
+/// The unconditional two-grant gate for every `layout.*` op.
+fn ensure_layout_access(state: &OpState) -> Result<(), NotCapable> {
+    ensure(grants(state).panes, "panes")?;
+    ensure(grants(state).reach_others, "reach-others")?;
+    Ok(())
+}
+
+/// Validate a layout name with the shared naming rule (names become
+/// filenames under `layouts/`; pane-name rules would permit separators) and
+/// hand back its trimmed form.
+fn validated_layout_name(name: &str) -> Result<&str, LayoutOpError> {
+    crate::models::naming::validate_name(name)
+        .map_err(|message| LayoutOpError(format!("invalid layout name: {message}")))?;
+    Ok(name.trim())
+}
+
+/// `<server>/layouts/` — the per-server named-layout store directory.
+fn layouts_dir_for(server: &str) -> Result<std::path::PathBuf, LayoutOpError> {
+    let home = crate::get_smudgy_home()
+        .map_err(|error| LayoutOpError(format!("cannot resolve the layouts store: {error}")))?;
+    Ok(home.join(server).join("layouts"))
+}
+
+/// Layout names fold case-insensitively — the same fold
+/// [`crate::models::naming::names_conflict`] applies, matching the UI-side
+/// store, so two names folding to the same string are the same layout.
+/// Public (re-exported through `session::runtime`) so the UI store's tests
+/// can pin all three folds to one another.
+#[must_use]
+pub fn layout_fold(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+/// The stored layout names (display casing as saved), sorted by folded
+/// form. A missing directory is an empty store. Stems that fail the naming
+/// rule are filtered out, matching the UI-side store: every layout
+/// operation validates its name first, so such a file could never be
+/// addressed — listing it would only offer a name no call can use.
+fn list_layouts_in(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if !path.is_file()
+                || !path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?;
+            if crate::models::naming::validate_name(stem).is_err() {
+                return None;
+            }
+            Some(stem.to_string())
+        })
+        .collect();
+    names.sort_by_key(|name| layout_fold(name));
+    names
+}
+
+/// Whether any stored layout folds onto `name`.
+fn layout_exists_in(dir: &std::path::Path, name: &str) -> bool {
+    let folded = layout_fold(name);
+    list_layouts_in(dir)
+        .iter()
+        .any(|stored| layout_fold(stored) == folded)
+}
+
+/// `layout.list` — the calling session's server's stored layout names.
+#[op2]
+#[serde]
+fn op_smudgy_layout_list(state: &mut OpState) -> Result<Vec<String>, LayoutCallError> {
+    ensure_layout_access(state)?;
+    let server = op_server_name(state);
+    let dir = layouts_dir_for(&server)?;
+    Ok(list_layouts_in(&dir))
+}
+
+/// `layout.save` — capture the calling session's server footprint as the
+/// named layout. The capture happens on the UI daemon (the only owner of
+/// the live window model), which serializes the snapshot synchronously and
+/// hands the atomic write to a background writer that coalesces rapid
+/// saves of the same name — the latest snapshot wins, and the write is
+/// best-effort durable. The op validates the name and queues the request,
+/// so a bad name throws here and a good one cannot fail validation later.
+#[op2(fast)]
+fn op_smudgy_layout_save(state: &mut OpState, #[string] name: &str) -> Result<(), LayoutCallError> {
+    ensure_layout_access(state)?;
+    let name = validated_layout_name(name)?.to_string();
+    queue_own_action(state, RuntimeAction::LayoutSave { name });
+    Ok(())
+}
+
+/// `layout.apply` — apply the named layout to the calling session's
+/// server's live footprint. Layout-only by contract (no spawns, closes,
+/// prompts, or OS-window changes); an unknown name throws here so the
+/// script hears about its typo, though the store can still drift before
+/// the daemon resolves the name again at apply time.
+#[op2(fast)]
+fn op_smudgy_layout_apply(
+    state: &mut OpState,
+    #[string] name: &str,
+) -> Result<(), LayoutCallError> {
+    ensure_layout_access(state)?;
+    let name = validated_layout_name(name)?.to_string();
+    let server = op_server_name(state);
+    let dir = layouts_dir_for(&server)?;
+    if !layout_exists_in(&dir, &name) {
+        return Err(LayoutOpError(format!("no layout named '{name}'")).into());
+    }
+    queue_own_action(state, RuntimeAction::LayoutApply { name });
+    Ok(())
 }
 
 /// Resolve a line-routing target to its live key. `name_id >= 0` is the

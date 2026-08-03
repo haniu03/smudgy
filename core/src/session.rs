@@ -136,6 +136,19 @@ pub enum SessionEvent {
     /// `RuntimeAction::PaneDisplayChanged` on settled pane layout changes, and
     /// push every pane's current size immediately so the mirror warms up.
     PaneMirrorInterest,
+    /// A script asked for this session's window footprint to be saved as
+    /// the named layout (`layout.save`). The daemon owns the capture and
+    /// the per-server store; the name arrives already validated.
+    LayoutSave {
+        name: String,
+    },
+    /// A script asked for a named layout to be applied (`layout.apply`).
+    /// Layout-only: the daemon rebinds what exists, scoped to this
+    /// session's server, and never spawns, closes, prompts, or touches OS
+    /// windows.
+    LayoutApply {
+        name: String,
+    },
     /// The merged completion word sets for the input of pane `key`
     /// (`docs/input.md` §3.8): every creator's registered
     /// suggestions in merge order (creators in first-contribution order,

@@ -12,6 +12,7 @@ pub enum Message {
     SettingsPressed,
     AutomationsPressed,
     MapEditorPressed,
+    LayoutsPressed,
     ToggleExpand,
     // Window controls: the toolbar doubles as the titlebar of the borderless
     // main window.
@@ -130,6 +131,10 @@ pub fn view(
                 crate::i18n::t!("toolbar-map-editor"),
                 Message::MapEditorPressed,
             ));
+            buttons.push(toolbar_button(
+                crate::i18n::t!("toolbar-layouts"),
+                Message::LayoutsPressed,
+            ));
         }
 
         buttons.push(toolbar_button(
@@ -151,9 +156,7 @@ pub fn view(
     } else {
         // Collapsed view: Hamburger + Text. This bar doubles as the window's
         // title bar, so it mirrors the OS title (incl. the dev-build marker).
-        let title = text(crate::main_window_title())
-            .size(14)
-            .color(TITLE_COLOR);
+        let title = text(crate::main_window_title()).size(14).color(TITLE_COLOR);
 
         row![
             menu_button(),
