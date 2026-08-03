@@ -6,13 +6,7 @@ None of this affects your use of Smudgy.
 
 ## Fonts
 
-**Fixedsys Excelsior font with programming ligatures**
-Distribution terms
-The font was originally authored by Darien Valentine @bathos and provided via a now-defunct site at fixedsysexcelsior.com. This derivative's source code repository and issue tracker can be found at github.com/kika/fixedsys.
-
-The creator(s) of this content have released it to the public domain. For jurisdictions where this is not permitted, it is released under the terms of the Creative Commons Zero Dedication.
-
-Every other bundled font is licensed under the **SIL Open Font License, Version 1.1**
+Every bundled font is licensed under the **SIL Open Font License, Version 1.1**
 (the full text appears under *License texts* below).
 
 - **Geist** and **Geist Mono** — Copyright 2024 The Geist Project Authors
@@ -162,7 +156,7 @@ covers.
 
 **Summary**
 
-- MIT License: 739
+- MIT License: 728
 - Apache License 2.0: 71
 - Unicode License v3: 28
 - BSD 3-Clause "New" or "Revised" License: 17
@@ -3211,6 +3205,7 @@ THE SOFTWARE IS PROVIDED "AS IS" AND ISC DISCLAIMS ALL WARRANTIES WITH REGARD TO
 
 Used by:
 
+- smudgy_core 0.4.2-dev
 - rustybuzz 0.20.1
 
 ~~~
@@ -3242,7 +3237,6 @@ Used by:
 
 Used by:
 
-- smudgy_core 0.5.3-rc
 - harfrust 0.3.2
 
 ~~~
@@ -3954,42 +3948,6 @@ DEALINGS IN THE SOFTWARE.
 Used by:
 
 - uuid 1.16.0
-
-~~~
-Copyright (c) 2014 The Rust Project Developers
-Copyright (c) 2018 Ashley Mannix, Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-~~~
-
-### MIT License
-
-Used by:
-
-- uuid 0.8.2
 
 ~~~
 Copyright (c) 2014 The Rust Project Developers
@@ -9535,37 +9493,6 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Used by:
 
-- fluent-bundle 0.16.0
-- fluent-syntax 0.12.0
-- intl-memoizer 0.5.3
-
-~~~
-Copyright 2017 Mozilla
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-~~~
-
-### MIT License
-
-Used by:
-
 - resvg 0.45.1
 - usvg 0.45.1
 
@@ -11731,7 +11658,6 @@ SOFTWARE.
 
 Used by:
 
-- iced_graphics 0.14.0
 - aead-gcm-stream 0.4.0
 - asn1-rs-derive 0.4.0
 - asn1-rs-impl 0.1.0
@@ -11802,7 +11728,6 @@ Used by:
 - dlopen2_derive 0.4.0
 - dpi 0.1.2
 - dprint-swc-ext 0.26.0
-- fluent-langneg 0.13.1
 - fqdn 0.5.2
 - gpu-alloc-types 0.3.0
 - gpu-alloc 0.6.0
@@ -11812,6 +11737,7 @@ Used by:
 - iced_core 0.14.0
 - iced_debug 0.14.0
 - iced_futures 0.14.0
+- iced_graphics 0.14.0
 - iced_highlighter 0.14.0
 - iced_program 0.14.0
 - iced_renderer 0.14.0
@@ -11824,7 +11750,6 @@ Used by:
 - include_dir 0.7.4
 - include_dir_macros 0.7.4
 - integer-sqrt 0.1.5
-- intl_pluralrules 7.0.2
 - lazy-regex-proc_macros 3.4.1
 - lcms2 6.1.0
 - libffi 5.1.0
@@ -11849,7 +11774,6 @@ Used by:
 - sys_traits 0.1.25
 - sys_traits_macros 0.1.0
 - tokio-eld 0.2.0
-- type-map 0.5.1
 - v8 147.4.0
 - validator 0.20.0
 - validator_derive 0.20.0
@@ -12095,7 +12019,6 @@ Copyright 2013-2014 RAD Game Tools and Valve Software
 Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
 Copyright (c) 2017 Frommi
 Copyright (c) 2017-2024 oyvindln
-
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -12471,37 +12394,6 @@ SOFTWARE.
 
 Used by:
 
-- discord-rich-presence 1.1.0
-
-~~~
-MIT License
-
-Copyright (c) 2025 vionya
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-~~~
-
-### MIT License
-
-Used by:
-
 - rsa 0.9.10
 - rustc-hash 2.1.1
 
@@ -12576,7 +12468,6 @@ Used by:
 - serde_core 1.0.228
 - serde_derive 1.0.228
 - serde_json 1.0.140
-- serde_repr 0.1.20
 - smol_str 0.2.2
 - syn 1.0.109
 - syn 2.0.101
@@ -12585,8 +12476,6 @@ Used by:
 - thiserror 1.0.69
 - thiserror 2.0.12
 - typeid 1.0.3
-- unic-langid-impl 0.9.6
-- unic-langid 0.9.6
 - unicode-id-start 1.3.1
 - unicode-ident 1.0.18
 - utf-8 0.7.6
