@@ -2,7 +2,7 @@
 locale-system = 使用系統語言
 locale-english = 英文（美國）
 locale-polish = 拋光
-locale-ukrainian = 烏克蘭文
+locale-ukrainian = 烏克蘭語
 locale-traditional-chinese = 繁體中文（臺灣）
 
 # 共用操作與狀態
