@@ -25,18 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shows exactly what the release will do (the preview and the drop share
   one geometry, so they can never disagree), and Escape cancels any drag
   with nothing moved.
-- **Your workspace comes back.** Smudgy now remembers your windows and
-  panes — positions, sizes, splits, tab groups and selections, hidden
-  panes, and which sessions were open — and rebuilds all of it at the
-  next launch. Sessions that were connected reconnect exactly as if you
-  had clicked Connect (your connect commands included); sessions you
-  opened offline stay offline. Script panes hold their exact places as
-  empty frames while scripts load, then fill in without reshuffling.
-  The mirror is continuous and crash-tolerant: even a forced shutdown
-  (an installer closing smudgy, Windows restarting) keeps a snapshot at
-  most a minute old, and an unreadable file means a clean start — never
-  a deleted one. Credentials, terminal contents, and script state are
-  never written.
+- **Pick up where you left off.** Every server remembers the last
+  arrangement you played it in — windows and panes, positions, sizes,
+  splits, tab groups and selections, hidden panes, and which sessions
+  were open. Smudgy still starts clean; the offer waits in the Connect
+  dialog, where each server shows "Restore last session" with the
+  profiles it will bring back. Restoring fills the window you are in
+  rather than opening another. Sessions that were connected reconnect
+  exactly as if you had clicked Connect (your connect commands
+  included); sessions you opened offline stay offline. Script panes hold
+  their exact places as empty frames while scripts load, then fill in
+  without reshuffling. The record is continuous and crash-tolerant: even
+  a forced shutdown (an installer closing smudgy, Windows restarting)
+  keeps a snapshot at most a minute old, and an unreadable file means
+  the offer simply does not appear — never a deleted one. Credentials,
+  terminal contents, and script state are never written.
 - **Named layouts.** The new Layouts button saves the current
   arrangement of the active session's server under a name and brings it
   back on demand. Applying runs the full flow: missing sessions spawn
