@@ -106,6 +106,17 @@ impl SessionStore {
         self.sessions.iter().map(|(id, session)| (*id, session))
     }
 
+    /// Collect and clear every session's workspace-dirty mark (connection-
+    /// intent changes). Part of the daemon's once-per-update sweep into the
+    /// autosave schedule.
+    pub fn take_workspace_dirty(&mut self) -> bool {
+        let mut dirty = false;
+        for session in self.sessions.values_mut() {
+            dirty |= std::mem::take(&mut session.workspace_dirty);
+        }
+        dirty
+    }
+
     /// Shuts the session's runtime down and drops its state. Returns whether
     /// the session existed (`false` makes a repeated close a clean no-op).
     ///
@@ -208,6 +219,10 @@ pub struct ManagedSession {
     /// Whether this session has ever been connected. Drives the Connect (never
     /// connected) vs Reconnect (was connected) label on the title-bar control.
     ever_connected: bool,
+    /// The connection intent changed since the daemon's last workspace
+    /// sweep (the intent is persisted per session slot). A mutation's whole
+    /// persistence cost is this boolean store.
+    workspace_dirty: bool,
 
     /// This server's config — the address plus the OSC 8 link-trust grants —
     /// shared with the link handler and updated when the user opts in from
@@ -249,7 +264,6 @@ struct PendingLinkConfirm {
 #[derive(Debug, Clone)]
 pub enum Message {
     None,
-    Close,
     Input(session_input::Message),
     /// A message for one pane-hosted input's `SessionInput`.
     PaneInput(PaneKey, session_input::Message),
@@ -764,6 +778,7 @@ impl ManagedSession {
             connected_at_unix_ms: None,
             auto_connect,
             ever_connected: false,
+            workspace_dirty: false,
             mapper,
             widget_root,
             map_store,
@@ -865,25 +880,39 @@ impl ManagedSession {
         }
     }
 
-    /// Slim title-bar content for a script pane: its display-cased name. Kept
-    /// intrinsic-width — the bar's leftover space is the drag pick area.
-    pub fn script_pane_title(&self, key: PaneKey) -> Element<'static, Message> {
-        let label = self
-            .panes
-            .get(&key)
-            .map_or_else(|| key.to_string(), |pane| pane.def.name.to_string());
-        container(
-            text(label)
-                .size(12)
-                .color(Color::from_rgba8(255, 250, 239, 0.6)),
-        )
-        .padding(Padding {
-            top: 4.0,
-            right: 10.0,
-            bottom: 4.0,
-            left: 10.0,
-        })
-        .into()
+    /// The display label for one of this session's panes: profile/server for
+    /// main, the display-cased pane name for a script pane (unknown keys — a
+    /// stale slot mid-teardown — fall back to the key itself).
+    pub fn pane_label(&self, key: PaneKey) -> String {
+        if key == MAIN_PANE_KEY {
+            format!("{} ({})", self.profile_name, self.server_name)
+        } else {
+            self.panes
+                .get(&key)
+                .map_or_else(|| key.to_string(), |pane| pane.def.name.to_string())
+        }
+    }
+
+    /// Whether this session has ever been connected (drives the Connect vs
+    /// Reconnect label on its tab's connection control).
+    pub fn ever_connected(&self) -> bool {
+        self.ever_connected
+    }
+
+    /// The session's connection *intent* — the explicit online/offline
+    /// choice (Connect sets it, Disconnect clears it), never the observed
+    /// socket state. This is what the workspace mirror persists, so a
+    /// snapshot taken during a transient outage cannot flip next-launch
+    /// behavior.
+    pub fn connect_intent(&self) -> bool {
+        self.auto_connect
+    }
+
+    /// One pane's definition, for durable descriptor building (namespace +
+    /// name identity). `None` for the main pane (which has no `PaneDisplay`
+    /// entry) and for stale keys mid-teardown.
+    pub fn pane_def(&self, key: PaneKey) -> Option<&PaneDef> {
+        self.panes.get(&key).map(|pane| &pane.def)
     }
 
     /// The body of a script pane: the widget entries targeting it, stacked
@@ -1214,6 +1243,23 @@ impl ManagedSession {
         }
     }
 
+    /// Arm the obscured-blur mark on the input behind `key` (see
+    /// [`session_input::SessionInput::note_obscured`]): the tab switch about
+    /// to obscure the pane must not let the blur it inflicts clear the
+    /// user's in-progress text. A pane without an input takes no mark.
+    pub fn note_pane_input_obscured(&mut self, key: PaneKey) {
+        let input = if key == MAIN_PANE_KEY {
+            Some(&mut self.input)
+        } else {
+            self.panes
+                .get_mut(&key)
+                .and_then(|pane| pane.input.as_mut())
+        };
+        if let Some(input) = input {
+            input.note_obscured();
+        }
+    }
+
     /// Every live input — the main input first, then each pane-hosted one —
     /// for the paths that fan a session-wide fact out to all of them
     /// (hotkeys, mirror interest).
@@ -1310,11 +1356,6 @@ impl ManagedSession {
     /// Handle session-specific messages
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Close => {
-                // Session teardown is the daemon's job (store removal, grid
-                // cleanup, runtime shutdown); nothing to do at this level.
-                Task::none()
-            }
             Message::SetMapperCurrentLocation(area_id, room_number) => {
                 self.map_store.set_current_location(area_id, room_number);
                 Task::none()
@@ -1548,7 +1589,9 @@ impl ManagedSession {
                     SessionEvent::PaneResize { .. }
                     | SessionEvent::PaneRelocate { .. }
                     | SessionEvent::PaneTearOut { .. }
-                    | SessionEvent::PaneSwap { .. } => Task::none(),
+                    | SessionEvent::PaneSwap { .. }
+                    | SessionEvent::LayoutSave { .. }
+                    | SessionEvent::LayoutApply { .. } => Task::none(),
                     SessionEvent::Connected => {
                         self.connected = true;
                         self.ever_connected = true;
@@ -1667,6 +1710,8 @@ impl ManagedSession {
                 // An explicit connect marks online intent, so a later reload
                 // restores the connection like any normal session.
                 self.auto_connect = true;
+                // Connection intent persists per session slot.
+                self.workspace_dirty = true;
                 match session::config::load_connect_action(&self.server_name, &self.profile_name) {
                     Ok(action) => self.send_runtime_action(action),
                     Err(e) => log::error!("Failed to load connection config: {e:?}"),
@@ -1689,6 +1734,8 @@ impl ManagedSession {
                 // silently reconnect. The runtime emits `Disconnected` back,
                 // which flips `connected` off.
                 self.auto_connect = false;
+                // Connection intent persists per session slot.
+                self.workspace_dirty = true;
                 self.send_runtime_action(RuntimeAction::Disconnect);
                 Task::none()
             }
@@ -1782,82 +1829,6 @@ impl ManagedSession {
             }
             Message::None => Task::none(),
         }
-    }
-
-    /// Title-bar content for this session's pane: the profile/server label,
-    /// styled as a tab. Deliberately intrinsic-width — pane_grid's drag pick
-    /// area is the title bar minus the bounds of the content *and* controls,
-    /// so a fill-width header would leave nothing to drag the pane by.
-    pub fn title_content(&self, is_active: bool) -> Element<'_, Message> {
-        let title = text(format!("{} ({})", self.profile_name, self.server_name))
-            .size(13)
-            .color(Color::from_rgba8(
-                255,
-                250,
-                239,
-                if is_active { 1.0 } else { 0.45 },
-            ));
-
-        container(title)
-            .padding(Padding {
-                top: 5.0,
-                right: 12.0,
-                bottom: 5.0,
-                left: 12.0,
-            })
-            .style(move |_: &crate::Theme| container::Style {
-                background: Some(
-                    Color::from_rgba8(255, 255, 255, if is_active { 0.08 } else { 0.03 }).into(),
-                ),
-                border: Border {
-                    radius: iced::border::Radius {
-                        top_left: 6.0,
-                        top_right: 6.0,
-                        bottom_right: 0.0,
-                        bottom_left: 0.0,
-                    },
-                    ..Border::default()
-                },
-                ..Default::default()
-            })
-            .into()
-    }
-
-    /// Title-bar controls: the connection toggle and session close. pane_grid
-    /// renders controls outside the drag pick area, so these stay plain
-    /// clicks even mid-bar.
-    pub fn title_controls(&self) -> Element<'_, Message> {
-        // The connection control: Disconnect when live, otherwise Reconnect
-        // (was connected before) or Connect (opened offline, never connected).
-        let (conn_label, conn_message) = if self.connected {
-            (
-                crate::i18n::t!("session-action-disconnect"),
-                Message::Disconnect,
-            )
-        } else if self.ever_connected {
-            (
-                crate::i18n::t!("session-action-reconnect"),
-                Message::Reconnect,
-            )
-        } else {
-            (
-                crate::i18n::t!("session-action-connect"),
-                Message::Reconnect,
-            )
-        };
-
-        let connection_button = button(text(conn_label).size(12))
-            .style(smudgy_theme::builtins::button::subtle)
-            .padding([2, 10])
-            .on_press(conn_message);
-
-        let close_button =
-            title_bar_icon_button(crate::assets::hero_icons::X_MARK.clone(), Message::Close);
-
-        row![connection_button, close_button]
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .into()
     }
 
     /// The pane body under the title bar: the terminal (with the

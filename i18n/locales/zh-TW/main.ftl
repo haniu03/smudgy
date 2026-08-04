@@ -190,6 +190,11 @@ session-action-connect = 連線
 session-action-reconnect = 重新連線
 session-action-disconnect = 中斷連線
 
+# Pane tab strip controls
+pane-tab-close = 關閉連線
+pane-tab-hide = 隱藏面板
+pane-tab-show = 顯示面板
+
 # 伺服器與設定檔管理
 servers-title = 伺服器
 servers-loading = 正在載入伺服器…
@@ -236,6 +241,7 @@ profiles-load-error = 無法載入此伺服器的設定檔。
 profiles-error-load = 載入伺服器「{ $server }」的設定檔時發生錯誤：{ $error }
 profiles-new = + 新增設定檔
 profiles-empty = 新增設定檔後即可連線
+profiles-restore-last = 還原上次工作階段（{ $profiles }）
 profile-name = 設定檔名稱
 profile-name-placeholder = 甘道夫
 profile-description = 說明（選填）
@@ -281,7 +287,29 @@ window-automations = Smudgy automations — { $server }
 toolbar-connect = 連線
 toolbar-automations = 自動化
 toolbar-map-editor = 地圖編輯器
+toolbar-layouts = 版面配置
 toolbar-settings = 設定
+
+# Named layouts menu
+layouts-apply-hint = 點選版面配置即可套用。
+layouts-empty = { $server } 尚未有已儲存的版面配置。
+layouts-overwrite = 覆寫
+layouts-rename = 重新命名
+layouts-save-as = 將目前配置另存為...
+layouts-reset = 重設窗格版面
+layouts-name-placeholder = 版面配置名稱
+layouts-confirm-overwrite = 以目前的排列覆寫版面配置「{ $name }」？
+layouts-confirm-delete = 刪除版面配置「{ $name }」？
+layouts-confirm-reset = 釋放此工作階段已儲存的窗格幾何，並依目前的指令碼定義重新排列窗格？
+layouts-saved = 已儲存版面配置「{ $name }」。
+layouts-saved-partial = 已儲存版面配置「{ $name }」— 有 { $count } 個保留的預留分頁無法納入。
+layouts-save-failed = 無法儲存版面配置：{ $error }
+layouts-keep-or-close-intro = 此版面配置未包含以下工作階段。請選擇每個工作階段的處理方式：
+layouts-keep = 保留
+layouts-close = 關閉
+layouts-keep-chosen = ✓ 保留
+layouts-close-chosen = ✓ 關閉
+layouts-apply = 套用版面配置
 shell-no-sessions = 尚無連線
 shell-connect-help = 選擇伺服器與設定檔以建立連線。
 shell-connect-action = 連線至伺服器
@@ -1311,7 +1339,7 @@ permission-can-send-both = 可像手動輸入一樣傳送遊戲指令（會經�
 permission-can-send-aliases = 像手動輸入一樣傳送遊戲指令，可能觸發別名
 permission-can-send-direct = 略過別名，直接傳送指令到遊戲
 permission-can-echo = 在畫面上顯示文字
-permission-can-sessions = 與其他已開啟的工作階段互動
+permission-can-sessions = 與其他已開啟的工作階段互動，包括重新排列此伺服器的視窗版面配置
 permission-can-display = 隱藏、重新設定樣式、插入或取代遊戲文字，並查看目前文字列
 permission-can-map-read = 讀取你的地圖
 permission-can-map-write = 變更你的地圖
@@ -1319,7 +1347,7 @@ permission-can-widgets = 建立及變更畫面小工具
 permission-can-interop-write = 廣播事件並發佈其他套件可回應的共享狀態
 permission-can-interop-read = 監聽事件並讀取共享狀態
 permission-can-interop-broadcast = 在此伺服器的工作階段中與套件使用 BroadcastChannel
-permission-can-panes = 建立工作階段輸出窗格並將遊戲文字列導入其中
+permission-can-panes = 建立工作階段輸出窗格、將遊戲文字列導入其中，並儲存或套用具名視窗版面配置
 permission-can-gmcp = 傳送 GMCP 訊息到遊戲並管理 GMCP 模組
 permission-cannot-send = 傳送指令到遊戲
 permission-cannot-aliases = 建立別名

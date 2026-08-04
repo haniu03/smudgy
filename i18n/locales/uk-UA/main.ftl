@@ -241,6 +241,7 @@ profiles-load-error = Не вдалося завантажити профілі 
 profiles-error-load = Помилка завантаження профілів для «{ $server }»: { $error }
 profiles-new = + Новий профіль
 profiles-empty = Додайте профіль, щоб підключитися
+profiles-restore-last = Відновити останню сесію ({ $profiles })
 profile-name = Назва профілю
 profile-name-placeholder = Gandalf
 profile-description = Опис (необов'язково)

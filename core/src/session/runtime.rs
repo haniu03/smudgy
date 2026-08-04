@@ -61,6 +61,7 @@ pub(crate) use remote_interop::SharedRemoteStateRegistry;
 use pane::{PaneKey, PaneRegistry, MAIN_PANE_KEY};
 
 pub use script_action::ScriptAction;
+pub use script_engine::layout_fold;
 use script_engine::{ScriptEngine, ScriptEngineParams};
 #[cfg(not(feature = "bench-api"))]
 use store::SessionStore;

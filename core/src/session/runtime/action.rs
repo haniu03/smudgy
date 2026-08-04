@@ -489,6 +489,20 @@ pub enum RuntimeAction {
     /// subscription): tell the UI to start feeding the pane-size mirror
     /// (`SessionEvent::PaneMirrorInterest`). Sent once per session.
     PaneMirrorInterest,
+    /// A script asked for the calling session's window footprint to be
+    /// saved as the named layout. The UI daemon owns the capture and the
+    /// per-server store; the name was validated op-side, so the daemon can
+    /// treat it as a store key.
+    LayoutSave {
+        name: String,
+    },
+    /// A script asked for a named layout to be applied. Layout-only by
+    /// contract: the UI rebinds what exists, scoped to the calling
+    /// session's server, and never spawns, closes, prompts, or touches OS
+    /// windows.
+    LayoutApply {
+        name: String,
+    },
     /// One coalesced pane-size update from the UI (sent only while the
     /// session has flagged interest; change-gated per pane on settled
     /// layouts, never per drag frame). The dispatch arm writes it into the

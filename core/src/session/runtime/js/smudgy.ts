@@ -76,6 +76,9 @@ const {
     op_smudgy_pane_clear,
     op_smudgy_pane_list,
     op_smudgy_pane_resolve,
+    op_smudgy_layout_save,
+    op_smudgy_layout_apply,
+    op_smudgy_layout_list,
     op_smudgy_input_get,
     op_smudgy_input_apply,
     op_smudgy_input_submission_generation,
@@ -4190,6 +4193,22 @@ function __smudgy_make_api(creator: { kind: string }) {
             },
             mergeKeys(...names: string[]): void {
                 op_smudgy_gmcp_merge_keys(names.map((n) => String(n)));
+            },
+        }),
+        // Named workspace layouts. This shim only coerces names to strings:
+        // scope, validation, gating, and routing (save/apply queue to the
+        // UI daemon, list reads the store directly) live op-side -- see the
+        // named-layouts banner in script_engine/ops.rs. The author-facing
+        // contract is `layout` in smudgy-core.d.ts.
+        layout: Object.freeze({
+            save(name: string): void {
+                op_smudgy_layout_save(String(name));
+            },
+            apply(name: string): void {
+                op_smudgy_layout_apply(String(name));
+            },
+            list(): string[] {
+                return op_smudgy_layout_list() as string[];
             },
         }),
     };

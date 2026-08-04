@@ -68,6 +68,33 @@ pub struct Styles {
     pub general: General,
     pub text: Text,
     pub modal: Modal,
+    pub tabs: Tabs,
+}
+
+/// The pane tab strip and its drag/drop feedback. Tab emphasis is a ladder —
+/// the strip scales `label`'s alpha per state (rendered/active at full
+/// strength down through hidden), so themes supply the base colors and the
+/// ladder stays uniform across themes.
+#[derive(Debug, Clone)]
+pub struct Tabs {
+    /// Tab label text at full emphasis.
+    pub label: Color,
+    /// Tab surface behind the active session's rendered tab.
+    pub surface_active: Color,
+    /// Tab surface behind a rendered tab of an inactive session.
+    pub surface_rendered: Color,
+    /// Tab surface behind a tab that is not currently rendered.
+    pub surface_inactive: Color,
+    /// Composited over a tab's label surface while the pointer hovers it.
+    pub hover_wash: Color,
+    /// The faint outline marking a durably selected tab whose body a
+    /// fallback currently renders (the selected tab is hidden).
+    pub selection_marker: Color,
+    /// Fill of the drop-target surface a pane drag would land on.
+    pub drop_highlight: Color,
+    /// The insertion caret between tabs and the active drop surface's
+    /// outline.
+    pub drop_marker: Color,
 }
 
 #[derive(Debug, Clone)]

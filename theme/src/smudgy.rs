@@ -1,6 +1,6 @@
 use iced::{Background, Border, Color, Gradient, Shadow, Vector, border::Radius, gradient::Linear};
 
-use super::{Button, Buttons, General, Modal, Styles, Text, Theme};
+use super::{Button, Buttons, General, Modal, Styles, Tabs, Text, Theme};
 
 #[must_use]
 pub fn smudgy() -> Theme {
@@ -24,6 +24,18 @@ pub fn smudgy() -> Theme {
                 normal: Color::from_rgb8(255, 250, 239),
                 success: Color::from_rgb8(0, 255, 0),
                 error: Color::from_rgb8(255, 0, 0),
+            },
+            tabs: Tabs {
+                // The warm off-white the rest of the chrome uses; the strip
+                // scales its alpha per tab state.
+                label: Color::from_rgb8(255, 250, 239),
+                surface_active: Color::from_rgba8(255, 255, 255, 0.08),
+                surface_rendered: Color::from_rgba8(255, 255, 255, 0.06),
+                surface_inactive: Color::from_rgba8(255, 255, 255, 0.03),
+                hover_wash: Color::from_rgba8(255, 255, 255, 0.05),
+                selection_marker: Color::from_rgba8(255, 255, 255, 0.15),
+                drop_highlight: Color::from_rgba8(120, 170, 255, 0.18),
+                drop_marker: Color::from_rgba8(255, 255, 255, 0.9),
             },
             modal: Modal {
                 title_bar_background: Background::Gradient(Gradient::Linear(

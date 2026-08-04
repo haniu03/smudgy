@@ -5,4 +5,5 @@ pub mod resize_grips;
 pub mod session_input;
 pub mod social_panel;
 pub mod stroke_sample;
+pub mod tab_strip;
 pub mod toolbar;

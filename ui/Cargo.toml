@@ -31,6 +31,12 @@ iced_runtime = { workspace = true }
 iced_graphics = "0.14"
 log = { workspace = true }
 smudgy_widgets = { workspace = true }
+# Inline-capacity tab lists in the pane-group layout model (same version the
+# rest of the tree already resolves to).
+smallvec = "1"
+# Stable-id side maps in the pane-group layout model (integer keys; same
+# version smudgy_core already pins).
+rustc-hash = "2"
 
 validator.workspace = true
 # Live pattern testing in the Automations window (alias/trigger testers).
@@ -99,6 +105,9 @@ iced-debug = ["iced/debug"]
 
 [dev-dependencies]
 async-trait = "0.1"
+# Isolated on-disk fixtures for the workspace load/set-aside tests (same
+# version core already pins).
+tempfile = "3"
 
 [build-dependencies]
 winresource = "0.1.17"

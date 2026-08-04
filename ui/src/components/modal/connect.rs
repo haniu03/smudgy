@@ -64,6 +64,10 @@ pub enum Event {
     /// Open the session without connecting: the runtime, mapper, and automations
     /// come up so the map editor / automations can be used offline.
     OpenOffline(ServerName, ProfileName),
+    /// Restore the server's last-session snapshot: spawn its stored slots
+    /// per their connection intent and apply the stored arrangement (the
+    /// full user-restore flow, owned by the daemon).
+    RestoreLastSession(ServerName),
 }
 
 // Messages handled internally by this modal's update logic
@@ -81,6 +85,7 @@ pub enum Message {
     CloseRequested, // E.g., from Esc key or background click mapped by parent
     ConnectProfile(ServerName, ProfileName),
     OpenOfflineProfile(ServerName, ProfileName),
+    RestoreLastSession(ServerName),
     // Server CRUD UI Actions
     RequestCreateServer,
     RequestEditServer(ServerName),
@@ -197,6 +202,11 @@ pub enum ProfileCrudAction {
 pub struct State {
     servers: Vec<Server>,
     profiles: HashMap<ServerName, Vec<Profile>>,
+    /// Per probed server: the profile names of its last-session snapshot in
+    /// slot order, or `None` when no usable snapshot exists. Absent until a
+    /// server is selected (each selection probes once per modal opening);
+    /// the detail pane offers "Restore last session" only for a `Some`.
+    last_sessions: HashMap<ServerName, Option<Vec<String>>>,
     selected_server: Option<ServerName>,
     is_loading_servers: bool,
     is_loading_profiles: Option<ServerName>,
@@ -270,6 +280,9 @@ impl State {
                 });
             profiles.sort_by(|a, b| a.name.cmp(&b.name));
             state.selected_server = Some(name.clone());
+            state
+                .last_sessions
+                .insert(name.clone(), load_last_session_profiles(&name));
             state.profiles.insert(name, profiles);
         }
         state.servers = servers;
@@ -277,11 +290,22 @@ impl State {
     }
 }
 
+/// Probe a server's last-session snapshot for the restore affordance: the
+/// stored profile names in slot order, or `None` when no usable snapshot
+/// exists. A small local read, done synchronously like the rest of the
+/// modal's disk reads.
+fn load_last_session_profiles(server: &ServerName) -> Option<Vec<String>> {
+    let template = crate::workspace::last_session::read(server)?;
+    let profiles = crate::workspace::last_session::profile_names(&template);
+    (!profiles.is_empty()).then_some(profiles)
+}
+
 impl Default for State {
     fn default() -> Self {
         State {
             servers: Vec::new(),
             profiles: HashMap::new(),
+            last_sessions: HashMap::new(),
             selected_server: None,
             is_loading_servers: false, // Load triggered by update
             is_loading_profiles: None,
@@ -399,6 +423,10 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
             if state.selected_server.as_ref() != Some(&server_name) {
                 let server_name_clone = server_name.clone();
                 state.selected_server = Some(server_name_clone.clone());
+                state
+                    .last_sessions
+                    .entry(server_name_clone.clone())
+                    .or_insert_with(|| load_last_session_profiles(&server_name_clone));
                 if !state.profiles.contains_key(&server_name_clone) {
                     state.is_loading_profiles = Some(server_name_clone.clone());
                     task = Task::perform(
@@ -428,6 +456,14 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
             state.server_form_data = ServerConfigFormData::default();
             state.server_crud_error = None;
             event = Some(Event::OpenOffline(server_name, profile_name));
+        }
+        Message::RestoreLastSession(server_name) => {
+            // Same housekeeping as `ConnectProfile`; the parent drives the
+            // full user-restore flow from the server's stored snapshot.
+            state.server_action = None;
+            state.server_form_data = ServerConfigFormData::default();
+            state.server_crud_error = None;
+            event = Some(Event::RestoreLastSession(server_name));
         }
         Message::RequestCreateServer => {
             state.server_action = Some(ServerCrudAction::Create);
@@ -637,6 +673,8 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     state.servers.retain(|s| s.name != deleted_name);
                     // Remove from profiles map
                     state.profiles.remove(&deleted_name);
+                    // Its probed last-session offer retires with it.
+                    state.last_sessions.remove(&deleted_name);
 
                     // If the deleted server was selected, select the first one or none
                     if state.selected_server.as_ref() == Some(&deleted_name) {

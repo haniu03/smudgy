@@ -758,6 +758,59 @@ declare module "smudgy:core" {
     mergeKeys(...names: string[]): void;
   };
 
+  /**
+   * Named workspace layouts for the current session's server. A layout is a
+   * saved snapshot of the windows that hold at least one of this server's
+   * panes -- their splits, tab groups, sizes, and pane positions -- stored
+   * under the server and addressed by name. Names are case-insensitive:
+   * `"Combat"` and `"combat"` are the same layout.
+   *
+   * `apply` rearranges only what already exists: live panes of this
+   * session's server move into the saved arrangement, panes the layout
+   * doesn't mention keep riding with their groups, and slots for panes or
+   * sessions that aren't open are held open for them to fill later. It
+   * never opens or closes sessions, never prompts, and never creates,
+   * closes, moves, or resizes app windows -- those are user actions,
+   * available through the Layouts toolbar menu.
+   *
+   * Layouts exist so users' saved arrangements win. `split()` sizes and
+   * placements are creation *defaults*, while an explicit `pane.resize()`
+   * is imperative intent that overrides the user's saved geometry -- exactly
+   * as a user divider drag would. So resizing panes at load time is an
+   * anti-pattern: it permanently defeats the sizes users saved. Use split
+   * defaults at creation and reserve `resize` for genuine runtime
+   * reactions; switch whole arrangements with `layout.apply`.
+   *
+   * Every `layout` method requires both the `panes` and `session:
+   * ["reach-others"]` capabilities: rearranging the workspace reaches
+   * every window showing this server, not just the panes this script made.
+   */
+  export const layout: {
+    /**
+     * Saves the current arrangement of this server's windows as `name`,
+     * replacing any layout the name (case-insensitively) already refers
+     * to. Only open panes are captured; a slot whose session is closed is
+     * not part of the snapshot.
+     *
+     * The snapshot is taken immediately, but the disk write is deferred
+     * and best-effort: rapid saves of the same name coalesce into one
+     * write (the latest snapshot wins), and a crash can lose a save made
+     * moments before. Cheap to call at gameplay rates.
+     */
+    save(name: string): void;
+    /**
+     * Applies the saved layout `name` to this server's live windows.
+     * Throws when no such layout exists. The apply itself is asynchronous
+     * and best-effort: a layout that no longer exists by the time it
+     * runs, or one that does not reference this server, does nothing.
+     * Safe to call at gameplay rates -- switching layouts writes nothing
+     * to disk.
+     */
+    apply(name: string): void;
+    /** The saved layout names for this server, sorted. */
+    list(): string[];
+  };
+
   // ---- Sessions -----------------------------------------------------------
 
   /** The name and subtext (caption) associated with a session. */
@@ -2051,6 +2104,7 @@ declare module "smudgy:core" {
     createDerived: typeof createDerived;
     readonly events: typeof events;
     readonly gmcp: typeof gmcp;
+    readonly layout: typeof layout;
     createAlias: typeof createAlias;
     createTrigger: typeof createTrigger;
     createTriggers: typeof createTriggers;

@@ -96,6 +96,20 @@ pub struct CloudHandles {
     pub base_url: Arc<String>,
 }
 
+/// Handles pointing at nothing: window unit tests exercise layout and
+/// lifecycle logic that never touches the cloud, but constructing a window
+/// requires the handle bundle.
+#[cfg(test)]
+pub(crate) fn test_handles() -> CloudHandles {
+    let credentials = CredentialSource::new(None);
+    CloudHandles {
+        snapshot: AccountHandle(Arc::new(ArcSwap::from_pointee(AccountSnapshot::default()))),
+        credentials: credentials.clone(),
+        client: CloudApiClient::new("http://localhost", credentials),
+        base_url: Arc::new("http://localhost".to_string()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     /// `/me` result for the credential generation it was issued under.

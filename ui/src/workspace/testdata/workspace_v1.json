@@ -1,0 +1,161 @@
+{
+  "version": 1,
+  "sessions": [
+    {
+      "id": 1,
+      "server": "ArcticMUD",
+      "profile": "Kestrel",
+      "connect": true
+    },
+    {
+      "id": 2,
+      "server": "ArcticMUD",
+      "profile": "Kestrel",
+      "connect": false
+    }
+  ],
+  "windows": [
+    {
+      "id": 1,
+      "geometry": {
+        "x": 100.0,
+        "y": 80.0,
+        "width": 1600.0,
+        "height": 900.0,
+        "scale": 1.25
+      },
+      "active_slot": 1,
+      "clusters": [
+        {
+          "weight": 1.0,
+          "root": {
+            "split": {
+              "axis": "vertical",
+              "sizing": {
+                "px": {
+                  "px": 300.0,
+                  "sized_first": false
+                }
+              },
+              "a": {
+                "group": {
+                  "tabs": [
+                    {
+                      "slot": 1,
+                      "id": "main"
+                    }
+                  ],
+                  "selected": 0
+                }
+              },
+              "b": {
+                "group": {
+                  "tabs": [
+                    {
+                      "slot": 1,
+                      "id": {
+                        "script": {
+                          "namespace": "user",
+                          "name": "chat",
+                          "display": "Chat"
+                        }
+                      }
+                    },
+                    {
+                      "slot": 1,
+                      "id": {
+                        "script": {
+                          "namespace": {
+                            "package": {
+                              "owner": "gtanger",
+                              "name": "mapper"
+                            }
+                          },
+                          "name": "minimap"
+                        }
+                      },
+                      "hidden": true
+                    }
+                  ],
+                  "selected": 1
+                }
+              }
+            }
+          }
+        },
+        {
+          "weight": 1.0,
+          "root": {
+            "group": {
+              "tabs": [
+                {
+                  "slot": 2,
+                  "id": "main"
+                }
+              ],
+              "selected": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "geometry": {
+        "x": 1750.0,
+        "y": 120.0,
+        "width": 700.0,
+        "height": 500.0,
+        "scale": 1.0
+      },
+      "maximized": true,
+      "active_slot": 2,
+      "clusters": [
+        {
+          "weight": 1.0,
+          "root": {
+            "split": {
+              "axis": "horizontal",
+              "sizing": {
+                "ratio": 0.65
+              },
+              "a": {
+                "group": {
+                  "tabs": [
+                    {
+                      "slot": 2,
+                      "id": {
+                        "script": {
+                          "namespace": "user",
+                          "name": "notes",
+                          "display": "Notes"
+                        }
+                      }
+                    }
+                  ],
+                  "selected": 0
+                }
+              },
+              "b": {
+                "group": {
+                  "tabs": [
+                    {
+                      "slot": 1,
+                      "id": {
+                        "script": {
+                          "namespace": "user",
+                          "name": "spells"
+                        }
+                      }
+                    }
+                  ],
+                  "selected": 0
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

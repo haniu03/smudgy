@@ -431,9 +431,29 @@ pub(super) fn view_server_details_and_profiles<'a>(
         .size(12)
         .style(builtins::text::muted);
 
-    let mut content_col = Column::new()
-        .push(title_row)
-        .push(address)
+    // "Restore last session (Kapusnik, Kapusta)" — offered only while the
+    // server's last-session snapshot exists and parses; the label carries
+    // its stored profile names in slot order. The button labels itself, so
+    // no separate accessible name is needed.
+    let restore_last: Option<Element<Message>> = state
+        .last_sessions
+        .get(server_name)
+        .and_then(|probed| probed.as_deref())
+        .and_then(crate::workspace::last_session::summary)
+        .map(|profiles| {
+            button(text(t!("profiles-restore-last", "profiles" => profiles)))
+                .width(Length::Fill)
+                .padding([6, 10])
+                .style(builtins::button::secondary)
+                .on_press(Message::RestoreLastSession(server_name.clone()))
+                .into()
+        });
+
+    let mut content_col = Column::new().push(title_row).push(address);
+    if let Some(restore_last) = restore_last {
+        content_col = content_col.push(restore_last);
+    }
+    content_col = content_col
         .push(vertical_space().height(Pixels(4.0)))
         .push(text(t!("profiles-title")).size(Pixels(18.0)))
         .push(helper)
