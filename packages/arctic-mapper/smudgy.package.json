@@ -1,8 +1,11 @@
 {
-  "version": "0.0.16",
+  "version": "0.1.1",
   "description": "An auto-mapper for ArcticMUD",
   "entry": "index.ts",
   "min_smudgy_version": "0.5.1",
+  "dependencies": [
+    "smudgy://kapusniak/map-layout"
+  ],
   "requires": [
     "smudgy://kapusniak/arctic-prompt"
   ],
@@ -72,12 +75,16 @@
     },
     {
       "key": "zMode",
-      "label": "Vertical (up/down) movement capturing",
+      "label": "Vertical (up/down) room placement",
       "secret": false,
       "required": false,
       "type": "dropdown",
-      "default": "normal",
+      "default": "auto",
       "options": [
+        {
+          "value": "auto",
+          "label": "Auto — infer levels or projected elevation from the nearby map section"
+        },
         {
           "value": "normal",
           "label": "Normal — up/down move between separate map levels"
