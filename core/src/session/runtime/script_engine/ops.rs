@@ -18,7 +18,10 @@ use crate::session::styled_line::{
     LinkTooltipCallback, LinkTooltipState, LinkTooltipText, Style, StyledLine, StyledLink,
     TextAttributes, Underline, sanitize_display_text,
 };
-use crate::session::{SessionId, registry};
+use crate::session::{
+    SessionId, registry,
+    ui_command::{PaneCommand, UiCommand, UiCommandProducer},
+};
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -171,6 +174,7 @@ deno_core::extension!(
     server_name: Arc<String>,
     script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>>,
     spawned_actions: ActionQueue,
+    ui_command_producer: Option<crate::session::ui_command::UiCommandProducer>,
     pending_line_operations: Rc<RefCell<Vec<LineOperation>>>,
     current_line: Rc<RefCell<Weak<StyledLine>>>,
     emitted_line_count: std::rc::Weak<Cell<usize>>,
@@ -282,6 +286,9 @@ deno_core::extension!(
     state.put::<ServerName>(ServerName(options.server_name));
     state.put::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>(options.script_functions);
     state.put::<ActionQueue>(options.spawned_actions);
+    state.put::<Option<crate::session::ui_command::UiCommandProducer>>(
+      options.ui_command_producer
+    );
     state.put::<Rc<RefCell<Vec<LineOperation>>>>(options.pending_line_operations);
     state.put::<Rc<RefCell<Weak<StyledLine>>>>(options.current_line);
     state.put::<std::rc::Weak<Cell<usize>>>(options.emitted_line_count);
@@ -2686,6 +2693,31 @@ fn route_session_action(state: &mut OpState, session_id: SessionId, action: Runt
         }
     } else {
         log::warn!("Dropping action for unknown session {session_id}");
+    }
+}
+
+/// Publish a pane mutation directly from the runtime where its script op ran.
+/// Returns `false` for headless embedders, whose legacy `SessionEvent` path is
+/// retained by [`route_pane_command`].
+fn publish_pane_command(state: &OpState, command: PaneCommand) -> bool {
+    let producer = state.borrow::<Option<UiCommandProducer>>().clone();
+    if let Some(producer) = producer {
+        producer.send(UiCommand::Pane(command))
+    } else {
+        false
+    }
+}
+
+/// The production UI uses the process-wide command bus. Headless callers keep
+/// the old per-session routing so existing embedders do not need a daemon.
+fn route_pane_command(
+    state: &mut OpState,
+    command: PaneCommand,
+    fallback_session: SessionId,
+    fallback: RuntimeAction,
+) {
+    if !publish_pane_command(state, command) {
+        route_session_action(state, fallback_session, fallback);
     }
 }
 
@@ -5812,10 +5844,11 @@ fn op_smudgy_pane_split<'s>(
 
     {
         let registry = target_pane_registry(state, target)?;
-        let outcome = registry
-            .lock()
-            .unwrap()
-            .split(&namespace, &spec.name, kind, def_state, input)?;
+        // Keep the registry locked through command publication. A foreign
+        // runtime can only resolve the new key after its Open is already in
+        // the UI bus, which linearizes create -> reference across runtimes.
+        let mut registry = registry.lock().unwrap();
+        let outcome = registry.split(&namespace, &spec.name, kind, def_state, input)?;
         if register_input {
             let callback = v8::Local::<v8::Function>::try_from(on_submit)
                 .map_err(|_| PaneOpError("input.onSubmit must be a function".to_string()))?;
@@ -5823,20 +5856,30 @@ fn op_smudgy_pane_split<'s>(
         }
         if outcome.created {
             let reference = registry
-                .lock()
-                .unwrap()
                 .resolve(&namespace, ref_name)
                 .map_or(pane::MAIN_PANE_KEY, |def| def.key);
+            let placement = pane::PanePlacement::Split {
+                reference,
+                direction,
+                size_px,
+            };
+            publish_pane_command(
+                state,
+                PaneCommand::Open {
+                    session_id: target,
+                    def: outcome.def.clone(),
+                    placement,
+                },
+            );
+            // The owning session stream still materializes display state ahead
+            // of its first AppendTo. Placement is idempotent UI-side when the
+            // bus wins the race to the daemon.
             route_session_action(
                 state,
                 target,
                 RuntimeAction::PaneOpened {
                     def: outcome.def.clone(),
-                    placement: pane::PanePlacement::Split {
-                        reference,
-                        direction,
-                        size_px,
-                    },
+                    placement,
                     reconcile_registry,
                 },
             );
@@ -5883,10 +5926,10 @@ fn op_smudgy_pane_add_tab<'s>(
         placeholder: input.placeholder.map(Arc::from),
     });
     let registry = target_pane_registry(state, target)?;
-    let outcome = registry
-        .lock()
-        .unwrap()
-        .split(&namespace, &spec.name, kind, def_state, input)?;
+    // See `pane_split`: publication while locked is the create/reference
+    // linearization point shared by every script runtime.
+    let mut registry = registry.lock().unwrap();
+    let outcome = registry.split(&namespace, &spec.name, kind, def_state, input)?;
     if register_input {
         let callback = v8::Local::<v8::Function>::try_from(on_submit)
             .map_err(|_| PaneOpError("input.onSubmit must be a function".to_string()))?;
@@ -5894,20 +5937,27 @@ fn op_smudgy_pane_add_tab<'s>(
     }
     if outcome.created {
         let reference = registry
-            .lock()
-            .unwrap()
             .resolve(&namespace, ref_name)
             .map_or(pane::MAIN_PANE_KEY, |def| def.key);
+        let placement = pane::PanePlacement::Tab {
+            reference,
+            position: pane::TabPosition::After,
+            selected,
+        };
+        publish_pane_command(
+            state,
+            PaneCommand::Open {
+                session_id: target,
+                def: outcome.def.clone(),
+                placement,
+            },
+        );
         route_session_action(
             state,
             target,
             RuntimeAction::PaneOpened {
                 def: outcome.def.clone(),
-                placement: pane::PanePlacement::Tab {
-                    reference,
-                    position: pane::TabPosition::After,
-                    selected,
-                },
+                placement,
                 reconcile_registry,
             },
         );
@@ -5966,7 +6016,22 @@ fn op_smudgy_pane_close(
     let namespace = pane_namespace(state);
 
     if target == *state.borrow::<SessionId>() {
-        let closed = pane_registry(state).lock().unwrap().close(&namespace, name);
+        let registry = pane_registry(state);
+        let (closed, ui_command_published) = {
+            let mut registry = registry.lock().unwrap();
+            let closed = registry.close(&namespace, name);
+            let published = match &closed {
+                Ok(key) => publish_pane_command(
+                    state,
+                    PaneCommand::Close {
+                        session_id: target,
+                        key: *key,
+                    },
+                ),
+                Err(_) => false,
+            };
+            (closed, published)
+        };
         match closed {
             Ok(key) => {
                 // The closed pane's input state — mirror, word sets, onSubmit
@@ -5978,19 +6043,39 @@ fn op_smudgy_pane_close(
                     state.borrow::<crate::session::runtime::SharedPaneInputCallbacks>(),
                     key,
                 );
-                queue_own_action(state, RuntimeAction::PaneClosed { key });
+                queue_own_action(
+                    state,
+                    RuntimeAction::PaneClosed {
+                        key,
+                        ui_command_published,
+                    },
+                );
                 Ok(())
             }
             Err(pane::PaneError::NoSuchPane(_)) => Ok(()),
             Err(err) => Err(err.into()),
         }
     } else {
+        let registry = target_pane_registry(state, target)?;
+        let ui_command_published = {
+            let registry = registry.lock().unwrap();
+            registry.resolve(&namespace, name).is_some_and(|def| {
+                publish_pane_command(
+                    state,
+                    PaneCommand::Close {
+                        session_id: target,
+                        key: def.key,
+                    },
+                )
+            })
+        };
         route_session_action(
             state,
             target,
             RuntimeAction::PaneCloseRemote {
                 namespace,
                 name: Arc::from(name),
+                ui_command_published,
             },
         );
         Ok(())
@@ -6225,8 +6310,14 @@ fn op_smudgy_pane_resize(
     if width.is_none() && height.is_none() {
         return Ok(());
     }
-    route_session_action(
+    route_pane_command(
         state,
+        PaneCommand::Resize {
+            session_id: target,
+            key,
+            width,
+            height,
+        },
         target,
         RuntimeAction::PaneResize { key, width, height },
     );
@@ -6264,14 +6355,22 @@ fn op_smudgy_pane_relocate(
     if reference == key {
         return Err(PaneOpError("cannot relocate a pane relative to itself".to_string()).into());
     }
-    route_session_action(
+    let size_px = placement_px(size_px);
+    route_pane_command(
         state,
+        PaneCommand::Relocate {
+            session_id: target,
+            key,
+            reference,
+            direction,
+            size_px,
+        },
         target,
         RuntimeAction::PaneRelocate {
             key,
             reference,
             direction,
-            size_px: placement_px(size_px),
+            size_px,
         },
     );
     Ok(())
@@ -6302,8 +6401,16 @@ fn op_smudgy_pane_group_with(
     if target == reference_session && key == reference {
         return Ok(());
     }
-    route_session_action(
+    route_pane_command(
         state,
+        PaneCommand::GroupWith {
+            session_id: target,
+            key,
+            reference_session,
+            reference,
+            position,
+            selected,
+        },
         target,
         RuntimeAction::PaneGroupWith {
             key,
@@ -6328,7 +6435,15 @@ fn op_smudgy_pane_select(
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
     let key = resolve_live_pane(state, target, name)?;
-    route_session_action(state, target, RuntimeAction::PaneSelect { key });
+    route_pane_command(
+        state,
+        PaneCommand::Select {
+            session_id: target,
+            key,
+        },
+        target,
+        RuntimeAction::PaneSelect { key },
+    );
     Ok(())
 }
 
@@ -6348,14 +6463,17 @@ fn op_smudgy_pane_tear_out(
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
     let key = resolve_placement_pane(state, target, name, pane::PaneError::TearOutMain)?;
-    route_session_action(
+    let (width, height) = (placement_px(width), placement_px(height));
+    route_pane_command(
         state,
-        target,
-        RuntimeAction::PaneTearOut {
+        PaneCommand::TearOut {
+            session_id: target,
             key,
-            width: placement_px(width),
-            height: placement_px(height),
+            width,
+            height,
         },
+        target,
+        RuntimeAction::PaneTearOut { key, width, height },
     );
     Ok(())
 }
@@ -6393,8 +6511,14 @@ fn op_smudgy_pane_swap(
     if target == other_target && key == other_key {
         return Ok(());
     }
-    route_session_action(
+    route_pane_command(
         state,
+        PaneCommand::Swap {
+            session_id: target,
+            key,
+            other_session: other_target,
+            other_key,
+        },
         target,
         RuntimeAction::PaneSwap {
             key,
