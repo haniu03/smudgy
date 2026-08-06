@@ -130,6 +130,7 @@ export const IsometricZMoveCoordinates = {
 };
 
 export enum ZMode {
+    Auto,
     Normal,
     Isometric,
 }
@@ -171,13 +172,16 @@ function configuredMode(): State {
     return MODE_BY_PARAM[paramString("mode") ?? ""] ?? State.Active;
 }
 
-/** The `zMode` param (normal/isometric) -> how up/down movement is projected. */
+/** The `zMode` param is a creation preference; existing links encode their own style. */
 const ZMODE_BY_PARAM: Record<string, ZMode> = {
+    auto: ZMode.Auto,
     normal: ZMode.Normal,
+    levels: ZMode.Normal,
     isometric: ZMode.Isometric,
+    projected: ZMode.Isometric,
 };
 function configuredZMode(): ZMode {
-    return ZMODE_BY_PARAM[paramString("zMode") ?? ""] ?? ZMode.Normal;
+    return ZMODE_BY_PARAM[paramString("zMode") ?? ""] ?? ZMode.Auto;
 }
 
 /**
@@ -425,7 +429,7 @@ export class MapState {
 export class MapOptions {
     debug: boolean = false;
     debugRaw: boolean = false;
-    /** How up/down movement is projected onto the map (the `zMode` param). */
+    /** Creation preference for new U/D links; Auto infers the nearby section. */
     zMode: ZMode = configuredZMode();
     /** Base text size (px) for the map panel's text/button/markdown widgets (the `textSize` param). */
     textSize: number = configuredTextSize();
@@ -433,6 +437,8 @@ export class MapOptions {
     widgetSize: number = configuredWidgetSize();
 
     get moveCoordinates() {
+        // Coordinate-only legacy operations have no topology to infer from.
+        // Auto therefore uses levels; room creation goes through map-layout.
         return this.zMode === ZMode.Isometric ? IsometricZMoveCoordinates : MoveCoordinates;
     }
 }

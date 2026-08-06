@@ -34,7 +34,7 @@ applied on reload):
 | **Mapper mode on load** | Active / Follow / Off | Which mode the mapper starts in. Active and Follow match `map active` / `map follow`; you can still switch live with the `map` commands above. (`map record` stays a live-only mode.) |
 | **Map panel text size** | Extra small / Small / Medium / Large / Extra large | Base text size for the map panel's headings, room/area notes (Markdown), button labels, and the notes editor. Flags render a quarter smaller. Medium (16 px) is the prior built-in default. |
 | **Map panel widget size (px)** | Any number | The initial size of the map/notes panes: the panes' width and the Map pane's height, in pixels (the map starts out square, then simply fills its pane as you move the dividers). Defaults to 350 (the prior built-in size); a non-positive value falls back to the default. |
-| **Vertical movement display** | Normal / Isometric | How `up`/`down` are drawn. **Normal** keeps them on a true vertical axis (separate map levels). **Isometric** projects them diagonally onto one plane (up = north-east, down = south-west). |
+| **Vertical movement display** | Auto / Normal / Isometric | Creation preference for new `up`/`down` links. **Auto** infers the nearest mapped section. **Normal** uses separate map levels. **Isometric** keeps the rooms on one level and lets the layout pass choose NE/NW or SE/SW from the surrounding geometry. Existing links retain the style encoded by their endpoint levels. |
 
 ## Command reference
 
@@ -47,6 +47,8 @@ map rooms                        List rooms in the selected area
 map move <direction>             Move the selection along an existing exit
 map path <from> <to>             Path between two rooms (tags: <number> or <area>#<number>)
 map push <direction>             Shift the selected room and everything connected, one step
+map reflow                       Recompute the complete current-area layout
+map z [auto|levels|projected]    Show or change the live U/D creation preference
 map refresh                      Re-look and re-capture the current room
 map debug [on|off]               Toggle diagnostic logging of capture/tracking decisions
 
@@ -66,6 +68,17 @@ map exit <dir> command <cmd>     Command sent instead of the direction (e.g. "en
 map exit <dir> clear open|command    Remove the open/movement command
 map exit <dir> closed|hidden|locked [true|false]   Set exit flags
 ```
+
+When recording creates a room, the mapper snapshots the area and runs the
+same integral-grid reflow used by `map reflow`. Correct directional lines are
+protected before crossings, link length, or compactness are considered. The
+snapshot exists only for that operation; ordinary movement does not maintain
+or recompute a shadow map.
+
+Before creating a look-alike room, recording checks the current area for an
+exact title/description match with an unconnected exit back toward the room
+you left. If it finds one, the map panel asks whether to rearrange and connect
+to that room or keep the rooms separate and create a new one.
 
 ## Speedwalks
 

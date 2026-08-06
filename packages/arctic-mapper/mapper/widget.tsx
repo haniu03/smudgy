@@ -29,6 +29,7 @@ const MAP_PANE = NOTES_PANE.split("top", {
 // ONCE and never re-rendered, while the info block re-renders freely as you move.
 const MAP_WIDGET_ID = "00_map";
 const INFO_WIDGET_ID = "01_map_info";
+const CONNECTION_DECISION_ID = "03_connection_decision";
 
 const HEADING_COLOR = "white";
 const ROOM_TITLE_COLOR = "#9e9e9e";
@@ -51,6 +52,56 @@ const NOTES_EDITOR_HEIGHT = 480;
 // A fresh editing buffer per open (TextEditor seeds `value` only when its id is new),
 // so reopening always shows the latest saved notes rather than a stale draft.
 let notesEditorSeq = 0;
+
+export interface ExistingRoomConnectionOption {
+    roomNumber: RoomNumber;
+    x: number;
+    y: number;
+    level: number;
+}
+
+export type ExistingRoomConnectionDecision =
+    | { type: "connect"; roomNumber: RoomNumber }
+    | { type: "create" };
+
+/** Ask a mapping question over the map pane and pause the caller until it is answered. */
+export function requestExistingRoomConnection(
+    title: string,
+    options: readonly ExistingRoomConnectionOption[],
+): Promise<ExistingRoomConnectionDecision> {
+    if (options.length === 0) return Promise.resolve({ type: "create" });
+
+    return new Promise((resolve) => {
+        const finish = (decision: ExistingRoomConnectionDecision) => {
+            removeWidget(CONNECTION_DECISION_ID);
+            resolve(decision);
+        };
+
+        createWidget(CONNECTION_DECISION_ID,
+            <Modal>
+                <Container background="#1e1e1e" width="fill">
+                    <Column width="fill" spacing={8} padding={16}>
+                        <Text color={HEADING_COLOR} size={TEXT_SIZE}>Possible map connection</Text>
+                        <Markdown size={TEXT_SIZE}>
+                            {`Another mapped room named \`${title}\` looks identical and could connect here by shifting some rooms on the map.`}
+                        </Markdown>
+                        <Text size={TEXT_SIZE}>
+                            These may be the same room reached by different routes, or two separate rooms that look alike.
+                        </Text>
+                        <Column width="fill" spacing={8}>
+                            {options.map((option) =>
+                                <Button variant="primary" onPress={() => finish({ type: "connect", roomNumber: option.roomNumber })}>
+                                    {`Shift map and connect to #${option.roomNumber} at ${option.x}, ${option.y}, ${option.level}`}
+                                </Button>
+                            )}
+                        </Column>
+                        <Button onPress={() => finish({ type: "create" })}>Create a separate room</Button>
+                    </Column>
+                </Container>
+            </Modal>,
+            { pane: MAP_PANE });
+    });
+}
 
 // A heading line, right-aligned as the panel's visual accent. When `onEdit` is given
 // the whole name becomes the click target (opening the notes editor); otherwise it's
