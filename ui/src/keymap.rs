@@ -141,22 +141,30 @@ pub fn hotkey_to_maybe_physical_key(hotkey: &HotkeyDefinition) -> MaybePhysicalK
         return MaybePhysicalKey::Key(Key::Character(c.into()));
     }
 
-    // Fallback to unidentified
+    // Script authors use the logical character directly (`"t"`). The persisted
+    // UI format also supports the explicit `Character(t)` spelling above.
+    if !hotkey.key.is_empty()
+        && !hotkey.key.starts_with("Code(")
+        && !hotkey.key.starts_with("Character(")
+    {
+        return MaybePhysicalKey::Key(Key::Character(hotkey.key.clone().into()));
+    }
+
+    // Malformed explicit wrappers and an empty key are unidentified.
     MaybePhysicalKey::Key(Key::Unidentified)
 }
 
 /// Converts a hotkey definition to iced Modifiers
 pub fn hotkey_to_iced_modifiers(hotkey: &HotkeyDefinition) -> Modifiers {
-    hotkey
-        .modifiers
-        .iter()
-        .fold(Modifiers::empty(), |m, item| match item.as_str() {
-            "CTRL" => m.union(Modifiers::CTRL),
-            "ALT" => m.union(Modifiers::ALT),
-            "SHIFT" => m.union(Modifiers::SHIFT),
-            "SUPER" => m.union(Modifiers::LOGO),
+    hotkey.modifiers.iter().fold(Modifiers::empty(), |m, item| {
+        match item.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => m.union(Modifiers::CTRL),
+            "alt" => m.union(Modifiers::ALT),
+            "shift" => m.union(Modifiers::SHIFT),
+            "super" | "meta" | "logo" => m.union(Modifiers::LOGO),
             _ => m,
-        })
+        }
+    })
 }
 
 /// Converts a string produced by `format!("{:?}", code)` back to an iced physical `key::Code`.
@@ -1007,6 +1015,25 @@ mod tests {
             }
             _ => panic!("Expected MaybePhysicalKey::Key(Key::Character('a'))"),
         }
+    }
+
+    #[test]
+    fn script_style_character_and_modifiers_are_normalized() {
+        let hotkey = HotkeyDefinition {
+            key: "t".to_string(),
+            modifiers: vec!["ctrl".to_string()],
+            script: None,
+            package: None,
+            language: smudgy_core::models::ScriptLang::Plaintext,
+            enabled: true,
+        };
+
+        let hotkey_keys: HotkeyKeys = hotkey.into();
+        assert_eq!(
+            hotkey_keys.main_key,
+            MaybePhysicalKey::Key(Key::Character("t".into()))
+        );
+        assert_eq!(hotkey_keys.modifiers, Modifiers::CTRL);
     }
 
     #[test]
