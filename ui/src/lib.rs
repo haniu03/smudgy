@@ -2453,6 +2453,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             session_id,
         } => {
             let window = AutomationsWindow::new(
+                id,
                 server_name.to_string(),
                 smudgy.account.handles(),
                 session_id,
