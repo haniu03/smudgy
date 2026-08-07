@@ -1173,6 +1173,9 @@ export function make() { return createEvent('dynamic'); }
                  refreshRequest.to(s).post({ full: false });\n\
                }\n\
                createHotkey({ key: \"F1\", modifiers: [\"ctrl\"] }, () => {}).delete();\n\
+               createHotkey({ key: \"t\", modifiers: [\"ctrl\"] }, () => {}).delete();\n\
+               createHotkey({ key: \"Code(KeyT)\", modifiers: [\"alt\", \"shift\"] }, () => {}).delete();\n\
+               createHotkey({ key: \"Character(é)\", modifiers: [\"super\"] }, () => {}).delete();\n\
                const t: string = line.text; void t;\n\
                const a = mapper.areas[0];\n\
                if (a) { const r = a.room(1); void r; const id: readonly [number, number] = a.id; void id; }\n\
@@ -1584,6 +1587,37 @@ export function make() { return createEvent('dynamic'); }
             !out.diagnostics.is_empty(),
             "an <Image /> without the required `src` must be a compile error"
         );
+    }
+
+    #[test]
+    fn invalid_hotkey_keys_and_modifiers_fail_to_compile() {
+        use std::collections::BTreeMap;
+
+        let mut ambient = BTreeMap::new();
+        ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
+        ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
+
+        for (name, source) in [
+            (
+                "bad-key.ts",
+                "import { createHotkey } from \"smudgy:core\";\n\
+                 createHotkey({ key: \"DefinitelyNotAKey\" }, () => {});\n",
+            ),
+            (
+                "bad-modifier.ts",
+                "import { createHotkey } from \"smudgy:core\";\n\
+                 createHotkey({ key: \"t\", modifiers: [\"command\"] }, () => {});\n",
+            ),
+        ] {
+            let mut sources = BTreeMap::new();
+            sources.insert(name.to_string(), source.to_string());
+            let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+                .expect("the generator itself must not crash on a type error");
+            assert!(
+                !out.diagnostics.is_empty(),
+                "{name} must fail the strongly typed createHotkey contract"
+            );
+        }
     }
 
     /// The runtime implementation in `js/smudgy.ts`, type-checked against the contract here.
