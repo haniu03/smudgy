@@ -103,6 +103,10 @@ pub fn focus_target<T: Send + 'static>(target: Id) -> Task<T> {
     iced::advanced::widget::operate(FocusTarget { target })
 }
 
+fn effective_font_size(pane_font_size: Option<f32>, global_font_size: f32) -> f32 {
+    pane_font_size.unwrap_or(global_font_size)
+}
+
 /// A component for inputting text in a session with advanced features
 #[derive(Debug, Clone)]
 pub struct SessionInput {
@@ -962,8 +966,12 @@ impl SessionInput {
         }
     }
 
-    /// Render the component
-    pub fn view(&self) -> Element<'_, Message> {
+    /// Render the component using a pane font-size override when present.
+    ///
+    /// Pane font size is display state for the whole pane, not only its
+    /// scrollback. Keeping the override at this boundary also applies it to
+    /// widgets-only pane inputs, which have no terminal from which to inherit.
+    pub fn view_with_font_size(&self, font_size: Option<f32>) -> Element<'_, Message> {
         let prefs = crate::prefs::current();
 
         let input = HotkeyMatchingInput::<Message, crate::theme::Theme, iced::Renderer>::new(
@@ -972,7 +980,7 @@ impl SessionInput {
             &self.value,
         )
         .font(prefs.font)
-        .size(prefs.font_size)
+        .size(effective_font_size(font_size, prefs.font_size))
         .id(self.input_id.clone())
         .secure(self.masked && !self.masked_reveal)
         .suppress_clipboard_writes(self.masked)
@@ -1046,6 +1054,12 @@ impl SessionInput {
 mod tests {
     use super::*;
     use smudgy_core::session::styled_line::StyledLine;
+
+    #[test]
+    fn pane_font_size_overrides_the_global_input_size() {
+        assert_eq!(effective_font_size(Some(23.0), 14.0), 23.0);
+        assert_eq!(effective_font_size(None, 14.0), 14.0);
+    }
 
     /// Submit a command unmasked (seeding history) via the real submit path.
     fn submit_unmasked(input: &mut SessionInput, text: &str) {

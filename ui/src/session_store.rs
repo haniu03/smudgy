@@ -179,10 +179,9 @@ pub struct ManagedSession {
     /// so the mutable def fields the UI reads are mirrored here — set via
     /// `PaneUpdated` when a script re-policies `main`.
     main_title_bar: TitleBarPolicy,
-    /// The main pane's terminal font override, mirrored beside
+    /// The main pane's font override, mirrored beside
     /// `main_title_bar` (set via `setFontSize` on main, `change-display`
-    /// gated). Scrollback text only — the session input stays on the global
-    /// preference.
+    /// gated). Applied to both scrollback and the session input.
     main_font_size: Option<f32>,
 
     widget_root: WidgetRoot<'static, crate::Theme, crate::Renderer>,
@@ -965,7 +964,9 @@ impl ManagedSession {
                 match pane.input.as_ref() {
                     Some(input) => column![
                         content,
-                        input.view().map(move |msg| Message::PaneInput(key, msg))
+                        input
+                            .view_with_font_size(pane.def.font_size)
+                            .map(move |msg| Message::PaneInput(key, msg))
                     ]
                     .spacing(10)
                     .width(Length::Fill)
@@ -1857,7 +1858,10 @@ impl ManagedSession {
         let terminal_area = stack![terminal, widgets];
 
         // Map input messages to session messages
-        let input = self.input.view().map(Message::Input);
+        let input = self
+            .input
+            .view_with_font_size(self.main_font_size)
+            .map(Message::Input);
 
         let body: Element<'_, Message> = column![terminal_area, input]
             .spacing(10)
