@@ -306,6 +306,28 @@ impl SessionInput {
         self
     }
 
+    /// Seeds recent history loaded for this session, newest first.
+    ///
+    /// Loading is deliberately quieter than [`Self::add_to_history`]: it is
+    /// initial state, not a new history mutation, so it does not bump the
+    /// revision. The runtime-ready resync sends the complete initial snapshot
+    /// unconditionally.
+    pub fn with_history(mut self, entries: Vec<String>) -> Self {
+        for entry in entries {
+            if self.history.len() >= self.max_history {
+                break;
+            }
+            if entry.trim().is_empty() {
+                continue;
+            }
+            let entry = Arc::new(entry);
+            if !self.history.contains(&entry) {
+                self.history.push_back(entry);
+            }
+        }
+        self
+    }
+
     /// Set the hint text shown while the input is empty.
     pub fn with_placeholder(mut self, placeholder: &str) -> Self {
         self.placeholder = placeholder.to_string();
@@ -1334,6 +1356,22 @@ mod tests {
         submit_unmasked(&mut input, "first");
         assert!(input.history_revision() > rev);
         assert_eq!(history_entries(&input), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn loaded_history_is_sanitized_capped_and_not_a_new_mutation() {
+        let mut entries = vec!["newest".to_string(), " ".to_string(), "newest".to_string()];
+        entries.extend((0..110).map(|i| format!("command-{i}")));
+
+        let input = SessionInput::new().with_history(entries);
+
+        let loaded = history_entries(&input);
+        assert_eq!(loaded.len(), 100);
+        assert_eq!(loaded[0], "newest");
+        assert_eq!(loaded[1], "command-0");
+        assert_eq!(loaded[99], "command-98");
+        assert_eq!(input.history_revision(), 0);
+        assert!(input.history_index.is_none());
     }
 
     /// A scripted `history.push()` and a typed submission share

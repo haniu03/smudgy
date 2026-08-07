@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod aliases;
 pub mod auth;
 pub mod hotkeys;
+pub mod input_history;
 pub mod local_packages;
 pub mod map_scopes;
 pub mod modules;
