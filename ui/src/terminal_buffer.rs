@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::prefs::TerminalPalette;
+use crate::prefs::TerminalPrefs;
 use smudgy_core::session::runtime::line_operation::LineOperation;
 use smudgy_core::session::styled_line::{Color, LinkAction, Style, StyledLine};
 use std::collections::{HashSet, VecDeque};
@@ -35,13 +35,8 @@ const LINK_WASH_ALPHA: f32 = 0.14;
 /// `DefaultBackground` at the op boundary and so still washes, while a background
 /// literally painted the theme's background color counts as explicit and doesn't.
 #[inline]
-fn make_span(
-    text: &str,
-    style: Style,
-    linked: bool,
-    palette: &TerminalPalette,
-) -> Span<'static, Link> {
-    let fg = palette.resolve(style.fg);
+fn make_span(text: &str, style: Style, linked: bool, prefs: &TerminalPrefs) -> Span<'static, Link> {
+    let fg = prefs.resolve(style.fg);
     let mut span = Span::<'static, Link>::new(Cow::Owned(text.to_string())).color(fg);
     // Only a meaningful background sets the span highlight: the widget draws a
     // quad per highlighted span region, so the (overwhelmingly common) default
@@ -53,7 +48,7 @@ fn make_span(
             ..fg
         }));
     } else if style.bg != Color::DefaultBackground {
-        span = span.background(Background::Color(palette.resolve(style.bg)));
+        span = span.background(Background::Color(prefs.resolve(style.bg)));
     }
     if linked { span.underline(true) } else { span }
 }
@@ -62,10 +57,7 @@ fn make_span(
 /// given palette. Style spans are split at link boundaries so linked ranges get
 /// the link affordance without disturbing the line's own colors.
 #[inline]
-fn to_spans(
-    styled_line: &Arc<StyledLine>,
-    palette: &TerminalPalette,
-) -> Rc<Vec<Span<'static, Link>>> {
+fn to_spans(styled_line: &Arc<StyledLine>, prefs: &TerminalPrefs) -> Rc<Vec<Span<'static, Link>>> {
     let mut spans = Vec::with_capacity(styled_line.spans.len());
     for span_info in &styled_line.spans {
         let (begin, end) = (span_info.begin_pos, span_info.end_pos);
@@ -74,7 +66,7 @@ fn to_spans(
                 &styled_line.text[begin..end],
                 span_info.style,
                 false,
-                palette,
+                prefs,
             ));
             continue;
         }
@@ -94,7 +86,7 @@ fn to_spans(
                     &styled_line.text[cursor..linked_begin],
                     span_info.style,
                     false,
-                    palette,
+                    prefs,
                 ));
             }
             let linked_end = link.end_pos.min(end);
@@ -102,7 +94,7 @@ fn to_spans(
                 &styled_line.text[linked_begin..linked_end],
                 span_info.style,
                 true,
-                palette,
+                prefs,
             ));
             cursor = linked_end;
         }
@@ -111,7 +103,7 @@ fn to_spans(
                 &styled_line.text[cursor..end],
                 span_info.style,
                 false,
-                palette,
+                prefs,
             ));
         }
     }
@@ -184,8 +176,10 @@ impl BufferLine {
     /// invalidated (palette change, line edit) — the pane's paragraph cache
     /// keys on that identity.
     pub fn spans(&self) -> &Rc<Vec<Span<'static, ()>>> {
-        self.spans
-            .get_or_init(|| to_spans(&self.styled_line, &crate::prefs::current().palette))
+        self.spans.get_or_init(|| {
+            let prefs = crate::prefs::current();
+            to_spans(&self.styled_line, &prefs)
+        })
     }
 
     /// Drop the baked spans so the next access re-bakes them (and downstream
@@ -859,8 +853,8 @@ mod tests {
     #[test]
     fn to_spans_splits_at_link_boundaries_with_chip() {
         let line = linked_line("go north now", 3, 8);
-        let palette = &crate::prefs::current().palette;
-        let spans = to_spans(&line, palette);
+        let prefs = crate::prefs::current();
+        let spans = to_spans(&line, &prefs);
 
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[0].text, "go ");
@@ -871,7 +865,7 @@ mod tests {
         // the segments around it keep the plain background.
         assert!(!spans[0].underline && !spans[2].underline);
         assert!(spans[1].underline);
-        let fg = palette.resolve(Color::Rgb {
+        let fg = prefs.resolve(Color::Rgb {
             r: 200,
             g: 10,
             b: 10,
@@ -913,14 +907,14 @@ mod tests {
             end_pos: 5,
             action: LinkAction::Send(Arc::from("north")),
         });
-        let palette = &crate::prefs::current().palette;
-        let spans = to_spans(&Arc::new(line), palette);
+        let prefs = crate::prefs::current();
+        let spans = to_spans(&Arc::new(line), &prefs);
         assert_eq!(spans.len(), 1);
         // The author's background wins over the wash; the underline stays.
         assert!(spans[0].underline);
         assert_eq!(
             spans[0].highlight.map(|h| h.background),
-            Some(Background::Color(palette.resolve(Color::Rgb {
+            Some(Background::Color(prefs.resolve(Color::Rgb {
                 r: 1,
                 g: 2,
                 b: 3

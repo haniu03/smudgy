@@ -109,28 +109,23 @@ fn component(value: i64) -> u8 {
 fn color_256(index: i64) -> Color {
     match index.clamp(0, 255) {
         n @ 16..=231 => {
-            #[allow(clippy::cast_precision_loss)]
-            let n = (n - 16) as f32;
-            let r = (n / 36.0).floor();
-            let g = ((n - (r * 36.0)) / 6.0).floor();
-            let b = n - (r * 36.0) - (g * 6.0);
-            let mul = 255.0 / 6.0;
-
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let n = n - 16;
+            let component = |level: i64| {
+                // Xterm deliberately gives the first non-zero cube level a
+                // larger step so dark colors remain distinguishable from a
+                // black terminal background.
+                u8::try_from(if level == 0 { 0 } else { 55 + 40 * level }).unwrap_or(255)
+            };
             Color::Rgb {
-                r: (r * mul).round() as u8,
-                g: (g * mul).round() as u8,
-                b: (b * mul).round() as u8,
+                r: component(n / 36),
+                g: component((n % 36) / 6),
+                b: component(n % 6),
             }
         }
         n @ 232..=255 => {
-            let range = 255.0 / (255.0 - 232.0);
-            #[allow(
-                clippy::cast_precision_loss,
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss
-            )]
-            let val = (range * (n - 232) as f32).round() as u8;
+            // Xterm's grayscale ramp spans 8..=238 in steps of ten, leaving
+            // the ANSI black/white slots to represent the endpoints.
+            let val = u8::try_from(8 + 10 * (n - 232)).unwrap_or(238);
             Color::Rgb {
                 r: val,
                 g: val,
@@ -313,7 +308,7 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnsiColor, Color, process};
+    use super::{AnsiColor, Color, color_256, process};
     use crate::session::styled_line::Style;
     use vtparse::CsiParam;
 
@@ -453,9 +448,9 @@ mod tests {
         assert_eq!(
             apply(default_style(), "38;5;999").fg,
             Color::Rgb {
-                r: 255,
-                g: 255,
-                b: 255
+                r: 238,
+                g: 238,
+                b: 238
             }
         );
     }
@@ -522,17 +517,49 @@ mod tests {
     fn cube_and_grayscale_mapping() {
         assert_eq!(
             apply(default_style(), "38;5;196").fg,
-            Color::Rgb { r: 213, g: 0, b: 0 }
+            Color::Rgb { r: 255, g: 0, b: 0 }
         );
         assert_eq!(
             apply(default_style(), "38;5;232").fg,
-            Color::Rgb { r: 0, g: 0, b: 0 }
+            Color::Rgb { r: 8, g: 8, b: 8 }
         );
         assert_eq!(
             apply(default_style(), "38;5;7").fg,
             Color::Ansi {
                 color: AnsiColor::White,
                 bold: false
+            }
+        );
+    }
+
+    #[test]
+    fn cube_uses_xterm_component_levels() {
+        let levels = [0, 95, 135, 175, 215, 255];
+        for (level, expected) in levels.into_iter().enumerate() {
+            let index = 16 + i64::try_from(level).unwrap_or(0) * 36;
+            assert_eq!(
+                color_256(index),
+                Color::Rgb {
+                    r: expected,
+                    g: 0,
+                    b: 0,
+                }
+            );
+        }
+        assert_eq!(
+            color_256(231),
+            Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }
+        );
+        assert_eq!(
+            color_256(255),
+            Color::Rgb {
+                r: 238,
+                g: 238,
+                b: 238,
             }
         );
     }

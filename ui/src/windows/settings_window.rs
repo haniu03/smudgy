@@ -121,6 +121,7 @@ pub enum Message {
     PrefLineLengthChanged(String),
     PrefLineLengthSubmitted,
     PrefThemeSelected(String),
+    PrefThemeExtendedColorsToggled(bool),
     PrefScrollbackChanged(String),
     PrefScrollbackSubmitted,
     PrefSeparatorChanged(String),
@@ -654,6 +655,10 @@ impl SettingsWindow {
                 // The panel now edits the new theme's own tweak entry; an
                 // open picker would point at the old theme's slot.
                 self.tweak_picker = None;
+                self.settings_changed()
+            }
+            Message::PrefThemeExtendedColorsToggled(enabled) => {
+                self.settings.theme_extended_colors = enabled;
                 self.settings_changed()
             }
             Message::PrefScrollbackChanged(value) => {
@@ -1310,6 +1315,15 @@ impl SettingsWindow {
             .spacing(2),
         );
         col = col.push(self.tweak_panel());
+        col = col.push(
+            column![
+                checkbox(self.settings.theme_extended_colors)
+                    .label(t!("preferences-theme-extended-colors"))
+                    .on_toggle(Message::PrefThemeExtendedColorsToggled),
+                dim_text_owned(t!("preferences-theme-extended-colors-help")),
+            ]
+            .spacing(2),
+        );
         col = col.push(pref_input(
             t!("preferences-scrollback"),
             "100000",

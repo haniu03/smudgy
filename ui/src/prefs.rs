@@ -51,10 +51,118 @@ pub struct TerminalPalette {
     pub derive_app_theme: bool,
 }
 
+/// Perceptually uniform color used while constructing the themed RGB cube.
+/// Palette colors enter and leave as gamma-encoded sRGB; interpolation happens
+/// here so equal-sized steps are much closer to equal visual changes.
+#[derive(Clone, Copy)]
+struct Oklab {
+    lightness: f32,
+    green_red: f32,
+    blue_yellow: f32,
+}
+
+impl Oklab {
+    #[allow(clippy::excessive_precision)]
+    fn from_srgb(color: Color) -> Self {
+        let red = srgb_to_linear(color.r);
+        let green = srgb_to_linear(color.g);
+        let blue = srgb_to_linear(color.b);
+
+        let long =
+            0.412_221_46_f32.mul_add(red, 0.536_332_55_f32.mul_add(green, 0.051_445_995 * blue));
+        let medium =
+            0.211_903_5_f32.mul_add(red, 0.680_699_5_f32.mul_add(green, 0.107_396_96 * blue));
+        let short =
+            0.088_302_46_f32.mul_add(red, 0.281_718_85_f32.mul_add(green, 0.629_978_7 * blue));
+
+        let long = long.cbrt();
+        let medium = medium.cbrt();
+        let short = short.cbrt();
+
+        Self {
+            lightness: 0.210_454_26_f32.mul_add(
+                long,
+                0.793_617_8_f32.mul_add(medium, -0.004_072_047 * short),
+            ),
+            green_red: 1.977_998_5_f32.mul_add(
+                long,
+                (-2.428_592_2_f32).mul_add(medium, 0.450_593_7 * short),
+            ),
+            blue_yellow: 0.025_904_037_f32.mul_add(
+                long,
+                0.782_771_77_f32.mul_add(medium, -0.808_675_77 * short),
+            ),
+        }
+    }
+
+    #[allow(clippy::excessive_precision)]
+    fn into_srgb(self) -> Color {
+        let long = 0.396_337_78_f32.mul_add(
+            self.green_red,
+            0.215_803_76_f32.mul_add(self.blue_yellow, self.lightness),
+        );
+        let medium = (-0.105_561_346_f32).mul_add(
+            self.green_red,
+            (-0.063_854_17_f32).mul_add(self.blue_yellow, self.lightness),
+        );
+        let short = (-0.089_484_18_f32).mul_add(
+            self.green_red,
+            (-1.291_485_5_f32).mul_add(self.blue_yellow, self.lightness),
+        );
+
+        let long = long.powi(3);
+        let medium = medium.powi(3);
+        let short = short.powi(3);
+
+        let red = 4.076_741_7_f32.mul_add(
+            long,
+            (-3.307_711_6_f32).mul_add(medium, 0.230_969_94 * short),
+        );
+        let green =
+            (-1.268_438_f32).mul_add(long, 2.609_757_4_f32.mul_add(medium, -0.341_319_4 * short));
+        let blue = (-0.004_196_086_3_f32).mul_add(
+            long,
+            (-0.703_418_6_f32).mul_add(medium, 1.707_614_7 * short),
+        );
+
+        Color::from_rgb(
+            linear_to_srgb(red),
+            linear_to_srgb(green),
+            linear_to_srgb(blue),
+        )
+    }
+
+    fn mix(self, other: Self, amount: f32) -> Self {
+        let interpolate = |from: f32, to: f32| (to - from).mul_add(amount, from);
+        Self {
+            lightness: interpolate(self.lightness, other.lightness),
+            green_red: interpolate(self.green_red, other.green_red),
+            blue_yellow: interpolate(self.blue_yellow, other.blue_yellow),
+        }
+    }
+}
+
+fn srgb_to_linear(channel: f32) -> f32 {
+    if channel <= 0.040_45 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(channel: f32) -> f32 {
+    let encoded = if channel <= 0.003_130_8 {
+        12.92 * channel
+    } else {
+        1.055 * channel.powf(1.0 / 2.4) - 0.055
+    };
+    encoded.clamp(0.0, 1.0)
+}
+
 impl TerminalPalette {
     /// Maps a styled-line color through this palette.
     #[must_use]
-    pub fn resolve(&self, vt_color: VtColor) -> Color {
+    pub fn resolve(&self, vt_color: VtColor, theme_extended_colors: bool) -> Color {
         match vt_color {
             VtColor::Ansi { color, bold } => {
                 let base = match color {
@@ -69,7 +177,13 @@ impl TerminalPalette {
                 };
                 self.ansi[base + usize::from(bold) * 8]
             }
-            VtColor::Rgb { r, g, b } => self.archetypal(r, g, b),
+            VtColor::Rgb { r, g, b } => {
+                if theme_extended_colors {
+                    self.archetypal(r, g, b)
+                } else {
+                    Color::from_rgb8(r, g, b)
+                }
+            }
             VtColor::Echo => self.echo,
             VtColor::Warn => self.warn,
             VtColor::Output => self.output,
@@ -101,24 +215,38 @@ impl TerminalPalette {
     }
 
     /// Archetypal interpretation of a truecolor (and 256-color, which core
-    /// flattens to RGB) value: each channel is an *intensity* interpolated
-    /// between the theme background and the theme's bright primary for that
-    /// channel, instead of between black and the pure sRGB primary. Servers
-    /// that pick RGB colors assuming a black background therefore land on
-    /// theme-coherent colors: (0,0,0) is the theme background, (255,0,0) is
-    /// red as *this theme* says red, and grays ride the bg→white ramp.
+    /// flattens to RGB) value. The eight corners of the server's RGB cube map
+    /// to the theme background and its seven bright ANSI colors; trilinear
+    /// interpolation in OKLab keeps intermediate steps perceptually smooth.
+    /// The theme's bright colors are therefore the output ceiling rather than
+    /// unrestricted sRGB primaries. A bright-white slot too close to the
+    /// background uses the readable default foreground, as bold plain text
+    /// does.
     #[must_use]
     pub fn archetypal(&self, r: u8, g: u8, b: u8) -> Color {
-        let bg = self.background;
-        let bright_red = self.ansi[9];
-        let bright_green = self.ansi[10];
-        let bright_blue = self.ansi[12];
-        let lerp = |from: f32, to: f32, t: f32| (to - from).mul_add(t, from);
-        Color::from_rgb(
-            lerp(bg.r, bright_red.r, f32::from(r) / 255.0),
-            lerp(bg.g, bright_green.g, f32::from(g) / 255.0),
-            lerp(bg.b, bright_blue.b, f32::from(b) / 255.0),
-        )
+        let red = f32::from(r) / 255.0;
+        let green = f32::from(g) / 255.0;
+        let blue = f32::from(b) / 255.0;
+
+        // Corner order follows the RGB bits: black/background, red, green,
+        // yellow, blue, magenta, cyan, white.
+        let background = Oklab::from_srgb(self.background);
+        let bright_red = Oklab::from_srgb(self.ansi[9]);
+        let bright_green = Oklab::from_srgb(self.ansi[10]);
+        let bright_yellow = Oklab::from_srgb(self.ansi[11]);
+        let bright_blue = Oklab::from_srgb(self.ansi[12]);
+        let bright_magenta = Oklab::from_srgb(self.ansi[13]);
+        let bright_cyan = Oklab::from_srgb(self.ansi[14]);
+        let bright_white = Oklab::from_srgb(self.bright_default());
+
+        let black_red = background.mix(bright_red, red);
+        let green_yellow = bright_green.mix(bright_yellow, red);
+        let blue_magenta = bright_blue.mix(bright_magenta, red);
+        let cyan_white = bright_cyan.mix(bright_white, red);
+        let no_blue = black_red.mix(green_yellow, green);
+        let full_blue = blue_magenta.mix(cyan_white, green);
+
+        no_blue.mix(full_blue, blue).into_srgb()
     }
 }
 
@@ -169,6 +297,10 @@ pub struct TerminalPrefs {
     /// The effective palette: the chosen base scheme with the user's
     /// per-theme tweaks applied. Base schemes are never modified.
     pub palette: Arc<TerminalPalette>,
+    /// Whether server-supplied 256-color and truecolor values pass through
+    /// the palette's perceptual cube. False renders those values as literal
+    /// sRGB while leaving named ANSI colors theme-controlled.
+    pub theme_extended_colors: bool,
     /// What the command input does with the text after a send (and, for the
     /// default, on focus loss). Non-visual, so it never bumps `generation`.
     pub command_input_behavior: CommandInputBehavior,
@@ -220,6 +352,12 @@ pub fn script_palette(settings: &Settings) -> ScriptPalette {
 }
 
 impl TerminalPrefs {
+    /// Resolves one terminal color using the current extended-color policy.
+    #[must_use]
+    pub fn resolve(&self, color: VtColor) -> Color {
+        self.palette.resolve(color, self.theme_extended_colors)
+    }
+
     fn from_settings(settings: &Settings, generation: u64) -> Self {
         let font_size = settings.terminal_font_size.clamp(8.0, 40.0);
         Self {
@@ -231,6 +369,7 @@ impl TerminalPrefs {
             // validation, and 0 columns would shape zero-width paragraphs.
             line_length: settings.terminal_line_length.map(|len| len.clamp(20, 1000)),
             palette: Arc::new(effective_palette(settings)),
+            theme_extended_colors: settings.theme_extended_colors,
             command_input_behavior: settings.command_input_behavior,
             mask_input_on_server_echo: settings.mask_input_on_server_echo,
             hide_pane_headers: settings.hide_pane_headers,
@@ -430,7 +569,8 @@ pub fn apply(settings: &Settings) {
         && next.font_size == current.font_size
         && next.line_height == current.line_height
         && next.line_length == current.line_length
-        && *next.palette == *current.palette;
+        && *next.palette == *current.palette
+        && next.theme_extended_colors == current.theme_extended_colors;
     if !visually_equal {
         next.generation = current.generation + 1;
     }
@@ -541,4 +681,67 @@ pub fn app_theme() -> smudgy_theme::Theme {
     theme.styles.modal.body_background = Background::Color(mix(bg, fg, 0.04));
 
     theme
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Color, TerminalPalette, palettes};
+
+    fn assert_color_close(actual: Color, expected: Color) {
+        const TOLERANCE: f32 = 0.000_1;
+        assert!(
+            (actual.r - expected.r).abs() < TOLERANCE
+                && (actual.g - expected.g).abs() < TOLERANCE
+                && (actual.b - expected.b).abs() < TOLERANCE,
+            "actual {actual:?}, expected {expected:?}"
+        );
+    }
+
+    #[test]
+    fn archetypal_cube_hits_complete_palette_corners() {
+        let palette = &palettes::SMUDGY;
+        let cases = [
+            ((0, 0, 0), palette.background),
+            ((255, 0, 0), palette.ansi[9]),
+            ((0, 255, 0), palette.ansi[10]),
+            ((255, 255, 0), palette.ansi[11]),
+            ((0, 0, 255), palette.ansi[12]),
+            ((255, 0, 255), palette.ansi[13]),
+            ((0, 255, 255), palette.ansi[14]),
+            ((255, 255, 255), palette.ansi[15]),
+        ];
+
+        for ((red, green, blue), expected) in cases {
+            assert_color_close(palette.archetypal(red, green, blue), expected);
+        }
+    }
+
+    #[test]
+    fn light_palette_cube_uses_full_colors_and_readable_white() {
+        let palette: &TerminalPalette = &palettes::SOLARIZED_LIGHT;
+        assert_color_close(palette.archetypal(255, 0, 0), palette.ansi[9]);
+        // Solarized Light's bright-white slot equals its background, so the
+        // same guard as bold default text selects the readable foreground.
+        assert_color_close(palette.archetypal(255, 255, 255), palette.foreground);
+    }
+
+    #[test]
+    fn literal_extended_colors_bypass_the_theme_cube() {
+        use smudgy_core::session::styled_line::Color as VtColor;
+
+        let palette = &palettes::SOLARIZED_LIGHT;
+        let source = VtColor::Rgb {
+            r: 95,
+            g: 135,
+            b: 175,
+        };
+        assert_eq!(
+            palette.resolve(source, false),
+            Color::from_rgb8(95, 135, 175)
+        );
+        assert_ne!(
+            palette.resolve(source, true),
+            Color::from_rgb8(95, 135, 175)
+        );
+    }
 }

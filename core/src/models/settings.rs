@@ -214,6 +214,12 @@ pub struct Settings {
     /// Named theme: terminal color scheme plus app background/accent.
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Map server-supplied 256-color and truecolor values through the
+    /// selected theme's perceptual color cube. Off renders those RGB values
+    /// literally; the 16 named ANSI colors remain theme-controlled either
+    /// way.
+    #[serde(default = "default_true")]
+    pub theme_extended_colors: bool,
     /// Non-destructive per-theme adjustments, keyed by theme name. The base
     /// schemes are never modified; tweaks survive switching themes and back.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -536,6 +542,7 @@ impl Default for Settings {
             terminal_font_ligatures: false,
             terminal_line_length: None,
             theme: default_theme(),
+            theme_extended_colors: true,
             theme_tweaks: std::collections::HashMap::new(),
             image_cache_max_mb: default_image_cache_max_mb(),
             command_separator: default_command_separator(),
@@ -845,6 +852,21 @@ mod tests {
         let json = serde_json::to_string(&settings).expect("settings serialize");
         let parsed: Settings = serde_json::from_str(&json).expect("settings parse");
         assert_eq!(parsed.locale, "zh-TW");
+    }
+
+    #[test]
+    fn themed_extended_colors_default_on_and_round_trip_off() {
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("existing settings parse");
+        assert!(settings.theme_extended_colors);
+
+        let literal = Settings {
+            theme_extended_colors: false,
+            ..Settings::default()
+        };
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&literal).unwrap()).unwrap();
+        assert!(!parsed.theme_extended_colors);
     }
 
     #[test]
