@@ -156,10 +156,10 @@ pub struct PaneDef {
     /// Always `false` for main via scripts (hiding main throws); the user's
     /// eyeball may still set it.
     pub hidden: bool,
-    /// Per-pane terminal font size override in px (validated to the same
+    /// Per-pane font size override in px (validated to the same
     /// 8–40 range as the global setting); `None` follows the global setting.
-    /// Affects the pane's terminal scrollback rendering only — input lines
-    /// stay on the global preference.
+    /// Applies to the pane's scrollback and input, including inputs hosted by
+    /// widgets-only panes.
     pub font_size: Option<f32>,
     /// The pane's own input line, when the creating spec asked for one.
     /// Creation-time identity, like `kind`: a `split()` hitting an existing

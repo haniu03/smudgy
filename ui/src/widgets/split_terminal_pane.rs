@@ -31,8 +31,9 @@ struct SplitTerminalPane<'a> {
     /// `Message`-agnostic, and the handler sends the runtime action itself (the
     /// session's NAWS report — wired only for the session's main terminal).
     pub on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
-    /// Per-pane terminal font override (`docs/panes.md`); `None` follows the
-    /// global preference. Scrollback text only — the input line stays global.
+    /// Per-pane font override (`docs/panes.md`); `None` follows the global
+    /// preference. This widget applies it to scrollback; the pane composition
+    /// applies the same value to any input line.
     pub font_size: Option<f32>,
 }
 
