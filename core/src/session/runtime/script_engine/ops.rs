@@ -14,8 +14,8 @@ use crate::session::runtime::{
     SingletonRegistry,
 };
 use crate::session::styled_line::{
-    Color, LinkAction, LinkMenu, LinkMenuItem, LinkTooltip, LinkTooltipCallback, LinkTooltipState,
-    LinkTooltipText, Style, StyledLine, StyledLink, sanitize_display_text,
+    Color, LinkAction, LinkMenu, LinkMenuItem, LinkMenuTitle, LinkTooltip, LinkTooltipCallback,
+    LinkTooltipState, LinkTooltipText, Style, StyledLine, StyledLink, sanitize_display_text,
 };
 use crate::session::{SessionId, registry};
 
@@ -3613,7 +3613,11 @@ fn resolve_link_menu(
     let Some(menu) = menu else {
         return Ok(None);
     };
-    let title = menu.title.as_deref().and_then(single_line_text);
+    let title = menu
+        .title
+        .as_deref()
+        .and_then(single_line_text)
+        .map(|text| LinkMenuTitle { text, style: None });
     let items = menu
         .items
         .iter()
@@ -3655,6 +3659,7 @@ fn wire_link_to_styled(
             primary_enabled: link.enabled,
             menu,
             menu_on_left_click,
+            protocol: None,
         },
     };
     let tooltip = links

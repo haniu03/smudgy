@@ -101,6 +101,8 @@ pub enum RuntimeAction {
     Disconnect,
     HandleIncomingLine(Arc<StyledLine>),
     HandleIncomingPartialLine(Arc<StyledLine>),
+    /// A decoded telnet GA/EOR boundary, ordered behind its prompt text.
+    PromptBoundary,
     /// A carriage-return overprint superseded the incoming open line: drop any
     /// prefix already delivered as a partial (the text after the `\r` replaces
     /// it). Emitted by the VT layer before the replacement frame's bytes.

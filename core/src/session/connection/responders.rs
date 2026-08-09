@@ -40,10 +40,15 @@ pub mod new_environ {
         (b"OSC_HYPERLINKS_COMPACT", b"1"),
         (b"OSC_HYPERLINKS_DISABLED", b"1"),
         (b"OSC_HYPERLINKS_MENU", b"1"),
+        (b"OSC_HYPERLINKS_PRESETS", b"1"),
         (b"OSC_HYPERLINKS_PROMPT", b"1"),
+        (b"OSC_HYPERLINKS_SELECTION", b"1"),
         (b"OSC_HYPERLINKS_SEND", b"1"),
+        (b"OSC_HYPERLINKS_SPOILER", b"1"),
         (b"OSC_HYPERLINKS_STYLE_BASIC", b"1"),
+        (b"OSC_HYPERLINKS_STYLE_STATES", b"1"),
         (b"OSC_HYPERLINKS_TOOLTIP", b"1"),
+        (b"OSC_HYPERLINKS_VISIBILITY", b"1"),
     ];
 
     fn requested_user_vars(payload: &[u8]) -> Vec<Vec<u8>> {
@@ -375,7 +380,12 @@ mod tests {
             b"OSC_HYPERLINKS_COMPACT".as_slice(),
             b"OSC_HYPERLINKS_DISABLED".as_slice(),
             b"OSC_HYPERLINKS_MENU".as_slice(),
+            b"OSC_HYPERLINKS_PRESETS".as_slice(),
+            b"OSC_HYPERLINKS_SELECTION".as_slice(),
+            b"OSC_HYPERLINKS_SPOILER".as_slice(),
             b"OSC_HYPERLINKS_STYLE_BASIC".as_slice(),
+            b"OSC_HYPERLINKS_STYLE_STATES".as_slice(),
+            b"OSC_HYPERLINKS_VISIBILITY".as_slice(),
         ] {
             assert!(
                 payload

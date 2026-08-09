@@ -431,6 +431,11 @@ impl Inner<'_> {
                     ))),
                 }
             }
+            RuntimeAction::PromptBoundary => {
+                self.pending_buffer_updates
+                    .push(BufferUpdate::PromptBoundary);
+                Ok(ActionResult::None)
+            }
             RuntimeAction::RetractIncomingPartialLine => {
                 self.retract_incoming_open_line_sync();
                 Ok(ActionResult::None)

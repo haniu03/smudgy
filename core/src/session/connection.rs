@@ -89,11 +89,11 @@ mod ingest {
                 if b != b'\n' && b != b'\r' {
                     vt_processor.push_raw_incoming_byte(b);
                 }
-                vt_parser.parse_byte(b, &mut *vt_processor);
+                vt_processor.parse_byte(vt_parser, b);
             }
         } else {
             for &b in data {
-                vt_parser.parse_byte(b, &mut *vt_processor);
+                vt_processor.parse_byte(vt_parser, b);
             }
         }
     }

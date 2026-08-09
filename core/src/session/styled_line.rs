@@ -116,12 +116,141 @@ pub struct LinkTextStyle {
     pub decoration_color: Option<LinkColor>,
 }
 
+impl LinkTextStyle {
+    /// Overlay the properties explicitly authored by `higher` onto this
+    /// style. OSC pseudo-classes compose property-by-property rather than
+    /// replacing the complete base object.
+    #[must_use]
+    pub fn overlay(&self, higher: &Self) -> Self {
+        Self {
+            foreground: higher.foreground.or(self.foreground),
+            background: higher.background.or(self.background),
+            bold: higher.bold.or(self.bold),
+            italic: higher.italic.or(self.italic),
+            underline: higher.underline.or(self.underline),
+            overline: higher.overline.or(self.overline),
+            strikethrough: higher.strikethrough.or(self.strikethrough),
+            decoration_color: higher.decoration_color.or(self.decoration_color),
+        }
+    }
+}
+
 /// Authored visual style for a link. The wrapper exists even when every
 /// property is absent: `{ "style": {} }` is still an authored style and must
 /// suppress Smudgy's fallback underline/wash.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LinkStyle {
     pub base: LinkTextStyle,
+    pub active: Option<LinkTextStyle>,
+    pub hover: Option<LinkTextStyle>,
+    pub focus_visible: Option<LinkTextStyle>,
+    pub focus: Option<LinkTextStyle>,
+    pub visited: Option<LinkTextStyle>,
+    pub selected: Option<LinkTextStyle>,
+    pub disabled: Option<LinkTextStyle>,
+    pub link: Option<LinkTextStyle>,
+    pub any_link: Option<LinkTextStyle>,
+}
+
+/// Stateful OSC styling inputs, resolved by the terminal pane in Mudlet's
+/// documented low-to-high priority order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinkStyleState {
+    pub active: bool,
+    pub hover: bool,
+    pub focus_visible: bool,
+    pub focus: bool,
+    pub visited: bool,
+    pub selected: bool,
+    pub disabled: bool,
+}
+
+impl LinkStyle {
+    #[must_use]
+    pub fn resolve(&self, state: LinkStyleState) -> LinkTextStyle {
+        let mut resolved = self.base.clone();
+        // Lowest to highest priority: any-link, link, disabled, selected,
+        // visited, focus, focus-visible, hover, active.
+        for style in [
+            self.any_link.as_ref(),
+            (!state.visited).then_some(self.link.as_ref()).flatten(),
+            state.disabled.then_some(self.disabled.as_ref()).flatten(),
+            state.selected.then_some(self.selected.as_ref()).flatten(),
+            state.visited.then_some(self.visited.as_ref()).flatten(),
+            state.focus.then_some(self.focus.as_ref()).flatten(),
+            state
+                .focus_visible
+                .then_some(self.focus_visible.as_ref())
+                .flatten(),
+            state.hover.then_some(self.hover.as_ref()).flatten(),
+            state.active.then_some(self.active.as_ref()).flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            resolved = resolved.overlay(style);
+        }
+        resolved
+    }
+
+    #[must_use]
+    pub fn has_states(&self) -> bool {
+        self.active.is_some()
+            || self.hover.is_some()
+            || self.focus_visible.is_some()
+            || self.focus.is_some()
+            || self.visited.is_some()
+            || self.selected.is_some()
+            || self.disabled.is_some()
+            || self.link.is_some()
+            || self.any_link.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkVisibilityAction {
+    Conceal,
+    Reveal,
+    RevealThenConceal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkVisibilityExpire {
+    pub input: bool,
+    pub prompt: bool,
+    pub output: bool,
+    pub output_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkVisibility {
+    pub action: LinkVisibilityAction,
+    /// An explicitly supplied delay. `None` is distinct from `Some(0)`: reveal
+    /// links without a delay wait for an expiry trigger, while a zero delay
+    /// reveals immediately.
+    pub delay_ms: Option<u64>,
+    pub expire: LinkVisibilityExpire,
+    pub whole_line: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSelection {
+    pub group: Arc<str>,
+    pub value: Arc<str>,
+    pub toggle: bool,
+    pub selected: bool,
+    pub exclusive: bool,
+    pub disabled: bool,
+}
+
+/// Mudlet-compatible behavior carried only by server-authored OSC links.
+/// Script links deliberately bypass the wire-size cap and do not acquire
+/// protocol-only state by accident.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LinkProtocol {
+    pub visibility: Option<LinkVisibility>,
+    pub selection: Option<LinkSelection>,
+    pub spoiler: bool,
 }
 
 /// What a click on a linked range of a line does.
@@ -142,6 +271,9 @@ pub enum LinkAction {
         /// A null-primary script menu may use an ordinary left click as a
         /// second way to open the context menu.
         menu_on_left_click: bool,
+        /// Protocol-only state (selection, visibility and spoiler behavior).
+        /// Script-authored configured links always carry `None` here.
+        protocol: Option<LinkProtocol>,
     },
     /// Send this command on the clicked pane's session, as if typed (alias
     /// processing and command splitting apply). Serialized into the line, so
@@ -240,15 +372,36 @@ impl LinkAction {
 
     #[must_use]
     pub fn is_interactive(&self) -> bool {
-        self.primary().is_some() || self.menu().is_some()
+        self.primary().is_some()
+            || self.menu().is_some()
+            || self.protocol().is_some_and(|protocol| protocol.spoiler)
+    }
+
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, Self::Configured { disabled: true, .. })
+    }
+
+    #[must_use]
+    pub fn protocol(&self) -> Option<&LinkProtocol> {
+        match self {
+            Self::Configured { protocol, .. } => protocol.as_ref(),
+            _ => None,
+        }
     }
 }
 
 /// A right-click menu attached to a link-styled range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkMenu {
-    pub title: Option<Arc<str>>,
+    pub title: Option<LinkMenuTitle>,
     pub items: Arc<[LinkMenuItem]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkMenuTitle {
+    pub text: Arc<str>,
+    pub style: Option<LinkTextStyle>,
 }
 
 /// One context-menu row. OSC menu labels and script labels are always rendered

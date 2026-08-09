@@ -671,7 +671,10 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
     assert!(menu_only.links[0].action.primary().is_none());
     assert!(menu_only.links[0].action.opens_menu_on_left_click());
     let menu = menu_only.links[0].action.menu().expect("enabled link menu");
-    assert_eq!(menu.title.as_deref(), Some("Actions"));
+    assert_eq!(
+        menu.title.as_ref().map(|title| title.text.as_ref()),
+        Some("Actions")
+    );
     assert_eq!(
         menu_only.links[0]
             .tooltip

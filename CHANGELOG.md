@@ -367,8 +367,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server. Mudlet-compatible OSC styling now controls link colors, bold,
   italic, underline/overline/strikethrough forms, and decoration color;
   unstyled links retain Smudgy's underline and subtle wash, while an authored
-  style (including `underline: false`) takes precedence. Other URI schemes are
-  ignored.
+  style (including `underline: false`) takes precedence. Stateful hover,
+  press, focus, visited, selected, disabled, link, and any-link styles follow
+  Mudlet's priority order. Tooltips, styled menu titles, context menus,
+  disabled links, spoilers, timed/input/prompt/output visibility, radio and
+  checkbox selection groups, compact keys, and session presets are supported;
+  links can be traversed and activated from the keyboard. Incoming OSC 8 URIs
+  are capped at 4096 bytes in the scanner, deceptive invisible controls are
+  rendered visibly, and unapproved URI schemes are ignored. Script-authored
+  links retain their existing unrestricted payload size.
 
 ### Fixed
 

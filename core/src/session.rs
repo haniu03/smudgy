@@ -274,6 +274,10 @@ pub enum BufferUpdate {
     Append(Arc<StyledLine>),
     /// Commit the main buffer's open line.
     EnsureNewLine,
+    /// A telnet GA/EOR prompt boundary. Carries no text; terminal panes use it
+    /// to advance OSC 8 visibility expiry without conflating partial socket
+    /// flushes with real prompts.
+    PromptBoundary,
     /// One WHOLE line for a non-main pane. Routing is decided per logical
     /// line, so pane buffers never receive fragments — core assembles the
     /// full line before queuing this.

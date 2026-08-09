@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -6,8 +8,9 @@ use vtparse::{CsiParam, VTActor, VTParser};
 use crate::session::{
     runtime::RuntimeAction,
     styled_line::{
-        LinkAction, LinkColor, LinkDecoration, LinkMenu, LinkMenuItem, LinkSpan, LinkStyle,
-        LinkTextStyle, LinkTooltip, LinkTooltipText, Style, StyledLine, VtSpan,
+        LinkAction, LinkColor, LinkDecoration, LinkMenu, LinkMenuItem, LinkMenuTitle, LinkProtocol,
+        LinkSelection, LinkSpan, LinkStyle, LinkTextStyle, LinkTooltip, LinkTooltipText,
+        LinkVisibility, LinkVisibilityAction, LinkVisibilityExpire, Style, StyledLine, VtSpan,
     },
 };
 
@@ -21,6 +24,63 @@ pub use sgr::process as sgr_process;
 /// The most bytes an OSC 8 URI may carry; longer links are ignored (the text
 /// still displays, unlinked).
 const MAX_OSC8_URI_LEN: usize = 4096;
+
+fn dangerous_invisible(c: char, prose: bool) -> bool {
+    if prose && (matches!(c, '\u{200c}' | '\u{200d}') || ('\u{e0000}'..='\u{e007f}').contains(&c)) {
+        return false;
+    }
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{061c}'
+            | '\u{115f}'
+            | '\u{1160}'
+            | '\u{17b4}'
+            | '\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}'
+    )
+}
+
+fn push_display_char(out: &mut String, c: char, prose: bool) {
+    if dangerous_invisible(c, prose) {
+        write!(out, "\\u{{{:X}}}", u32::from(c)).expect("writing to a String cannot fail");
+    } else {
+        out.push(c);
+    }
+}
+
+fn sanitize_display_text(text: &str, prose: bool) -> Arc<str> {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        push_display_char(&mut out, c, prose);
+    }
+    Arc::from(out)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum Osc8Scan {
+    #[default]
+    Ground,
+    Escape,
+    Selector,
+    Payload {
+        uri_bytes: usize,
+        separators: u8,
+        escape: bool,
+    },
+    Discard {
+        escape: bool,
+    },
+}
 
 struct TooltipAnsiActor {
     text: String,
@@ -65,7 +125,7 @@ impl TooltipAnsiActor {
         if std::mem::take(&mut self.pending_cr) {
             self.text.push('\n');
         }
-        self.text.push(c);
+        push_display_char(&mut self.text, c, true);
     }
 
     fn finish(mut self) -> Option<LinkTooltipText> {
@@ -183,6 +243,7 @@ struct Osc8Config {
     disabled: bool,
     menu: Option<LinkMenu>,
     style: Option<LinkStyle>,
+    protocol: Option<LinkProtocol>,
 }
 
 fn link_color(value: &serde_json::Value) -> Option<LinkColor> {
@@ -224,46 +285,157 @@ fn style_field<'a>(
     style.get(full).or_else(|| style.get(compact))
 }
 
+fn parse_link_text_style(value: &serde_json::Value) -> Option<LinkTextStyle> {
+    let style = value.as_object()?;
+    Some(LinkTextStyle {
+        foreground: style_field(style, "color", "c").and_then(link_color),
+        background: style_field(style, "bg", "bg").and_then(link_color),
+        bold: style_field(style, "bold", "b").and_then(serde_json::Value::as_bool),
+        italic: style_field(style, "italic", "i").and_then(serde_json::Value::as_bool),
+        underline: style_field(style, "underline", "u").and_then(link_decoration),
+        overline: style_field(style, "overline", "o").and_then(link_decoration),
+        strikethrough: style_field(style, "strikethrough", "st").and_then(link_decoration),
+        decoration_color: style_field(style, "text-decoration-color", "tdc").and_then(link_color),
+    })
+}
+
 fn parse_link_style(value: &serde_json::Value) -> Option<LinkStyle> {
     let style = value.as_object()?;
+    let state = |full, compact| style_field(style, full, compact).and_then(parse_link_text_style);
     Some(LinkStyle {
-        base: LinkTextStyle {
-            foreground: style_field(style, "color", "c").and_then(link_color),
-            background: style_field(style, "bg", "bg").and_then(link_color),
-            bold: style_field(style, "bold", "b").and_then(serde_json::Value::as_bool),
-            italic: style_field(style, "italic", "i").and_then(serde_json::Value::as_bool),
-            underline: style_field(style, "underline", "u").and_then(link_decoration),
-            overline: style_field(style, "overline", "o").and_then(link_decoration),
-            strikethrough: style_field(style, "strikethrough", "st").and_then(link_decoration),
-            decoration_color: style_field(style, "text-decoration-color", "tdc")
-                .and_then(link_color),
-        },
+        base: parse_link_text_style(value)?,
+        active: state("active", "a"),
+        hover: state("hover", "h"),
+        focus_visible: state("focus-visible", "fv"),
+        focus: state("focus", "f"),
+        visited: state("visited", "vi"),
+        selected: state("selected", "sl"),
+        disabled: state("disabled", "d"),
+        link: state("link", "l"),
+        any_link: state("any-link", "al"),
     })
+}
+
+fn parse_visibility(value: &serde_json::Value) -> Option<LinkVisibility> {
+    let visibility = value.as_object()?;
+    let action = match visibility.get("action")? {
+        serde_json::Value::String(action) if action.eq_ignore_ascii_case("conceal") => {
+            LinkVisibilityAction::Conceal
+        }
+        serde_json::Value::String(action) if action.eq_ignore_ascii_case("reveal") => {
+            LinkVisibilityAction::Reveal
+        }
+        serde_json::Value::Array(actions)
+            if actions.len() == 2
+                && actions[0].as_str() == Some("reveal")
+                && actions[1].as_str() == Some("conceal") =>
+        {
+            LinkVisibilityAction::RevealThenConceal
+        }
+        _ => return None,
+    };
+    let expire = visibility
+        .get("expire")
+        .and_then(serde_json::Value::as_object);
+    let expire_bool = |name| {
+        expire
+            .and_then(|value| value.get(name))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    Some(LinkVisibility {
+        action,
+        delay_ms: visibility.get("delay").and_then(serde_json::Value::as_u64),
+        expire: LinkVisibilityExpire {
+            input: expire_bool("input"),
+            prompt: expire_bool("prompt"),
+            output: expire_bool("output"),
+            output_delay_ms: expire
+                .and_then(|value| value.get("outputDelay"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(500),
+        },
+        whole_line: visibility
+            .get("wholeline")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn parse_selection(value: &serde_json::Value) -> Option<LinkSelection> {
+    let selection = value.as_object()?;
+    let group = sanitize_single_line_text(selection.get("group")?.as_str()?)?;
+    let value = sanitize_single_line_text(selection.get("value")?.as_str()?)?;
+    let flag = |name, default| {
+        selection
+            .get(name)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(default)
+    };
+    Some(LinkSelection {
+        group,
+        value,
+        toggle: flag("toggle", true),
+        selected: flag("selected", false),
+        exclusive: flag("exclusive", true),
+        disabled: flag("disabled", false),
+    })
+}
+
+fn deep_merge(base: &mut serde_json::Value, higher: serde_json::Value) {
+    match (base, higher) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(higher)) => {
+            for (key, value) in higher {
+                if let Some(existing) = base.get_mut(&key) {
+                    deep_merge(existing, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (base, higher) => *base = higher,
+    }
 }
 
 /// Extract the first valid Mudlet-compatible `config` tooltip and remove all
 /// literal `config` query fields from the actionable target. Smudgy advertises
 /// `OSC_HYPERLINKS_TOOLTIP`, so the extension specification reserves this key;
 /// an ordinary URL can retain one by percent-encoding the key itself.
-fn osc8_config(uri: &str) -> (String, Osc8Config) {
+fn osc8_config(uri: &str, presets: &HashMap<String, serde_json::Value>) -> (String, Osc8Config) {
     let (before_fragment, fragment) = uri
         .split_once('#')
         .map_or((uri, None), |(head, tail)| (head, Some(tail)));
     let Some((base, query)) = before_fragment.split_once('?') else {
         return (uri.to_string(), Osc8Config::default());
     };
-    if !query.split('&').any(|field| field.starts_with("config=")) {
+    if !query
+        .split('&')
+        .any(|field| field.starts_with("config=") || field.starts_with("preset="))
+    {
         return (uri.to_string(), Osc8Config::default());
     }
-    let config = query.split('&').find_map(|field| {
+    let override_config = query.split('&').find_map(|field| {
         let encoded = field.strip_prefix("config=")?;
         let decoded = percent_decode(encoded);
         serde_json::from_str::<serde_json::Value>(&decoded).ok()
     });
+    let preset = query.split('&').find_map(|field| {
+        field
+            .strip_prefix("preset=")
+            .map(percent_decode)
+            .and_then(|name| presets.get(&name).cloned())
+    });
+    let mut config = preset;
+    if let Some(higher) = override_config {
+        match &mut config {
+            Some(base) => deep_merge(base, higher),
+            None => config = Some(higher),
+        }
+    }
 
     let kept: Vec<_> = query
         .split('&')
-        .filter(|field| !field.starts_with("config="))
+        .filter(|field| !field.starts_with("config=") && !field.starts_with("preset="))
         .collect();
     let mut target = String::with_capacity(uri.len());
     target.push_str(base);
@@ -300,6 +472,25 @@ fn osc8_config(uri: &str) -> (String, Osc8Config) {
         .get("style")
         .or_else(|| config.get("s"))
         .and_then(parse_link_style);
+    let visibility = config
+        .get("visibility")
+        .or_else(|| config.get("v"))
+        .and_then(parse_visibility);
+    let selection = config
+        .get("selection")
+        .or_else(|| config.get("sel"))
+        .and_then(parse_selection);
+    let spoiler = config
+        .get("spoiler")
+        .or_else(|| config.get("sp"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let protocol =
+        (visibility.is_some() || selection.is_some() || spoiler).then_some(LinkProtocol {
+            visibility,
+            selection,
+            spoiler,
+        });
     (
         target,
         Osc8Config {
@@ -307,18 +498,24 @@ fn osc8_config(uri: &str) -> (String, Osc8Config) {
             disabled,
             menu,
             style,
+            protocol,
         },
     )
 }
 
-fn menu_title(value: &serde_json::Value) -> Option<Arc<str>> {
-    value
+fn menu_title(value: &serde_json::Value) -> Option<LinkMenuTitle> {
+    let text = value
         .as_str()
         .or_else(|| value.get("text").and_then(serde_json::Value::as_str))
-        .and_then(sanitize_single_line_text)
+        .and_then(sanitize_single_line_text)?;
+    let style = value
+        .get("style")
+        .or_else(|| value.get("s"))
+        .and_then(parse_link_text_style);
+    Some(LinkMenuTitle { text, style })
 }
 
-fn parse_menu(value: &serde_json::Value, title: Option<Arc<str>>) -> Option<LinkMenu> {
+fn parse_menu(value: &serde_json::Value, title: Option<LinkMenuTitle>) -> Option<LinkMenu> {
     let mut items = Vec::new();
     for value in value.as_array()? {
         if value.as_str() == Some("-") {
@@ -347,10 +544,14 @@ fn parse_menu(value: &serde_json::Value, title: Option<Arc<str>>) -> Option<Link
 
 /// Menu chrome stays one-line even though tooltip prose may be multiline.
 fn sanitize_single_line_text(text: &str) -> Option<Arc<str>> {
-    let cleaned: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let mut cleaned = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            cleaned.push(' ');
+        } else {
+            push_display_char(&mut cleaned, c, true);
+        }
+    }
     let cleaned = cleaned.trim();
     (!cleaned.is_empty()).then(|| Arc::from(cleaned))
 }
@@ -378,39 +579,53 @@ fn server_action_for_uri(uri: &str) -> Option<LinkAction> {
 
 fn action_display_target(action: &LinkAction) -> Option<Arc<str>> {
     match action.disclosed_target()? {
-        LinkAction::OpenUrl(url) => Some(url.clone()),
-        LinkAction::ServerSend(command) => Some(Arc::from(format!("send:{command}"))),
-        LinkAction::Prompt(command) => Some(Arc::from(format!("prompt:{command}"))),
-        LinkAction::Send(command) => Some(command.clone()),
+        LinkAction::OpenUrl(url) => Some(sanitize_display_text(url, false)),
+        LinkAction::ServerSend(command) => {
+            Some(sanitize_display_text(&format!("send:{command}"), false))
+        }
+        LinkAction::Prompt(command) => {
+            Some(sanitize_display_text(&format!("prompt:{command}"), false))
+        }
+        LinkAction::Send(command) => Some(sanitize_display_text(command, false)),
         LinkAction::Callback { .. } | LinkAction::Configured { .. } => None,
     }
 }
 
-fn link_action_for_uri(uri: &str) -> Option<ParsedLink> {
+fn link_action_for_uri(
+    uri: &str,
+    presets: &HashMap<String, serde_json::Value>,
+) -> Option<ParsedLink> {
     if uri.len() > MAX_OSC8_URI_LEN {
         log::debug!("OSC 8 URI over {MAX_OSC8_URI_LEN} bytes ignored");
         return None;
     }
-    let (target, config) = osc8_config(uri);
+    let (target, config) = osc8_config(uri, presets);
     let Some(primary) = server_action_for_uri(&target) else {
         log::debug!("OSC 8 URI with unsupported scheme ignored");
         return None;
     };
     let display_target = action_display_target(&primary);
-    let tooltip = if let Some(text) = config.tooltip {
+    let tooltip = if config
+        .protocol
+        .as_ref()
+        .is_some_and(|protocol| protocol.spoiler)
+    {
+        LinkTooltip::text(Arc::from("Click to reveal"), display_target.clone())
+    } else if let Some(text) = config.tooltip {
         LinkTooltip::styled_text(text, display_target.clone())
     } else if config.menu.is_some() && !config.disabled {
         LinkTooltip::text(Arc::from("Right-click for menu"), display_target.clone())
     } else {
         LinkTooltip::text(display_target.clone()?, None)
     };
-    let action = if config.disabled || config.menu.is_some() {
+    let action = if config.disabled || config.menu.is_some() || config.protocol.is_some() {
         LinkAction::Configured {
             primary: Some(Box::new(primary)),
             disabled: config.disabled,
             primary_enabled: true,
             menu: config.menu,
             menu_on_left_click: false,
+            protocol: config.protocol,
         }
     } else {
         primary
@@ -482,6 +697,11 @@ pub struct VtProcessor {
     /// though the flag flips concurrently with an in-flight parse run (see
     /// [`Self::refresh_capture_raw`]).
     capture_raw: bool,
+    /// Mudlet-compatible OSC 8 presets live for exactly one connection/
+    /// processor lifetime and are never shared across sessions.
+    link_presets: HashMap<String, serde_json::Value>,
+    osc8_scan: Osc8Scan,
+    discard_current_osc8: bool,
 }
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
@@ -501,6 +721,9 @@ impl VtProcessor {
             session_runtime_tx,
             raw_wanted: None,
             capture_raw: true,
+            link_presets: HashMap::new(),
+            osc8_scan: Osc8Scan::default(),
+            discard_current_osc8: false,
         }
     }
 
@@ -665,11 +888,17 @@ impl VtProcessor {
         // not overwrite what follows.
         self.pending_cr = None;
         if self.buf.is_empty() {
+            self.session_runtime_tx
+                .send(RuntimeAction::PromptBoundary)
+                .ok();
             return;
         }
         let pending_line = Arc::new(self.consume_into_pending_line());
         self.session_runtime_tx
             .send(RuntimeAction::HandleIncomingPartialLine(pending_line))
+            .ok();
+        self.session_runtime_tx
+            .send(RuntimeAction::PromptBoundary)
             .ok();
         self.buf.clear();
         self.buf_raw.clear();
@@ -697,6 +926,95 @@ impl VtProcessor {
             self.buf_raw.push(byte);
         }
     }
+
+    /// Feed one byte through the VT parser while bounding OSC 8 buffering at
+    /// the scanner. Once an overlong sequence is recognized, the parser gets
+    /// a synthetic terminator and the remainder is swallowed through the real
+    /// BEL/ST. This prevents a hostile peer from making vtparse retain an
+    /// unbounded URI; script-authored links never pass through this path.
+    pub fn parse_byte(&mut self, parser: &mut VTParser, byte: u8) {
+        use Osc8Scan::{Discard, Escape, Ground, Payload, Selector};
+
+        match self.osc8_scan {
+            Ground => {
+                self.osc8_scan = if byte == 0x1b {
+                    Escape
+                } else if byte == 0x9d {
+                    Selector
+                } else {
+                    Ground
+                };
+                parser.parse_byte(byte, self);
+            }
+            Escape => {
+                self.osc8_scan = if byte == b']' {
+                    Selector
+                } else if byte == 0x1b {
+                    Escape
+                } else {
+                    Ground
+                };
+                parser.parse_byte(byte, self);
+            }
+            Selector => {
+                self.osc8_scan = if byte == b'8' {
+                    Payload {
+                        uri_bytes: 0,
+                        separators: 0,
+                        escape: false,
+                    }
+                } else if byte == 0x1b {
+                    Escape
+                } else {
+                    Ground
+                };
+                parser.parse_byte(byte, self);
+            }
+            Payload {
+                uri_bytes,
+                separators,
+                escape,
+            } => {
+                let terminated = byte == 0x07 || byte == 0x9c || (escape && byte == b'\\');
+                if terminated {
+                    self.osc8_scan = Ground;
+                    parser.parse_byte(byte, self);
+                    return;
+                }
+                let (uri_bytes, separators) = if byte == b';' && separators < 2 {
+                    (uri_bytes, separators + 1)
+                } else if separators >= 2 {
+                    let added = usize::from(escape) + usize::from(byte != 0x1b);
+                    (uri_bytes.saturating_add(added), separators)
+                } else {
+                    (uri_bytes, separators)
+                };
+                if uri_bytes > MAX_OSC8_URI_LEN {
+                    self.discard_current_osc8 = true;
+                    parser.parse_byte(0x07, self);
+                    self.osc8_scan = Discard {
+                        escape: byte == 0x1b,
+                    };
+                } else {
+                    self.osc8_scan = Payload {
+                        uri_bytes,
+                        separators,
+                        escape: byte == 0x1b,
+                    };
+                    parser.parse_byte(byte, self);
+                }
+            }
+            Discard { escape } => {
+                if byte == 0x07 || byte == 0x9c || (escape && byte == b'\\') {
+                    self.osc8_scan = Ground;
+                } else {
+                    self.osc8_scan = Discard {
+                        escape: byte == 0x1b,
+                    };
+                }
+            }
+        }
+    }
 }
 
 impl VTActor for VtProcessor {
@@ -704,7 +1022,13 @@ impl VTActor for VtProcessor {
         if let Some(raw_mark) = self.pending_cr.take() {
             self.restart_open_line(raw_mark);
         }
-        self.push_incoming_char(b);
+        if self.cursor_link.is_some() && dangerous_invisible(b, false) {
+            let mut escaped = String::new();
+            push_display_char(&mut escaped, b, false);
+            self.buf.push_str(&escaped);
+        } else {
+            self.push_incoming_char(b);
+        }
     }
 
     fn execute_c0_or_c1(&mut self, control: u8) {
@@ -755,6 +1079,11 @@ impl VTActor for VtProcessor {
         if params.first() != Some(&&b"8"[..]) {
             return;
         }
+        if std::mem::take(&mut self.discard_current_osc8) {
+            self.close_link_range(false);
+            log::debug!("overlong OSC 8 sequence ignored at scanner");
+            return;
+        }
         // A well-formed OSC 8 is `8 ; params ; URI`; anything shorter (a
         // truncated `ESC]8;` or bare `ESC]8`) is treated as a close so a
         // degenerate sequence can't leave a link open over later lines.
@@ -767,7 +1096,28 @@ impl VTActor for VtProcessor {
             self.close_link_range(false);
             return;
         }
-        match link_action_for_uri(&String::from_utf8_lossy(&uri)) {
+        let uri = String::from_utf8_lossy(&uri);
+        if starts_with_ascii_case_insensitive(&uri, "preset:") {
+            self.close_link_range(false);
+            if uri.len() > MAX_OSC8_URI_LEN {
+                return;
+            }
+            let definition = &uri[7..];
+            let (name, query) = definition.split_once('?').unwrap_or((definition, ""));
+            let name = percent_decode(name);
+            let config = query.split('&').find_map(|field| {
+                let encoded = field.strip_prefix("config=")?;
+                serde_json::from_str::<serde_json::Value>(&percent_decode(encoded)).ok()
+            });
+            if !name.is_empty()
+                && !name.chars().any(char::is_control)
+                && let Some(config @ serde_json::Value::Object(_)) = config
+            {
+                self.link_presets.insert(name, config);
+            }
+            return;
+        }
+        match link_action_for_uri(&uri, &self.link_presets) {
             Some(link) => self.open_link(link),
             // Unsupported scheme: the text still displays, unlinked.
             None => self.close_link_range(false),
@@ -807,7 +1157,7 @@ mod tests {
                 if b != b'\n' && b != b'\r' {
                     self.processor.push_raw_incoming_byte(b);
                 }
-                self.parser.parse_byte(b, &mut self.processor);
+                self.processor.parse_byte(&mut self.parser, b);
             }
         }
 
@@ -953,7 +1303,8 @@ mod tests {
     }
 
     use crate::session::styled_line::{
-        LinkAction, LinkColor, LinkDecoration, LinkMenuItem, LinkTooltip, StyledLine,
+        LinkAction, LinkColor, LinkDecoration, LinkMenuItem, LinkStyleState, LinkTooltip,
+        LinkVisibilityAction, StyledLine,
     };
 
     fn committed_lines(actions: &[RuntimeAction]) -> Vec<std::sync::Arc<StyledLine>> {
@@ -1040,6 +1391,108 @@ mod tests {
         h.feed(b"\x1b]8;;send:look?config=%7B%22style%22%3A%7B%7D%7D\x1b\\look\x1b]8;;\x1b\\\n");
         let lines = committed_lines(&h.actions());
         assert!(lines[0].links[0].style.is_some());
+    }
+
+    #[test]
+    fn osc8_state_styles_parse_compact_names_and_resolve_priority() {
+        let mut h = harness();
+        h.feed(b"\x1b]8;;send:look?config={\"s\":{\"c\":\"white\",\"al\":{\"c\":\"blue\"},\"l\":{\"b\":true},\"vi\":{\"c\":\"purple\"},\"h\":{\"c\":\"red\"},\"a\":{\"c\":\"green\"}}}\x1b\\look\x1b]8;;\x1b\\\n");
+        let lines = committed_lines(&h.actions());
+        let style = lines[0].links[0].style.as_ref().expect("style");
+        assert!(style.has_states());
+        let visited_hover = style.resolve(LinkStyleState {
+            visited: true,
+            hover: true,
+            ..LinkStyleState::default()
+        });
+        assert_eq!(
+            visited_hover.foreground,
+            Some(LinkColor {
+                red: 255,
+                green: 0,
+                blue: 0,
+                alpha: 255,
+            })
+        );
+        let active = style.resolve(LinkStyleState {
+            active: true,
+            hover: true,
+            ..LinkStyleState::default()
+        });
+        assert_eq!(
+            active.foreground,
+            Some(LinkColor {
+                red: 0,
+                green: 128,
+                blue: 0,
+                alpha: 255,
+            })
+        );
+        assert_eq!(active.bold, Some(true));
+    }
+
+    #[test]
+    fn osc8_compact_protocol_behaviors_are_retained() {
+        let mut h = harness();
+        h.feed(b"\x1b]8;;send:vote?config={\"sp\":true,\"v\":{\"action\":[\"reveal\",\"conceal\"],\"delay\":25,\"wholeline\":true},\"sel\":{\"group\":\"poll\",\"value\":\"yes\",\"toggle\":false,\"selected\":true,\"exclusive\":false,\"disabled\":true}}\x1b\\yes\x1b]8;;\x1b\\\n");
+        let lines = committed_lines(&h.actions());
+        let link = &lines[0].links[0];
+        let protocol = link.action.protocol().expect("protocol behavior");
+        assert!(protocol.spoiler);
+        let visibility = protocol.visibility.as_ref().expect("visibility");
+        assert_eq!(visibility.action, LinkVisibilityAction::RevealThenConceal);
+        assert_eq!(visibility.delay_ms, Some(25));
+        assert!(visibility.whole_line);
+        let selection = protocol.selection.as_ref().expect("selection");
+        assert_eq!(selection.group.as_ref(), "poll");
+        assert_eq!(selection.value.as_ref(), "yes");
+        assert!(!selection.toggle);
+        assert!(selection.selected);
+        assert!(!selection.exclusive);
+        assert!(selection.disabled);
+        assert_eq!(
+            link.tooltip.as_ref().and_then(LinkTooltip::display),
+            Some((
+                std::sync::Arc::from("Click to reveal"),
+                Some(std::sync::Arc::from("send:vote"))
+            ))
+        );
+    }
+
+    #[test]
+    fn osc8_presets_are_session_scoped_and_deep_merge_overrides() {
+        let mut h = harness();
+        h.feed(b"\x1b]8;;preset:danger?config={\"s\":{\"c\":\"red\",\"b\":true},\"t\":\"Danger\"}\x1b\\\x1b]8;;\x1b\\");
+        h.feed(b"\x1b]8;;send:attack?preset=danger&config={\"s\":{\"c\":\"blue\"}}\x1b\\attack\x1b]8;;\x1b\\\n");
+        let lines = committed_lines(&h.actions());
+        let link = &lines[0].links[0];
+        let style = &link.style.as_ref().expect("preset style").base;
+        assert_eq!(style.bold, Some(true));
+        assert_eq!(
+            style.foreground,
+            Some(LinkColor {
+                red: 0,
+                green: 0,
+                blue: 255,
+                alpha: 255,
+            })
+        );
+        assert_eq!(
+            link.tooltip.as_ref().and_then(LinkTooltip::display),
+            Some((
+                std::sync::Arc::from("Danger"),
+                Some(std::sync::Arc::from("send:attack"))
+            ))
+        );
+    }
+
+    #[test]
+    fn osc8_link_copy_escapes_direction_controls() {
+        let mut h = harness();
+        h.feed("\x1b]8;;send:look\x1b\\safe\u{202e}txt\x1b]8;;\x1b\\\n".as_bytes());
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "safe\\u{202E}txt");
+        assert_eq!(lines[0].links[0].end_pos, lines[0].text.len());
     }
 
     #[test]
@@ -1267,7 +1720,10 @@ mod tests {
         let link = &lines[0].links[0];
         let menu = link.action.menu().expect("an enabled menu");
         assert!(!link.action.opens_menu_on_left_click());
-        assert_eq!(menu.title.as_deref(), Some("Actions"));
+        assert_eq!(
+            menu.title.as_ref().map(|title| title.text.as_ref()),
+            Some("Actions")
+        );
         assert_eq!(menu.items.len(), 3);
         assert!(matches!(menu.items[1], LinkMenuItem::Separator));
         assert!(matches!(
@@ -1303,6 +1759,21 @@ mod tests {
         let lines = committed_lines(&h.actions());
         assert_eq!(lines[0].text, "text");
         assert!(lines[0].links.is_empty());
+    }
+
+    #[test]
+    fn osc8_scanner_discards_an_overlong_sequence_across_reads() {
+        let mut h = harness();
+        h.feed(b"\x1b]8;;https://example.com/");
+        h.feed(&vec![b'x'; MAX_OSC8_URI_LEN]);
+        h.feed(b"still-discarded\x1b\\plain \x1b]8;;send:look\x1b\\look\x1b]8;;\x1b\\\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "plain look");
+        assert_eq!(lines[0].links.len(), 1);
+        assert_eq!(
+            lines[0].links[0].action,
+            LinkAction::ServerSend(std::sync::Arc::from("look"))
+        );
     }
 
     #[test]

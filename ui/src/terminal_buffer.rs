@@ -4,12 +4,13 @@ use selection::Selection;
 use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::prefs::TerminalPrefs;
 use smudgy_core::session::runtime::line_operation::LineOperation;
 use smudgy_core::session::styled_line::{
-    Blink, Color, LinkAction, LinkColor, LinkDecoration, LinkStyle, LinkTooltip, Style, StyledLine,
-    Underline,
+    Blink, Color, LinkAction, LinkColor, LinkDecoration, LinkSpan, LinkStyle, LinkTextStyle,
+    LinkTooltip, Style, StyledLine, Underline,
 };
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
@@ -42,6 +43,28 @@ pub struct LinkClickEvent {
 /// foreground is the Markdown link color renders identically to a Markdown link.
 const LINK_WASH_ALPHA: f32 = 0.14;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkRenderStyle {
+    pub authored: bool,
+    pub style: LinkTextStyle,
+    pub spoiler_concealed: bool,
+    pub hidden: bool,
+}
+
+impl LinkRenderStyle {
+    fn base(link: &LinkSpan) -> Self {
+        Self {
+            authored: link.style.is_some(),
+            style: link
+                .style
+                .as_ref()
+                .map_or_else(LinkTextStyle::default, |style| style.base.clone()),
+            spoiler_concealed: false,
+            hidden: false,
+        }
+    }
+}
+
 /// One renderable segment: underlined over the foreground wash when linked (unless
 /// the span sets an explicit background, which wins — the underline stays).
 /// "Explicit" is judged by the resolved color model: `bg: "default"` normalizes to
@@ -55,8 +78,26 @@ pub(crate) fn make_span(
     link_style: Option<&LinkStyle>,
     prefs: &TerminalPrefs,
 ) -> Span<'static, Link> {
+    let resolved = link_style.map(|style| LinkRenderStyle {
+        authored: true,
+        style: style.base.clone(),
+        spoiler_concealed: false,
+        hidden: false,
+    });
+    make_resolved_span(text, style, linked, resolved.as_ref(), false, prefs)
+}
+
+#[inline]
+fn make_resolved_span(
+    text: &str,
+    style: Style,
+    linked: bool,
+    link_style: Option<&LinkRenderStyle>,
+    line_hidden: bool,
+    prefs: &TerminalPrefs,
+) -> Span<'static, Link> {
     let mut attributes = style.attributes;
-    let authored = link_style.map(|style| &style.base);
+    let authored = link_style.map(|style| &style.style);
     if let Some(value) = authored.and_then(|style| style.bold) {
         attributes.bold = value;
     }
@@ -91,7 +132,7 @@ pub(crate) fn make_span(
         .and_then(|style| style.background)
         .map(authored_color)
         .or_else(|| (style.bg != Color::DefaultBackground).then(|| terminal_color(style.bg)));
-    let (mut fg, background) = if attributes.reverse {
+    let (mut fg, mut background) = if attributes.reverse {
         (
             logical_bg.unwrap_or(prefs.palette.background),
             Some(logical_fg),
@@ -117,7 +158,10 @@ pub(crate) fn make_span(
     let mut underline = authored
         .and_then(|style| style.underline)
         .unwrap_or(sgr_underline);
-    if linked && link_style.is_none() && underline == LinkDecoration::None {
+    if linked
+        && !link_style.is_some_and(|style| style.authored)
+        && underline == LinkDecoration::None
+    {
         underline = LinkDecoration::Solid;
     }
     let overline = authored
@@ -134,6 +178,44 @@ pub(crate) fn make_span(
     let decoration_color = authored
         .and_then(|style| style.decoration_color)
         .map(authored_color);
+    let hidden = line_hidden || link_style.is_some_and(|style| style.hidden);
+    let spoiler_concealed = link_style.is_some_and(|style| style.spoiler_concealed);
+    if spoiler_concealed {
+        let base = background.unwrap_or(prefs.palette.background);
+        let luminance = 0.2126 * base.r + 0.7152 * base.g + 0.0722 * base.b;
+        let cover = if luminance < 0.1 {
+            iced::Color::from_rgb8(40, 40, 40)
+        } else if luminance < 0.5 {
+            iced::Color::from_rgb(
+                (base.r * 1.4).min(1.0),
+                (base.g * 1.4).min(1.0),
+                (base.b * 1.4).min(1.0),
+            )
+        } else {
+            iced::Color::from_rgb(base.r / 1.4, base.g / 1.4, base.b / 1.4)
+        };
+        fg = cover;
+        background = Some(cover);
+        underline = LinkDecoration::None;
+    }
+    if hidden {
+        fg = iced::Color::TRANSPARENT;
+        background = None;
+        underline = LinkDecoration::None;
+    }
+    let overline = if hidden || spoiler_concealed {
+        LinkDecoration::None
+    } else {
+        overline
+    };
+    let strikethrough = if hidden || spoiler_concealed {
+        LinkDecoration::None
+    } else {
+        strikethrough
+    };
+    let decoration_color = (!hidden && !spoiler_concealed)
+        .then_some(decoration_color)
+        .flatten();
     let mut span = Span::<'static, Link>::new(Cow::Owned(text.to_string()))
         .color(fg)
         .font(font)
@@ -143,7 +225,12 @@ pub(crate) fn make_span(
     // quad per highlighted span region, so the (overwhelmingly common) default
     // background must stay decoration-free rather than painting a quad of the
     // pane's own color under every span.
-    if linked && link_style.is_none() && background.is_none() {
+    if linked
+        && !link_style.is_some_and(|style| style.authored)
+        && background.is_none()
+        && !hidden
+        && !spoiler_concealed
+    {
         span = span.background(Background::Color(iced::Color {
             a: LINK_WASH_ALPHA,
             ..fg
@@ -170,15 +257,25 @@ pub(crate) fn make_span(
 /// the link affordance without disturbing the line's own colors.
 #[inline]
 fn to_spans(styled_line: &Arc<StyledLine>, prefs: &TerminalPrefs) -> Rc<Vec<Span<'static, Link>>> {
+    to_spans_with(styled_line, prefs, false, LinkRenderStyle::base)
+}
+
+fn to_spans_with(
+    styled_line: &Arc<StyledLine>,
+    prefs: &TerminalPrefs,
+    line_hidden: bool,
+    resolve: impl Fn(&LinkSpan) -> LinkRenderStyle,
+) -> Rc<Vec<Span<'static, Link>>> {
     let mut spans = Vec::with_capacity(styled_line.spans.len());
     for span_info in &styled_line.spans {
         let (begin, end) = (span_info.begin_pos, span_info.end_pos);
         if styled_line.links.is_empty() || begin == end {
-            spans.push(make_span(
+            spans.push(make_resolved_span(
                 &styled_line.text[begin..end],
                 span_info.style,
                 false,
                 None,
+                line_hidden,
                 prefs,
             ));
             continue;
@@ -195,30 +292,34 @@ fn to_spans(styled_line: &Arc<StyledLine>, prefs: &TerminalPrefs) -> Rc<Vec<Span
             }
             let linked_begin = link.begin_pos.max(cursor);
             if linked_begin > cursor {
-                spans.push(make_span(
+                spans.push(make_resolved_span(
                     &styled_line.text[cursor..linked_begin],
                     span_info.style,
                     false,
                     None,
+                    line_hidden,
                     prefs,
                 ));
             }
             let linked_end = link.end_pos.min(end);
-            spans.push(make_span(
+            let resolved = resolve(link);
+            spans.push(make_resolved_span(
                 &styled_line.text[linked_begin..linked_end],
                 span_info.style,
                 true,
-                link.style.as_ref(),
+                Some(&resolved),
+                line_hidden,
                 prefs,
             ));
             cursor = linked_end;
         }
         if cursor < end {
-            spans.push(make_span(
+            spans.push(make_resolved_span(
                 &styled_line.text[cursor..end],
                 span_info.style,
                 false,
                 None,
+                line_hidden,
                 prefs,
             ));
         }
@@ -298,6 +399,15 @@ impl BufferLine {
         })
     }
 
+    pub(crate) fn spans_with_link_state(
+        &self,
+        prefs: &TerminalPrefs,
+        line_hidden: bool,
+        resolve: impl Fn(&LinkSpan) -> LinkRenderStyle,
+    ) -> Rc<Vec<Span<'static, SpanMetadata>>> {
+        to_spans_with(&self.styled_line, prefs, line_hidden, resolve)
+    }
+
     /// Drop the baked spans so the next access re-bakes them (and downstream
     /// paragraph caches, keyed on the `Rc` identity, naturally miss).
     fn invalidate_spans(&mut self) {
@@ -318,6 +428,10 @@ pub struct TerminalBuffer {
     /// mutation — so the per-frame hover path can skip hit testing entirely on
     /// the (overwhelmingly common) linkless buffer via [`Self::has_links`].
     lines_with_links: usize,
+    visibility_input_epoch: u64,
+    visibility_prompt_epoch: u64,
+    visibility_output_epoch: u64,
+    visibility_last_output: Option<Instant>,
 }
 
 impl Default for TerminalBuffer {
@@ -350,7 +464,33 @@ impl TerminalBuffer {
             last_line_number: 0,
             span_generation: crate::prefs::current().generation,
             lines_with_links: 0,
+            visibility_input_epoch: 0,
+            visibility_prompt_epoch: 0,
+            visibility_output_epoch: 0,
+            visibility_last_output: None,
         }
+    }
+
+    pub fn note_visibility_input(&mut self) {
+        self.visibility_input_epoch = self.visibility_input_epoch.wrapping_add(1);
+    }
+
+    pub fn note_visibility_prompt(&mut self) {
+        self.visibility_prompt_epoch = self.visibility_prompt_epoch.wrapping_add(1);
+    }
+
+    pub fn note_visibility_output(&mut self) {
+        self.visibility_output_epoch = self.visibility_output_epoch.wrapping_add(1);
+        self.visibility_last_output = Some(Instant::now());
+    }
+
+    pub(crate) fn visibility_epochs(&self) -> (u64, u64, u64, Option<Instant>) {
+        (
+            self.visibility_input_epoch,
+            self.visibility_prompt_epoch,
+            self.visibility_output_epoch,
+            self.visibility_last_output,
+        )
     }
 
     /// Whether any held line carries a link span. O(1); the per-frame hover
@@ -687,6 +827,11 @@ impl TerminalBuffer {
     /// The link action under byte `column` of absolute line `line_number`, if any.
     /// Backs the pane's hover cursor and click dispatch.
     pub fn link_at(&self, line_number: usize, column: usize) -> Option<LinkAction> {
+        self.link_span_at(line_number, column)
+            .map(|link| link.action)
+    }
+
+    pub(crate) fn link_span_at(&self, line_number: usize, column: usize) -> Option<LinkSpan> {
         let offset = self.last_line_number - self.lines.len();
         if line_number <= offset || line_number > self.last_line_number {
             return None;
@@ -696,7 +841,23 @@ impl TerminalBuffer {
             .links
             .iter()
             .find(|link| link.begin_pos <= column && column < link.end_pos)
-            .map(|link| link.action.clone())
+            .cloned()
+    }
+
+    pub(crate) fn all_link_spans(&self) -> Vec<(usize, LinkSpan)> {
+        let offset = self.last_line_number - self.lines.len();
+        self.lines
+            .iter()
+            .enumerate()
+            .flat_map(|(index, line)| {
+                let line_number = offset + index + 1;
+                line.styled_line
+                    .links
+                    .iter()
+                    .cloned()
+                    .map(move |link| (line_number, link))
+            })
+            .collect()
     }
 
     /// The tooltip metadata under byte `column` of absolute line `line_number`.
@@ -1143,6 +1304,54 @@ mod tests {
     }
 
     #[test]
+    fn protocol_concealment_suppresses_every_visual_affordance() {
+        let prefs = crate::prefs::current();
+        let resolved = LinkRenderStyle {
+            authored: false,
+            style: LinkTextStyle::default(),
+            spoiler_concealed: false,
+            hidden: true,
+        };
+        let span = make_resolved_span(
+            "hidden",
+            Style::DEFAULT,
+            true,
+            Some(&resolved),
+            false,
+            &prefs,
+        );
+        assert_eq!(span.color, Some(iced::Color::TRANSPARENT));
+        assert!(span.highlight.is_none());
+        assert!(!span.underline);
+        assert!(!span.strikethrough);
+    }
+
+    #[test]
+    fn spoiler_cover_matches_foreground_and_background() {
+        let prefs = crate::prefs::current();
+        let resolved = LinkRenderStyle {
+            authored: false,
+            style: LinkTextStyle::default(),
+            spoiler_concealed: true,
+            hidden: false,
+        };
+        let span = make_resolved_span(
+            "secret",
+            Style::DEFAULT,
+            true,
+            Some(&resolved),
+            false,
+            &prefs,
+        );
+        let foreground = span.color.expect("foreground");
+        let Background::Color(background) = span.highlight.expect("cover").background else {
+            panic!("spoiler cover must be a color");
+        };
+        assert_eq!(foreground, background);
+        assert!(!span.underline);
+    }
+
+    #[test]
     fn authored_osc_false_values_override_active_sgr_attributes() {
         use smudgy_core::session::styled_line::{LinkTextStyle, TextAttributes};
 
@@ -1155,6 +1364,7 @@ mod tests {
                 strikethrough: Some(LinkDecoration::None),
                 ..LinkTextStyle::default()
             },
+            ..LinkStyle::default()
         };
         let span = make_span(
             "link",

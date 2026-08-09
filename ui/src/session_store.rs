@@ -1055,9 +1055,13 @@ impl ManagedSession {
         let tx = self.runtime_tx.clone()?;
         let server_config = self.server_config.clone();
         let pending = self.pending_link_confirm.clone();
+        let terminal_buffer = self.terminal_buffer.clone();
         Some(Rc::new(move |event: LinkClickEvent| {
             let action = match event.action {
-                LinkAction::Send(command) => RuntimeAction::Send(Arc::new(command.to_string())),
+                LinkAction::Send(command) => {
+                    terminal_buffer.borrow_mut().note_visibility_input();
+                    RuntimeAction::Send(Arc::new(command.to_string()))
+                }
                 LinkAction::Callback {
                     session,
                     isolate_token,
@@ -1091,6 +1095,7 @@ impl ManagedSession {
                 }
                 LinkAction::ServerSend(command) => {
                     if server_config.borrow().allows_server_link(None) {
+                        terminal_buffer.borrow_mut().note_visibility_input();
                         RuntimeAction::Send(Arc::new(command.to_string()))
                     } else {
                         *pending.borrow_mut() = Some(PendingLinkConfirm {
@@ -1148,6 +1153,7 @@ impl ManagedSession {
         match action {
             LinkAction::OpenUrl(url) => open_url_in_browser(url),
             LinkAction::ServerSend(command) => {
+                self.terminal_buffer.borrow_mut().note_visibility_input();
                 self.send_runtime_action(RuntimeAction::Send(Arc::new(command.to_string())));
             }
             // Prompt and script links never pass through the trust gate.
@@ -1225,6 +1231,7 @@ impl ManagedSession {
     fn handle_input_event(&mut self, event: session_input::Event) {
         match event {
             session_input::Event::Submit { text, masked } => {
+                self.terminal_buffer.borrow_mut().note_visibility_input();
                 self.send_runtime_action(submit_runtime_action(text, masked));
             }
             session_input::Event::HotkeyTriggered(id) => {
@@ -1536,8 +1543,13 @@ impl ManagedSession {
                                 BufferUpdate::EnsureNewLine => {
                                     self.terminal_buffer.borrow_mut().commit_current_line();
                                 }
+                                BufferUpdate::PromptBoundary => {
+                                    self.terminal_buffer.borrow_mut().note_visibility_prompt();
+                                }
                                 BufferUpdate::Append(line) => {
-                                    self.terminal_buffer.borrow_mut().extend_line(line.clone());
+                                    let mut buffer = self.terminal_buffer.borrow_mut();
+                                    buffer.note_visibility_output();
+                                    buffer.extend_line(line.clone());
                                 }
                                 BufferUpdate::AppendTo(key, line) => {
                                     // Core validates sinks against the live registry when it
@@ -1549,6 +1561,7 @@ impl ManagedSession {
                                     {
                                         Some(buffer) => {
                                             let mut buffer = buffer.borrow_mut();
+                                            buffer.note_visibility_output();
                                             // Whole-line delivery: start a fresh line, commit it.
                                             buffer.extend_line(line.clone());
                                             buffer.commit_current_line();

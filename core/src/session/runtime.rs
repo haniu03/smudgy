@@ -1653,6 +1653,7 @@ impl Inner<'_> {
                         }
                         self.log_open_line.clear();
                     }
+                    BufferUpdate::PromptBoundary => {}
                     BufferUpdate::AppendTo(_, line) => {
                         if self.log_open_on_disk {
                             rewind_provisional_open_line(log_file, self.log_committed_len)?;
