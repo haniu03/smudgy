@@ -180,9 +180,9 @@ impl Inner<'_> {
                 published,
                 writes,
             } => {
-                let (actions, bindings_changed) =
-                    self.script_engine
-                        .remote_store_flushed(source, &published, &writes);
+                let (actions, bindings_changed) = self
+                    .script_engine
+                    .remote_store_flushed(source, &published, &writes);
                 if bindings_changed
                     && let Err(error) = self.ui_tx.try_send(TaggedSessionEvent {
                         session_id: self.session_id,
@@ -202,9 +202,9 @@ impl Inner<'_> {
                 depth,
             } => {
                 let mut local = Vec::new();
-                for runtime in crate::session::registry::get_runtimes_for_server(
-                    self.server_name.as_str(),
-                ) {
+                for runtime in
+                    crate::session::registry::get_runtimes_for_server(self.server_name.as_str())
+                {
                     let action = RuntimeAction::InteropEvent {
                         canonical: Arc::clone(&canonical),
                         stamped: Arc::clone(&stamped),
@@ -439,6 +439,15 @@ impl Inner<'_> {
                 if let Some(fut) = self.flush_buffer_updates()? {
                     fut.await?;
                 }
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::LinkTooltipChanged => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::LinkTooltipChanged,
+                    })
+                    .await?;
                 Ok(ActionResult::None)
             }
             // Echo arms append WITHOUT flushing: delivery rides the run loop's
@@ -724,6 +733,37 @@ impl Inner<'_> {
                             .ok();
                     } else {
                         warn!("Dropping link click for session {session}: no live runtime");
+                    }
+                    Ok(ActionResult::None)
+                }
+            }
+            RuntimeAction::ResolveLinkTooltip {
+                session,
+                isolate,
+                instance,
+                id,
+                state,
+            } => {
+                // Like click callbacks, tooltip callbacks execute in the isolate
+                // that created the fragment, even when another session displays it.
+                if session == self.session_id {
+                    self.script_engine
+                        .resolve_link_tooltip(&isolate, instance, id, state)
+                } else {
+                    if let Some(runtime) = crate::session::registry::get_runtime(session) {
+                        runtime
+                            .tx
+                            .send(RuntimeAction::ResolveLinkTooltip {
+                                session,
+                                isolate,
+                                instance,
+                                id,
+                                state,
+                            })
+                            .ok();
+                    } else {
+                        state.resolve(None);
+                        warn!("Dropping link tooltip for session {session}: no live runtime");
                     }
                     Ok(ActionResult::None)
                 }
@@ -1296,12 +1336,9 @@ impl Inner<'_> {
                 placement,
                 reconcile_registry,
             } => {
-                let Some((def, placement)) = prepare_pane_open(
-                    &self.pane_registry,
-                    def,
-                    placement,
-                    reconcile_registry,
-                ) else {
+                let Some((def, placement)) =
+                    prepare_pane_open(&self.pane_registry, def, placement, reconcile_registry)
+                else {
                     // A foreign split mutates this data-only registry on its
                     // caller thread before queueing the open. Reconcile at the
                     // owner queue: an intervening close retires the key (drop
@@ -1663,11 +1700,13 @@ impl Inner<'_> {
                 let callback = self.pane_input_callbacks.lock().unwrap().get(key);
                 let Some(cb) = callback else {
                     if !retry {
-                        let _ = self.session_runtime_tx.send(RuntimeAction::PaneInputSubmit {
-                            key,
-                            text,
-                            retry: true,
-                        });
+                        let _ = self
+                            .session_runtime_tx
+                            .send(RuntimeAction::PaneInputSubmit {
+                                key,
+                                text,
+                                retry: true,
+                            });
                         return Ok(ActionResult::None);
                     }
                     warn!(
@@ -1680,10 +1719,9 @@ impl Inner<'_> {
                     if let Some(runtime) = crate::session::registry::get_runtime(cb.home_session)
                         && runtime.server_name.as_str() == self.server_name.as_str()
                     {
-                        let _ = runtime.tx.send(RuntimeAction::InvokePaneInputSubmit {
-                            callback: cb,
-                            text,
-                        });
+                        let _ = runtime
+                            .tx
+                            .send(RuntimeAction::InvokePaneInputSubmit { callback: cb, text });
                     } else {
                         warn!("Dropping pane-input submission: callback home session is gone");
                     }
@@ -1900,7 +1938,10 @@ impl Inner<'_> {
                 // The UI's history update: write the mirror the history read op
                 // consults. Unconditional — history changes per submission, not
                 // per keystroke, so there is no interest gate to check.
-                self.input_mirror.lock().unwrap().apply_history(key, entries);
+                self.input_mirror
+                    .lock()
+                    .unwrap()
+                    .apply_history(key, entries);
                 Ok(ActionResult::None)
             }
             RuntimeAction::InputWordSetsChanged { key } => {

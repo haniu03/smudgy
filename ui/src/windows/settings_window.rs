@@ -16,7 +16,8 @@ use iced::{Alignment, Background, Color, Length, Task};
 use smudgy_cloud::cloud_api::{ApiKeyInfo, AuthSession, CreatedApiKey, SessionInfo, UserProfile};
 use smudgy_cloud::{CloudError, Uuid};
 use smudgy_core::models::settings::{
-    CommandInputBehavior, Settings, ThemeTweaks, clear_update_check_seed, load_settings,
+    CommandInputBehavior, MAX_LINK_TOOLTIP_DELAY_MS, Settings, ThemeTweaks,
+    clear_update_check_seed, load_settings,
 };
 
 use crate::cloud_account::CloudHandles;
@@ -125,6 +126,8 @@ pub enum Message {
     PrefThemeExtendedColorsToggled(bool),
     PrefScrollbackChanged(String),
     PrefScrollbackSubmitted,
+    PrefLinkTooltipDelayChanged(String),
+    PrefLinkTooltipDelaySubmitted,
     PrefSeparatorChanged(String),
     PrefSeparatorSubmitted,
     PrefRawPrefixChanged(String),
@@ -206,6 +209,7 @@ pub struct SettingsWindow {
     font_size_input: String,
     line_length_input: String,
     scrollback_input: String,
+    link_tooltip_delay_input: String,
     separator_input: String,
     raw_prefix_input: String,
     /// Monospaced system font families, `None` until the first Preferences
@@ -242,6 +246,7 @@ impl SettingsWindow {
             .map(|len| len.to_string())
             .unwrap_or_default();
         let scrollback_input = settings.scrollback_length.to_string();
+        let link_tooltip_delay_input = settings.link_tooltip_delay_ms.to_string();
         let separator_input = settings.command_separator.clone();
         let raw_prefix_input = settings.raw_line_prefix.clone();
         Self {
@@ -264,6 +269,7 @@ impl SettingsWindow {
             font_size_input,
             line_length_input,
             scrollback_input,
+            link_tooltip_delay_input,
             separator_input,
             raw_prefix_input,
             system_fonts: None,
@@ -679,6 +685,19 @@ impl SettingsWindow {
                     _ => Update::none(),
                 }
             }
+            Message::PrefLinkTooltipDelayChanged(value) => {
+                self.link_tooltip_delay_input = value;
+                Update::none()
+            }
+            Message::PrefLinkTooltipDelaySubmitted => {
+                match self.link_tooltip_delay_input.trim().parse::<u64>() {
+                    Ok(delay) if delay <= MAX_LINK_TOOLTIP_DELAY_MS => {
+                        self.settings.link_tooltip_delay_ms = delay;
+                        self.settings_changed()
+                    }
+                    _ => Update::none(),
+                }
+            }
             // Unlike the numeric fields (whose commit is gated to Enter so a
             // half-typed value can't destructively trim the buffer), the
             // separator and prefix are short and free-form: commit on every
@@ -1028,8 +1047,7 @@ impl SettingsWindow {
             col = col.push(
                 container(
                     column![
-                        text(t!("account-verify-description"))
-                        .size(13),
+                        text(t!("account-verify-description")).size(13),
                         text_input(ts!("account-code-placeholder"), &self.code_input)
                             .on_input(Message::CodeChanged)
                             .on_submit(Message::VerifySubmitted)
@@ -1159,8 +1177,7 @@ impl SettingsWindow {
                 .on_input(Message::EmailChanged)
                 .on_submit(Message::CodeRequested)
                 .width(280),
-            text(t!("account-sign-in-description"))
-            .size(12),
+            text(t!("account-sign-in-description")).size(12),
             button(text(t!("account-email-code")).size(14))
                 .style(theme::builtins::button::primary)
                 .padding([6, 16])
@@ -1191,10 +1208,7 @@ impl SettingsWindow {
                     .width(280),
             );
         } else {
-            col = col.push(
-                text(t!("account-code-sent", "email" => email))
-                .size(13),
-            );
+            col = col.push(text(t!("account-code-sent", "email" => email)).size(13));
         }
 
         col = col
@@ -1246,6 +1260,10 @@ impl SettingsWindow {
         let scrollback_valid = matches!(
             self.scrollback_input.trim().parse::<usize>(),
             Ok(lines) if (100..=10_000_000).contains(&lines)
+        );
+        let link_tooltip_delay_valid = matches!(
+            self.link_tooltip_delay_input.trim().parse::<u64>(),
+            Ok(delay) if delay <= MAX_LINK_TOOLTIP_DELAY_MS
         );
 
         let mut col = column![text(t!("preferences-title")).size(20)].spacing(12);
@@ -1347,6 +1365,16 @@ impl SettingsWindow {
             140.0,
             Message::PrefScrollbackChanged,
             Message::PrefScrollbackSubmitted,
+        ));
+        col = col.push(pref_input(
+            t!("preferences-link-tooltip-delay"),
+            "0",
+            &self.link_tooltip_delay_input,
+            link_tooltip_delay_valid,
+            Some(t!("preferences-link-tooltip-delay-help")),
+            140.0,
+            Message::PrefLinkTooltipDelayChanged,
+            Message::PrefLinkTooltipDelaySubmitted,
         ));
         col = col.push(
             column![
@@ -1698,10 +1726,7 @@ impl SettingsWindow {
                 .padding([4, 10])
                 .on_press(Message::CreateApiKeyPressed),
         );
-        col = col.push(
-            text(t!("security-create-key-help"))
-                .size(11),
-        );
+        col = col.push(text(t!("security-create-key-help")).size(11));
 
         col = col.push(rule::horizontal(1));
 
@@ -1725,7 +1750,7 @@ impl SettingsWindow {
                                 "security-session-expires",
                                 "date" => session.expires_at.format("%Y-%m-%d").to_string()
                             ))
-                                .size(12),
+                            .size(12),
                             text(match &session.last_used_at {
                                 Some(at) => t!(
                                     "security-last-used",
@@ -1889,10 +1914,22 @@ fn tweak_tab_button(
 /// The Adjust tab: the four tweak sliders, their semantics hint, and reset.
 fn tweak_adjust_view(tweaks: &ThemeTweaks) -> ThemedElement<'static, Message> {
     column![
-        tweak_slider_row(t!("theme-background"), TweakSlider::Background, tweaks.background),
-        tweak_slider_row(t!("theme-brightness"), TweakSlider::Brightness, tweaks.brightness),
+        tweak_slider_row(
+            t!("theme-background"),
+            TweakSlider::Background,
+            tweaks.background
+        ),
+        tweak_slider_row(
+            t!("theme-brightness"),
+            TweakSlider::Brightness,
+            tweaks.brightness
+        ),
         tweak_slider_row(t!("theme-contrast"), TweakSlider::Contrast, tweaks.contrast),
-        tweak_slider_row(t!("theme-saturation"), TweakSlider::Saturation, tweaks.saturation),
+        tweak_slider_row(
+            t!("theme-saturation"),
+            TweakSlider::Saturation,
+            tweaks.saturation
+        ),
         dim_text_owned(t!("theme-adjust-help")),
         button(text(t!("theme-reset-adjustments")).size(12))
             .style(theme::builtins::button::secondary)

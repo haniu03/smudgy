@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::prefs::TerminalPrefs;
 use smudgy_core::session::runtime::line_operation::LineOperation;
 use smudgy_core::session::styled_line::{
-    Blink, Color, LinkAction, Style, StyledLine, Underline,
+    Blink, Color, LinkAction, LinkTooltip, Style, StyledLine, Underline,
 };
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
@@ -196,8 +196,8 @@ fn strip_possessive_suffix(word: &str) -> &str {
     }
 }
 
-impl AsRef<[Span<'static, Link>]> for BufferLine {
-    fn as_ref(&self) -> &[Span<'static, Link>] {
+impl AsRef<[Span<'static, SpanMetadata>]> for BufferLine {
+    fn as_ref(&self) -> &[Span<'static, SpanMetadata>] {
         self.spans().as_slice()
     }
 }
@@ -210,7 +210,7 @@ pub struct BufferLine {
     /// window, scrollback eviction) never pays `to_spans` at all; only lines
     /// the pane actually lays out are baked. Cleared — not eagerly rebaked —
     /// on palette changes and line edits.
-    spans: std::cell::OnceCell<Rc<Vec<Span<'static, Link>>>>,
+    spans: std::cell::OnceCell<Rc<Vec<Span<'static, SpanMetadata>>>>,
 }
 
 impl PartialEq for BufferLine {
@@ -233,7 +233,7 @@ impl BufferLine {
     /// first access. The returned `Rc` is pointer-stable until the spans are
     /// invalidated (palette change, line edit) — the pane's paragraph cache
     /// keys on that identity.
-    pub fn spans(&self) -> &Rc<Vec<Span<'static, Link>>> {
+    pub fn spans(&self) -> &Rc<Vec<Span<'static, SpanMetadata>>> {
         self.spans.get_or_init(|| {
             let prefs = crate::prefs::current();
             to_spans(&self.styled_line, &prefs)
@@ -641,6 +641,22 @@ impl TerminalBuffer {
             .map(|link| link.action.clone())
     }
 
+    /// The tooltip metadata under byte `column` of absolute line `line_number`.
+    /// Kept separate from click lookup so hover can resolve lazy script copy
+    /// without manufacturing a click event.
+    pub fn link_tooltip_at(&self, line_number: usize, column: usize) -> Option<LinkTooltip> {
+        let offset = self.last_line_number - self.lines.len();
+        if line_number <= offset || line_number > self.last_line_number {
+            return None;
+        }
+        let line = self.lines.get(line_number - offset - 1)?;
+        line.styled_line
+            .links
+            .iter()
+            .find(|link| link.begin_pos <= column && column < link.end_pos)
+            .and_then(|link| link.tooltip.clone())
+    }
+
     pub fn perform_line_operation(&mut self, line_number: usize, operation: LineOperation) {
         let offset = self.last_line_number - self.lines.len();
         // A line older than the buffer holds (scrolled out, or dropped by
@@ -692,9 +708,7 @@ impl TerminalBuffer {
 mod tests {
     use super::*;
     use smudgy_core::session::connection::vt_processor::AnsiColor;
-    use smudgy_core::session::styled_line::{
-        Blink, StyledLine, TextAttributes, Underline, VtSpan,
-    };
+    use smudgy_core::session::styled_line::{Blink, StyledLine, TextAttributes, Underline, VtSpan};
     use std::num::NonZeroUsize; // Assuming VtSpan is needed for StyledLine::new
 
     // Helper to create Arc<StyledLine> for tests
@@ -908,6 +922,7 @@ mod tests {
             begin_pos: begin,
             end_pos: end,
             action: LinkAction::Send(Arc::from("north")),
+            tooltip: None,
         });
         Arc::new(line)
     }
@@ -1074,6 +1089,7 @@ mod tests {
             begin_pos: 0,
             end_pos: 5,
             action: LinkAction::Send(Arc::from("north")),
+            tooltip: None,
         });
         let prefs = crate::prefs::current();
         let spans = to_spans(&Arc::new(line), &prefs);

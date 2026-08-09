@@ -15,6 +15,7 @@ use iced::{
     },
     window,
 };
+use smudgy_core::session::styled_line::LinkTooltipCallback;
 
 mod scroll_bar;
 mod terminal_pane;
@@ -25,6 +26,7 @@ struct SplitTerminalPane<'a> {
     pub selection: Rc<RefCell<Selection>>,
     pub buffer: Ref<'a, TerminalBuffer>,
     pub on_link: Option<Rc<dyn Fn(LinkClickEvent)>>,
+    pub on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
     /// Called with `(cols, rows)` when the pane's character grid changes — the full
     /// terminal region in cells, quantized so it only fires on actual grid changes.
     /// A plain callback for the same reason as `on_link`: the pane stays
@@ -43,6 +45,7 @@ impl<'a> SplitTerminalPane<'a> {
             selection,
             buffer,
             on_link: None,
+            on_link_tooltip: None,
             on_grid_change: None,
             font_size: None,
         }
@@ -51,6 +54,7 @@ impl<'a> SplitTerminalPane<'a> {
     fn terminal_pane(&self) -> TerminalPane<'a> {
         terminal_pane(Ref::clone(&self.buffer), self.selection.clone())
             .on_link(self.on_link.clone())
+            .on_link_tooltip(self.on_link_tooltip.clone())
             .font_size(self.font_size)
     }
 
@@ -632,6 +636,7 @@ pub fn split_terminal_pane<'a, Message, Theme, Renderer>(
     buffer: Ref<'a, TerminalBuffer>,
     selection: Rc<RefCell<Selection>>,
     on_link: Option<Rc<dyn Fn(LinkClickEvent)>>,
+    on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
     on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
     font_size: Option<f32>,
 ) -> Element<'a, Message, Theme, Renderer>
@@ -644,6 +649,7 @@ where
 {
     let mut pane = SplitTerminalPane::new(buffer, selection);
     pane.on_link = on_link;
+    pane.on_link_tooltip = on_link_tooltip;
     pane.on_grid_change = on_grid_change;
     pane.font_size = font_size;
     Element::new(pane)

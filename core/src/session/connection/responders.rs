@@ -22,6 +22,83 @@ pub mod ttype {
     pub const SEND: u8 = 1;
 }
 
+/// RFC 1572 NEW-ENVIRON responder for the OSC 8 capability variables used by
+/// current MUD servers. These are USERVARs rather than process environment
+/// variables; nothing from the host environment is ever exposed.
+pub mod new_environ {
+    use super::super::telnet::{frame_subnegotiation, option};
+
+    pub const IS: u8 = 0;
+    pub const SEND: u8 = 1;
+    const VAR: u8 = 0;
+    const VALUE: u8 = 1;
+    const ESC: u8 = 2;
+    const USERVAR: u8 = 3;
+
+    const CAPABILITIES: &[(&[u8], &[u8])] = &[
+        (b"OSC_HYPERLINKS", b"1"),
+        (b"OSC_HYPERLINKS_COMPACT", b"1"),
+        (b"OSC_HYPERLINKS_DISABLED", b"1"),
+        (b"OSC_HYPERLINKS_MENU", b"1"),
+        (b"OSC_HYPERLINKS_PROMPT", b"1"),
+        (b"OSC_HYPERLINKS_SEND", b"1"),
+        (b"OSC_HYPERLINKS_TOOLTIP", b"1"),
+    ];
+
+    fn requested_user_vars(payload: &[u8]) -> Vec<Vec<u8>> {
+        let mut requested = Vec::new();
+        let mut cursor = 0;
+        while cursor < payload.len() {
+            let kind = payload[cursor];
+            cursor += 1;
+            if kind != VAR && kind != USERVAR {
+                break;
+            }
+            let mut name = Vec::new();
+            while cursor < payload.len() {
+                match payload[cursor] {
+                    VAR | USERVAR => break,
+                    ESC => {
+                        cursor += 1;
+                        if let Some(&escaped) = payload.get(cursor) {
+                            name.push(escaped);
+                            cursor += 1;
+                        }
+                    }
+                    byte => {
+                        name.push(byte);
+                        cursor += 1;
+                    }
+                }
+            }
+            if kind == USERVAR {
+                requested.push(name);
+            }
+        }
+        requested
+    }
+
+    /// Answer an empty SEND with all supported capabilities, or a selective
+    /// SEND with only recognized USERVAR names, preserving catalogue order.
+    pub fn answer_send(request: &[u8], replies: &mut Vec<u8>) {
+        let requested = (!request.is_empty()).then(|| requested_user_vars(request));
+        let mut payload = vec![IS];
+        for &(name, value) in CAPABILITIES {
+            if requested.as_ref().is_none_or(|requested| {
+                requested
+                    .iter()
+                    .any(|wanted| wanted.eq_ignore_ascii_case(name))
+            }) {
+                payload.push(USERVAR);
+                payload.extend_from_slice(name);
+                payload.push(VALUE);
+                payload.extend_from_slice(value);
+            }
+        }
+        frame_subnegotiation(option::NEW_ENVIRON, &payload, replies);
+    }
+}
+
 /// MTTS capability bits, advertised in the third TTYPE response
 /// (`MTTS <bitvector>`; <https://tintin.mudhalla.net/protocols/mtts/>).
 pub mod mtts {
@@ -244,8 +321,10 @@ fn frame_naws((cols, rows): (u16, u16), replies: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::super::telnet::command::{IAC, SB, SE};
-    use super::super::telnet::option::{NAWS, TTYPE};
-    use super::{CLIENT_NAME, ProtocolState, TERMINAL_TYPE, mtts, pack_dims, ttype, unpack_dims};
+    use super::super::telnet::option::{NAWS, NEW_ENVIRON, TTYPE};
+    use super::{
+        CLIENT_NAME, ProtocolState, TERMINAL_TYPE, mtts, new_environ, pack_dims, ttype, unpack_dims,
+    };
 
     /// Strip one `IAC SB <opt> … IAC SE` frame, returning the option and payload.
     fn unframe(buf: &[u8]) -> (u8, Vec<u8>) {
@@ -272,6 +351,56 @@ mod tests {
         state.on_ttype_send(&mut replies);
         let (_, payload) = unframe(&replies);
         assert_eq!(&payload[1..], b"MTTS 2317", "SSL bit set over TLS");
+    }
+
+    #[test]
+    fn new_environ_advertises_only_truthful_osc8_capabilities() {
+        let mut replies = Vec::new();
+        new_environ::answer_send(&[], &mut replies);
+        let (option, payload) = unframe(&replies);
+        assert_eq!(option, NEW_ENVIRON);
+        assert_eq!(payload[0], new_environ::IS);
+        assert!(
+            payload
+                .windows(b"OSC_HYPERLINKS_TOOLTIP".len())
+                .any(|window| window == b"OSC_HYPERLINKS_TOOLTIP")
+        );
+        assert!(
+            payload
+                .windows(b"OSC_HYPERLINKS_PROMPT".len())
+                .any(|window| window == b"OSC_HYPERLINKS_PROMPT")
+        );
+        for capability in [
+            b"OSC_HYPERLINKS_COMPACT".as_slice(),
+            b"OSC_HYPERLINKS_DISABLED".as_slice(),
+            b"OSC_HYPERLINKS_MENU".as_slice(),
+        ] {
+            assert!(
+                payload
+                    .windows(capability.len())
+                    .any(|window| window == capability)
+            );
+        }
+    }
+
+    #[test]
+    fn new_environ_honors_selective_uservar_send() {
+        let request = [
+            3, b'O', b'S', b'C', b'_', b'H', b'Y', b'P', b'E', b'R', b'L', b'I', b'N', b'K', b'S',
+            b'_', b'T', b'O', b'O', b'L', b'T', b'I', b'P',
+        ];
+        let mut replies = Vec::new();
+        new_environ::answer_send(&request, &mut replies);
+        let (_, payload) = unframe(&replies);
+        assert_eq!(
+            payload,
+            [
+                &[new_environ::IS, 3][..],
+                b"OSC_HYPERLINKS_TOOLTIP",
+                &[1, b'1'],
+            ]
+            .concat()
+        );
     }
 
     #[test]

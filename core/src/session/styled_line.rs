@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::connection::vt_processor;
 
@@ -79,11 +81,27 @@ pub struct VtSpan {
 /// What a click on a linked range of a line does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkAction {
+    /// A link-styled range with optional secondary behavior. `primary: None`
+    /// is useful for tooltip-only script text; `disabled` preserves hover copy
+    /// while suppressing both the primary action and context menu.
+    Configured {
+        primary: Option<Box<LinkAction>>,
+        /// Protocol-level disabled state: blocks both primary activation and
+        /// the context menu.
+        disabled: bool,
+        /// Script-level activation switch: blocks only the left-click path;
+        /// an attached menu remains available from right-click.
+        primary_enabled: bool,
+        menu: Option<LinkMenu>,
+        /// A null-primary script menu may use an ordinary left click as a
+        /// second way to open the context menu.
+        menu_on_left_click: bool,
+    },
     /// Send this command on the clicked pane's session, as if typed (alias
     /// processing and command splitting apply). Serialized into the line, so
     /// it works for as long as the line is on screen.
     Send(Arc<str>),
-    /// Open this http(s) URL in the system browser. Minted only by the VT
+    /// Open this http(s)/ftp URL in the system browser. Minted only by the VT
     /// layer from a server's OSC 8 hyperlink — scripts have no wire form for
     /// it — so activation is gated by the per-server link-trust policy.
     OpenUrl(Arc<str>),
@@ -91,6 +109,9 @@ pub enum LinkAction {
     /// `send:` URI), not from a script: activation is gated by the same
     /// per-server trust policy as [`LinkAction::OpenUrl`].
     ServerSend(Arc<str>),
+    /// Prefill the main command input without submitting it. Minted by an OSC
+    /// 8 `prompt:` URI.
+    Prompt(Arc<str>),
     /// Run a script callback in the engine that created the fragment. The
     /// line carries only this address — the function itself stays in its
     /// isolate's registry, so a click after that engine is gone is a no-op.
@@ -107,6 +128,278 @@ pub enum LinkAction {
     },
 }
 
+impl LinkAction {
+    /// The action a normal left click may execute. Disabled and tooltip-only
+    /// configured links return `None`.
+    #[must_use]
+    pub fn primary(&self) -> Option<&Self> {
+        match self {
+            Self::Configured { disabled: true, .. }
+            | Self::Configured {
+                primary_enabled: false,
+                ..
+            }
+            | Self::Configured { primary: None, .. } => None,
+            Self::Configured {
+                primary: Some(primary),
+                ..
+            } => primary.primary(),
+            _ => Some(self),
+        }
+    }
+
+    /// The underlying primary target, even when activation is disabled. Used
+    /// only for honest tooltip disclosure.
+    #[must_use]
+    pub fn disclosed_target(&self) -> Option<&Self> {
+        match self {
+            Self::Configured {
+                primary: Some(primary),
+                ..
+            } => primary.disclosed_target(),
+            Self::Configured { primary: None, .. } => None,
+            _ => Some(self),
+        }
+    }
+
+    /// The enabled context menu, if one was supplied.
+    #[must_use]
+    pub fn menu(&self) -> Option<&LinkMenu> {
+        match self {
+            Self::Configured {
+                disabled: false,
+                menu,
+                ..
+            } => menu.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Whether a normal left click should open the menu instead of dispatching
+    /// a primary action. Right-click menu availability is governed by
+    /// [`Self::menu`] independently.
+    #[must_use]
+    pub fn opens_menu_on_left_click(&self) -> bool {
+        matches!(
+            self,
+            Self::Configured {
+                disabled: false,
+                primary_enabled: true,
+                menu: Some(_),
+                menu_on_left_click: true,
+                ..
+            }
+        )
+    }
+
+    #[must_use]
+    pub fn is_interactive(&self) -> bool {
+        self.primary().is_some() || self.menu().is_some()
+    }
+}
+
+/// A right-click menu attached to a link-styled range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkMenu {
+    pub title: Option<Arc<str>>,
+    pub items: Arc<[LinkMenuItem]>,
+}
+
+/// One context-menu row. OSC menu labels and script labels are always rendered
+/// as plain text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkMenuItem {
+    Separator,
+    Action { label: Arc<str>, action: LinkAction },
+}
+
+/// Safe, display-ready tooltip copy. ANSI control sequences have already been
+/// reduced to plain text plus semantic terminal color spans; no executable
+/// terminal controls remain in `text`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkTooltipText {
+    pub text: Arc<str>,
+    pub spans: Arc<[VtSpan]>,
+}
+
+impl LinkTooltipText {
+    #[must_use]
+    pub fn plain(text: Arc<str>) -> Self {
+        let len = text.len();
+        Self {
+            text,
+            spans: Arc::from([VtSpan {
+                style: Style::default(),
+                begin_pos: 0,
+                end_pos: len,
+            }]),
+        }
+    }
+}
+
+const TOOLTIP_IDLE: u8 = 0;
+const TOOLTIP_LOADING: u8 = 1;
+const TOOLTIP_READY: u8 = 2;
+const TOOLTIP_FAILED: u8 = 3;
+
+/// Shared result cell for a script-authored tooltip callback. The UI atomically
+/// claims the first hover, the owning isolate resolves the callback (which may
+/// be async), and every copy of the linked line observes the cached result.
+#[derive(Debug, Default)]
+pub struct LinkTooltipState {
+    status: AtomicU8,
+    text: RwLock<Option<LinkTooltipText>>,
+}
+
+impl LinkTooltipState {
+    /// Claim the one lazy resolution attempt made for this tooltip.
+    #[must_use]
+    pub fn begin_request(&self) -> bool {
+        self.status
+            .compare_exchange(
+                TOOLTIP_IDLE,
+                TOOLTIP_LOADING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Publish a callback result. `None` is a terminal failure; the target
+    /// fallback (when one exists) remains available to the UI.
+    pub fn resolve(&self, text: Option<LinkTooltipText>) {
+        let ready = text.is_some();
+        *self
+            .text
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = text;
+        self.status.store(
+            if ready { TOOLTIP_READY } else { TOOLTIP_FAILED },
+            Ordering::Release,
+        );
+    }
+
+    #[must_use]
+    pub fn text(&self) -> Option<LinkTooltipText> {
+        if self.status.load(Ordering::Acquire) != TOOLTIP_READY {
+            return None;
+        }
+        self.text
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// The callback address and shared result cell for a lazy script tooltip.
+#[derive(Debug, Clone)]
+pub struct LinkTooltipCallback {
+    pub session: super::SessionId,
+    pub isolate_token: Arc<str>,
+    pub id: u64,
+    pub state: Arc<LinkTooltipState>,
+}
+
+impl PartialEq for LinkTooltipCallback {
+    fn eq(&self, other: &Self) -> bool {
+        self.session == other.session
+            && self.isolate_token == other.isolate_token
+            && self.id == other.id
+    }
+}
+
+impl Eq for LinkTooltipCallback {}
+
+/// The primary hover copy for a link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTooltipSource {
+    Text(LinkTooltipText),
+    Callback(LinkTooltipCallback),
+}
+
+/// Hover copy attached to a linked range. `target` is present only when the
+/// primary copy is custom; the UI renders the real action target beneath it in
+/// muted text so author-provided help cannot conceal a deceptive destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkTooltip {
+    pub source: LinkTooltipSource,
+    pub target: Option<Arc<str>>,
+}
+
+impl LinkTooltip {
+    #[must_use]
+    pub fn text(text: Arc<str>, target: Option<Arc<str>>) -> Self {
+        Self {
+            source: LinkTooltipSource::Text(LinkTooltipText::plain(text)),
+            target,
+        }
+    }
+
+    #[must_use]
+    pub fn styled_text(text: LinkTooltipText, target: Option<Arc<str>>) -> Self {
+        Self {
+            source: LinkTooltipSource::Text(text),
+            target,
+        }
+    }
+
+    #[must_use]
+    pub fn callback(callback: LinkTooltipCallback, target: Option<Arc<str>>) -> Self {
+        Self {
+            source: LinkTooltipSource::Callback(callback),
+            target,
+        }
+    }
+
+    /// The current renderable `(primary, secondary target)` pair. Before a
+    /// callback resolves, a known target is the safe fallback; a callback-only
+    /// link simply has no tooltip yet.
+    #[must_use]
+    pub fn display(&self) -> Option<(Arc<str>, Option<Arc<str>>)> {
+        self.display_styled()
+            .map(|(primary, secondary)| (primary.text, secondary))
+    }
+
+    /// The current renderable styled primary copy and plain secondary target.
+    #[must_use]
+    pub fn display_styled(&self) -> Option<(LinkTooltipText, Option<Arc<str>>)> {
+        match &self.source {
+            LinkTooltipSource::Text(text) => {
+                Some((text.clone(), self.secondary_for(text.text.as_ref())))
+            }
+            LinkTooltipSource::Callback(callback) => callback
+                .state
+                .text()
+                .map(|text| {
+                    let secondary = self.secondary_for(text.text.as_ref());
+                    (text, secondary)
+                })
+                .or_else(|| {
+                    self.target
+                        .clone()
+                        .map(|target| (LinkTooltipText::plain(target), None))
+                }),
+        }
+    }
+
+    fn secondary_for(&self, primary: &str) -> Option<Arc<str>> {
+        self.target
+            .as_ref()
+            .filter(|target| target.as_ref() != primary)
+            .cloned()
+    }
+
+    /// Claim this dynamic tooltip's first resolution and return the request to
+    /// route home. Static and already-requested tooltips return `None`.
+    #[must_use]
+    pub fn request(&self) -> Option<LinkTooltipCallback> {
+        let LinkTooltipSource::Callback(callback) = &self.source else {
+            return None;
+        };
+        callback.state.begin_request().then(|| callback.clone())
+    }
+}
+
 /// One clickable byte range of a line. Kept in a list parallel to the style
 /// spans (not on [`VtSpan`]) so the hot ingest path and the span-surgery code
 /// stay link-free; link ranges may cross style-span boundaries and vice versa.
@@ -115,6 +408,14 @@ pub struct LinkSpan {
     pub begin_pos: usize,
     pub end_pos: usize,
     pub action: LinkAction,
+    pub tooltip: Option<LinkTooltip>,
+}
+
+/// Link metadata on one styled-text run before its byte range is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyledLink {
+    pub action: LinkAction,
+    pub tooltip: Option<LinkTooltip>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +475,7 @@ impl StyledLine {
                     begin_pos: link.begin_pos + self.text.len(),
                     end_pos: link.end_pos + self.text.len(),
                     action: link.action.clone(),
+                    tooltip: link.tooltip.clone(),
                 }))
                 .collect(),
             raw: match self.raw {
@@ -213,6 +515,7 @@ impl StyledLine {
                         begin_pos: link.begin_pos,
                         end_pos: clipped_end,
                         action: link.action.clone(),
+                        tooltip: link.tooltip.clone(),
                     });
                 }
             }
@@ -225,6 +528,7 @@ impl StyledLine {
                         begin_pos,
                         end_pos,
                         action: link.action.clone(),
+                        tooltip: link.tooltip.clone(),
                     });
                 }
             }
@@ -445,6 +749,29 @@ impl StyledLine {
         runs: &[(&str, Style, Option<LinkAction>)],
         empty_style: Style,
     ) -> Self {
+        let runs: Vec<_> = runs
+            .iter()
+            .map(|(text, style, action)| {
+                (
+                    *text,
+                    *style,
+                    action.clone().map(|action| StyledLink {
+                        action,
+                        tooltip: None,
+                    }),
+                )
+            })
+            .collect();
+        Self::from_linked_runs(&runs, empty_style)
+    }
+
+    /// Build a line like [`Self::from_styled_runs`], retaining optional hover
+    /// metadata on each linked run.
+    #[must_use]
+    pub fn from_linked_runs(
+        runs: &[(&str, Style, Option<StyledLink>)],
+        empty_style: Style,
+    ) -> Self {
         let mut text = String::with_capacity(runs.iter().map(|(t, _, _)| t.len()).sum());
         let mut spans: Vec<VtSpan> = Vec::with_capacity(runs.len());
         let mut links: Vec<LinkSpan> = Vec::new();
@@ -464,15 +791,20 @@ impl StyledLine {
                     end_pos: text.len(),
                 }),
             }
-            if let Some(action) = link {
+            if let Some(link) = link {
                 match links.last_mut() {
-                    Some(prev) if prev.action == *action && prev.end_pos == begin => {
+                    Some(prev)
+                        if prev.action == link.action
+                            && prev.tooltip == link.tooltip
+                            && prev.end_pos == begin =>
+                    {
                         prev.end_pos = text.len();
                     }
                     _ => links.push(LinkSpan {
                         begin_pos: begin,
                         end_pos: text.len(),
-                        action: action.clone(),
+                        action: link.action.clone(),
+                        tooltip: link.tooltip.clone(),
                     }),
                 }
             }
@@ -945,7 +1277,11 @@ mod tests {
             cursor = span.end_pos;
         }
         assert_eq!(cursor, line.text.len(), "spans do not reach end of text");
-        assert_eq!(rendered, line.text, "spans do not tile text: {:?}", line.spans);
+        assert_eq!(
+            rendered, line.text,
+            "spans do not tile text: {:?}",
+            line.spans
+        );
     }
 
     #[test]
@@ -1024,6 +1360,7 @@ mod tests {
                 begin_pos: 3,
                 end_pos: 8,
                 action: send_link("north"),
+                tooltip: None,
             }]
         );
     }
@@ -1039,7 +1376,15 @@ mod tests {
             ],
             style,
         );
-        assert_eq!(line.links, vec![LinkSpan { begin_pos: 2, end_pos: 6, action: send_link("go") }]);
+        assert_eq!(
+            line.links,
+            vec![LinkSpan {
+                begin_pos: 2,
+                end_pos: 6,
+                action: send_link("go"),
+                tooltip: None,
+            }]
+        );
 
         // Insert before the link: it shifts right.
         line = line.insert("XX", 0, 0, style);
@@ -1054,8 +1399,18 @@ mod tests {
         assert_eq!(
             split.links,
             vec![
-                LinkSpan { begin_pos: 4, end_pos: 5, action: send_link("go") },
-                LinkSpan { begin_pos: 6, end_pos: 7, action: send_link("go") },
+                LinkSpan {
+                    begin_pos: 4,
+                    end_pos: 5,
+                    action: send_link("go"),
+                    tooltip: None,
+                },
+                LinkSpan {
+                    begin_pos: 6,
+                    end_pos: 7,
+                    action: send_link("go"),
+                    tooltip: None,
+                },
             ]
         );
 

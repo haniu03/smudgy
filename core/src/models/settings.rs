@@ -138,6 +138,11 @@ pub const DEFAULT_API_BASE_URL: &str = if is_dev_build() {
     "https://api.smudgy.org"
 };
 
+/// Largest link-tooltip delay accepted by the preferences UI and renderer.
+/// Keeps a hand-edited settings file from scheduling an effectively unbounded
+/// redraw deadline.
+pub const MAX_LINK_TOOLTIP_DELAY_MS: u64 = 60_000;
+
 /// Represents the global application settings.
 ///
 /// Loaded from / saved to `settings.json` in the main smudgy config directory.
@@ -215,6 +220,10 @@ pub struct Settings {
     /// width. This is client-side wrapping only (no NAWS negotiation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_line_length: Option<u16>,
+    /// Time the pointer must remain over a terminal link before its tooltip is
+    /// shown, in milliseconds. Zero shows tooltips immediately.
+    #[serde(default)]
+    pub link_tooltip_delay_ms: u64,
     /// Named theme: terminal color scheme plus app background/accent.
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -546,6 +555,7 @@ impl Default for Settings {
             terminal_font_ligatures: false,
             terminal_bold_is_bright: true,
             terminal_line_length: None,
+            link_tooltip_delay_ms: 0,
             theme: default_theme(),
             theme_extended_colors: true,
             theme_tweaks: std::collections::HashMap::new(),
@@ -851,6 +861,36 @@ mod tests {
     }
 
     #[test]
+    fn link_tooltip_delay_defaults_to_zero_and_roundtrips() {
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("existing settings parse");
+        assert_eq!(settings.link_tooltip_delay_ms, 0);
+
+        let configured = Settings {
+            link_tooltip_delay_ms: 375,
+            ..Settings::default()
+        };
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
+        assert_eq!(parsed.link_tooltip_delay_ms, 375);
+    }
+
+    #[test]
+    fn bold_is_bright_defaults_on_and_roundtrips_off() {
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("existing settings parse");
+        assert!(settings.terminal_bold_is_bright);
+
+        let configured = Settings {
+            terminal_bold_is_bright: false,
+            ..Settings::default()
+        };
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
+        assert!(!parsed.terminal_bold_is_bright);
+    }
+
+    #[test]
     fn locale_preference_roundtrips_without_changing_legacy_defaults() {
         let mut settings = Settings::default();
         settings.locale = "zh-TW".to_string();
@@ -872,21 +912,6 @@ mod tests {
         let parsed: Settings =
             serde_json::from_str(&serde_json::to_string(&literal).unwrap()).unwrap();
         assert!(!parsed.theme_extended_colors);
-    }
-
-    #[test]
-    fn bold_is_bright_defaults_on_and_roundtrips_off() {
-        let existing = r#"{ "scrollback_length": 5000 }"#;
-        let settings: Settings = serde_json::from_str(existing).expect("existing settings parse");
-        assert!(settings.terminal_bold_is_bright);
-
-        let configured = Settings {
-            terminal_bold_is_bright: false,
-            ..Settings::default()
-        };
-        let parsed: Settings =
-            serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
-        assert!(!parsed.terminal_bold_is_bright);
     }
 
     #[test]
@@ -940,14 +965,16 @@ mod tests {
         // An existing settings file without the field deserializes with the feature OFF.
         let existing = r#"{ "scrollback_length": 5000 }"#;
         let settings: Settings = serde_json::from_str(existing).expect("parse");
-        assert!(!settings.advanced_scripting_features, "advanced features default off");
+        assert!(
+            !settings.advanced_scripting_features,
+            "advanced features default off"
+        );
 
         let on = Settings {
             advanced_scripting_features: true,
             ..Settings::default()
         };
-        let parsed: Settings =
-            serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        let parsed: Settings = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
         assert!(parsed.advanced_scripting_features);
     }
 
@@ -977,8 +1004,7 @@ mod tests {
             auto_check_for_updates: false,
             ..Settings::default()
         };
-        let parsed: Settings =
-            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        let parsed: Settings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!parsed.auto_check_for_updates);
     }
 
@@ -994,8 +1020,7 @@ mod tests {
             discord_rich_presence: false,
             ..Settings::default()
         };
-        let parsed: Settings =
-            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        let parsed: Settings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!parsed.discord_rich_presence);
     }
 
@@ -1011,7 +1036,10 @@ mod tests {
         };
         let parsed: Settings =
             serde_json::from_str(&serde_json::to_string(&dismissed).unwrap()).unwrap();
-        assert_eq!(parsed.dismissed_signin_banner_version.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            parsed.dismissed_signin_banner_version.as_deref(),
+            Some("1.2.3")
+        );
 
         // Unset stays out of settings.json entirely.
         let json = serde_json::to_string(&Settings::default()).expect("serialize");

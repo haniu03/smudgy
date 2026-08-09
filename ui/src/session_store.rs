@@ -32,12 +32,12 @@ use smudgy_core::models::profile::load_profile;
 use smudgy_core::models::server::{ServerConfig, link_url_host, load_server, update_server};
 use smudgy_core::models::settings::{ScriptSettings, Settings, load_settings};
 use smudgy_core::session::SessionParams;
-use smudgy_core::session::runtime::input::InputSnapshot;
+use smudgy_core::session::runtime::input::{InputOp, InputSnapshot};
 use smudgy_core::session::runtime::pane::{
     MAIN_PANE_KEY, MAIN_PANE_NAME_ID, PaneDef, PaneKey, PaneKind, TitleBarPolicy,
 };
 use smudgy_core::session::runtime::{IsolateId, RuntimeAction};
-use smudgy_core::session::styled_line::LinkAction;
+use smudgy_core::session::styled_line::{LinkAction, LinkTooltipCallback};
 use smudgy_core::session::{self, SessionEvent, SessionId};
 use smudgy_core::session::{BufferUpdate, TaggedSessionEvent};
 use smudgy_map_widget::map_view;
@@ -951,6 +951,7 @@ impl ManagedSession {
                             buffer.borrow(),
                             pane.selection.clone(),
                             self.link_handler(),
+                            self.link_tooltip_handler(),
                             // NAWS describes the main terminal; script panes don't report.
                             None,
                             pane.def.font_size,
@@ -1102,10 +1103,43 @@ impl ManagedSession {
                         return;
                     }
                 }
+                LinkAction::Prompt(text) => {
+                    for op in [InputOp::Replace(Arc::new(text.to_string())), InputOp::Focus] {
+                        if let Err(e) = tx.send(RuntimeAction::InputApply {
+                            key: MAIN_PANE_KEY,
+                            op,
+                        }) {
+                            log::error!("Failed to apply OSC prompt to session input: {e}");
+                            break;
+                        }
+                    }
+                    return;
+                }
+                // TerminalPane resolves configured primary actions and menu
+                // rows before dispatch. Treat an unexpected wrapper as inert.
+                LinkAction::Configured { .. } => return,
             };
             if let Err(e) = tx.send(action) {
                 log::error!("Failed to send link action to session runtime: {e}");
             }
+        }))
+    }
+
+    /// Route a lazy hover callback to the isolate that created the styled link.
+    /// The shared result cell lives in terminal scrollback, so completion needs
+    /// only a repaint wake rather than a buffer mutation.
+    fn link_tooltip_handler(&self) -> Option<Rc<dyn Fn(LinkTooltipCallback)>> {
+        let tx = self.runtime_tx.clone()?;
+        Some(Rc::new(move |request: LinkTooltipCallback| {
+            let (isolate, instance) = IsolateId::from_widget_token(&request.isolate_token);
+            tx.send(RuntimeAction::ResolveLinkTooltip {
+                session: request.session,
+                isolate,
+                instance,
+                id: request.id,
+                state: request.state,
+            })
+            .ok();
         }))
     }
 
@@ -1116,8 +1150,11 @@ impl ManagedSession {
             LinkAction::ServerSend(command) => {
                 self.send_runtime_action(RuntimeAction::Send(Arc::new(command.to_string())));
             }
-            // Script links never pass through the trust gate.
-            LinkAction::Send(_) | LinkAction::Callback { .. } => {}
+            // Prompt and script links never pass through the trust gate.
+            LinkAction::Prompt(_)
+            | LinkAction::Configured { .. }
+            | LinkAction::Send(_)
+            | LinkAction::Callback { .. } => {}
         }
     }
 
@@ -1623,8 +1660,7 @@ impl ManagedSession {
                     SessionEvent::Connected => {
                         self.connected = true;
                         self.ever_connected = true;
-                        self.connected_at_unix_ms =
-                            Some(crate::discord_presence::unix_now_ms());
+                        self.connected_at_unix_ms = Some(crate::discord_presence::unix_now_ms());
                         Task::none()
                     }
                     SessionEvent::Disconnected => {
@@ -1638,6 +1674,7 @@ impl ManagedSession {
                         // update here — processing the message redraws the view.
                         Task::none()
                     }
+                    SessionEvent::LinkTooltipChanged => Task::none(),
                     SessionEvent::InputOp { key, op } => {
                         // The op layer refuses targets without an input, so a
                         // miss here can only be a bug. Warn-and-drop like an
@@ -1872,6 +1909,7 @@ impl ManagedSession {
             self.terminal_buffer.borrow(),
             self.terminal_pane_selection.clone(),
             self.link_handler(),
+            self.link_tooltip_handler(),
             self.grid_change_handler(),
             self.main_font_size,
         ))

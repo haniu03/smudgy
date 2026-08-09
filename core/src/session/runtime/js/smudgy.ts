@@ -54,6 +54,7 @@ const {
     op_smudgy_session_reload,
     op_smudgy_session_send,
     op_smudgy_session_send_raw,
+    op_smudgy_resolve_link_tooltip,
     op_smudgy_insert,
     op_smudgy_replace,
     op_smudgy_highlight,
@@ -238,9 +239,38 @@ interface LinkClick {
     alt: boolean;
 }
 
-/** A run's click action: a command to send, or a handler function (extracted into a
- *  side array before the payload crosses the op boundary -- functions don't serialize). */
-type LinkSpec = { send: string } | { fn: (click: LinkClick) => void };
+type LinkTooltip = string | (() => unknown | PromiseLike<unknown>);
+type LinkHandler = (click: LinkClick) => void;
+type LinkActionSpec = { send: string } | { fn: LinkHandler };
+
+interface LinkMenuItem {
+    label: string;
+    action: string | LinkHandler;
+}
+
+interface LinkOptions {
+    tooltip?: LinkTooltip;
+    enabled?: boolean;
+    menu?: readonly ("-" | LinkMenuItem)[];
+    title?: string;
+}
+
+type TooltipSpec = { text: string } | { fn: (requestId: string) => void };
+
+/** A run's click action plus optional hover copy. Functions are extracted into a
+ *  side array before the payload crosses the op boundary. */
+interface LinkSpec {
+    action: LinkActionSpec | null;
+    tooltip: TooltipSpec | null;
+    enabled: boolean;
+    menu: readonly (LinkMenuItemSpec | null)[] | null;
+    title: string | null;
+}
+
+interface LinkMenuItemSpec {
+    label: string;
+    action: LinkActionSpec;
+}
 
 /** One flattened run of a fragment: its text plus the colors it has resolved so far.
  *  `null` means unset -- filled by an enclosing fragment's style, or by the delivery
@@ -461,28 +491,116 @@ interface StyleTag {
     (text: TemplateStringsArray, ...values: unknown[]): StyledTextImpl;
 }
 
+/** Normalize optional hover copy. A function is wrapped so its sync result or
+ *  promise completion reports back through one native completion op. */
+function __styled_tooltip(options: LinkOptions | undefined): TooltipSpec | null {
+    if (options === undefined) return null;
+    if (typeof options !== "object" || options === null) {
+        throw new TypeError("link() options must be an object");
+    }
+    if (options.tooltip === undefined) return null;
+    const tooltip = options.tooltip;
+    if (typeof tooltip === "string") return { text: tooltip };
+    if (typeof tooltip !== "function") {
+        throw new TypeError("link() tooltip must be a string or function");
+    }
+    return {
+        fn: (requestId: string): void => {
+            Promise.resolve()
+                .then(() => tooltip())
+                .then(
+                    (value) => op_smudgy_resolve_link_tooltip(requestId, String(value)),
+                    (error) => {
+                        op_smudgy_resolve_link_tooltip(requestId, null);
+                        console.error(error);
+                    },
+                );
+        },
+    };
+}
+
+function __styled_menu(options: LinkOptions | undefined): readonly (LinkMenuItemSpec | null)[] | null {
+    if (options === undefined || options.menu === undefined) return null;
+    if (!Array.isArray(options.menu) || options.menu.length === 0) {
+        throw new TypeError("link() menu must be a non-empty array");
+    }
+    return options.menu.map((item, index) => {
+        if (item === "-") return null;
+        if (typeof item !== "object" || item === null) {
+            throw new TypeError(`link() menu item ${index} must be "-" or { label, action }`);
+        }
+        if (typeof item.label !== "string" || item.label.trim() === "") {
+            throw new TypeError(`link() menu item ${index} label must be a non-empty string`);
+        }
+        const action = item.action;
+        if (typeof action === "string") {
+            if (action === "") {
+                throw new TypeError(`link() menu item ${index} command must not be empty`);
+            }
+            return { label: item.label, action: { send: action } };
+        }
+        if (typeof action === "function") {
+            return { label: item.label, action: { fn: action } };
+        }
+        throw new TypeError(`link() menu item ${index} action must be a command or function`);
+    });
+}
+
 /** Makes text clickable: `link("north")` sends the command when clicked (as if
  *  typed); `link(fn)` runs the handler. Returns a template tag, so it composes with
  *  `style` by nesting -- the innermost link wins on overlap. */
-function link(action: string | ((click: LinkClick) => void)): StyleTag {
-    let spec: LinkSpec;
+function link(
+    action: string | LinkHandler | null,
+    options?: LinkOptions,
+): StyleTag {
+    const tooltip = __styled_tooltip(options);
+    const menu = __styled_menu(options);
+    if (options?.enabled !== undefined && typeof options.enabled !== "boolean") {
+        throw new TypeError("link() enabled must be a boolean");
+    }
+    if (options?.title !== undefined && typeof options.title !== "string") {
+        throw new TypeError("link() title must be a string");
+    }
+    let primary: LinkActionSpec | null;
     if (typeof action === "string") {
         if (action === "") {
             throw new TypeError("link() command must not be empty");
         }
-        spec = { send: action };
+        primary = { send: action };
     } else if (typeof action === "function") {
-        spec = { fn: action };
+        primary = { fn: action };
+    } else if (action === null) {
+        primary = null;
     } else {
-        throw new TypeError("link() expects a command string or a click handler function");
+        throw new TypeError("link() expects a command string, click handler function, or null");
     }
+    const spec: LinkSpec = {
+        action: primary,
+        tooltip,
+        enabled: options?.enabled ?? true,
+        menu,
+        title: options?.title ?? null,
+    };
     return ((strings: TemplateStringsArray, ...values: unknown[]) =>
         __styled_from_template(null, null, spec, strings, values)) as StyleTag;
 }
 
 /** A run's link in wire form: a command, or an index into the callbacks array the op
  *  receives beside the payload. */
-type WireLink = { send: string } | { cb: number } | null;
+type WireTooltip = { text: string } | { cb: number };
+type WireAction = { send: string } | { cb: number };
+type WireMenuItem = { separator: true } | { label: string; action: WireAction };
+interface WireMenu {
+    title?: string;
+    items: WireMenuItem[];
+}
+interface WireLinkValue {
+    action: WireAction | null;
+    tooltip?: WireTooltip;
+    enabled?: boolean;
+    menu?: WireMenu;
+}
+type WireLink = WireLinkValue | null;
 
 /** The wire shape of one SPLICE run (see ops.rs `StyledRunWire`; the echo path
  *  crosses packed instead -- see `__styled_echo_packed`). */
@@ -495,17 +613,38 @@ interface WireRun {
 
 /** Build the link converter one flatten pass uses: `{ fn }` specs are deduplicated
  *  into `callbacks` and become `{ cb }` indexes; command links pass through. */
-function __styled_make_wire_link(
-    callbacks: ((click: LinkClick) => void)[],
-): (spec: LinkSpec | null) => WireLink {
-    return (spec) => {
-        if (spec === null || "send" in spec) return spec;
-        let index = callbacks.indexOf(spec.fn);
+function __styled_make_wire_link(callbacks: Function[]): (spec: LinkSpec | null) => WireLink {
+    const callbackIndex = (fn: Function): number => {
+        let index = callbacks.indexOf(fn);
         if (index === -1) {
             index = callbacks.length;
-            callbacks.push(spec.fn);
+            callbacks.push(fn);
         }
-        return { cb: index };
+        return index;
+    };
+    const tooltipWire = (tooltip: TooltipSpec | null): WireTooltip | undefined => {
+        if (tooltip === null) return undefined;
+        return "text" in tooltip ? tooltip : { cb: callbackIndex(tooltip.fn) };
+    };
+    const actionWire = (action: LinkActionSpec): WireAction =>
+        "send" in action ? { send: action.send } : { cb: callbackIndex(action.fn) };
+    return (spec) => {
+        if (spec === null) return null;
+        const tooltip = tooltipWire(spec.tooltip);
+        const menu = spec.menu === null
+            ? undefined
+            : {
+                ...(spec.title === null ? {} : { title: spec.title }),
+                items: spec.menu.map((item): WireMenuItem => item === null
+                    ? { separator: true }
+                    : { label: item.label, action: actionWire(item.action) }),
+            };
+        return {
+            action: spec.action === null ? null : actionWire(spec.action),
+            ...(tooltip === undefined ? {} : { tooltip }),
+            ...(spec.enabled ? {} : { enabled: false }),
+            ...(menu === undefined ? {} : { menu }),
+        };
     };
 }
 
@@ -551,7 +690,8 @@ function __styled_encode_color(value: Color | null): number {
 interface PackedStyled {
     text: string;
     records: Uint32Array;
-    callbacks: ((click: LinkClick) => void)[];
+    advancedLinks: string;
+    callbacks: Function[];
 }
 
 /** Flatten a fragment into the packed payload: whole lines, split on `\n` (a run
@@ -559,11 +699,14 @@ interface PackedStyled {
  *  links dedupe into `callbacks` by identity; send links collect at the FRONT of
  *  `text` with their lengths at the TAIL of `records`. */
 function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
-    const callbacks: ((click: LinkClick) => void)[] = [];
+    const callbacks: Function[] = [];
+    const advancedLinks: WireLinkValue[] = [];
     const sendLengths: number[] = [];
+    const tooltipLengths: number[] = [];
     let sendText = "";
+    let tooltipText = "";
     let runText = "";
-    let w = 2; // records cursor; slots 0/1 (line/send counts) patch at the end
+    let w = 3; // records cursor; slots 0..2 (line/send/tooltip counts) patch at the end
     let lineCount = 0;
     let runCountSlot = 0;
     let runCount = 0;
@@ -577,39 +720,66 @@ function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
         __packedScratch[runCountSlot] = runCount;
         lineCount++;
     };
-    const pushRun = (piece: string, fg: number, bg: number, link: number): void => {
+    const pushRun = (
+        piece: string,
+        fg: number,
+        bg: number,
+        link: number,
+        tooltip: number,
+    ): void => {
         if (piece === "") return;
-        if (__packedScratch.length < w + 4) __packed_grow(w + 4);
+        if (__packedScratch.length < w + 5) __packed_grow(w + 5);
         __packedScratch[w++] = piece.length;
         __packedScratch[w++] = fg;
         __packedScratch[w++] = bg;
         __packedScratch[w++] = link;
+        __packedScratch[w++] = tooltip;
         runText += piece;
         runCount++;
     };
-    const encodeLink = (spec: LinkSpec | null): number => {
-        if (spec === null) return 0;
-        if ("send" in spec) {
-            sendText += spec.send;
-            sendLengths.push(spec.send.length);
-            return 0x40000000 | (sendLengths.length - 1);
-        }
-        let index = callbacks.indexOf(spec.fn);
+    const callbackIndex = (fn: Function): number => {
+        let index = callbacks.indexOf(fn);
         if (index === -1) {
             index = callbacks.length;
-            callbacks.push(spec.fn);
+            callbacks.push(fn);
         }
-        return 0x80000000 | index;
+        return index;
+    };
+    const encodeTooltip = (tooltip: TooltipSpec | null): number => {
+        if (tooltip === null) return 0;
+        if ("text" in tooltip) {
+            tooltipText += tooltip.text;
+            tooltipLengths.push(tooltip.text.length);
+            return 0x40000000 | (tooltipLengths.length - 1);
+        }
+        return 0x80000000 | callbackIndex(tooltip.fn);
+    };
+    const wireLink = __styled_make_wire_link(callbacks);
+    const encodeLink = (spec: LinkSpec | null): [number, number] => {
+        if (spec === null) return [0, 0];
+        if (spec.action === null || !spec.enabled || spec.menu !== null) {
+            const wire = wireLink(spec);
+            if (wire === null) throw new TypeError("internal advanced link encoding failure");
+            advancedLinks.push(wire);
+            return [0xC0000000 | (advancedLinks.length - 1), 0];
+        }
+        const tooltip = encodeTooltip(spec.tooltip);
+        if ("send" in spec.action) {
+            sendText += spec.action.send;
+            sendLengths.push(spec.action.send.length);
+            return [0x40000000 | (sendLengths.length - 1), tooltip];
+        }
+        return [0x80000000 | callbackIndex(spec.action.fn), tooltip];
     };
 
     beginLine();
     for (const run of frag._runs) {
         const fg = __styled_encode_color(run.fg);
         const bg = __styled_encode_color(run.bg);
-        const link = encodeLink(run.link);
+        const [link, tooltip] = encodeLink(run.link);
         // Common case: no newline in the run.
         if (run.text.indexOf("\n") === -1) {
-            pushRun(run.text, fg, bg, link);
+            pushRun(run.text, fg, bg, link, tooltip);
             continue;
         }
         const parts = run.text.split("\n");
@@ -618,18 +788,23 @@ function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
                 endLine();
                 beginLine();
             }
-            pushRun(parts[i], fg, bg, link);
+            pushRun(parts[i], fg, bg, link, tooltip);
         }
     }
     endLine();
 
-    if (__packedScratch.length < w + sendLengths.length) __packed_grow(w + sendLengths.length);
+    if (__packedScratch.length < w + sendLengths.length + tooltipLengths.length) {
+        __packed_grow(w + sendLengths.length + tooltipLengths.length);
+    }
     for (const length of sendLengths) __packedScratch[w++] = length;
+    for (const length of tooltipLengths) __packedScratch[w++] = length;
     __packedScratch[0] = lineCount;
     __packedScratch[1] = sendLengths.length;
+    __packedScratch[2] = tooltipLengths.length;
     return {
-        text: sendText + runText,
+        text: sendText + tooltipText + runText,
         records: __packedScratch.subarray(0, w),
+        advancedLinks: JSON.stringify(advancedLinks),
         callbacks,
     };
 }
@@ -641,8 +816,8 @@ function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
 function __styled_splice_args(
     text: StyledTextImpl,
     options: ColorOptions,
-): { runs: WireRun[]; callbacks: ((click: LinkClick) => void)[] } {
-    const callbacks: ((click: LinkClick) => void)[] = [];
+): { runs: WireRun[]; callbacks: Function[] } {
+    const callbacks: Function[] = [];
     const wireLink = __styled_make_wire_link(callbacks);
     // Match the plain path's tolerance: a null color option means unset.
     const baseFg = options.fg != null ? __styled_check_color(options.fg) : null;
@@ -993,7 +1168,14 @@ class Pane {
         const arg = __styled_echo_arg(text, values);
         if (__is_styled_text(arg)) {
             const packed = __styled_echo_packed(arg);
-            op_smudgy_pane_echo_styled(this._sessionId, this._name, packed.text, packed.records, packed.callbacks);
+            op_smudgy_pane_echo_styled(
+                this._sessionId,
+                this._name,
+                packed.text,
+                packed.records,
+                packed.advancedLinks,
+                packed.callbacks,
+            );
         } else {
             op_smudgy_pane_echo(this._sessionId, this._name, String(arg));
         }
@@ -1677,8 +1859,8 @@ class Session {
     echo(line: string | StyledTextLike | TemplateStringsArray, ...values: unknown[]): void {
         const arg = __styled_echo_arg(line, values);
         if (__is_styled_text(arg)) {
-            const { text, records, callbacks } = __styled_echo_packed(arg);
-            op_smudgy_session_echo_styled(this.id, text, records, callbacks);
+            const { text, records, advancedLinks, callbacks } = __styled_echo_packed(arg);
+            op_smudgy_session_echo_styled(this.id, text, records, advancedLinks, callbacks);
         } else {
             op_smudgy_session_echo(this.id, String(arg));
         }

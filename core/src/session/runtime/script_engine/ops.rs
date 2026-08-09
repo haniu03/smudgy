@@ -2,7 +2,7 @@ use crate::models::ScriptLang;
 use crate::models::aliases::AliasDefinition;
 use crate::models::hotkeys::HotkeyDefinition;
 use crate::models::triggers::TriggerDefinition;
-use crate::session::connection::vt_processor::AnsiColor;
+use crate::session::connection::vt_processor::{AnsiColor, parse_link_tooltip_text};
 use crate::session::runtime::line_operation::{LineOperation, SpliceRun};
 use crate::session::runtime::pane;
 use crate::session::runtime::script_engine::FunctionId;
@@ -14,7 +14,8 @@ use crate::session::runtime::{
     SingletonRegistry,
 };
 use crate::session::styled_line::{
-    Color, LinkAction, Style, StyledLine, TextAttributes, sanitize_display_text,
+    Color, LinkAction, LinkMenu, LinkMenuItem, LinkTooltip, LinkTooltipCallback, LinkTooltipState,
+    LinkTooltipText, Style, StyledLine, StyledLink, sanitize_display_text,
 };
 use crate::session::{SessionId, registry};
 
@@ -42,6 +43,7 @@ deno_core::extension!(
     op_smudgy_session_reload,
     op_smudgy_session_send,
     op_smudgy_session_send_raw,
+    op_smudgy_resolve_link_tooltip,
     op_smudgy_create_simple_alias,
     op_smudgy_create_simple_trigger,
     op_smudgy_create_javascript_function_trigger,
@@ -326,6 +328,9 @@ deno_core::extension!(
     // register callbacks here; the engine resolves clicked ids back through it. Living in
     // `OpState` ties every `v8::Global` to its isolate's teardown.
     state.put::<SharedLinkCallbacks>(Rc::new(RefCell::new(LinkCallbacks::default())));
+    state.put::<SharedPendingLinkTooltips>(Rc::new(RefCell::new(
+        PendingLinkTooltips::default(),
+    )));
   },
 );
 
@@ -2525,10 +2530,8 @@ fn op_smudgy_procedure_post(
         // Queue-briefly (D1): only for a producer that can ever receive — one with a home
         // (`user` always has one). A post to an uninstalled producer can never deliver, so
         // buffering it would just hoard garbage.
-        let addressable = store::is_addressable(
-            state.borrow::<store::HomeRegistry>(),
-            &root.producer,
-        );
+        let addressable =
+            store::is_addressable(state.borrow::<store::HomeRegistry>(), &root.producer);
         if addressable {
             let dropped_oldest = state
                 .borrow::<crate::session::runtime::SharedMessageBus>()
@@ -2824,12 +2827,80 @@ impl LinkCallbacks {
 
 pub type SharedLinkCallbacks = Rc<RefCell<LinkCallbacks>>;
 
-/// The wire shape of a run's link: a command to send, or an index into the
-/// callbacks array travelling beside the payload.
+/// Tooltip resolutions currently running in this isolate, keyed by the opaque
+/// decimal token passed to the JS wrapper. Entries disappear on success,
+/// rejection, or isolate teardown.
+#[derive(Default)]
+pub struct PendingLinkTooltips {
+    next_id: u64,
+    requests: HashMap<u64, Arc<LinkTooltipState>>,
+}
+
+impl PendingLinkTooltips {
+    pub fn insert(&mut self, state: Arc<LinkTooltipState>) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.requests.insert(id, state);
+        id
+    }
+
+    pub fn remove(&mut self, id: u64) -> Option<Arc<LinkTooltipState>> {
+        self.requests.remove(&id)
+    }
+}
+
+pub type SharedPendingLinkTooltips = Rc<RefCell<PendingLinkTooltips>>;
+
+/// The wire shape of a run's link. Keeping the primary action nested lets
+/// `null` represent tooltip-only link styling without overloading an empty
+/// command.
+#[derive(serde::Deserialize)]
+struct LinkWire {
+    #[serde(default)]
+    action: Option<ScriptLinkActionWire>,
+    #[serde(default)]
+    tooltip: Option<TooltipWire>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    menu: Option<LinkMenuWire>,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
-enum LinkWire {
+enum ScriptLinkActionWire {
     Send { send: String },
+    Callback { cb: u32 },
+}
+
+#[derive(serde::Deserialize)]
+struct LinkMenuWire {
+    #[serde(default)]
+    title: Option<String>,
+    items: Vec<LinkMenuItemWire>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum LinkMenuItemWire {
+    Separator {
+        separator: bool,
+    },
+    Action {
+        label: String,
+        action: ScriptLinkActionWire,
+    },
+}
+
+/// Static tooltip text or an index into the same callback array link clicks use.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum TooltipWire {
+    Text { text: String },
     Callback { cb: u32 },
 }
 
@@ -2845,6 +2916,12 @@ struct LinkContext {
     session: SessionId,
     isolate_token: Arc<str>,
     callback_ids: Vec<u64>,
+    tooltip_states: Vec<Arc<LinkTooltipState>>,
+}
+
+enum ResolvedTooltip {
+    Text(LinkTooltipText),
+    Callback(u32),
 }
 
 /// Register the payload's callback functions (if any) into this isolate's
@@ -2873,8 +2950,90 @@ fn link_context(
     Ok(LinkContext {
         session: *state.borrow::<SessionId>(),
         isolate_token: state.borrow::<LinkIsolateToken>().0.clone(),
+        tooltip_states: callback_ids
+            .iter()
+            .map(|_| Arc::new(LinkTooltipState::default()))
+            .collect(),
         callback_ids,
     })
+}
+
+fn single_line_text(text: &str) -> Option<Arc<str>> {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| Arc::from(cleaned))
+}
+
+fn tooltip_target(action: &LinkAction) -> Option<Arc<str>> {
+    match action.disclosed_target()? {
+        LinkAction::Send(command) => Some(command.clone()),
+        LinkAction::OpenUrl(url) => Some(url.clone()),
+        LinkAction::ServerSend(command) => Some(Arc::from(format!("send:{command}"))),
+        LinkAction::Prompt(command) => Some(Arc::from(format!("prompt:{command}"))),
+        LinkAction::Callback { .. } | LinkAction::Configured { .. } => None,
+    }
+}
+
+impl LinkContext {
+    fn tooltip(
+        &self,
+        tooltip: Option<ResolvedTooltip>,
+        action: &LinkAction,
+    ) -> Result<Option<LinkTooltip>, StyledTextOpError> {
+        let target = tooltip_target(action);
+        match tooltip {
+            Some(ResolvedTooltip::Text(text)) => Ok(Some(LinkTooltip::styled_text(text, target))),
+            Some(ResolvedTooltip::Callback(index)) => {
+                let index = index as usize;
+                let id = self.callback_ids.get(index).copied().ok_or_else(|| {
+                    StyledTextOpError::Invalid(
+                        "link tooltip callback index out of range".to_string(),
+                    )
+                })?;
+                let state = self.tooltip_states.get(index).cloned().ok_or_else(|| {
+                    StyledTextOpError::Invalid(
+                        "link tooltip callback state out of range".to_string(),
+                    )
+                })?;
+                Ok(Some(LinkTooltip::callback(
+                    LinkTooltipCallback {
+                        session: self.session,
+                        isolate_token: self.isolate_token.clone(),
+                        id,
+                        state,
+                    },
+                    target,
+                )))
+            }
+            // Script-created links keep their historical no-tooltip behavior
+            // unless the author opts in through `LinkOptions`.
+            None => Ok(None),
+        }
+    }
+}
+
+/// Completion half of a script tooltip wrapper. The wrapper catches both sync
+/// throws and promise rejections and calls this exactly once with text or `None`.
+#[op2]
+fn op_smudgy_resolve_link_tooltip(
+    state: &mut OpState,
+    #[string] request_id: &str,
+    #[string] text: Option<String>,
+) -> Result<(), StyledTextOpError> {
+    let request_id = request_id
+        .parse::<u64>()
+        .map_err(|_| packed_invalid("invalid link tooltip request id"))?;
+    let pending = state.borrow::<SharedPendingLinkTooltips>().clone();
+    let Some(request) = pending.borrow_mut().remove(request_id) else {
+        return Ok(());
+    };
+    let text = text.and_then(|text| parse_link_tooltip_text(&text));
+    request.resolve(text);
+    queue_own_action(state, RuntimeAction::LinkTooltipChanged);
+    Ok(())
 }
 
 /// One color in the wire shape the public `Color` type serializes to: a name, an exact
@@ -2930,11 +3089,13 @@ struct StyledRunWire {
 // records:
 //   [0] line count L
 //   [1] send-link count S
-//   L × { run count R, R × 4: [text length (UTF-16 units), fg, bg, link] }
+//   [2] static-tooltip count T
+//   L × { run count R, R × 5: [text length (UTF-16 units), fg, bg, link, tooltip] }
 //   S × 1: send text length (UTF-16 code units)  -- at the TAIL because the
 //          encoder discovers sends while walking runs, in one pass
+//   T × 1: tooltip text length (UTF-16 code units), also at the tail
 //
-// text: the S send strings in order, then every run's text in line/run order.
+// text: the S send strings, the T static tooltip strings, then every run's text.
 //
 // color u32: 0 = unset (delivery default). Else the top byte is a tag:
 //   1 = RGB   (low 24 bits: r<<16 | g<<8 | b)
@@ -2943,7 +3104,9 @@ struct StyledRunWire {
 //
 // link u32: 0 = none. Else the top 2 bits are a tag over a 30-bit index:
 //   1 = send (index into the send strings), 2 = callback (index into the
-//   callbacks array travelling beside the payload).
+//   callbacks array travelling beside the payload), 3 = advanced link (index
+//   into the JSON link table travelling beside the packed payload).
+// tooltip u32 uses the same tags: 1 = static text index, 2 = callback index.
 
 /// Bounds-checked cursor over the packed record table.
 struct PackedReader<'a> {
@@ -2965,6 +3128,12 @@ impl PackedReader<'_> {
 
 fn packed_invalid(message: &str) -> StyledTextOpError {
     StyledTextOpError::Invalid(message.to_string())
+}
+
+fn parse_advanced_links(json: &str) -> Result<Vec<LinkWire>, StyledTextOpError> {
+    serde_json::from_str(json).map_err(|error| {
+        StyledTextOpError::Invalid(format!("invalid advanced link table: {error}"))
+    })
 }
 
 /// Decode one packed color. `0` is unset (`None`); an unknown tag or stray bits
@@ -3011,9 +3180,18 @@ fn packed_color(value: u32) -> Result<Option<Color>, StyledTextOpError> {
 }
 
 /// One packed link, decoded but not yet resolved against the send/callback tables.
+#[derive(Clone, Copy)]
 enum PackedLink {
     None,
     Send(usize),
+    Callback(usize),
+    Advanced(usize),
+}
+
+#[derive(Clone, Copy)]
+enum PackedTooltip {
+    None,
+    Text(usize),
     Callback(usize),
 }
 
@@ -3022,7 +3200,17 @@ fn packed_link(value: u32) -> Result<PackedLink, StyledTextOpError> {
         0 if value == 0 => Ok(PackedLink::None),
         1 => Ok(PackedLink::Send((value & 0x3fff_ffff) as usize)),
         2 => Ok(PackedLink::Callback((value & 0x3fff_ffff) as usize)),
+        3 => Ok(PackedLink::Advanced((value & 0x3fff_ffff) as usize)),
         _ => Err(packed_invalid("unknown link tag")),
+    }
+}
+
+fn packed_tooltip(value: u32) -> Result<PackedTooltip, StyledTextOpError> {
+    match value >> 30 {
+        0 if value == 0 => Ok(PackedTooltip::None),
+        1 => Ok(PackedTooltip::Text((value & 0x3fff_ffff) as usize)),
+        2 => Ok(PackedTooltip::Callback((value & 0x3fff_ffff) as usize)),
+        _ => Err(packed_invalid("unknown tooltip tag")),
     }
 }
 
@@ -3069,17 +3257,25 @@ fn packed_take_units(
 fn packed_validate(
     text: &str,
     records: &[u32],
+    advanced_links: &[LinkWire],
     callback_count: u32,
 ) -> Result<(), StyledTextOpError> {
-    let (line_records, send_lengths) = packed_split(records)?;
+    advanced_links
+        .iter()
+        .try_for_each(|link| link.validate(callback_count))?;
+    let (line_records, send_lengths, tooltip_lengths) = packed_split(records)?;
     let send_count = send_lengths.len();
+    let tooltip_count = tooltip_lengths.len();
     let mut rest = text;
     for units in send_lengths {
         rest = packed_take_units(rest, *units, false)?.1;
     }
+    for units in tooltip_lengths {
+        rest = packed_take_units(rest, *units, false)?.1;
+    }
     let mut reader = PackedReader {
         records: line_records,
-        pos: 2,
+        pos: 3,
     };
     let line_count = line_records[0];
     for _ in 0..line_count {
@@ -3088,12 +3284,31 @@ fn packed_validate(
             let units = reader.next()?;
             packed_color(reader.next()?)?;
             packed_color(reader.next()?)?;
-            match packed_link(reader.next()?)? {
+            let link = packed_link(reader.next()?)?;
+            match link {
                 PackedLink::Send(index) if index >= send_count => {
                     return Err(packed_invalid("link send index out of range"));
                 }
                 PackedLink::Callback(index) if index >= callback_count as usize => {
                     return Err(packed_invalid("link callback index out of range"));
+                }
+                PackedLink::Advanced(index) if index >= advanced_links.len() => {
+                    return Err(packed_invalid("advanced link index out of range"));
+                }
+                _ => {}
+            }
+            let tooltip = packed_tooltip(reader.next()?)?;
+            if matches!(link, PackedLink::Advanced(_)) && !matches!(tooltip, PackedTooltip::None) {
+                return Err(packed_invalid(
+                    "advanced link must carry its tooltip in the link table",
+                ));
+            }
+            match tooltip {
+                PackedTooltip::Text(index) if index >= tooltip_count => {
+                    return Err(packed_invalid("link tooltip text index out of range"));
+                }
+                PackedTooltip::Callback(index) if index >= callback_count as usize => {
+                    return Err(packed_invalid("link tooltip callback index out of range"));
                 }
                 _ => {}
             }
@@ -3111,17 +3326,25 @@ fn packed_validate(
 
 /// Split the record table into its line region and the tail of send lengths,
 /// bounds-checking the header.
-fn packed_split(records: &[u32]) -> Result<(&[u32], &[u32]), StyledTextOpError> {
-    if records.len() < 2 {
+type PackedSections<'a> = (&'a [u32], &'a [u32], &'a [u32]);
+
+fn packed_split(records: &[u32]) -> Result<PackedSections<'_>, StyledTextOpError> {
+    if records.len() < 3 {
         return Err(packed_invalid("truncated styled payload records"));
     }
     let send_count = records[1] as usize;
+    let tooltip_count = records[2] as usize;
+    let tail_count = send_count
+        .checked_add(tooltip_count)
+        .ok_or_else(|| packed_invalid("styled payload table lengths overflow"))?;
     let split = records
         .len()
-        .checked_sub(send_count)
-        .filter(|split| *split >= 2)
+        .checked_sub(tail_count)
+        .filter(|split| *split >= 3)
         .ok_or_else(|| packed_invalid("truncated styled payload records"))?;
-    Ok(records.split_at(split))
+    let (line_records, tail) = records.split_at(split);
+    let (send_lengths, tooltip_lengths) = tail.split_at(send_count);
+    Ok((line_records, send_lengths, tooltip_lengths))
 }
 
 /// Build the payload's `StyledLine`s in one pass: run text is sliced straight out
@@ -3133,10 +3356,11 @@ fn packed_split(records: &[u32]) -> Result<(&[u32], &[u32]), StyledTextOpError> 
 fn packed_echo_lines(
     text: &str,
     records: &[u32],
-    links: &LinkContext,
+    advanced_links: &[LinkWire],
+    link_context: &LinkContext,
     default_style: Style,
 ) -> Result<Vec<Arc<StyledLine>>, StyledTextOpError> {
-    let (line_records, send_lengths) = packed_split(records)?;
+    let (line_records, send_lengths, tooltip_lengths) = packed_split(records)?;
     let mut rest = text;
     let mut sends: Vec<Arc<str>> = Vec::with_capacity(send_lengths.len());
     for units in send_lengths {
@@ -3144,15 +3368,21 @@ fn packed_echo_lines(
         sends.push(Arc::from(piece));
         rest = tail;
     }
+    let mut tooltips: Vec<Option<LinkTooltipText>> = Vec::with_capacity(tooltip_lengths.len());
+    for units in tooltip_lengths {
+        let (piece, tail) = packed_take_units(rest, *units, false)?;
+        tooltips.push(parse_link_tooltip_text(piece));
+        rest = tail;
+    }
     let mut reader = PackedReader {
         records: line_records,
-        pos: 2,
+        pos: 3,
     };
     let line_count = line_records[0] as usize;
     let mut lines = Vec::with_capacity(line_count);
     for _ in 0..line_count {
         let run_count = reader.next()? as usize;
-        let mut runs: Vec<(std::borrow::Cow<str>, Style, Option<LinkAction>)> =
+        let mut runs: Vec<(std::borrow::Cow<str>, Style, Option<StyledLink>)> =
             Vec::with_capacity(run_count);
         for _ in 0..run_count {
             let units = reader.next()?;
@@ -3161,35 +3391,58 @@ fn packed_echo_lines(
                 bg: packed_color(reader.next()?)?.map_or(default_style.bg, normalize_bg),
                 attributes: default_style.attributes,
             };
-            let link = match packed_link(reader.next()?)? {
-                PackedLink::None => None,
+            let packed_link = packed_link(reader.next()?)?;
+            let action = match packed_link {
+                PackedLink::None | PackedLink::Advanced(_) => None,
                 PackedLink::Send(index) => {
                     Some(LinkAction::Send(sends.get(index).cloned().ok_or_else(
                         || packed_invalid("link send index out of range"),
                     )?))
                 }
                 PackedLink::Callback(index) => {
-                    let id = links
+                    let id = link_context
                         .callback_ids
                         .get(index)
                         .copied()
                         .ok_or_else(|| packed_invalid("link callback index out of range"))?;
                     Some(LinkAction::Callback {
-                        session: links.session,
-                        isolate_token: links.isolate_token.clone(),
+                        session: link_context.session,
+                        isolate_token: link_context.isolate_token.clone(),
                         id,
                     })
                 }
+            };
+            let tooltip = match packed_tooltip(reader.next()?)? {
+                PackedTooltip::None => None,
+                PackedTooltip::Text(index) => tooltips
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| packed_invalid("link tooltip text index out of range"))?
+                    .map(ResolvedTooltip::Text),
+                PackedTooltip::Callback(index) => Some(ResolvedTooltip::Callback(
+                    u32::try_from(index)
+                        .map_err(|_| packed_invalid("link tooltip callback index overflow"))?,
+                )),
+            };
+            let link = if let PackedLink::Advanced(index) = packed_link {
+                wire_link_to_styled(advanced_links.get(index), link_context)?
+            } else if let Some(action) = action {
+                Some(StyledLink {
+                    tooltip: link_context.tooltip(tooltip, &action)?,
+                    action,
+                })
+            } else {
+                None
             };
             let (piece, tail) = packed_take_units(rest, units, true)?;
             rest = tail;
             runs.push((sanitize_display_text(piece), style, link));
         }
-        let refs: Vec<(&str, Style, Option<LinkAction>)> = runs
+        let refs: Vec<(&str, Style, Option<StyledLink>)> = runs
             .iter()
             .map(|(text, style, link)| (text.as_ref(), *style, link.clone()))
             .collect();
-        lines.push(Arc::new(StyledLine::from_styled_runs(&refs, default_style)));
+        lines.push(Arc::new(StyledLine::from_linked_runs(&refs, default_style)));
     }
     Ok(lines)
 }
@@ -3263,14 +3516,79 @@ pub enum LineCallError {
 
 /// Resolve a splice run's wire link to its [`LinkAction`]. (The echo path resolves
 /// links from the packed table in [`packed_echo_lines`].)
-fn wire_link_to_action(
-    link: &Option<LinkWire>,
+fn wire_tooltip(tooltip: Option<&TooltipWire>) -> Option<ResolvedTooltip> {
+    match tooltip {
+        Some(TooltipWire::Text { text }) => {
+            parse_link_tooltip_text(text).map(ResolvedTooltip::Text)
+        }
+        Some(TooltipWire::Callback { cb }) => Some(ResolvedTooltip::Callback(*cb)),
+        None => None,
+    }
+}
+
+fn validate_script_link_action(
+    action: &ScriptLinkActionWire,
+    callback_count: u32,
+) -> Result<(), StyledTextOpError> {
+    match action {
+        ScriptLinkActionWire::Send { send } if send.is_empty() => Err(StyledTextOpError::Invalid(
+            "link command must not be empty".to_string(),
+        )),
+        ScriptLinkActionWire::Callback { cb } if *cb >= callback_count => Err(
+            StyledTextOpError::Invalid("link callback index out of range".to_string()),
+        ),
+        _ => Ok(()),
+    }
+}
+
+impl LinkWire {
+    fn validate(&self, callback_count: u32) -> Result<(), StyledTextOpError> {
+        if let Some(action) = &self.action {
+            validate_script_link_action(action, callback_count)?;
+        }
+        if let Some(TooltipWire::Callback { cb }) = &self.tooltip
+            && *cb >= callback_count
+        {
+            return Err(StyledTextOpError::Invalid(
+                "link tooltip callback index out of range".to_string(),
+            ));
+        }
+        if let Some(menu) = &self.menu {
+            if menu.items.is_empty() {
+                return Err(StyledTextOpError::Invalid(
+                    "link menu must contain at least one item".to_string(),
+                ));
+            }
+            for item in &menu.items {
+                match item {
+                    LinkMenuItemWire::Separator { separator } if !separator => {
+                        return Err(StyledTextOpError::Invalid(
+                            "invalid link menu separator".to_string(),
+                        ));
+                    }
+                    LinkMenuItemWire::Action { label, action } => {
+                        if single_line_text(label).is_none() {
+                            return Err(StyledTextOpError::Invalid(
+                                "link menu label must not be empty".to_string(),
+                            ));
+                        }
+                        validate_script_link_action(action, callback_count)?;
+                    }
+                    LinkMenuItemWire::Separator { .. } => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn resolve_script_link_action(
+    action: &ScriptLinkActionWire,
     links: &LinkContext,
-) -> Result<Option<LinkAction>, StyledTextOpError> {
-    match link {
-        None => Ok(None),
-        Some(LinkWire::Send { send }) => Ok(Some(LinkAction::Send(Arc::from(send.as_str())))),
-        Some(LinkWire::Callback { cb }) => {
+) -> Result<LinkAction, StyledTextOpError> {
+    match action {
+        ScriptLinkActionWire::Send { send } => Ok(LinkAction::Send(Arc::from(send.as_str()))),
+        ScriptLinkActionWire::Callback { cb } => {
             let id = links
                 .callback_ids
                 .get(*cb as usize)
@@ -3278,13 +3596,79 @@ fn wire_link_to_action(
                 .ok_or_else(|| {
                     StyledTextOpError::Invalid("link callback index out of range".to_string())
                 })?;
-            Ok(Some(LinkAction::Callback {
+            Ok(LinkAction::Callback {
                 session: links.session,
                 isolate_token: links.isolate_token.clone(),
                 id,
-            }))
+            })
         }
     }
+}
+
+fn resolve_link_menu(
+    menu: Option<&LinkMenuWire>,
+    links: &LinkContext,
+) -> Result<Option<LinkMenu>, StyledTextOpError> {
+    let Some(menu) = menu else {
+        return Ok(None);
+    };
+    let title = menu.title.as_deref().and_then(single_line_text);
+    let items = menu
+        .items
+        .iter()
+        .map(|item| match item {
+            LinkMenuItemWire::Separator { .. } => Ok(LinkMenuItem::Separator),
+            LinkMenuItemWire::Action { label, action } => Ok(LinkMenuItem::Action {
+                label: single_line_text(label).ok_or_else(|| {
+                    StyledTextOpError::Invalid("link menu label must not be empty".to_string())
+                })?,
+                action: resolve_script_link_action(action, links)?,
+            }),
+        })
+        .collect::<Result<Vec<_>, StyledTextOpError>>()?;
+    Ok(Some(LinkMenu {
+        title,
+        items: items.into(),
+    }))
+}
+
+fn wire_link_to_styled(
+    link: Option<&LinkWire>,
+    links: &LinkContext,
+) -> Result<Option<StyledLink>, StyledTextOpError> {
+    let Some(link) = link else {
+        return Ok(None);
+    };
+    let primary = link
+        .action
+        .as_ref()
+        .map(|action| resolve_script_link_action(action, links))
+        .transpose()?;
+    let menu = resolve_link_menu(link.menu.as_ref(), links)?;
+    let menu_on_left_click = link.enabled && primary.is_none() && menu.is_some();
+    let action = match primary {
+        Some(primary) if link.enabled && menu.is_none() => primary,
+        primary => LinkAction::Configured {
+            primary: primary.map(Box::new),
+            disabled: false,
+            primary_enabled: link.enabled,
+            menu,
+            menu_on_left_click,
+        },
+    };
+    let tooltip = links
+        .tooltip(wire_tooltip(link.tooltip.as_ref()), &action)?
+        .or_else(|| {
+            action.menu().map(|_| {
+                let hint = if action.opens_menu_on_left_click() {
+                    "Click or right-click for menu"
+                } else {
+                    "Right-click for menu"
+                };
+                LinkTooltip::text(Arc::from(hint), tooltip_target(&action))
+            })
+        });
+    Ok(Some(StyledLink { action, tooltip }))
 }
 
 impl StyledRunWire {
@@ -3303,12 +3687,8 @@ impl StyledRunWire {
         if let Some(bg) = &self.bg {
             bg.to_color()?;
         }
-        if let Some(LinkWire::Callback { cb }) = &self.link
-            && *cb >= callback_count
-        {
-            return Err(StyledTextOpError::Invalid(
-                "link callback index out of range".to_string(),
-            ));
+        if let Some(link) = &self.link {
+            link.validate(callback_count)?;
         }
         Ok(())
     }
@@ -3325,7 +3705,7 @@ impl StyledRunWire {
                 .as_ref()
                 .map(|bg| bg.to_color().map(normalize_bg))
                 .transpose()?,
-            link: wire_link_to_action(&self.link, links)?,
+            link: wire_link_to_styled(self.link.as_ref(), links)?,
             text: match sanitize_display_text(&self.text) {
                 std::borrow::Cow::Borrowed(_) => self.text,
                 std::borrow::Cow::Owned(cleaned) => cleaned,
@@ -3338,7 +3718,7 @@ impl StyledRunWire {
 const ECHO_DEFAULT_STYLE: Style = Style {
     fg: Color::Echo,
     bg: Color::DefaultBackground,
-    attributes: TextAttributes::DEFAULT,
+    ..Style::DEFAULT
 };
 
 /// Convert and register the splice payload the two splice ops share: the runs of ONE
@@ -3426,14 +3806,22 @@ fn op_smudgy_session_echo_styled(
     session_id: u32,
     #[string] text: &str,
     #[buffer] records: &[u32],
+    #[string] advanced_links: &str,
     callbacks: v8::Local<v8::Array>,
 ) -> Result<(), StyledTextOpError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).echo, "echo")?;
-    packed_validate(text, records, callbacks.length())?;
-    let links = link_context(scope, state, callbacks)?;
-    let lines = packed_echo_lines(text, records, &links, ECHO_DEFAULT_STYLE)?;
-    route_session_action(state, target, RuntimeAction::EchoStyled(lines));
+    let advanced_links = parse_advanced_links(advanced_links)?;
+    packed_validate(text, records, &advanced_links, callbacks.length())?;
+    let link_context = link_context(scope, state, callbacks)?;
+    let styled_lines = packed_echo_lines(
+        text,
+        records,
+        &advanced_links,
+        &link_context,
+        ECHO_DEFAULT_STYLE,
+    )?;
+    route_session_action(state, target, RuntimeAction::EchoStyled(styled_lines));
     Ok(())
 }
 
@@ -4705,7 +5093,11 @@ fn op_smudgy_input_apply(
     #[serde] op: InputApplyWire,
 ) -> Result<(), PaneCallError> {
     let (target, key) = resolve_input_target(state, session_id, name)?;
-    route_session_action(state, target, RuntimeAction::InputApply { key, op: op.into() });
+    route_session_action(
+        state,
+        target,
+        RuntimeAction::InputApply { key, op: op.into() },
+    );
     Ok(())
 }
 
@@ -5196,9 +5588,8 @@ fn op_smudgy_pane_split<'s>(
             .unwrap()
             .split(&namespace, &spec.name, kind, def_state, input)?;
         if register_input {
-            let callback = v8::Local::<v8::Function>::try_from(on_submit).map_err(|_| {
-                PaneOpError("input.onSubmit must be a function".to_string())
-            })?;
+            let callback = v8::Local::<v8::Function>::try_from(on_submit)
+                .map_err(|_| PaneOpError("input.onSubmit must be a function".to_string()))?;
             register_pane_input_callback(scope, state, target, outcome.def.key, callback)?;
         }
         if outcome.created {
@@ -5525,7 +5916,11 @@ fn op_smudgy_pane_resize(
     if width.is_none() && height.is_none() {
         return Ok(());
     }
-    route_session_action(state, target, RuntimeAction::PaneResize { key, width, height });
+    route_session_action(
+        state,
+        target,
+        RuntimeAction::PaneResize { key, width, height },
+    );
     Ok(())
 }
 
@@ -5683,15 +6078,23 @@ fn op_smudgy_pane_echo_styled(
     #[string] name: &str,
     #[string] text: &str,
     #[buffer] records: &[u32],
+    #[string] advanced_links: &str,
     callbacks: v8::Local<v8::Array>,
 ) -> Result<(), StyledTextOpError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
     let namespace = pane_namespace(state);
     let key = resolve_own_terminal_pane(state, target, &namespace, name)?;
-    packed_validate(text, records, callbacks.length())?;
-    let links = link_context(scope, state, callbacks)?;
-    let lines = packed_echo_lines(text, records, &links, ECHO_DEFAULT_STYLE)?;
+    let advanced_links = parse_advanced_links(advanced_links)?;
+    packed_validate(text, records, &advanced_links, callbacks.length())?;
+    let link_context = link_context(scope, state, callbacks)?;
+    let styled_lines = packed_echo_lines(
+        text,
+        records,
+        &advanced_links,
+        &link_context,
+        ECHO_DEFAULT_STYLE,
+    )?;
     route_session_action(
         state,
         target,
@@ -5699,7 +6102,7 @@ fn op_smudgy_pane_echo_styled(
             key,
             namespace,
             name: Arc::from(name),
-            lines,
+            lines: styled_lines,
         },
     );
     Ok(())
@@ -6365,6 +6768,7 @@ mod tests {
     use super::{
         AnsiColor, Color, ECHO_DEFAULT_STYLE, EventSourceFilter, IsolateId, LinkContext, SessionId,
         canonical_procedure, fold_name, packed_echo_lines, packed_validate, param_read_allowed,
+        single_line_text,
     };
     use crate::session::runtime::store::ProducerKey;
     use crate::session::styled_line::LinkAction;
@@ -6383,8 +6787,20 @@ mod tests {
         LinkContext {
             session: SessionId::from(1u32),
             isolate_token: Arc::from("test-isolate"),
+            tooltip_states: callback_ids
+                .iter()
+                .map(|_| Arc::new(super::LinkTooltipState::default()))
+                .collect(),
             callback_ids,
         }
+    }
+
+    #[test]
+    fn menu_copy_remains_single_line() {
+        assert_eq!(
+            single_line_text("one\r\ntwo\tthree").as_deref(),
+            Some("one  two three")
+        );
     }
 
     /// Validate-then-build, the exact sequence the ops run.
@@ -6394,8 +6810,14 @@ mod tests {
         callback_count: u32,
         callback_ids: Vec<u64>,
     ) -> Result<Vec<Arc<crate::session::styled_line::StyledLine>>, super::StyledTextOpError> {
-        packed_validate(text, records, callback_count)?;
-        packed_echo_lines(text, records, &link_ctx(callback_ids), ECHO_DEFAULT_STYLE)
+        packed_validate(text, records, &[], callback_count)?;
+        packed_echo_lines(
+            text,
+            records,
+            &[],
+            &link_ctx(callback_ids),
+            ECHO_DEFAULT_STYLE,
+        )
     }
 
     #[test]
@@ -6404,20 +6826,24 @@ mod tests {
         // "default" background (which must normalize to DefaultBackground).
         let records = [
             2,
-            0, // 2 lines, 0 sends
+            0,
+            0, // 2 lines, 0 sends, 0 tooltips
             2,
             2,
             RGB_123,
+            0,
             0,
             0,
             1,
             0,
             0,
             0, // line 1: 2 runs
+            0,
             1,
             2,
             ANSI_RED_BRIGHT,
             ROLE_DEFAULT,
+            0,
             0, // line 2: 1 run
         ];
         let lines = decode("Hi!ok", &records, 0, Vec::new()).expect("valid payload");
@@ -6448,7 +6874,7 @@ mod tests {
 
     #[test]
     fn packed_empty_fragment_is_one_empty_line() {
-        let lines = decode("", &[1, 0, 0], 0, Vec::new()).expect("valid payload");
+        let lines = decode("", &[1, 0, 0, 0], 0, Vec::new()).expect("valid payload");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text, "");
         assert_eq!(lines[0].spans.len(), 1);
@@ -6461,17 +6887,20 @@ mod tests {
         // the records; callbacks resolve through the registered id list.
         let records = [
             1,
-            1, // 1 line, 1 send
+            1,
+            0, // 1 line, 1 send, 0 tooltips
             2,
             4,
             0,
             0,
             LINK_SEND_0,
+            0,
             2,
             0,
             0,
-            LINK_CB_0, // "go n" send-linked, "ok" cb-linked
-            5,         // send "north" is 5 units
+            LINK_CB_0,
+            0, // "go n" send-linked, "ok" cb-linked
+            5, // send "north" is 5 units
         ];
         let lines = decode("northgo nok", &records, 1, vec![42]).expect("valid payload");
         assert_eq!(lines[0].text, "go nok");
@@ -6484,6 +6913,7 @@ mod tests {
             (lines[0].links[0].begin_pos, lines[0].links[0].end_pos),
             (0, 4)
         );
+        assert!(lines[0].links[0].tooltip.is_none());
         let LinkAction::Callback { id, .. } = &lines[0].links[1].action else {
             panic!("second link must be a callback");
         };
@@ -6491,10 +6921,60 @@ mod tests {
     }
 
     #[test]
+    fn packed_static_and_lazy_tooltips_keep_the_real_target() {
+        let records = [
+            1,
+            1,
+            1, // 1 line, 1 send, 1 static tooltip
+            2,
+            2,
+            0,
+            0,
+            LINK_SEND_0,
+            0x4000_0000,
+            2,
+            0,
+            0,
+            LINK_CB_0,
+            0x8000_0001,
+            5,  // send "north"
+            14, // tooltip "\x1b[31mhello\x1b[0m"
+        ];
+        let lines = decode("north\x1b[31mhello\x1b[0mgocb", &records, 2, vec![42, 43])
+            .expect("valid payload");
+
+        let static_tip = lines[0].links[0].tooltip.as_ref().expect("static tooltip");
+        assert_eq!(
+            static_tip.display(),
+            Some((Arc::from("hello"), Some(Arc::from("north"))))
+        );
+        let (styled, _) = static_tip.display_styled().expect("styled tooltip");
+        assert!(styled.spans.iter().all(|span| {
+            matches!(
+                span.style.fg,
+                Color::Ansi {
+                    color: AnsiColor::Red,
+                    bold: false
+                }
+            )
+        }));
+
+        let lazy_tip = lines[0].links[1].tooltip.as_ref().expect("lazy tooltip");
+        assert_eq!(lazy_tip.display(), None);
+        let request = lazy_tip.request().expect("first hover claims callback");
+        assert_eq!(request.id, 43);
+        assert!(lazy_tip.request().is_none(), "callback runs only once");
+        request
+            .state
+            .resolve(super::parse_link_tooltip_text("ready"));
+        assert_eq!(lazy_tip.display(), Some((Arc::from("ready"), None)));
+    }
+
+    #[test]
     fn packed_non_bmp_text_maps_utf16_units_to_byte_offsets() {
         // "\u{1F600}!" is 3 UTF-16 units and 5 UTF-8 bytes; the differently-colored
         // "?" pins the span boundary at the byte (not unit) offset.
-        let records = [1, 0, 2, 3, 0, 0, 0, 1, RGB_123, 0, 0];
+        let records = [1, 0, 0, 2, 3, 0, 0, 0, 0, 1, RGB_123, 0, 0, 0];
         let lines = decode("\u{1F600}!?", &records, 0, Vec::new()).expect("valid payload");
         assert_eq!(lines[0].text, "\u{1F600}!?");
         assert_eq!(
@@ -6510,66 +6990,105 @@ mod tests {
     #[test]
     fn packed_control_characters_are_stripped_not_fatal() {
         // "a\rb" is dirty data: the \r is stripped, the run still lands.
-        let lines = decode("a\rb", &[1, 0, 1, 3, 0, 0, 0], 0, Vec::new()).expect("valid");
+        let lines = decode("a\rb", &[1, 0, 0, 1, 3, 0, 0, 0, 0], 0, Vec::new()).expect("valid");
         assert_eq!(lines[0].text, "ab");
     }
 
     #[test]
     fn packed_validate_rejects_malformed_payloads() {
         let cases: &[(&str, &str, Vec<u32>, u32)] = &[
-            ("newline in a run", "a\nb", vec![1, 0, 1, 3, 0, 0, 0], 0),
+            (
+                "newline in a run",
+                "a\nb",
+                vec![1, 0, 0, 1, 3, 0, 0, 0, 0],
+                0,
+            ),
             (
                 "unknown color tag",
                 "x",
-                vec![1, 0, 1, 1, 0x0400_0000, 0, 0],
+                vec![1, 0, 0, 1, 1, 0x0400_0000, 0, 0, 0],
                 0,
             ),
             (
                 "unknown role color",
                 "x",
-                vec![1, 0, 1, 1, 0x0300_0004, 0, 0],
+                vec![1, 0, 0, 1, 1, 0x0300_0004, 0, 0, 0],
                 0,
             ),
             (
                 "unknown ansi index",
                 "x",
-                vec![1, 0, 1, 1, 0x0200_0010, 0, 0],
+                vec![1, 0, 0, 1, 1, 0x0200_0010, 0, 0, 0],
                 0,
             ),
             (
                 "unknown link tag",
                 "x",
-                vec![1, 0, 1, 1, 0, 0, 0xC000_0000],
+                vec![1, 0, 0, 1, 1, 0, 0, 0xC000_0000, 0],
                 0,
             ),
-            ("nonzero link with tag 0", "x", vec![1, 0, 1, 1, 0, 0, 1], 0),
+            (
+                "nonzero link with tag 0",
+                "x",
+                vec![1, 0, 0, 1, 1, 0, 0, 1, 0],
+                0,
+            ),
             (
                 "callback index out of range",
                 "x",
-                vec![1, 0, 1, 1, 0, 0, LINK_CB_0],
+                vec![1, 0, 0, 1, 1, 0, 0, LINK_CB_0, 0],
                 0,
             ),
             (
                 "send index out of range",
                 "x",
-                vec![1, 0, 1, 1, 0, 0, LINK_SEND_0],
+                vec![1, 0, 0, 1, 1, 0, 0, LINK_SEND_0, 0],
                 0,
             ),
-            ("truncated records", "x", vec![1, 0, 1, 1, 0], 0),
+            (
+                "unknown tooltip tag",
+                "x",
+                vec![1, 0, 0, 1, 1, 0, 0, 0, 0xC000_0000],
+                0,
+            ),
+            (
+                "tooltip callback index out of range",
+                "x",
+                vec![1, 0, 0, 1, 1, 0, 0, 0, LINK_CB_0],
+                0,
+            ),
+            (
+                "tooltip text index out of range",
+                "x",
+                vec![1, 0, 0, 1, 1, 0, 0, 0, LINK_SEND_0],
+                0,
+            ),
+            ("truncated records", "x", vec![1, 0, 0, 1, 1, 0], 0),
             (
                 "text shorter than records",
                 "x",
-                vec![1, 0, 1, 2, 0, 0, 0],
+                vec![1, 0, 0, 1, 2, 0, 0, 0, 0],
                 0,
             ),
-            ("trailing text", "xy", vec![1, 0, 1, 1, 0, 0, 0], 0),
-            ("trailing records", "x", vec![1, 0, 1, 1, 0, 0, 0, 0], 0),
-            ("send count past table", "x", vec![1, 9, 1, 1, 0, 0, 0], 0),
-            ("surrogate split", "\u{1F600}", vec![1, 0, 1, 1, 0, 0, 0], 0),
+            ("trailing text", "xy", vec![1, 0, 0, 1, 1, 0, 0, 0, 0], 0),
+            (
+                "trailing records",
+                "x",
+                vec![1, 0, 0, 1, 1, 0, 0, 0, 0, 0],
+                0,
+            ),
+            ("send count past table", "x", vec![1, 9, 0, 0], 0),
+            ("tooltip count past table", "x", vec![1, 0, 9, 0], 0),
+            (
+                "surrogate split",
+                "\u{1F600}",
+                vec![1, 0, 0, 1, 1, 0, 0, 0, 0],
+                0,
+            ),
         ];
         for (what, text, records, callback_count) in cases {
             assert!(
-                packed_validate(text, records, *callback_count).is_err(),
+                packed_validate(text, records, &[], *callback_count).is_err(),
                 "expected {what} to be rejected"
             );
         }
@@ -6635,7 +7154,17 @@ mod tests {
         assert!(EventSourceFilter::Exact(other).accepts(own, other));
         assert!(!EventSourceFilter::Exact(other).accepts(own, own));
         assert!(EventSourceFilter::All { include_self: true }.accepts(own, own));
-        assert!(EventSourceFilter::All { include_self: false }.accepts(own, other));
-        assert!(!EventSourceFilter::All { include_self: false }.accepts(own, own));
+        assert!(
+            EventSourceFilter::All {
+                include_self: false
+            }
+            .accepts(own, other)
+        );
+        assert!(
+            !EventSourceFilter::All {
+                include_self: false
+            }
+            .accepts(own, own)
+        );
     }
 }

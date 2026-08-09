@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
-use vtparse::{CsiParam, VTActor};
+use vtparse::{CsiParam, VTActor, VTParser};
 
 use crate::session::{
     runtime::RuntimeAction,
-    styled_line::StyledLine,
-    styled_line::{LinkAction, LinkSpan, Style, VtSpan},
+    styled_line::{
+        LinkAction, LinkMenu, LinkMenuItem, LinkSpan, LinkTooltip, LinkTooltipText, Style,
+        StyledLine, VtSpan,
+    },
 };
 
 mod sgr;
@@ -18,32 +20,339 @@ pub use sgr::process as sgr_process;
 
 /// The most bytes an OSC 8 URI may carry; longer links are ignored (the text
 /// still displays, unlinked).
-const MAX_OSC8_URI_LEN: usize = 8192;
+const MAX_OSC8_URI_LEN: usize = 4096;
+
+struct TooltipAnsiActor {
+    text: String,
+    spans: Vec<VtSpan>,
+    style: Style,
+    span_start: usize,
+    pending_cr: bool,
+}
+
+impl Default for TooltipAnsiActor {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            spans: Vec::new(),
+            style: Style::default(),
+            span_start: 0,
+            pending_cr: false,
+        }
+    }
+}
+
+impl TooltipAnsiActor {
+    fn close_span(&mut self) {
+        if self.text.len() > self.span_start {
+            self.spans.push(VtSpan {
+                style: self.style,
+                begin_pos: self.span_start,
+                end_pos: self.text.len(),
+            });
+            self.span_start = self.text.len();
+        }
+    }
+
+    fn set_style(&mut self, style: Style) {
+        if style != self.style {
+            self.close_span();
+            self.style = style;
+        }
+    }
+
+    fn push(&mut self, c: char) {
+        if std::mem::take(&mut self.pending_cr) {
+            self.text.push('\n');
+        }
+        self.text.push(c);
+    }
+
+    fn finish(mut self) -> Option<LinkTooltipText> {
+        if self.pending_cr {
+            self.text.push('\n');
+        }
+        self.close_span();
+
+        let begin = self.text.len() - self.text.trim_start().len();
+        let end = self.text.trim_end().len();
+        if begin >= end {
+            return None;
+        }
+        let text: Arc<str> = Arc::from(&self.text[begin..end]);
+        let spans: Vec<_> = self
+            .spans
+            .into_iter()
+            .filter_map(|span| {
+                let span_begin = span.begin_pos.max(begin);
+                let span_end = span.end_pos.min(end);
+                (span_begin < span_end).then_some(VtSpan {
+                    style: span.style,
+                    begin_pos: span_begin - begin,
+                    end_pos: span_end - begin,
+                })
+            })
+            .collect();
+        Some(LinkTooltipText {
+            text,
+            spans: spans.into(),
+        })
+    }
+}
+
+impl VTActor for TooltipAnsiActor {
+    fn print(&mut self, c: char) {
+        self.push(c);
+    }
+
+    fn execute_c0_or_c1(&mut self, control: u8) {
+        match control {
+            b'\r' => {
+                if self.pending_cr {
+                    self.text.push('\n');
+                }
+                self.pending_cr = true;
+            }
+            b'\n' => {
+                self.pending_cr = false;
+                self.text.push('\n');
+            }
+            _ => self.push(' '),
+        }
+    }
+
+    fn dcs_hook(
+        &mut self,
+        _byte: u8,
+        _params: &[i64],
+        _intermediates: &[u8],
+        _ignored_excess_intermediates: bool,
+    ) {
+    }
+
+    fn dcs_put(&mut self, _byte: u8) {}
+
+    fn dcs_unhook(&mut self) {}
+
+    fn esc_dispatch(
+        &mut self,
+        _params: &[i64],
+        _intermediates: &[u8],
+        _ignored_excess_intermediates: bool,
+        _byte: u8,
+    ) {
+    }
+
+    fn csi_dispatch(&mut self, params: &[CsiParam], _parameters_truncated: bool, byte: u8) {
+        if byte == b'm' {
+            self.set_style(sgr::process(self.style, params));
+        }
+    }
+
+    fn osc_dispatch(&mut self, _params: &[&[u8]]) {}
+
+    fn apc_dispatch(&mut self, _data: Vec<u8>) {}
+}
+
+/// Parse authored tooltip copy as a safe SGR-only ANSI document. SGR updates
+/// become semantic color spans; every other terminal sequence is discarded.
+#[must_use]
+pub fn parse_link_tooltip_text(text: &str) -> Option<LinkTooltipText> {
+    let mut parser = VTParser::new();
+    let mut actor = TooltipAnsiActor::default();
+    for &byte in text.as_bytes() {
+        parser.parse_byte(byte, &mut actor);
+    }
+    actor.finish()
+}
 
 /// Map an OSC 8 URI to its click action. The scheme allowlist is the trust
 /// boundary: `http`/`https` open the browser (behind the per-server confirm),
 /// a `send:` URI sends its percent-decoded command (same gate), and anything
 /// else — `file:`, `javascript:`, unknown schemes — yields no link at all.
-fn link_action_for_uri(uri: &str) -> Option<LinkAction> {
+#[derive(Debug)]
+struct ParsedLink {
+    action: LinkAction,
+    tooltip: LinkTooltip,
+}
+
+#[derive(Default)]
+struct Osc8Config {
+    tooltip: Option<LinkTooltipText>,
+    disabled: bool,
+    menu: Option<LinkMenu>,
+}
+
+/// Extract the first valid Mudlet-compatible `config` tooltip and remove all
+/// literal `config` query fields from the actionable target. Smudgy advertises
+/// `OSC_HYPERLINKS_TOOLTIP`, so the extension specification reserves this key;
+/// an ordinary URL can retain one by percent-encoding the key itself.
+fn osc8_config(uri: &str) -> (String, Osc8Config) {
+    let (before_fragment, fragment) = uri
+        .split_once('#')
+        .map_or((uri, None), |(head, tail)| (head, Some(tail)));
+    let Some((base, query)) = before_fragment.split_once('?') else {
+        return (uri.to_string(), Osc8Config::default());
+    };
+    if !query.split('&').any(|field| field.starts_with("config=")) {
+        return (uri.to_string(), Osc8Config::default());
+    }
+    let config = query.split('&').find_map(|field| {
+        let encoded = field.strip_prefix("config=")?;
+        let decoded = percent_decode(encoded);
+        serde_json::from_str::<serde_json::Value>(&decoded).ok()
+    });
+
+    let kept: Vec<_> = query
+        .split('&')
+        .filter(|field| !field.starts_with("config="))
+        .collect();
+    let mut target = String::with_capacity(uri.len());
+    target.push_str(base);
+    if !kept.is_empty() {
+        target.push('?');
+        target.push_str(&kept.join("&"));
+    }
+    if let Some(fragment) = fragment {
+        target.push('#');
+        target.push_str(fragment);
+    }
+    let Some(config) = config else {
+        return (target, Osc8Config::default());
+    };
+    let tooltip = config
+        .get("tooltip")
+        .or_else(|| config.get("t"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_link_tooltip_text);
+    let disabled = config
+        .get("disabled")
+        .or_else(|| config.get("d"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let title = config
+        .get("title")
+        .or_else(|| config.get("ti"))
+        .and_then(menu_title);
+    let menu = config
+        .get("menu")
+        .or_else(|| config.get("m"))
+        .and_then(|menu| parse_menu(menu, title));
+    (
+        target,
+        Osc8Config {
+            tooltip,
+            disabled,
+            menu,
+        },
+    )
+}
+
+fn menu_title(value: &serde_json::Value) -> Option<Arc<str>> {
+    value
+        .as_str()
+        .or_else(|| value.get("text").and_then(serde_json::Value::as_str))
+        .and_then(sanitize_single_line_text)
+}
+
+fn parse_menu(value: &serde_json::Value, title: Option<Arc<str>>) -> Option<LinkMenu> {
+    let mut items = Vec::new();
+    for value in value.as_array()? {
+        if value.as_str() == Some("-") {
+            items.push(LinkMenuItem::Separator);
+            continue;
+        }
+        let Some((label, uri)) = value.as_object().and_then(|item| {
+            item.iter()
+                .find_map(|(label, uri)| uri.as_str().map(|uri| (label, uri)))
+        }) else {
+            continue;
+        };
+        let Some(label) = sanitize_single_line_text(label) else {
+            continue;
+        };
+        let Some(action) = server_action_for_uri(uri) else {
+            continue;
+        };
+        items.push(LinkMenuItem::Action { label, action });
+    }
+    (!items.is_empty()).then(|| LinkMenu {
+        title,
+        items: items.into(),
+    })
+}
+
+/// Menu chrome stays one-line even though tooltip prose may be multiline.
+fn sanitize_single_line_text(text: &str) -> Option<Arc<str>> {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| Arc::from(cleaned))
+}
+
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    value.len() >= prefix.len()
+        && value.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+fn server_action_for_uri(uri: &str) -> Option<LinkAction> {
+    if starts_with_ascii_case_insensitive(uri, "http://")
+        || starts_with_ascii_case_insensitive(uri, "https://")
+        || starts_with_ascii_case_insensitive(uri, "ftp://")
+    {
+        return Some(LinkAction::OpenUrl(Arc::from(uri)));
+    }
+    if starts_with_ascii_case_insensitive(uri, "send:") {
+        return Some(LinkAction::ServerSend(Arc::from(percent_decode(&uri[5..]))));
+    }
+    if starts_with_ascii_case_insensitive(uri, "prompt:") {
+        return Some(LinkAction::Prompt(Arc::from(percent_decode(&uri[7..]))));
+    }
+    None
+}
+
+fn action_display_target(action: &LinkAction) -> Option<Arc<str>> {
+    match action.disclosed_target()? {
+        LinkAction::OpenUrl(url) => Some(url.clone()),
+        LinkAction::ServerSend(command) => Some(Arc::from(format!("send:{command}"))),
+        LinkAction::Prompt(command) => Some(Arc::from(format!("prompt:{command}"))),
+        LinkAction::Send(command) => Some(command.clone()),
+        LinkAction::Callback { .. } | LinkAction::Configured { .. } => None,
+    }
+}
+
+fn link_action_for_uri(uri: &str) -> Option<ParsedLink> {
     if uri.len() > MAX_OSC8_URI_LEN {
         log::debug!("OSC 8 URI over {MAX_OSC8_URI_LEN} bytes ignored");
         return None;
     }
-    // Compare on bytes: a `str` slice at `p.len()` would panic when the URI
-    // begins with multibyte UTF-8 that straddles that offset (server input).
-    let prefix = |p: &str| {
-        uri.len() > p.len() && uri.as_bytes()[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+    let (target, config) = osc8_config(uri);
+    let Some(primary) = server_action_for_uri(&target) else {
+        log::debug!("OSC 8 URI with unsupported scheme ignored");
+        return None;
     };
-    if prefix("http://") || prefix("https://") {
-        return Some(LinkAction::OpenUrl(Arc::from(uri)));
-    }
-    if prefix("send:") {
-        return Some(LinkAction::ServerSend(Arc::from(
-            percent_decode(&uri[5..]).as_str(),
-        )));
-    }
-    log::debug!("OSC 8 URI with unsupported scheme ignored");
-    None
+    let display_target = action_display_target(&primary);
+    let tooltip = if let Some(text) = config.tooltip {
+        LinkTooltip::styled_text(text, display_target.clone())
+    } else if config.menu.is_some() && !config.disabled {
+        LinkTooltip::text(Arc::from("Right-click for menu"), display_target.clone())
+    } else {
+        LinkTooltip::text(display_target.clone()?, None)
+    };
+    let action = if config.disabled || config.menu.is_some() {
+        LinkAction::Configured {
+            primary: Some(Box::new(primary)),
+            disabled: config.disabled,
+            primary_enabled: true,
+            menu: config.menu,
+            menu_on_left_click: false,
+        }
+    } else {
+        primary
+    };
+    Some(ParsedLink { action, tooltip })
 }
 
 /// Decode `%XX` escapes (RFC 3986); anything malformed passes through
@@ -82,7 +391,7 @@ pub struct VtProcessor {
     /// The active OSC 8 link, applied to every character until `ESC]8;;`.
     /// Like the cursor style, it survives line commits (a multi-line link)
     /// and carriage-return overprints.
-    cursor_link: Option<LinkAction>,
+    cursor_link: Option<ParsedLink>,
     /// Where in `buf` the active link's current range began.
     link_open_pos: usize,
     /// A bare `\r` arrived: the next printable character overwrites the open
@@ -114,11 +423,7 @@ impl VtProcessor {
     #[must_use]
     pub fn new(session_runtime_tx: UnboundedSender<RuntimeAction>) -> Self {
         VtProcessor {
-            cursor_style: Style {
-                fg: Color::DefaultForeground { bold: false },
-                bg: Color::DefaultBackground,
-                ..Style::DEFAULT
-            },
+            cursor_style: Style::default(),
             buf: String::with_capacity(INPUT_BUFFER_CAPACITY),
             buf_raw: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
             span_info: Vec::new(),
@@ -152,8 +457,7 @@ impl VtProcessor {
     /// and the buffers are empty.
     fn refresh_capture_raw(&mut self) {
         if let Some(flag) = &self.raw_wanted {
-            self.capture_raw =
-                self.capture_raw && flag.load(std::sync::atomic::Ordering::Relaxed);
+            self.capture_raw = self.capture_raw && flag.load(std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -171,12 +475,13 @@ impl VtProcessor {
     /// line commit inside a still-open link — while an explicit `ESC]8;;`
     /// ends it.
     fn close_link_range(&mut self, keep_active: bool) {
-        if let Some(action) = &self.cursor_link {
+        if let Some(link) = &self.cursor_link {
             if self.buf.len() > self.link_open_pos {
                 self.link_info.push(LinkSpan {
                     begin_pos: self.link_open_pos,
                     end_pos: self.buf.len(),
-                    action: action.clone(),
+                    action: link.action.clone(),
+                    tooltip: Some(link.tooltip.clone()),
                 });
             }
             if !keep_active {
@@ -188,9 +493,9 @@ impl VtProcessor {
 
     /// Begin a link at the current buffer position, closing any open one (a
     /// second open without a close replaces it from that point).
-    fn open_link(&mut self, action: LinkAction) {
+    fn open_link(&mut self, link: ParsedLink) {
         self.close_link_range(false);
-        self.cursor_link = Some(action);
+        self.cursor_link = Some(link);
         self.link_open_pos = self.buf.len();
     }
 
@@ -395,7 +700,7 @@ impl VTActor for VtProcessor {
             return;
         }
         match link_action_for_uri(&String::from_utf8_lossy(&uri)) {
-            Some(action) => self.open_link(action),
+            Some(link) => self.open_link(link),
             // Unsupported scheme: the text still displays, unlinked.
             None => self.close_link_range(false),
         }
@@ -406,7 +711,7 @@ impl VTActor for VtProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, VtProcessor};
+    use super::{AnsiColor, Color, MAX_OSC8_URI_LEN, VtProcessor, parse_link_tooltip_text};
     use crate::session::runtime::RuntimeAction;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use vtparse::VTParser;
@@ -579,7 +884,7 @@ mod tests {
         assert_eq!(transcript(&h.actions()), ["partial:> ", "line:ok"]);
     }
 
-    use crate::session::styled_line::{LinkAction, StyledLine};
+    use crate::session::styled_line::{LinkAction, LinkMenuItem, LinkTooltip, StyledLine};
 
     fn committed_lines(actions: &[RuntimeAction]) -> Vec<std::sync::Arc<StyledLine>> {
         actions
@@ -603,6 +908,157 @@ mod tests {
         assert_eq!(
             lines[0].links[0].action,
             LinkAction::OpenUrl(std::sync::Arc::from("https://example.com"))
+        );
+        assert_eq!(
+            lines[0].links[0]
+                .tooltip
+                .as_ref()
+                .and_then(LinkTooltip::display),
+            Some((std::sync::Arc::from("https://example.com"), None))
+        );
+    }
+
+    #[test]
+    fn osc8_config_tooltip_strips_config_and_discloses_the_target() {
+        let mut h = harness();
+        h.feed(
+            b"\x1b]8;;https://example.com/pay?x=1&config=%7B%22tooltip%22%3A%22Trusted%20checkout%22%7D#receipt\x1b\\pay\x1b]8;;\x1b\\\n",
+        );
+        let lines = committed_lines(&h.actions());
+        let link = &lines[0].links[0];
+        assert_eq!(
+            link.action,
+            LinkAction::OpenUrl(std::sync::Arc::from("https://example.com/pay?x=1#receipt"))
+        );
+        assert_eq!(
+            link.tooltip.as_ref().and_then(LinkTooltip::display),
+            Some((
+                std::sync::Arc::from("Trusted checkout"),
+                Some(std::sync::Arc::from("https://example.com/pay?x=1#receipt"))
+            ))
+        );
+    }
+
+    #[test]
+    fn osc8_tooltip_preserves_json_lf_and_normalizes_crlf() {
+        let cases = [
+            (
+                b"%7B%22tooltip%22%3A%22Line%20one%5CnLine%20two%22%7D".as_slice(),
+                "Line one\nLine two",
+            ),
+            (
+                b"%7B%22tooltip%22%3A%22Line%20one%5Cr%5CnLine%20two%22%7D".as_slice(),
+                "Line one\nLine two",
+            ),
+        ];
+        for (config, expected) in cases {
+            let mut h = harness();
+            let mut input = b"\x1b]8;;https://example.com/stats?config=".to_vec();
+            input.extend_from_slice(config);
+            input.extend_from_slice(b"\x1b\\stats\x1b]8;;\x1b\\\n");
+            h.feed(&input);
+            let lines = committed_lines(&h.actions());
+            assert_eq!(
+                lines[0].links[0]
+                    .tooltip
+                    .as_ref()
+                    .and_then(LinkTooltip::display),
+                Some((
+                    std::sync::Arc::from(expected),
+                    Some(std::sync::Arc::from("https://example.com/stats"))
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn tooltip_ansi_parser_keeps_sgr_spans_and_discards_active_controls() {
+        let parsed =
+            parse_link_tooltip_text("\x1b[38;2;255;128;0mEPIC\x1b[0m\nDamage: \x1b[1;31m42\x1b[0m")
+                .expect("styled tooltip");
+        assert_eq!(parsed.text.as_ref(), "EPIC\nDamage: 42");
+        assert_eq!(
+            &parsed.text[parsed.spans[0].begin_pos..parsed.spans[0].end_pos],
+            "EPIC"
+        );
+        assert_eq!(
+            parsed.spans[0].style.fg,
+            Color::Rgb {
+                r: 255,
+                g: 128,
+                b: 0
+            }
+        );
+        assert!(parsed.spans.iter().any(|span| {
+            &parsed.text[span.begin_pos..span.end_pos] == "42"
+                && span.style.attributes.bold
+                && span.style.fg
+                    == Color::Ansi {
+                        color: AnsiColor::Red,
+                        bold: false,
+                    }
+        }));
+        assert_eq!(parsed.spans.first().map(|span| span.begin_pos), Some(0));
+        assert_eq!(
+            parsed.spans.last().map(|span| span.end_pos),
+            Some(parsed.text.len())
+        );
+        assert!(
+            parsed
+                .spans
+                .windows(2)
+                .all(|pair| pair[0].end_pos == pair[1].begin_pos)
+        );
+
+        let safe =
+            parse_link_tooltip_text("safe\x1b]8;;https://example.com/hidden\x1b\\text\x1b[2J\0end")
+                .expect("safe tooltip");
+        assert_eq!(safe.text.as_ref(), "safetext end");
+        assert!(!safe.text.contains('\x1b'));
+    }
+
+    #[test]
+    fn osc8_compact_tooltip_key_is_supported() {
+        let mut h = harness();
+        h.feed(
+            b"\x1b]8;;send:north?config=%7B%22t%22%3A%22Take%20the%20north%20exit%22%7D\x1b\\north\x1b]8;;\x1b\\\n",
+        );
+        let lines = committed_lines(&h.actions());
+        let link = &lines[0].links[0];
+        assert_eq!(
+            link.action,
+            LinkAction::ServerSend(std::sync::Arc::from("north"))
+        );
+        assert_eq!(
+            link.tooltip.as_ref().and_then(LinkTooltip::display),
+            Some((
+                std::sync::Arc::from("Take the north exit"),
+                Some(std::sync::Arc::from("send:north"))
+            ))
+        );
+    }
+
+    #[test]
+    fn osc8_reserved_config_is_stripped_even_when_malformed() {
+        let mut h = harness();
+        h.feed(b"\x1b]8;;https://example.com/?x=1&config=not-json\x1b\\x\x1b]8;;\x1b\\\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(
+            lines[0].links[0].action,
+            LinkAction::OpenUrl(std::sync::Arc::from("https://example.com/?x=1"))
+        );
+    }
+
+    #[test]
+    fn osc8_percent_encoded_config_key_remains_part_of_web_url() {
+        let mut h = harness();
+        h.feed(b"\x1b]8;;https://example.com/?%63%6f%6e%66%69%67=value\x1b\\x\x1b]8;;\x1b\\\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(
+            lines[0].links[0].action,
+            LinkAction::OpenUrl(std::sync::Arc::from(
+                "https://example.com/?%63%6f%6e%66%69%67=value"
+            ))
         );
     }
 
@@ -647,6 +1103,64 @@ mod tests {
     }
 
     #[test]
+    fn osc8_prompt_prefills_percent_decoded_text() {
+        let mut h = harness();
+        h.feed(b"\x1b]8;;prompt:cast%20fireball\x1b\\cast\x1b]8;;\x1b\\\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(
+            lines[0].links[0].action,
+            LinkAction::Prompt(std::sync::Arc::from("cast fireball"))
+        );
+    }
+
+    #[test]
+    fn osc8_compact_disabled_link_keeps_tooltip_but_has_no_primary_action() {
+        let mut h = harness();
+        h.feed(
+            b"\x1b]8;;send:north?config=%7B%22d%22%3Atrue%2C%22t%22%3A%22Unavailable%22%7D\x1b\\north\x1b]8;;\x1b\\\n",
+        );
+        let lines = committed_lines(&h.actions());
+        let link = &lines[0].links[0];
+        assert!(link.action.primary().is_none());
+        assert!(link.action.menu().is_none());
+        assert!(!link.action.opens_menu_on_left_click());
+        assert_eq!(
+            link.tooltip.as_ref().and_then(LinkTooltip::display),
+            Some((
+                std::sync::Arc::from("Unavailable"),
+                Some(std::sync::Arc::from("send:north"))
+            ))
+        );
+    }
+
+    #[test]
+    fn osc8_compact_menu_supports_actions_separators_title_and_default_tooltip() {
+        let mut h = harness();
+        h.feed(
+            b"\x1b]8;;send:look?config=%7B%22m%22%3A%5B%7B%22Look%22%3A%22send%3Alook%22%7D%2C%22-%22%2C%7B%22Cast%22%3A%22prompt%3Acast%2520fireball%22%7D%5D%2C%22ti%22%3A%22Actions%22%7D\x1b\\actions\x1b]8;;\x1b\\\n",
+        );
+        let lines = committed_lines(&h.actions());
+        let link = &lines[0].links[0];
+        let menu = link.action.menu().expect("an enabled menu");
+        assert!(!link.action.opens_menu_on_left_click());
+        assert_eq!(menu.title.as_deref(), Some("Actions"));
+        assert_eq!(menu.items.len(), 3);
+        assert!(matches!(menu.items[1], LinkMenuItem::Separator));
+        assert!(matches!(
+            &menu.items[2],
+            LinkMenuItem::Action { label, action: LinkAction::Prompt(command) }
+                if label.as_ref() == "Cast" && command.as_ref() == "cast fireball"
+        ));
+        assert_eq!(
+            link.tooltip.as_ref().and_then(LinkTooltip::display),
+            Some((
+                std::sync::Arc::from("Right-click for menu"),
+                Some(std::sync::Arc::from("send:look"))
+            ))
+        );
+    }
+
+    #[test]
     fn osc8_unsupported_schemes_render_plain_text() {
         let mut h = harness();
         h.feed(b"\x1b]8;;file:///etc/passwd\x1b\\name\x1b]8;;\x1b\\\n");
@@ -658,13 +1172,27 @@ mod tests {
     #[test]
     fn osc8_oversized_uri_is_ignored() {
         let mut payload = b"\x1b]8;;https://example.com/".to_vec();
-        payload.extend(std::iter::repeat_n(b'x', 9000));
+        payload.extend(std::iter::repeat_n(b'x', MAX_OSC8_URI_LEN));
         payload.extend_from_slice(b"\x1b\\text\x1b]8;;\x1b\\\n");
         let mut h = harness();
         h.feed(&payload);
         let lines = committed_lines(&h.actions());
         assert_eq!(lines[0].text, "text");
         assert!(lines[0].links.is_empty());
+    }
+
+    #[test]
+    fn osc8_uri_at_byte_cap_is_accepted() {
+        const PREFIX: &[u8] = b"https://example.com/";
+        let mut payload = b"\x1b]8;;".to_vec();
+        payload.extend_from_slice(PREFIX);
+        payload.extend(std::iter::repeat_n(b'x', MAX_OSC8_URI_LEN - PREFIX.len()));
+        payload.extend_from_slice(b"\x1b\\text\x1b]8;;\x1b\\\n");
+        let mut h = harness();
+        h.feed(&payload);
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "text");
+        assert_eq!(lines[0].links.len(), 1);
     }
 
     #[test]

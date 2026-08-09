@@ -1,11 +1,12 @@
 use std::{
     cell::{Ref, RefCell},
     rc::Rc,
+    sync::Arc,
 };
 
-use crate::terminal_buffer::{LinkClickEvent, SpanMetadata, TerminalBuffer};
+use crate::terminal_buffer::{LinkClickEvent, SpanMetadata, TerminalBuffer, make_span};
 use iced::{
-    Background, Event, Pixels, Rectangle,
+    Background, Border, Event, Pixels, Point, Rectangle, Size,
     advanced::{
         self, Layout, Widget, clipboard,
         graphics::core::keyboard,
@@ -19,6 +20,9 @@ use iced::{
     touch,
     widget::text::LineHeight,
     window,
+};
+use smudgy_core::session::styled_line::{
+    LinkAction, LinkMenu, LinkMenuItem, LinkTooltip, LinkTooltipCallback, LinkTooltipText,
 };
 
 mod spans;
@@ -110,6 +114,545 @@ pub(super) fn effective_metrics(
     }
 }
 
+/// Render an actionable destination without letting control, zero-width, or
+/// bidi-reordering characters conceal what will actually be opened or sent.
+fn safe_link_target(target: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let mut rendered = String::with_capacity(target.len().min(MAX_CHARS));
+    for (index, c) in target.chars().enumerate() {
+        if index == MAX_CHARS {
+            rendered.push('\u{2026}');
+            break;
+        }
+        let suspicious = c.is_control()
+            || matches!(
+                c,
+                '\u{061c}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{206f}'
+                    | '\u{feff}'
+            );
+        if suspicious {
+            use std::fmt::Write;
+            write!(rendered, "\\u{{{:04X}}}", u32::from(c)).ok();
+        } else {
+            rendered.push(c);
+        }
+    }
+    rendered
+}
+
+fn action_target(action: &LinkAction) -> Option<String> {
+    match action.disclosed_target()? {
+        LinkAction::Send(command) | LinkAction::OpenUrl(command) => Some(command.to_string()),
+        LinkAction::ServerSend(command) => Some(format!("send:{command}")),
+        LinkAction::Prompt(command) => Some(format!("prompt:{command}")),
+        LinkAction::Callback { .. } | LinkAction::Configured { .. } => None,
+    }
+}
+
+fn clipped_tooltip_text(text: &LinkTooltipText) -> LinkTooltipText {
+    // Enough for a dense 60-column by 20-row item/stat block plus breathing
+    // room, while still bounding paragraph shaping work from untrusted servers.
+    const MAX_CHARS: usize = 4096;
+    let mut chars = text.text.chars();
+    let mut result: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_none() {
+        return text.clone();
+    }
+    let cutoff = result.len();
+    result.push('\u{2026}');
+    let mut spans: Vec<_> = text
+        .spans
+        .iter()
+        .filter_map(|span| {
+            (span.begin_pos < cutoff).then_some(smudgy_core::session::styled_line::VtSpan {
+                style: span.style,
+                begin_pos: span.begin_pos,
+                end_pos: span.end_pos.min(cutoff),
+            })
+        })
+        .collect();
+    if let Some(last) = spans.last_mut() {
+        last.end_pos = result.len();
+    }
+    LinkTooltipText {
+        text: Arc::from(result),
+        spans: spans.into(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LinkTooltipParagraphCache<P: text::Paragraph> {
+    text: LinkTooltipText,
+    spans: Rc<Vec<iced::widget::text::Span<'static, Link>>>,
+    paragraph: P,
+    generation: u64,
+    content_width: f32,
+}
+
+fn draw_link_tooltip<Renderer>(
+    renderer: &mut Renderer,
+    prefs: &crate::prefs::TerminalPrefs,
+    viewport: Rectangle,
+    cursor: mouse::Cursor,
+    action: &LinkAction,
+    tooltip: &LinkTooltip,
+    paragraph_cache: &RefCell<Option<LinkTooltipParagraphCache<Renderer::Paragraph>>>,
+) where
+    Renderer: text::Renderer<Font = iced::Font>,
+    Renderer::Paragraph: iced::advanced::text::Paragraph<Font = iced::Font>,
+{
+    let Some(cursor) = cursor.position() else {
+        return;
+    };
+    let Some((primary, secondary)) = tooltip.display_styled() else {
+        return;
+    };
+    let target = action_target(action);
+    let primary = if secondary.is_none() && target.as_deref() == Some(primary.text.as_ref()) {
+        LinkTooltipText::plain(Arc::from(safe_link_target(primary.text.as_ref())))
+    } else {
+        clipped_tooltip_text(&primary)
+    };
+    let secondary = secondary.map(|target| safe_link_target(&target));
+
+    let padding = 8.0;
+    let gap = if secondary.is_some() { 3.0 } else { 0.0 };
+    let max_width = (viewport.width - 2.0).min(520.0);
+    if max_width < 2.0 * padding + 1.0 {
+        return;
+    }
+    let content_bounds = Size::new(max_width - 2.0 * padding, f32::INFINITY);
+    let make_plain_paragraph = |content: &str, size: f32| {
+        Renderer::Paragraph::with_text(iced::advanced::text::Text {
+            content,
+            bounds: content_bounds,
+            size: Pixels(size),
+            font: prefs.font,
+            line_height: LineHeight::Absolute(Pixels((size * 1.25).round())),
+            align_x: text::Alignment::Left,
+            align_y: alignment::Vertical::Top,
+            shaping: text::Shaping::Advanced,
+            wrapping: text::Wrapping::WordOrGlyph,
+        })
+    };
+    let mut paragraph_cache = paragraph_cache.borrow_mut();
+    let rebuild = paragraph_cache.as_ref().is_none_or(|cache| {
+        cache.text != primary
+            || cache.generation != prefs.generation
+            || cache.content_width != content_bounds.width
+    });
+    if rebuild {
+        let spans: Rc<Vec<iced::widget::text::Span<'static, Link>>> = Rc::new(
+            primary
+                .spans
+                .iter()
+                .map(|span| {
+                    make_span(
+                        &primary.text[span.begin_pos..span.end_pos],
+                        span.style,
+                        false,
+                        prefs,
+                    )
+                })
+                .collect(),
+        );
+        let paragraph = Renderer::Paragraph::with_spans(iced::advanced::text::Text {
+            content: spans.as_slice(),
+            bounds: content_bounds,
+            size: Pixels(13.0),
+            font: prefs.font,
+            line_height: LineHeight::Absolute(Pixels((13.0_f32 * 1.25).round())),
+            align_x: text::Alignment::Left,
+            align_y: alignment::Vertical::Top,
+            shaping: text::Shaping::Advanced,
+            wrapping: text::Wrapping::WordOrGlyph,
+        });
+        *paragraph_cache = Some(LinkTooltipParagraphCache {
+            text: primary.clone(),
+            spans,
+            paragraph,
+            generation: prefs.generation,
+            content_width: content_bounds.width,
+        });
+    }
+    let primary_cache = paragraph_cache
+        .as_ref()
+        .expect("tooltip paragraph cache was just populated");
+    let primary_paragraph = &primary_cache.paragraph;
+    let secondary_paragraph = secondary
+        .as_deref()
+        .map(|text| make_plain_paragraph(text, 11.0));
+    let content_width = secondary_paragraph
+        .as_ref()
+        .map_or(primary_paragraph.min_width(), |secondary| {
+            primary_paragraph.min_width().max(secondary.min_width())
+        });
+    let width = (content_width + 2.0 * padding).min(max_width);
+    let height = primary_paragraph.min_height()
+        + secondary_paragraph.as_ref().map_or(0.0, |p| p.min_height())
+        + gap
+        + 2.0 * padding;
+    let text_primitive = |content: String, size: f32, height: f32| iced::advanced::text::Text {
+        content,
+        bounds: Size::new(width - 2.0 * padding, height),
+        size: Pixels(size),
+        font: prefs.font,
+        line_height: LineHeight::Absolute(Pixels((size * 1.25).round())),
+        align_x: text::Alignment::Left,
+        align_y: alignment::Vertical::Top,
+        shaping: text::Shaping::Advanced,
+        wrapping: text::Wrapping::WordOrGlyph,
+    };
+
+    let right = viewport.x + viewport.width;
+    let bottom = viewport.y + viewport.height;
+    let x = (cursor.x + 12.0).min(right - width).max(viewport.x);
+    let below = cursor.y + 18.0;
+    let y = if below + height <= bottom {
+        below
+    } else {
+        (cursor.y - height - 8.0).max(viewport.y)
+    };
+    let bounds = Rectangle::new(Point::new(x, y), Size::new(width, height));
+    let foreground = prefs.palette.foreground;
+
+    // iced batches quads and glyphs into primitive sublayers. Without a fresh
+    // renderer layer, every terminal paragraph is composited after this card's
+    // fill, which makes the scrollback show through it. Use owned text primitives
+    // here too: fill_paragraph records only a weak reference, and these transient
+    // measurement paragraphs do not live until the GPU preparation pass.
+    renderer.start_layer(viewport);
+    renderer.fill_quad(
+        Quad {
+            bounds,
+            border: Border {
+                color: iced::Color {
+                    a: 0.28,
+                    ..foreground
+                },
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        },
+        Background::Color(iced::Color {
+            a: 0.97,
+            ..prefs.palette.background
+        }),
+    );
+    let primary_at = Point::new(x + padding, y + padding);
+    let primary_height = primary_paragraph.min_height();
+    for (index, span) in primary_cache.spans.iter().enumerate() {
+        let Some(highlight) = span.highlight else {
+            continue;
+        };
+        for region in primary_paragraph.span_bounds(index) {
+            let bounds = Rectangle {
+                x: primary_at.x + region.x,
+                y: primary_at.y + region.y,
+                width: region.width,
+                height: region.height,
+            };
+            renderer.fill_quad(
+                Quad {
+                    bounds,
+                    border: highlight.border,
+                    ..Default::default()
+                },
+                highlight.background,
+            );
+        }
+    }
+    renderer.fill_paragraph(primary_paragraph, primary_at, foreground, viewport);
+    if let (Some(secondary), Some(secondary_paragraph)) = (secondary, secondary_paragraph) {
+        let secondary_at = Point::new(x + padding, y + padding + primary_height + gap);
+        renderer.fill_text(
+            text_primitive(secondary, 11.0, secondary_paragraph.min_height()),
+            secondary_at,
+            iced::Color {
+                a: foreground.a * 0.58,
+                ..foreground
+            },
+            viewport,
+        );
+    }
+    renderer.end_layer();
+}
+
+#[derive(Debug, Clone)]
+struct LinkMenuPopup {
+    menu: LinkMenu,
+    anchor: Point,
+}
+
+struct LinkMenuGeometry {
+    bounds: Rectangle,
+    title: Option<Rectangle>,
+    rows: Vec<Rectangle>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HoveredLinkTooltip {
+    action: LinkAction,
+    tooltip: LinkTooltip,
+}
+
+#[derive(Debug, Clone)]
+enum LinkTooltipHover {
+    Waiting {
+        link: HoveredLinkTooltip,
+        at: Instant,
+    },
+    Open(HoveredLinkTooltip),
+}
+
+impl LinkTooltipHover {
+    fn link(&self) -> &HoveredLinkTooltip {
+        match self {
+            Self::Waiting { link, .. } | Self::Open(link) => link,
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        matches!(self, Self::Open(_))
+    }
+
+    fn is_open_for(&self, action: &LinkAction, tooltip: &LinkTooltip) -> bool {
+        matches!(
+            self,
+            Self::Open(link) if link.action == *action && link.tooltip == *tooltip
+        )
+    }
+}
+
+fn begin_link_tooltip_hover<Message>(
+    link: HoveredLinkTooltip,
+    delay: Duration,
+    now: Instant,
+    shell: &mut advanced::Shell<'_, Message>,
+) -> LinkTooltipHover {
+    if delay == Duration::ZERO {
+        shell.request_redraw();
+        LinkTooltipHover::Open(link)
+    } else {
+        shell.request_redraw_at(now + delay);
+        LinkTooltipHover::Waiting { link, at: now }
+    }
+}
+
+fn link_menu_geometry<Renderer>(
+    popup: &LinkMenuPopup,
+    prefs: &crate::prefs::TerminalPrefs,
+    viewport: Rectangle,
+) -> Option<LinkMenuGeometry>
+where
+    Renderer: text::Renderer<Font = iced::Font>,
+    Renderer::Paragraph: iced::advanced::text::Paragraph<Font = iced::Font>,
+{
+    const PADDING: f32 = 4.0;
+    const HORIZONTAL_PADDING: f32 = 10.0;
+    const ACTION_HEIGHT: f32 = 27.0;
+    const TITLE_HEIGHT: f32 = 25.0;
+    const SEPARATOR_HEIGHT: f32 = 9.0;
+    let max_width = (viewport.width - 2.0).min(420.0);
+    if max_width < 2.0 * (PADDING + HORIZONTAL_PADDING) + 1.0 {
+        return None;
+    }
+    let measure = |content: &str, size: f32| {
+        Renderer::Paragraph::with_text(iced::advanced::text::Text {
+            content,
+            bounds: Size::new(f32::INFINITY, f32::INFINITY),
+            size: Pixels(size),
+            font: prefs.font,
+            line_height: LineHeight::Absolute(Pixels((size * 1.25).round())),
+            align_x: text::Alignment::Left,
+            align_y: alignment::Vertical::Center,
+            shaping: text::Shaping::Advanced,
+            wrapping: text::Wrapping::None,
+        })
+        .min_width()
+    };
+    let title_width = popup
+        .menu
+        .title
+        .as_deref()
+        .map_or(0.0, |title| measure(title, 12.0));
+    let item_width = popup
+        .menu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            LinkMenuItem::Separator => None,
+            LinkMenuItem::Action { label, .. } => Some(measure(label, 13.0)),
+        })
+        .fold(0.0, f32::max);
+    let width = (title_width.max(item_width) + 2.0 * (PADDING + HORIZONTAL_PADDING))
+        .max(120.0_f32.min(max_width))
+        .min(max_width);
+    let content_height = popup.menu.title.as_ref().map_or(0.0, |_| TITLE_HEIGHT)
+        + popup
+            .menu
+            .items
+            .iter()
+            .map(|item| match item {
+                LinkMenuItem::Separator => SEPARATOR_HEIGHT,
+                LinkMenuItem::Action { .. } => ACTION_HEIGHT,
+            })
+            .sum::<f32>();
+    let height = content_height + 2.0 * PADDING;
+    let right = viewport.x + viewport.width;
+    let bottom = viewport.y + viewport.height;
+    let x = popup.anchor.x.min(right - width).max(viewport.x);
+    let y = popup.anchor.y.min(bottom - height).max(viewport.y);
+    let bounds = Rectangle::new(Point::new(x, y), Size::new(width, height));
+    let mut top = y + PADDING;
+    let title = popup.menu.title.as_ref().map(|_| {
+        let bounds = Rectangle::new(
+            Point::new(x + PADDING, top),
+            Size::new(width - 2.0 * PADDING, TITLE_HEIGHT),
+        );
+        top += TITLE_HEIGHT;
+        bounds
+    });
+    let rows = popup
+        .menu
+        .items
+        .iter()
+        .map(|item| {
+            let row_height = match item {
+                LinkMenuItem::Separator => SEPARATOR_HEIGHT,
+                LinkMenuItem::Action { .. } => ACTION_HEIGHT,
+            };
+            let bounds = Rectangle::new(
+                Point::new(x + PADDING, top),
+                Size::new(width - 2.0 * PADDING, row_height),
+            );
+            top += row_height;
+            bounds
+        })
+        .collect();
+    Some(LinkMenuGeometry {
+        bounds,
+        title,
+        rows,
+    })
+}
+
+fn draw_link_menu<Renderer>(
+    renderer: &mut Renderer,
+    prefs: &crate::prefs::TerminalPrefs,
+    viewport: Rectangle,
+    cursor: mouse::Cursor,
+    popup: &LinkMenuPopup,
+) where
+    Renderer: text::Renderer<Font = iced::Font>,
+    Renderer::Paragraph: iced::advanced::text::Paragraph<Font = iced::Font>,
+{
+    let Some(geometry) = link_menu_geometry::<Renderer>(popup, prefs, viewport) else {
+        return;
+    };
+    let foreground = prefs.palette.foreground;
+    let make_text = |content: String, size: f32, bounds: Rectangle| iced::advanced::text::Text {
+        content,
+        bounds: bounds.size(),
+        size: Pixels(size),
+        font: prefs.font,
+        line_height: LineHeight::Absolute(Pixels((size * 1.25).round())),
+        align_x: text::Alignment::Left,
+        align_y: alignment::Vertical::Center,
+        shaping: text::Shaping::Advanced,
+        wrapping: text::Wrapping::None,
+    };
+
+    renderer.start_layer(viewport);
+    renderer.fill_quad(
+        Quad {
+            bounds: geometry.bounds,
+            border: Border {
+                color: iced::Color {
+                    a: 0.3,
+                    ..foreground
+                },
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        },
+        Background::Color(iced::Color {
+            a: 0.98,
+            ..prefs.palette.background
+        }),
+    );
+    if let (Some(title), Some(title_bounds)) = (&popup.menu.title, geometry.title) {
+        let text_bounds = Rectangle {
+            x: title_bounds.x + 10.0,
+            width: title_bounds.width - 20.0,
+            ..title_bounds
+        };
+        renderer.fill_text(
+            make_text(title.to_string(), 12.0, text_bounds),
+            Point::new(text_bounds.x, text_bounds.center_y()),
+            iced::Color {
+                a: foreground.a * 0.62,
+                ..foreground
+            },
+            viewport,
+        );
+    }
+    for (item, row) in popup.menu.items.iter().zip(geometry.rows) {
+        match item {
+            LinkMenuItem::Separator => {
+                renderer.fill_quad(
+                    Quad {
+                        bounds: Rectangle::new(
+                            Point::new(row.x + 8.0, row.center_y() - 0.5),
+                            Size::new(row.width - 16.0, 1.0),
+                        ),
+                        ..Default::default()
+                    },
+                    Background::Color(iced::Color {
+                        a: foreground.a * 0.2,
+                        ..foreground
+                    }),
+                );
+            }
+            LinkMenuItem::Action { label, .. } => {
+                if cursor.is_over(row) {
+                    renderer.fill_quad(
+                        Quad {
+                            bounds: row,
+                            border: Border {
+                                radius: 3.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        Background::Color(iced::Color {
+                            a: foreground.a * 0.12,
+                            ..foreground
+                        }),
+                    );
+                }
+                let text_bounds = Rectangle {
+                    x: row.x + 10.0,
+                    width: row.width - 20.0,
+                    ..row
+                };
+                renderer.fill_text(
+                    make_text(label.to_string(), 13.0, text_bounds),
+                    Point::new(text_bounds.x, text_bounds.center_y()),
+                    foreground,
+                    viewport,
+                );
+            }
+        }
+    }
+    renderer.end_layer();
+}
+
 /// State specific to the TerminalPane widget instance.
 #[derive(Debug, Clone)]
 pub(super) struct State<P: text::Paragraph> {
@@ -129,6 +672,18 @@ pub(super) struct State<P: text::Paragraph> {
     /// release first and flips `Selecting` → `Selected`, so selection state alone
     /// cannot tell this pane a click just ended on it.
     pub pressed_cell: Option<BufferPosition>,
+    /// The terminal-owned OSC/script link context menu, anchored where it was
+    /// opened. Actions are cloned with the scrollback so the popup remains
+    /// valid even if new output arrives before a choice is clicked.
+    menu_popup: Option<LinkMenuPopup>,
+    /// Delay state for the OSC/script tooltip under the pointer. The link and
+    /// tooltip values form the hover identity, so moving within one linked
+    /// range does not restart the timer.
+    link_tooltip_hover: Option<LinkTooltipHover>,
+    /// Persistent rich paragraph for the open tooltip. iced's renderer keeps
+    /// paragraph primitives by weak reference until GPU preparation, so this
+    /// must outlive the draw call instead of being a transient local.
+    link_tooltip_paragraph: RefCell<Option<LinkTooltipParagraphCache<P>>>,
     /// Common timebase and current visibility phases for SGR 5/6 text.
     blink_epoch: Instant,
     slow_blink_visible: bool,
@@ -144,6 +699,9 @@ impl<P: text::Paragraph> Default for State<P> {
             advance: None,
             modifiers: keyboard::Modifiers::default(),
             pressed_cell: None,
+            menu_popup: None,
+            link_tooltip_hover: None,
+            link_tooltip_paragraph: RefCell::new(None),
             blink_epoch: Instant::now(),
             slow_blink_visible: true,
             fast_blink_visible: true,
@@ -218,6 +776,8 @@ pub struct TerminalPane<'a> {
     /// shell message so the pane stays `Message`-agnostic (it is instantiated under
     /// several message types); the handler sends the resulting runtime action itself.
     on_link: Option<Rc<dyn Fn(LinkClickEvent)>>,
+    /// Routes the one lazy first-hover request for script-authored tooltip copy.
+    on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
     /// Per-pane terminal font override (`docs/panes.md`); `None` follows the
     /// global preference.
     font_size: Option<f32>,
@@ -231,6 +791,7 @@ impl<'a> TerminalPane<'a> {
             selection,
             last_line_number: None,
             on_link: None,
+            on_link_tooltip: None,
             font_size: None,
         }
     }
@@ -242,6 +803,14 @@ impl<'a> TerminalPane<'a> {
 
     pub fn on_link(mut self, on_link: Option<Rc<dyn Fn(LinkClickEvent)>>) -> Self {
         self.on_link = on_link;
+        self
+    }
+
+    pub fn on_link_tooltip(
+        mut self,
+        on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
+    ) -> Self {
+        self.on_link_tooltip = on_link_tooltip;
         self
     }
 
@@ -370,15 +939,6 @@ where
                         || text_bounds.width < cache.paragraph.min_bounds().width
                     {
                         cache.paragraph.resize(text_bounds);
-                        if let Some(paragraph) = &mut cache.slow_blink_hidden {
-                            paragraph.resize(text_bounds);
-                        }
-                        if let Some(paragraph) = &mut cache.fast_blink_hidden {
-                            paragraph.resize(text_bounds);
-                        }
-                        if let Some(paragraph) = &mut cache.all_blink_hidden {
-                            paragraph.resize(text_bounds);
-                        }
                         cache.max_valid_width = text_bounds.width;
                     }
 
@@ -393,7 +953,6 @@ where
             let spans = Spans::with_selection(line.spans().clone(), line_selection);
 
             let spans_vec = spans.spans();
-
             let make_paragraph = |content: &[iced::widget::text::Span<'static, Link>]| {
                 Renderer::Paragraph::with_spans(iced::advanced::text::Text {
                     content,
@@ -449,7 +1008,7 @@ where
         _theme: &Theme,
         _style_defaults: &renderer::Style,
         layout: Layout<'_>,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
@@ -582,6 +1141,32 @@ where
                     clipped_viewport,
                 );
             }
+
+            if let Some(popup) = &state.menu_popup {
+                draw_link_menu(renderer, &prefs, clipped_viewport, cursor, popup);
+            } else if let Some(position) = cursor.position_in(layout.bounds())
+                && let Some(buffer_position) = state.hit_test(layout.bounds(), position)
+                && let Some(action) = self
+                    .terminal_buffer
+                    .link_at(buffer_position.line, buffer_position.column)
+                && let Some(tooltip) = self
+                    .terminal_buffer
+                    .link_tooltip_at(buffer_position.line, buffer_position.column)
+                && state
+                    .link_tooltip_hover
+                    .as_ref()
+                    .is_some_and(|hover| hover.is_open_for(&action, &tooltip))
+            {
+                draw_link_tooltip(
+                    renderer,
+                    &prefs,
+                    clipped_viewport,
+                    cursor,
+                    &action,
+                    &tooltip,
+                    &state.link_tooltip_paragraph,
+                );
+            }
         }
     }
 
@@ -590,7 +1175,7 @@ where
         tree: &Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         if cursor.is_over(layout.bounds()) {
@@ -599,13 +1184,24 @@ where
             // hit test at all.
             if self.on_link.is_some() && self.terminal_buffer.has_links() {
                 let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+                if let Some(popup) = &state.menu_popup
+                    && let Some(clipped_viewport) = layout.bounds().intersection(viewport)
+                    && let Some(geometry) = link_menu_geometry::<Renderer>(
+                        popup,
+                        &crate::prefs::current(),
+                        clipped_viewport,
+                    )
+                    && cursor.is_over(geometry.bounds)
+                {
+                    return mouse::Interaction::Pointer;
+                }
                 if let Some(position) = cursor
                     .position_in(layout.bounds())
                     .and_then(|position| state.hit_test(layout.bounds(), position))
                     && self
                         .terminal_buffer
                         .link_at(position.line, position.column)
-                        .is_some()
+                        .is_some_and(|action| action.is_interactive())
                 {
                     return mouse::Interaction::Pointer;
                 }
@@ -625,8 +1221,9 @@ where
         _renderer: &Renderer,
         clipboard: &mut dyn advanced::Clipboard,
         shell: &mut advanced::Shell<'_, Message>,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
     ) {
+        let cursor_moved = matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }));
         if let Event::Window(window::Event::RedrawRequested(now)) = event {
             let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
             let blink_modes = state
@@ -653,10 +1250,173 @@ where
                 );
             }
         }
+        if matches!(
+            event,
+            Event::Mouse(_) | Event::Window(window::Event::RedrawRequested(_))
+        ) {
+            let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+            let hovered = state
+                .menu_popup
+                .is_none()
+                .then(|| cursor.position_in(layout.bounds()))
+                .flatten()
+                .and_then(|position| state.hit_test(layout.bounds(), position))
+                .and_then(|position| {
+                    let action = self
+                        .terminal_buffer
+                        .link_at(position.line, position.column)?;
+                    let tooltip = self
+                        .terminal_buffer
+                        .link_tooltip_at(position.line, position.column)?;
+                    Some(HoveredLinkTooltip { action, tooltip })
+                });
+            let now = Instant::now();
+            let delay = Duration::from_millis(crate::prefs::current().link_tooltip_delay_ms);
+            let previous = state.link_tooltip_hover.take();
+            state.link_tooltip_hover = match (previous, hovered) {
+                (None, None) => None,
+                (Some(previous), None) => {
+                    if previous.is_open() {
+                        shell.request_redraw();
+                    }
+                    None
+                }
+                (None, Some(link)) => Some(begin_link_tooltip_hover(link, delay, now, shell)),
+                (Some(previous), Some(link)) if previous.link() != &link => {
+                    if previous.is_open() {
+                        shell.request_redraw();
+                    }
+                    Some(begin_link_tooltip_hover(link, delay, now, shell))
+                }
+                (Some(LinkTooltipHover::Waiting { at, .. }), Some(link)) => {
+                    let elapsed = at.elapsed();
+                    if elapsed >= delay {
+                        shell.request_redraw();
+                        Some(LinkTooltipHover::Open(link))
+                    } else {
+                        shell.request_redraw_at(now + delay - elapsed);
+                        Some(LinkTooltipHover::Waiting { link, at })
+                    }
+                }
+                (Some(LinkTooltipHover::Open(_)), Some(link)) => {
+                    if cursor_moved {
+                        shell.request_redraw();
+                    }
+                    Some(LinkTooltipHover::Open(link))
+                }
+            };
+        }
+
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+        ) {
+            let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+            if let Some(popup) = state.menu_popup.clone()
+                && let Some(clipped_viewport) = layout.bounds().intersection(viewport)
+                && let Some(geometry) = link_menu_geometry::<Renderer>(
+                    &popup,
+                    &crate::prefs::current(),
+                    clipped_viewport,
+                )
+            {
+                let chosen = cursor.position().and_then(|point| {
+                    popup.menu.items.iter().zip(&geometry.rows).find_map(
+                        |(item, bounds)| match item {
+                            LinkMenuItem::Action { action, .. } if bounds.contains(point) => {
+                                Some(action.clone())
+                            }
+                            _ => None,
+                        },
+                    )
+                });
+                let inside = cursor.is_over(geometry.bounds);
+                state.menu_popup = None;
+                shell.invalidate_layout();
+                shell.request_redraw();
+                if let Some(action) = chosen {
+                    if let Some(on_link) = self.on_link.as_ref() {
+                        on_link(LinkClickEvent {
+                            action,
+                            shift: state.modifiers.shift(),
+                            ctrl: state.modifiers.control(),
+                            alt: state.modifiers.alt(),
+                        });
+                    }
+                    shell.capture_event();
+                    return;
+                }
+                if inside {
+                    shell.capture_event();
+                    return;
+                }
+            }
+        }
+
         match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+                let had_popup = state.menu_popup.is_some();
+                let menu = self
+                    .on_link
+                    .as_ref()
+                    .and_then(|_| cursor.position_in(layout.bounds()))
+                    .and_then(|position| state.hit_test(layout.bounds(), position))
+                    .and_then(|position| {
+                        self.terminal_buffer.link_at(position.line, position.column)
+                    })
+                    .and_then(|action| action.menu().cloned());
+                state.menu_popup =
+                    menu.zip(cursor.position())
+                        .map(|(menu, anchor)| LinkMenuPopup {
+                            menu,
+                            anchor: Point::new(anchor.x + 2.0, anchor.y + 2.0),
+                        });
+                if state.menu_popup.is_some() {
+                    state.pressed_cell = None;
+                    state.link_tooltip_hover = None;
+                    shell.invalidate_layout();
+                    shell.request_redraw();
+                    shell.capture_event();
+                } else if had_popup {
+                    shell.invalidate_layout();
+                    shell.request_redraw();
+                }
+            }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerPressed { .. }) => {
                 let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+
+                // Null-primary script menus are ordinary left-click menus. Open
+                // them on mouse-down so the next frame can paint the popup without
+                // waiting for a full click/release cycle. Touch keeps the existing
+                // tap-on-release path below so a scroll gesture cannot open one.
+                if matches!(
+                    event,
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                ) && let Some(anchor) = cursor.position()
+                    && let Some(position) = cursor
+                        .position_in(layout.bounds())
+                        .and_then(|position| state.hit_test(layout.bounds(), position))
+                    && let Some(action) =
+                        self.terminal_buffer.link_at(position.line, position.column)
+                    && action.opens_menu_on_left_click()
+                    && let Some(menu) = action.menu().cloned()
+                {
+                    state.menu_popup = Some(LinkMenuPopup {
+                        menu,
+                        anchor: Point::new(anchor.x + 2.0, anchor.y + 2.0),
+                    });
+                    state.pressed_cell = None;
+                    state.link_tooltip_hover = None;
+                    state.is_focused = true;
+                    shell.invalidate_layout();
+                    shell.request_redraw();
+                    // Keep the press uncaptured, like ordinary terminal clicks,
+                    // so the parent can still focus this session's command input.
+                    return;
+                }
+
                 let mut selection = self.selection.borrow_mut();
 
                 if let Some(click_position) = cursor.position_in(layout.bounds()) {
@@ -693,17 +1453,30 @@ where
                     && let Some(action) =
                         self.terminal_buffer.link_at(position.line, position.column)
                 {
-                    on_link(LinkClickEvent {
-                        action,
-                        shift: state.modifiers.shift(),
-                        ctrl: state.modifiers.control(),
-                        alt: state.modifiers.alt(),
-                    });
-                    // The handler may have staged UI state (the link-trust
-                    // confirm dialog slot) rather than publishing a message;
-                    // invalidate so it renders this frame, like the
-                    // selection updates above.
-                    shell.invalidate_layout();
+                    if let Some(primary) = action.primary().cloned() {
+                        on_link(LinkClickEvent {
+                            action: primary,
+                            shift: state.modifiers.shift(),
+                            ctrl: state.modifiers.control(),
+                            alt: state.modifiers.alt(),
+                        });
+                        // The handler may have staged UI state (the link-trust
+                        // confirm dialog slot) rather than publishing a message;
+                        // invalidate so it renders this frame, like the
+                        // selection updates above.
+                        shell.invalidate_layout();
+                    } else if action.opens_menu_on_left_click()
+                        && let Some(menu) = action.menu().cloned()
+                        && let Some(anchor) = cursor.position()
+                    {
+                        state.menu_popup = Some(LinkMenuPopup {
+                            menu,
+                            anchor: Point::new(anchor.x + 2.0, anchor.y + 2.0),
+                        });
+                        state.link_tooltip_hover = None;
+                        shell.invalidate_layout();
+                        shell.request_redraw();
+                    }
                 }
 
                 let mut selection = self.selection.borrow_mut();
@@ -724,6 +1497,25 @@ where
             }
             Event::Mouse(mouse::Event::CursorMoved { position: _ }) => {
                 let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+
+                if state.menu_popup.is_some() {
+                    shell.request_redraw();
+                }
+
+                if let Some(on_tooltip) = self.on_link_tooltip.as_ref()
+                    && state.menu_popup.is_none()
+                    && self.terminal_buffer.has_links()
+                    && let Some(position) = cursor
+                        .position_in(layout.bounds())
+                        .and_then(|position| state.hit_test(layout.bounds(), position))
+                    && let Some(tooltip) = self
+                        .terminal_buffer
+                        .link_tooltip_at(position.line, position.column)
+                    && let Some(request) = tooltip.request()
+                {
+                    on_tooltip(request);
+                    shell.request_redraw();
+                }
 
                 // The pointer left the pressed cell (or the pane): whatever ends this
                 // press, it is a drag, not a click.
@@ -775,6 +1567,16 @@ where
                 // state was created after the last ModifiersChanged (a fresh pane, a
                 // rebuilt tree) while a modifier was already held.
                 state.modifiers = *modifiers;
+
+                if matches!(
+                    key.as_ref(),
+                    keyboard::Key::Named(keyboard::key::Named::Escape)
+                ) && state.menu_popup.take().is_some()
+                {
+                    shell.invalidate_layout();
+                    shell.capture_event();
+                    return;
+                }
 
                 if state.is_focused {
                     match key.as_ref() {
