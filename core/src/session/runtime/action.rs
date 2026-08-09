@@ -101,6 +101,8 @@ pub enum RuntimeAction {
     Disconnect,
     HandleIncomingLine(Arc<StyledLine>),
     HandleIncomingPartialLine(Arc<StyledLine>),
+    /// A decoded telnet GA/EOR boundary, ordered behind its prompt text.
+    PromptBoundary,
     /// A carriage-return overprint superseded the incoming open line: drop any
     /// prefix already delivered as a partial (the text after the `\r` replaces
     /// it). Emitted by the VT layer before the replacement frame's bytes.
@@ -205,6 +207,17 @@ pub enum RuntimeAction {
         shift: bool,
         ctrl: bool,
         alt: bool,
+    },
+    /// Lazily resolve a script link's hover text in the isolate that created
+    /// it. The shared state is also held by the line in the UI; completion
+    /// publishes into it and emits a repaint wake. Stale addresses fail the
+    /// state silently, matching click-callback lifetime semantics.
+    ResolveLinkTooltip {
+        session: SessionId,
+        isolate: IsolateId,
+        instance: u64,
+        id: u64,
+        state: Arc<crate::session::styled_line::LinkTooltipState>,
     },
     CallJavascriptFunction {
         /// The isolate owning `script_functions[id]` (see `EvalJavascript::isolate`).
@@ -555,6 +568,9 @@ pub enum RuntimeAction {
         script_settings: Box<crate::models::settings::ScriptSettings>,
     },
     RequestRepaint,
+    /// A tooltip callback published into its shared result cell; wake the UI
+    /// even though no terminal-buffer mutation was needed.
+    LinkTooltipChanged,
     Connected,
     Disconnected,
     /// One inbound GMCP message (`docs/gmcp.md` §3): the dotted message name and the

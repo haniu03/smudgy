@@ -72,6 +72,7 @@ const fn default_style() -> Style {
     Style {
         fg: Color::DefaultForeground { bold: false },
         bg: Color::DefaultBackground,
+        ..Style::DEFAULT
     }
 }
 
@@ -319,6 +320,7 @@ fn ansi_style(i: usize) -> Style {
             bold: i.is_multiple_of(2),
         },
         bg: Color::DefaultBackground,
+        ..Style::DEFAULT
     }
 }
 
@@ -513,6 +515,7 @@ fn sanity_check(lines: &[String]) {
     let styled = Style {
         fg: red(true),
         bg: Color::DefaultBackground,
+        ..Style::DEFAULT
     };
     assert_eq!(
         sgr_process(styled, &parse_sgr_params(b"\x1b[0m")),

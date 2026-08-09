@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::session::styled_line::{Color, LinkAction, LinkSpan, Style, StyledLine};
+#[cfg(test)]
+use crate::session::styled_line::LinkAction;
+use crate::session::styled_line::{Color, LinkSpan, Style, StyledLine, StyledLink};
 
 /// One run of a styled splice: its text, the colors it SET (an unset channel
 /// inherits the style at the splice point when the operation applies — which is
@@ -10,7 +12,7 @@ pub struct SpliceRun {
     pub text: String,
     pub fg: Option<Color>,
     pub bg: Option<Color>,
-    pub link: Option<LinkAction>,
+    pub link: Option<StyledLink>,
 }
 
 /// A pure text/style **transform** applied to one line. Suppression and
@@ -68,6 +70,7 @@ fn splice_style_at(line: &StyledLine, position: usize) -> Style {
             Style {
                 fg: Color::DefaultForeground { bold: false },
                 bg: Color::DefaultBackground,
+                ..Style::DEFAULT
             },
             |span| span.style,
         )
@@ -114,11 +117,12 @@ impl LineOperation {
                     let style = Style {
                         fg: run.fg.unwrap_or(base_style.fg),
                         bg: run.bg.unwrap_or(base_style.bg),
+                        attributes: base_style.attributes,
                     };
                     if style != base_style {
                         result = result.highlight(cursor, run_end, style);
                     }
-                    if let Some(action) = &run.link
+                    if let Some(link) = &run.link
                         && run_end > cursor
                     {
                         let may_merge = result.links.len() > fresh_links_start;
@@ -128,14 +132,18 @@ impl LineOperation {
                             Some(prev)
                                 if may_merge
                                     && prev.end_pos == cursor
-                                    && prev.action == *action =>
+                                    && prev.action == link.action
+                                    && prev.tooltip == link.tooltip
+                                    && prev.style == link.style =>
                             {
                                 prev.end_pos = run_end;
                             }
                             _ => result.links.push(LinkSpan {
                                 begin_pos: cursor,
                                 end_pos: run_end,
-                                action: action.clone(),
+                                action: link.action.clone(),
+                                tooltip: link.tooltip.clone(),
+                                style: link.style.clone(),
                             }),
                         }
                     }
@@ -168,6 +176,7 @@ mod tests {
                 b: 30,
             },
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         }
     }
 
@@ -200,6 +209,14 @@ mod tests {
         assert_eq!(cursor, line.text.len(), "spans do not cover the text");
     }
 
+    fn styled_link(action: LinkAction) -> StyledLink {
+        StyledLink {
+            action,
+            tooltip: None,
+            style: None,
+        }
+    }
+
     #[test]
     fn splice_inherits_unset_colors_and_carries_links() {
         let line = single_span_line("go north now");
@@ -211,13 +228,13 @@ mod tests {
                     text: "N".to_string(),
                     fg: None,
                     bg: None,
-                    link: Some(link.clone()),
+                    link: Some(styled_link(link.clone())),
                 },
                 SpliceRun {
                     text: "ORTH".to_string(),
                     fg: Some(bright(AnsiColor::Red)),
                     bg: None,
-                    link: Some(link.clone()),
+                    link: Some(styled_link(link.clone())),
                 },
             ]),
             begin: 3,
@@ -233,7 +250,8 @@ mod tests {
             style_at(&result, 4),
             Style {
                 fg: bright(AnsiColor::Red),
-                bg: Color::DefaultBackground
+                bg: Color::DefaultBackground,
+                ..Style::DEFAULT
             }
         );
         assert_eq!(style_at(&result, 9), base_style());
@@ -244,6 +262,8 @@ mod tests {
                 begin_pos: 3,
                 end_pos: 8,
                 action: link,
+                tooltip: None,
+                style: None,
             }]
         );
     }
@@ -256,10 +276,12 @@ mod tests {
         let red = Style {
             fg: bright(AnsiColor::Red),
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let green = Style {
             fg: bright(AnsiColor::Green),
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let line = Arc::new(StyledLine::new(
             text,
@@ -298,14 +320,17 @@ mod tests {
         let default = Style {
             fg: Color::DefaultForeground { bold: false },
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let green = Style {
             fg: bright(AnsiColor::Green),
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let red = Style {
             fg: bright(AnsiColor::Red),
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let line = Arc::new(StyledLine::new(
             "beforefooafter",
@@ -358,6 +383,8 @@ mod tests {
             begin_pos: 3,
             end_pos: 8,
             action: action.clone(),
+            tooltip: None,
+            style: None,
         });
         let line = Arc::new(inner);
 
@@ -368,7 +395,7 @@ mod tests {
                 text: "!".to_string(),
                 fg: None,
                 bg: None,
-                link: Some(action.clone()),
+                link: Some(styled_link(action.clone())),
             }]),
             begin: 8,
             end: 8,
@@ -382,11 +409,15 @@ mod tests {
                     begin_pos: 3,
                     end_pos: 8,
                     action: action.clone(),
+                    tooltip: None,
+                    style: None,
                 },
                 LinkSpan {
                     begin_pos: 8,
                     end_pos: 9,
                     action,
+                    tooltip: None,
+                    style: None,
                 },
             ]
         );
@@ -406,6 +437,8 @@ mod tests {
             begin_pos: 3,
             end_pos: 8,
             action: LinkAction::Send(std::sync::Arc::from("north")),
+            tooltip: None,
+            style: None,
         });
         let line = Arc::new(inner);
 

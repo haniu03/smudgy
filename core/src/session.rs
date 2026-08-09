@@ -123,10 +123,16 @@ pub enum SessionEvent {
     /// hold the new values and the widget render closures read them lock-free,
     /// so the UI needs no state change — processing the message redraws the view.
     StoreBindingsChanged,
+    /// A lazy script-link tooltip resolved into the shared cell held by the
+    /// rendered line. Pure repaint wake; no UI-owned state changes.
+    LinkTooltipChanged,
     /// Apply one scripted input mutation to the input of pane `key`
     /// (`docs/input.md` §3.4). Travels the ordered channel, so ops
     /// land in the order scripts issued them.
-    InputOp { key: PaneKey, op: InputOp },
+    InputOp {
+        key: PaneKey,
+        op: InputOp,
+    },
     /// The session thread has flagged input-mirror interest: start sending
     /// `RuntimeAction::InputStateChanged` on input changes, and push the
     /// current state immediately so the mirror warms up.
@@ -168,7 +174,9 @@ pub enum SessionEvent {
     /// with a script-set mask UI-side: the input stays masked while either
     /// is active (`docs/input.md` §3.10). Also sent with `false` on
     /// disconnect, since the option dies with the connection.
-    ServerEcho { enabled: bool },
+    ServerEcho {
+        enabled: bool,
+    },
 }
 #[derive(Debug, Clone)]
 pub struct TaggedSessionEvent {
@@ -266,6 +274,10 @@ pub enum BufferUpdate {
     Append(Arc<StyledLine>),
     /// Commit the main buffer's open line.
     EnsureNewLine,
+    /// A telnet GA/EOR prompt boundary. Carries no text; terminal panes use it
+    /// to advance OSC 8 visibility expiry without conflating partial socket
+    /// flushes with real prompts.
+    PromptBoundary,
     /// One WHOLE line for a non-main pane. Routing is decided per logical
     /// line, so pane buffers never receive fragments — core assembles the
     /// full line before queuing this.

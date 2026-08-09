@@ -364,10 +364,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (or the first command link) opens a confirmation showing the exact
   destination — nothing the server sends can disguise it — where you can also
   choose to always allow that site or always trust every link from that
-  server. Other URI schemes are ignored.
+  server. Mudlet-compatible OSC styling now controls link colors, bold,
+  italic, underline/overline/strikethrough forms, and decoration color;
+  unstyled links retain Smudgy's underline and subtle wash, while an authored
+  style (including `underline: false`) takes precedence. Stateful hover,
+  press, focus, visited, selected, disabled, link, and any-link styles follow
+  Mudlet's priority order. Tooltips, styled menu titles, context menus,
+  disabled links, spoilers, timed/input/prompt/output visibility, radio and
+  checkbox selection groups, compact keys, and session presets are supported;
+  links can be traversed and activated from the keyboard. Incoming OSC 8 URIs
+  are capped at 4096 bytes in the scanner, deceptive invisible controls are
+  rendered visibly, and unapproved URI schemes are ignored. Script-authored
+  links retain their existing unrestricted payload size.
 
 ### Fixed
 
+- **JSR packages can load slash-normalized dependencies.** Smudgy now accepts
+  both `jsr:@scope/package` and the `jsr:/@scope/package` form emitted by Deno
+  and found in published JSR packages, instead of rejecting the latter as an
+  unscoped package.
 - **Map preferences stop retrying maps that can't sync.** A map disabled
   locally that the cloud can't store a preference for (a local-only map, or
   one you no longer have access to) was re-pushed on every 90-second sync
@@ -380,11 +395,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at both ends — the codes were dropped during ingest, and the terminal
   never painted span backgrounds (which also kept link chips and underlines
   from rendering).
-- **One unsupported ANSI code no longer discards a whole style sequence.**
-  Codes smudgy doesn't render (underline, italic, blink, …) used to poison
-  every color that shared their sequence — `ESC[1;4;31m` displayed as plain
-  text instead of bright red. Each code now applies independently, the
-  bare-reset form `ESC[m` resets, colon-form extended colors
+- **ANSI text attributes display.** Bold is now real font weight, and faint,
+  italic, underline, double underline, slow/fast blink, reverse video, and
+  crossed-out text render instead of being discarded. A new preference,
+  enabled by default for compatibility, controls whether bold text also uses
+  the bright ANSI palette; explicit bright-color codes stay bright either
+  way. Attribute set/reset codes apply independently, unknown codes no longer
+  poison colors beside them, bare `ESC[m` resets, colon-form extended colors
   (`38:2::r:g:b`) parse, and out-of-range color components clamp instead of
   wrapping around.
 - **Progress bars that redraw with a bare carriage return display as one

@@ -88,6 +88,8 @@ pub mod option {
     pub const EOR: u8 = 25;
     /// Negotiate About Window Size (RFC 1073).
     pub const NAWS: u8 = 31;
+    /// New Environment Option (RFC 1572), used by MUDs for client capability variables.
+    pub const NEW_ENVIRON: u8 = 39;
     /// Charset (RFC 2066).
     pub const CHARSET: u8 = 42;
     /// Mud Server Data Protocol.
@@ -260,7 +262,8 @@ fn offered_codec(name: &[u8]) -> Option<CompressionStart> {
 /// Whether we agree to enable `option` on **our** side when the server sends `DO` (we reply
 /// `WILL`). We accept `SGA` (harmless, and common), `EOR`, and the two options whose
 /// subnegotiation responders live in the connection layer (`responders.rs`): `TTYPE` (terminal
-/// type + MTTS capability advertisement) and `NAWS` (window-size report). `DO CHARSET` is
+/// type + MTTS capability advertisement), `NAWS` (window-size report), and `NEW_ENVIRON`
+/// (truthful client capability variables). `DO CHARSET` is
 /// refused: per RFC 2066 the WILL side is expected to drive the REQUEST, and smudgy only
 /// *answers* requests — accepting would leave a strict server waiting forever for a REQUEST
 /// that never comes. Servers negotiate charsets with us via their own `WILL CHARSET`.
@@ -268,7 +271,7 @@ fn offered_codec(name: &[u8]) -> Option<CompressionStart> {
 fn accept_local(option: u8) -> bool {
     matches!(
         option,
-        option::SGA | option::EOR | option::TTYPE | option::NAWS
+        option::SGA | option::EOR | option::TTYPE | option::NAWS | option::NEW_ENVIRON
     )
 }
 
@@ -791,16 +794,23 @@ mod tests {
         assert_eq!(r.options, &[(Side::Local, SGA, true)]);
     }
 
-    /// TTYPE and NAWS are accepted on our side (their subnegotiation responders live in the
-    /// connection layer) and surfaced through `on_option` so those responders can act.
+    /// TTYPE, NAWS, and NEW-ENVIRON are accepted on our side (their responders live in the
+    /// connection layer) and surfaced through `on_option` so stateful responders can act.
     #[test]
-    fn server_do_for_ttype_and_naws_is_accepted_with_will() {
-        use super::option::TTYPE;
-        let r = run(&[IAC, DO, TTYPE, IAC, DO, NAWS]);
-        assert_eq!(r.sent, &[IAC, WILL, TTYPE, IAC, WILL, NAWS]);
+    fn server_do_for_local_responders_is_accepted_with_will() {
+        use super::option::{NEW_ENVIRON, TTYPE};
+        let r = run(&[IAC, DO, TTYPE, IAC, DO, NAWS, IAC, DO, NEW_ENVIRON]);
+        assert_eq!(
+            r.sent,
+            &[IAC, WILL, TTYPE, IAC, WILL, NAWS, IAC, WILL, NEW_ENVIRON]
+        );
         assert_eq!(
             r.options,
-            &[(Side::Local, TTYPE, true), (Side::Local, NAWS, true)]
+            &[
+                (Side::Local, TTYPE, true),
+                (Side::Local, NAWS, true),
+                (Side::Local, NEW_ENVIRON, true)
+            ]
         );
     }
 

@@ -1073,94 +1073,95 @@ impl<'a> ScriptEngine<'a> {
         // embedder's extras. Returns the registry so the caller wraps the isolate around it,
         // plus the instance nonce allocated here (the ops bake it into the widget routing
         // token, and the caller records it on the `Isolate` so dispatch can compare the two).
-        let make_extensions = |isolate_id: IsolateId,
-                               smudgy_grants: ops::SmudgyGrants,
-                               data_dir: std::path::PathBuf,
-                               image_policy: smudgy_cloud::image_source::ImageSourcePolicy| {
-            let instance = NEXT_ISOLATE_INSTANCE.fetch_add(1, Ordering::Relaxed);
-            let script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>> =
-                Rc::new(RefCell::new(Vec::new()));
-            let mut extensions = vec![
-                ops::smudgy_ops::init(
-                    session_id,
-                    Arc::clone(&server_name),
-                    script_functions.clone(),
-                    spawned_actions.clone(),
-                    pending_ops.clone(),
-                    current_line_for_ext.clone(),
-                    emitted_line_count.clone(),
-                    // The read ops resolve `buffer.line(n)` against this ring.
-                    recent_lines.clone(),
-                    // The `getCurrentLocation` read op resolves against this shared cell.
-                    current_location.clone(),
-                    // The `getSettings` read op resolves against this shared snapshot.
-                    settings_snapshot.clone(),
-                    // The `gmcp.enabled` read op resolves against this shared cell.
-                    gmcp_enabled.clone(),
-                    // The pane ops mutate this shared registry synchronously; the isolate's
-                    // namespace is derived from `isolate_id` inside the ops.
-                    pane_registry.clone(),
-                    // The current-line routing ops (redirect/copy/gag) write here.
-                    line_routing.clone(),
-                    // The input read op resolves `input.value`/`cursor`/… against this
-                    // mirror and flags interest on it; writes bypass it.
-                    input_mirror.clone(),
-                    // The `pane.size` read op resolves against this mirror and flags
-                    // interest on it (as does a `pane:resize` subscription).
-                    pane_size_mirror.clone(),
-                    // The ambient `submission` ops act on this shared cell while a
-                    // `sys:input` handler splice is live.
-                    input_submission.clone(),
-                    // The completion word-set registry ops mutate and read this shared
-                    // cell synchronously, scoped by the caller's (isolate, origin).
-                    input_word_sets.clone(),
-                    // The pane-input registration op records onSubmit handler addresses
-                    // here; the runtime's `PaneInputSubmit` dispatch arm resolves them.
-                    pane_input_callbacks.clone(),
-                    // The ops stamp this id onto every automation they create, so the trigger
-                    // Manager keys them under `(isolate, …)` — coexistence across isolates.
-                    isolate_id,
-                    // The instantiation nonce the widget routing token carries (see above).
-                    instance,
-                    // Same `Rc` for every isolate: the singleton dedupe is session-wide.
-                    singleton_registry.clone(),
-                    // The introspection mirror the `get`/`list`/`exists` ops read.
-                    automation_registry.clone(),
-                    // The smudgy op-capabilities this isolate may use
-                    // (`PACKAGE-ISOLATES-OP-CAPABILITIES.md`). `all()` for main/trusted; the
-                    // consented set for a sandbox. The gated ops read it from `OpState`, and its
-                    // `widgets` bit is mirrored to the `smudgy_widgets` ops via `WidgetsEnabled`.
-                    smudgy_grants,
-                    // Same `Rc` for every isolate: the event bus is session-wide (`PACKAGE-EVENTS.md`).
-                    event_registry.clone(),
-                    // Same `Rc` for every isolate: the session store is session-wide; writes
-                    // journal here and the runtime flushes per turn.
-                    session_store.clone(),
-                    remote_state_registry.clone(),
-                    // Same `Rc` for every isolate: the message bus routes posts to the
-                    // producer's home instance across isolates (`interop.md` §6).
-                    message_bus.clone(),
-                    // Same `Rc` for every isolate: the runtime catalogue samples emissions/
-                    // posts and records declarations (`docs/interop.md` §10).
-                    catalogue.clone(),
-                    // Same `Rc` for every isolate: the interop home registry the store/emit
-                    // write gates check (`docs/interop.md` §3).
-                    home_registry.clone(),
-                    // The store's widget-binding cell registry (interop.md §7), parked in `OpState`
-                    // for the leaf `smudgy_widgets` build ops to resolve binding tokens.
-                    store_bindings.clone(),
-                    // This isolate's `$DATA` dir, exposed to the script as `getDataDir()`.
-                    data_dir,
-                    // This isolate's image-source policy, read by the leaf `smudgy_widgets`
-                    // <Image> build ops to resolve + gate `src` strings (a bridge type in
-                    // `smudgy_cloud`, like `WidgetsEnabled`).
-                    image_policy,
-                ),
-                mapper_api::smudgy_mapper::init(mapper.clone()),
-            ];
-            extensions.extend((extra_extensions)());
-            (extensions, script_functions, instance)
-        };
+        let make_extensions =
+            |isolate_id: IsolateId,
+             smudgy_grants: ops::SmudgyGrants,
+             data_dir: std::path::PathBuf,
+             image_policy: smudgy_cloud::image_source::ImageSourcePolicy| {
+                let instance = NEXT_ISOLATE_INSTANCE.fetch_add(1, Ordering::Relaxed);
+                let script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>> =
+                    Rc::new(RefCell::new(Vec::new()));
+                let mut extensions = vec![
+                    ops::smudgy_ops::init(
+                        session_id,
+                        Arc::clone(&server_name),
+                        script_functions.clone(),
+                        spawned_actions.clone(),
+                        pending_ops.clone(),
+                        current_line_for_ext.clone(),
+                        emitted_line_count.clone(),
+                        // The read ops resolve `buffer.line(n)` against this ring.
+                        recent_lines.clone(),
+                        // The `getCurrentLocation` read op resolves against this shared cell.
+                        current_location.clone(),
+                        // The `getSettings` read op resolves against this shared snapshot.
+                        settings_snapshot.clone(),
+                        // The `gmcp.enabled` read op resolves against this shared cell.
+                        gmcp_enabled.clone(),
+                        // The pane ops mutate this shared registry synchronously; the isolate's
+                        // namespace is derived from `isolate_id` inside the ops.
+                        pane_registry.clone(),
+                        // The current-line routing ops (redirect/copy/gag) write here.
+                        line_routing.clone(),
+                        // The input read op resolves `input.value`/`cursor`/… against this
+                        // mirror and flags interest on it; writes bypass it.
+                        input_mirror.clone(),
+                        // The `pane.size` read op resolves against this mirror and flags
+                        // interest on it (as does a `pane:resize` subscription).
+                        pane_size_mirror.clone(),
+                        // The ambient `submission` ops act on this shared cell while a
+                        // `sys:input` handler splice is live.
+                        input_submission.clone(),
+                        // The completion word-set registry ops mutate and read this shared
+                        // cell synchronously, scoped by the caller's (isolate, origin).
+                        input_word_sets.clone(),
+                        // The pane-input registration op records onSubmit handler addresses
+                        // here; the runtime's `PaneInputSubmit` dispatch arm resolves them.
+                        pane_input_callbacks.clone(),
+                        // The ops stamp this id onto every automation they create, so the trigger
+                        // Manager keys them under `(isolate, …)` — coexistence across isolates.
+                        isolate_id,
+                        // The instantiation nonce the widget routing token carries (see above).
+                        instance,
+                        // Same `Rc` for every isolate: the singleton dedupe is session-wide.
+                        singleton_registry.clone(),
+                        // The introspection mirror the `get`/`list`/`exists` ops read.
+                        automation_registry.clone(),
+                        // The smudgy op-capabilities this isolate may use
+                        // (`PACKAGE-ISOLATES-OP-CAPABILITIES.md`). `all()` for main/trusted; the
+                        // consented set for a sandbox. The gated ops read it from `OpState`, and its
+                        // `widgets` bit is mirrored to the `smudgy_widgets` ops via `WidgetsEnabled`.
+                        smudgy_grants,
+                        // Same `Rc` for every isolate: the event bus is session-wide (`PACKAGE-EVENTS.md`).
+                        event_registry.clone(),
+                        // Same `Rc` for every isolate: the session store is session-wide; writes
+                        // journal here and the runtime flushes per turn.
+                        session_store.clone(),
+                        remote_state_registry.clone(),
+                        // Same `Rc` for every isolate: the message bus routes posts to the
+                        // producer's home instance across isolates (`interop.md` §6).
+                        message_bus.clone(),
+                        // Same `Rc` for every isolate: the runtime catalogue samples emissions/
+                        // posts and records declarations (`docs/interop.md` §10).
+                        catalogue.clone(),
+                        // Same `Rc` for every isolate: the interop home registry the store/emit
+                        // write gates check (`docs/interop.md` §3).
+                        home_registry.clone(),
+                        // The store's widget-binding cell registry (interop.md §7), parked in `OpState`
+                        // for the leaf `smudgy_widgets` build ops to resolve binding tokens.
+                        store_bindings.clone(),
+                        // This isolate's `$DATA` dir, exposed to the script as `getDataDir()`.
+                        data_dir,
+                        // This isolate's image-source policy, read by the leaf `smudgy_widgets`
+                        // <Image> build ops to resolve + gate `src` strings (a bridge type in
+                        // `smudgy_cloud`, like `WidgetsEnabled`).
+                        image_policy,
+                    ),
+                    mapper_api::smudgy_mapper::init(mapper.clone()),
+                ];
+                extensions.extend((extra_extensions)());
+                (extensions, script_functions, instance)
+            };
 
         // `smudgy://` resolution is PER-ISOLATE (`PACKAGE-ISOLATES-RESOLUTION.md`):
         // each isolate gets its own provider so it solves its own closure independently — main may
@@ -1727,7 +1728,12 @@ impl<'a> ScriptEngine<'a> {
                                 .map(|def| (def.name.clone(), def.key))
                                 .collect();
                             for (name, key) in doomed {
-                                if pane_registry.lock().unwrap().close(&namespace, &name).is_ok() {
+                                if pane_registry
+                                    .lock()
+                                    .unwrap()
+                                    .close(&namespace, &name)
+                                    .is_ok()
+                                {
                                     super::input::purge_pane_input_state(
                                         &input_mirror,
                                         &input_word_sets,
@@ -2114,10 +2120,9 @@ impl<'a> ScriptEngine<'a> {
         let receivers = self.message_bus.borrow().receivers(&canonical);
         let session = caller_session.to_json(false);
         if receivers.is_empty() {
-            let addressable = super::store::ProducerKey::parse(&producer)
-                .is_some_and(|producer| {
-                    super::store::is_addressable(&self.home_registry, &producer)
-                });
+            let addressable = super::store::ProducerKey::parse(&producer).is_some_and(|producer| {
+                super::store::is_addressable(&self.home_registry, &producer)
+            });
             if !addressable {
                 log::warn!(
                     "smudgy: directed procedure post to {producer}#{name} dropped: the producer is not installed"
@@ -2556,6 +2561,69 @@ impl<'a> ScriptEngine<'a> {
         };
 
         result
+    }
+
+    /// Start one lazy script-link tooltip resolver. The JS shim wraps the
+    /// author callback in a promise chain and reports completion through
+    /// `op_smudgy_resolve_link_tooltip`, so this synchronous dispatch never
+    /// stalls the session on slow async work.
+    pub fn resolve_link_tooltip(
+        &mut self,
+        isolate_id: &IsolateId,
+        instance: u64,
+        id: u64,
+        state: Arc<crate::session::styled_line::LinkTooltipState>,
+    ) -> Result<ActionResult> {
+        let Ok(bundle) = self.isolate_mut(isolate_id) else {
+            state.resolve(None);
+            return Ok(ActionResult::None);
+        };
+        if bundle.instance != instance {
+            state.resolve(None);
+            return Ok(ActionResult::None);
+        }
+        self.mark_isolate_ready(isolate_id);
+        let deno = self.isolate_mut(isolate_id)?.runtime.deno_runtime();
+        let function = {
+            let op_state = deno.op_state();
+            let op_state = op_state.borrow();
+            let registry = op_state.borrow::<ops::SharedLinkCallbacks>().clone();
+            let callbacks = registry.borrow();
+            callbacks.get(id).cloned()
+        };
+        let Some(function) = function else {
+            state.resolve(None);
+            return Ok(ActionResult::None);
+        };
+        let pending = {
+            let op_state = deno.op_state();
+            op_state
+                .borrow()
+                .borrow::<ops::SharedPendingLinkTooltips>()
+                .clone()
+        };
+        let request_id = pending.borrow_mut().insert(state);
+        deno.op_state().borrow_mut().put(ops::EventDepth(0));
+        let _entered = EnteredIsolate::enter(deno);
+        let context = deno.main_context();
+        let isolate = deno.v8_isolate();
+        v8::scope_with_context!(let scope, isolate, context);
+
+        let caught = {
+            v8::tc_scope!(let try_catch, scope);
+            let function = v8::Local::new(try_catch, &function);
+            let this = v8::undefined(try_catch).into();
+            let request = v8::String::new(try_catch, &request_id.to_string())
+                .map_or_else(|| v8::undefined(try_catch).into(), Into::into);
+            function.call(try_catch, this, &[request]);
+            try_catch.has_caught()
+        };
+        if caught {
+            if let Some(state) = pending.borrow_mut().remove(request_id) {
+                state.resolve(None);
+            }
+        }
+        Ok(ActionResult::None)
     }
 
     /// Deliver a pane-input submission to its registered `onSubmit` handler

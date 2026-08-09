@@ -1529,6 +1529,29 @@ declare module "smudgy:core" {
     alt: boolean;
   }
 
+  /** Hover text for a link. A function is evaluated lazily on first hover and
+   *  may return its text immediately or through a promise. Its result is cached. */
+  export type LinkTooltip = string | (() => string | PromiseLike<string>);
+
+  /** One action row in a link's right-click menu. A string sends a command;
+   *  a function receives the same modifier snapshot as a primary callback. */
+  export interface LinkMenuItem {
+    label: string;
+    action: string | ((click: LinkClick) => void);
+  }
+
+  export interface LinkOptions {
+    tooltip?: LinkTooltip;
+    /** Whether a normal left click may activate the link. Defaults to `true`.
+     *  A menu remains available from right-click when this is `false`. For a
+     *  null-action menu, `true` also lets an ordinary left click open it. */
+    enabled?: boolean;
+    /** Right-click rows. Use `"-"` for a separator. */
+    menu?: readonly (LinkMenuItem | "-")[];
+    /** Optional plain-text heading shown above the menu rows. */
+    title?: string;
+  }
+
   /**
    * Makes text clickable. Pass a command, and clicking the text sends it exactly as
    * if you typed it into the clicked window's session. Pass a function instead, and
@@ -1549,6 +1572,21 @@ declare module "smudgy:core" {
    * import { line, link, style } from "smudgy:core";
    *
    * line.replace("north", link("north")`${style.cyan`north`}`);
+   * line.replace("foo bar", link("https://www.google.com", {
+   *   tooltip: async () => "hello",
+   * })`foo bar`);
+   * line.replace("status", link(null, { tooltip: "Nothing to do yet" })`status`);
+   * line.replace("actions", link(null, {
+   *   enabled: false,
+   *   menu: [{ label: "Look", action: "look" }],
+   * })`actions`); // right-click only
+   * echo`${link("look", {
+   *   title: "Actions",
+   *   menu: [{ label: "Look", action: "look" }, "-", {
+   *     label: "Wave",
+   *     action: () => send("wave"),
+   *   }],
+   * })`room actions`}`;
    * ```
    *
    * A command link works forever, even on old lines. A function link lives with the
@@ -1556,8 +1594,12 @@ declare module "smudgy:core" {
    * nothing, and only the most recent function links are kept, so a very old one can
    * expire early. Prefer command links for anything long-lived.
    */
-  export function link(command: string): StyleTag;
-  export function link(onClick: (click: LinkClick) => void): StyleTag;
+  export function link(command: string, options?: LinkOptions): StyleTag;
+  export function link(onClick: (click: LinkClick) => void, options?: LinkOptions): StyleTag;
+  /** Produces link-styled text with no primary action. A supplied menu opens
+   *  from either left or right click by default; pass `{ enabled: false }` to
+   *  make that menu right-click-only. */
+  export function link(action: null, options?: LinkOptions): StyleTag;
 
   /**
    * Print a line in your session's output window; nothing is sent to the MUD.

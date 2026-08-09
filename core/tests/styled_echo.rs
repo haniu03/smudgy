@@ -11,7 +11,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use smudgy_core::session::connection::vt_processor::{AnsiColor, Color};
 use smudgy_core::session::runtime::{IsolateId, RuntimeAction};
-use smudgy_core::session::styled_line::{LinkAction, LinkSpan, Style, StyledLine};
+use smudgy_core::session::styled_line::{
+    LinkAction, LinkMenuItem, LinkSpan, LinkTooltip, Style, StyledLine,
+};
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
 
 const STYLED_ECHO_TS: &str = r#"
@@ -42,6 +44,7 @@ echo("SE_DONE");
 const ECHO_STYLE: Style = Style {
     fg: Color::Echo,
     bg: Color::DefaultBackground,
+    ..Style::DEFAULT
 };
 
 const fn bright(color: AnsiColor) -> Color {
@@ -63,7 +66,12 @@ fn assert_tiles(line: &StyledLine) {
         rendered.push_str(&line.text[span.begin_pos..span.end_pos]);
         cursor = span.end_pos;
     }
-    assert_eq!(cursor, line.text.len(), "spans do not cover {:?}", line.text);
+    assert_eq!(
+        cursor,
+        line.text.len(),
+        "spans do not cover {:?}",
+        line.text
+    );
     assert_eq!(rendered, line.text, "spans do not tile {:?}", line.text);
 }
 
@@ -148,7 +156,8 @@ async fn styled_echo_spans_reach_the_buffer() {
                 9,
                 Style {
                     fg: bright(AnsiColor::Red),
-                    bg: Color::DefaultBackground
+                    bg: Color::DefaultBackground,
+                    ..Style::DEFAULT
                 }
             ),
             (9, 14, ECHO_STYLE),
@@ -165,8 +174,13 @@ async fn styled_echo_spans_reach_the_buffer() {
                 2,
                 3,
                 Style {
-                    fg: Color::Rgb { r: 10, g: 20, b: 30 },
-                    bg: bright(AnsiColor::Blue)
+                    fg: Color::Rgb {
+                        r: 10,
+                        g: 20,
+                        b: 30
+                    },
+                    bg: bright(AnsiColor::Blue),
+                    ..Style::DEFAULT
                 }
             ),
             (3, 5, ECHO_STYLE),
@@ -178,6 +192,7 @@ async fn styled_echo_spans_reach_the_buffer() {
     let on_blue = |fg: Color| Style {
         fg,
         bg: bright(AnsiColor::Blue),
+        ..Style::DEFAULT
     };
     assert_eq!(
         spans_of(three),
@@ -198,7 +213,8 @@ async fn styled_echo_spans_reach_the_buffer() {
                 text.len(),
                 Style {
                     fg: bright(AnsiColor::Green),
-                    bg: Color::DefaultBackground
+                    bg: Color::DefaultBackground,
+                    ..Style::DEFAULT
                 }
             )]
         );
@@ -222,7 +238,8 @@ async fn styled_echo_spans_reach_the_buffer() {
             8,
             Style {
                 fg: bright(AnsiColor::Red),
-                bg: Color::DefaultBackground
+                bg: Color::DefaultBackground,
+                ..Style::DEFAULT
             }
         )]
     );
@@ -233,7 +250,9 @@ async fn styled_echo_spans_reach_the_buffer() {
         "unknown color must throw TypeError.\nTranscript:\n{transcript}"
     );
     assert!(
-        !lines.iter().any(|l| l.text == "ERR_MISSED" || l.text == "bad"),
+        !lines
+            .iter()
+            .any(|l| l.text == "ERR_MISSED" || l.text == "bad"),
         "the failed echo must not deliver.\nTranscript:\n{transcript}"
     );
 }
@@ -250,6 +269,17 @@ createTrigger("^You see exits", () => {
 // A styled insert whose options act as the inheritance base for its unset colors.
 createTrigger("^ITEM", () => {
     line.insert(style`[${style.red`hot`}]`, 0, 0, { fg: "yellow" });
+});
+
+// Link styling accepts the same lazy tooltip options whether echoed directly
+// or spliced into an incoming line.
+createTrigger("^TOOLTIP", () => {
+    line.replace("foo bar", link("https://www.google.com", {
+        tooltip: async () => {
+            await Promise.resolve();
+            return "hello";
+        },
+    })`foo bar`);
 });
 
 // Splicing a fragment containing a newline is a loud error, and the line survives.
@@ -306,8 +336,13 @@ async fn styled_splice_edits_incoming_lines() {
 
     // The incoming lines carry a known RGB style so inheritance is observable.
     let rgb = Style {
-        fg: Color::Rgb { r: 10, g: 20, b: 30 },
+        fg: Color::Rgb {
+            r: 10,
+            g: 20,
+            b: 30,
+        },
         bg: Color::DefaultBackground,
+        ..Style::DEFAULT
     };
     let incoming = |text: &str| {
         Arc::new(StyledLine::new(
@@ -333,8 +368,12 @@ async fn styled_splice_edits_incoming_lines() {
                     lines.push(line.clone());
                     if !sent && line.text == "SP_READY" {
                         sent = true;
-                        for text in ["You see exits: north and south", "ITEM thing", "BADSPLICE"]
-                        {
+                        for text in [
+                            "You see exits: north and south",
+                            "ITEM thing",
+                            "TOOLTIP foo bar",
+                            "BADSPLICE",
+                        ] {
                             tx.send(RuntimeAction::HandleIncomingLine(incoming(text)))
                                 .unwrap();
                             tx.send(RuntimeAction::RequestRepaint).unwrap();
@@ -349,8 +388,6 @@ async fn styled_splice_edits_incoming_lines() {
             }
         }
     }
-    tx.send(RuntimeAction::Shutdown).ok();
-
     let transcript = lines
         .iter()
         .map(|l| l.text.clone())
@@ -380,23 +417,74 @@ async fn styled_splice_edits_incoming_lines() {
             begin_pos: 15,
             end_pos: 20,
             action: LinkAction::Send(Arc::from("north")),
+            tooltip: None,
+            style: None,
         }]
     );
     assert_eq!(style_at(exits, 14), rgb);
     assert_eq!(
         style_at(exits, 15).fg,
-        Color::Ansi { color: AnsiColor::Cyan, bold: true }
+        Color::Ansi {
+            color: AnsiColor::Cyan,
+            bold: true
+        }
     );
     assert_eq!(style_at(exits, 20), rgb);
+
+    // The exact line.replace(link(..., { tooltip: async ... })`...`) surface
+    // produces a lazy callback. Before it resolves, the action target is the
+    // safe fallback; afterward it becomes muted secondary copy in the UI.
+    let tooltip_line = find("TOOLTIP foo bar");
+    let tooltip = tooltip_line.links[0]
+        .tooltip
+        .as_ref()
+        .expect("tooltip metadata")
+        .clone();
+    assert_eq!(
+        tooltip.display(),
+        Some((Arc::from("https://www.google.com"), None))
+    );
+    let request = tooltip.request().expect("first hover starts resolver");
+    let (isolate, instance) = IsolateId::from_widget_token(&request.isolate_token);
+    tx.send(RuntimeAction::ResolveLinkTooltip {
+        session: request.session,
+        isolate,
+        instance,
+        id: request.id,
+        state: request.state,
+    })
+    .unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), events.next())
+            .await
+            .expect("timed out waiting for async tooltip")
+            .expect("event stream ended while resolving tooltip");
+        if matches!(event.event, SessionEvent::LinkTooltipChanged) {
+            break;
+        }
+    }
+    assert_eq!(
+        tooltip.display(),
+        Some((
+            Arc::from("hello"),
+            Some(Arc::from("https://www.google.com"))
+        ))
+    );
 
     // insert() with options: "[" and "]" take the options base (yellow), "hot" is red.
     let item = find("[hot]ITEM thing");
     assert_tiles(item);
-    let yellow = Color::Ansi { color: AnsiColor::Yellow, bold: true };
+    let yellow = Color::Ansi {
+        color: AnsiColor::Yellow,
+        bold: true,
+    };
     assert_eq!(style_at(item, 0).fg, yellow);
     assert_eq!(
         style_at(item, 1).fg,
-        Color::Ansi { color: AnsiColor::Red, bold: true }
+        Color::Ansi {
+            color: AnsiColor::Red,
+            bold: true
+        }
     );
     assert_eq!(style_at(item, 4).fg, yellow);
     assert_eq!(style_at(item, 5), rgb);
@@ -408,6 +496,7 @@ async fn styled_splice_edits_incoming_lines() {
     );
     let bad = find("BADSPLICE");
     assert_eq!(bad.text, "BADSPLICE");
+    tx.send(RuntimeAction::Shutdown).ok();
 }
 
 const STYLED_LINKS_TS: &str = r#"
@@ -417,6 +506,22 @@ import { echo, style, link } from "smudgy:core";
 echo`Exit: ${link("north")`${style.cyan`north`}`}.`;
 // A callback link; the handler reports the click's modifiers.
 echo`${link((click) => echo("CLICKED shift=" + click.shift))`Click me`}`;
+// Tooltip-only and left-click-disabled text still carry link styling and hover metadata.
+echo`${link(null, { tooltip: "Passive help" })`Passive`}`;
+echo`${link(null, {
+    enabled: false,
+    tooltip: "Right-click actions",
+    menu: [{ label: "Go north", action: "north" }],
+})`Right-click only`}`;
+// A null-primary menu opens from either left or right click by default.
+echo`${link(null, {
+    title: "Actions",
+    menu: [
+        { label: "Look", action: "look" },
+        "-",
+        { label: "Wave", action: () => echo("MENU_CALLBACK") },
+    ],
+})`Menu only`}`;
 echo("SL_READY");
 "#;
 
@@ -496,6 +601,8 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
             begin_pos: 6,
             end_pos: 11,
             action: LinkAction::Send(Arc::from("north")),
+            tooltip: None,
+            style: None,
         }]
     );
 
@@ -513,10 +620,88 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
         id,
     } = clickable.links[0].action
     else {
-        panic!("expected a callback link, got {:?}", clickable.links[0].action);
+        panic!(
+            "expected a callback link, got {:?}",
+            clickable.links[0].action
+        );
     };
     assert_eq!(session, session_id);
     let (isolate, instance) = IsolateId::from_widget_token(isolate_token);
+
+    let passive = lines
+        .iter()
+        .find(|line| line.text == "Passive")
+        .expect("tooltip-only linked text");
+    assert!(passive.links[0].action.primary().is_none());
+    assert_eq!(
+        passive.links[0]
+            .tooltip
+            .as_ref()
+            .and_then(LinkTooltip::display),
+        Some((Arc::from("Passive help"), None))
+    );
+
+    let right_click_only = lines
+        .iter()
+        .find(|line| line.text == "Right-click only")
+        .expect("left-click-disabled linked text");
+    assert!(right_click_only.links[0].action.primary().is_none());
+    assert!(!right_click_only.links[0].action.opens_menu_on_left_click());
+    let right_click_menu = right_click_only.links[0]
+        .action
+        .menu()
+        .expect("right-click menu remains enabled");
+    assert!(matches!(
+        &right_click_menu.items[0],
+        LinkMenuItem::Action { label, action: LinkAction::Send(command) }
+            if label.as_ref() == "Go north" && command.as_ref() == "north"
+    ));
+    assert_eq!(
+        right_click_only.links[0]
+            .tooltip
+            .as_ref()
+            .and_then(LinkTooltip::display),
+        Some((Arc::from("Right-click actions"), None))
+    );
+
+    let menu_only = lines
+        .iter()
+        .find(|line| line.text == "Menu only")
+        .expect("menu-only linked text");
+    assert!(menu_only.links[0].action.primary().is_none());
+    assert!(menu_only.links[0].action.opens_menu_on_left_click());
+    let menu = menu_only.links[0].action.menu().expect("enabled link menu");
+    assert_eq!(
+        menu.title.as_ref().map(|title| title.text.as_ref()),
+        Some("Actions")
+    );
+    assert_eq!(
+        menu_only.links[0]
+            .tooltip
+            .as_ref()
+            .and_then(LinkTooltip::display),
+        Some((Arc::from("Click or right-click for menu"), None))
+    );
+    assert!(matches!(
+        &menu.items[0],
+        LinkMenuItem::Action { label, action: LinkAction::Send(command) }
+            if label.as_ref() == "Look" && command.as_ref() == "look"
+    ));
+    assert!(matches!(menu.items[1], LinkMenuItem::Separator));
+    let LinkMenuItem::Action {
+        action:
+            LinkAction::Callback {
+                session: menu_session,
+                isolate_token: menu_isolate,
+                id: menu_id,
+            },
+        ..
+    } = &menu.items[2]
+    else {
+        panic!("third menu row must be a callback")
+    };
+    assert_eq!(*menu_session, session_id);
+    let (menu_isolate_id, menu_instance) = IsolateId::from_widget_token(menu_isolate);
 
     // Click it, exactly as the UI would: the handler runs in its isolate and sees
     // the modifiers.
@@ -541,6 +726,30 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
             }) {
                 break;
             }
+        }
+    }
+
+    tx.send(RuntimeAction::InvokeLinkCallback {
+        session: *menu_session,
+        isolate: menu_isolate_id,
+        instance: menu_instance,
+        id: *menu_id,
+        shift: false,
+        ctrl: false,
+        alt: false,
+    })
+    .unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), events.next())
+            .await
+            .expect("timed out waiting for the menu callback echo")
+            .expect("event stream ended waiting for the menu callback echo");
+        if let SessionEvent::UpdateBuffer(updates) = event.event
+            && updates.iter().any(|update| {
+                matches!(update, BufferUpdate::Append(line) if line.text == "MENU_CALLBACK")
+            })
+        {
+            break;
         }
     }
 

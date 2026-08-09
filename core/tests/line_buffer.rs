@@ -111,6 +111,7 @@ fn rgb_line(text: &str) -> Arc<StyledLine> {
         style: Style {
             fg: Color::Rgb { r: 10, g: 20, b: 30 },
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         },
         begin_pos: 0,
         end_pos: text.len(),

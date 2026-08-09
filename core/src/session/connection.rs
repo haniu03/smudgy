@@ -89,11 +89,11 @@ mod ingest {
                 if b != b'\n' && b != b'\r' {
                     vt_processor.push_raw_incoming_byte(b);
                 }
-                vt_parser.parse_byte(b, &mut *vt_processor);
+                vt_processor.parse_byte(vt_parser, b);
             }
         } else {
             for &b in data {
-                vt_parser.parse_byte(b, &mut *vt_processor);
+                vt_processor.parse_byte(vt_parser, b);
             }
         }
     }
@@ -125,6 +125,14 @@ mod ingest {
                 // The reply rides the same inline buffer negotiation answers use.
                 if payload == [responders::ttype::SEND] {
                     self.protocol.on_ttype_send(self.replies);
+                }
+                return;
+            }
+            if option == telnet::option::NEW_ENVIRON {
+                // RFC 1572 / Mudlet capability convention: answer SEND with the
+                // small set of OSC 8 features Smudgy truthfully implements.
+                if let Some((&responders::new_environ::SEND, requested)) = payload.split_first() {
+                    responders::new_environ::answer_send(requested, self.replies);
                 }
                 return;
             }
@@ -936,12 +944,10 @@ impl Connection {
             // Subnegotiation responder state (TTYPE cycle, NAWS reporting). Reads the
             // shared size cell at report time, so the first NAWS answer already carries
             // the size the UI last reported; `secure` sets the MTTS SSL bit.
-            let mut protocol =
-                responders::ProtocolState::new(window_size, tls != TlsMode::Off);
+            let mut protocol = responders::ProtocolState::new(window_size, tls != TlsMode::Off);
             // Charset transcoding: the per-server setting seeds it (None = UTF-8, a pure
             // pass-through); a CHARSET negotiation switches it mid-stream.
-            let mut transcode =
-                transcode::Transcode::new(encoding.unwrap_or(encoding_rs::UTF_8));
+            let mut transcode = transcode::Transcode::new(encoding.unwrap_or(encoding_rs::UTF_8));
             // Negotiation replies to write back to the server, reused across reads.
             let mut telnet_replies: Vec<u8> = Vec::new();
             let (write_to_socket_tx, mut write_to_socket_rx) =
@@ -1625,6 +1631,29 @@ mod tests {
             // in the buffer), so the reply is exactly the IS frame.
             assert_eq!(replies, expected);
         }
+    }
+
+    #[test]
+    fn new_environ_advertises_osc8_tooltips_end_to_end() {
+        let option = telnet::option::NEW_ENVIRON;
+        let requested = [
+            &[responders::new_environ::SEND, 3][..],
+            b"OSC_HYPERLINKS_TOOLTIP",
+        ]
+        .concat();
+        let mut input = vec![command::IAC, command::DO, option];
+        telnet::frame_subnegotiation(option, &requested, &mut input);
+
+        let (replies, actions) = ingest_buffer(&input);
+        assert!(actions.is_empty());
+        let mut expected = vec![command::IAC, command::WILL, option];
+        responders::new_environ::answer_send(&requested[1..], &mut expected);
+        assert_eq!(replies, expected);
+        assert!(
+            replies
+                .windows(b"OSC_HYPERLINKS_TOOLTIP".len())
+                .any(|window| window == b"OSC_HYPERLINKS_TOOLTIP")
+        );
     }
 
     /// `DO NAWS` is accepted and immediately answered with the current window

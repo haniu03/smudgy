@@ -57,6 +57,7 @@ const STYLE_CYCLE: [Style; 4] = [
     Style {
         fg: Color::DefaultForeground { bold: false },
         bg: Color::DefaultBackground,
+        ..Style::DEFAULT
     },
     Style {
         fg: Color::Ansi {
@@ -64,6 +65,7 @@ const STYLE_CYCLE: [Style; 4] = [
             bold: false,
         },
         bg: Color::DefaultBackground,
+        ..Style::DEFAULT
     },
     Style {
         fg: Color::Ansi {
@@ -71,6 +73,7 @@ const STYLE_CYCLE: [Style; 4] = [
             bold: true,
         },
         bg: Color::DefaultBackground,
+        ..Style::DEFAULT
     },
     Style {
         fg: Color::Rgb {
@@ -79,6 +82,7 @@ const STYLE_CYCLE: [Style; 4] = [
             b: 60,
         },
         bg: Color::DefaultBackground,
+        ..Style::DEFAULT
     },
 ];
 
@@ -92,6 +96,7 @@ const HIGHLIGHT_STYLE: Style = Style {
         color: AnsiColor::Yellow,
         bold: false,
     },
+    ..Style::DEFAULT
 };
 
 /// Splits `text` into up to `parts` contiguous, non-empty chunks cut on char

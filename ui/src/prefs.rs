@@ -12,7 +12,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use arc_swap::ArcSwap;
 use iced::{Background, Color, Font};
 use smudgy_cloud::parse_css_color;
-use smudgy_core::models::settings::{CommandInputBehavior, ScriptPalette, Settings, ThemeTweaks};
+use smudgy_core::models::settings::{
+    CommandInputBehavior, MAX_LINK_TOOLTIP_DELAY_MS, ScriptPalette, Settings, ThemeTweaks,
+};
 use smudgy_core::session::connection::vt_processor::AnsiColor;
 use smudgy_core::session::styled_line::Color as VtColor;
 
@@ -291,9 +293,15 @@ pub struct TerminalPrefs {
     /// kept in the snapshot so a toggle bumps `generation` and re-shapes
     /// every cached paragraph.
     pub ligatures: bool,
+    /// Whether SGR bold also promotes ordinary/default ANSI foregrounds to
+    /// their bright palette equivalents.
+    pub bold_is_bright: bool,
     pub line_height: f32,
     /// Maximum line length in columns; `None` wraps at the pane width.
     pub line_length: Option<u16>,
+    /// Hover delay for OSC and script-created link tooltips, in milliseconds.
+    /// This does not affect context-menu opening.
+    pub link_tooltip_delay_ms: u64,
     /// The effective palette: the chosen base scheme with the user's
     /// per-theme tweaks applied. Base schemes are never modified.
     pub palette: Arc<TerminalPalette>,
@@ -364,10 +372,14 @@ impl TerminalPrefs {
             font: font_for_family(&settings.terminal_font_family),
             font_size,
             ligatures: settings.terminal_font_ligatures,
+            bold_is_bright: settings.terminal_bold_is_bright,
             line_height: (font_size * 1.25).round(),
             // Clamp here too: hand-edited settings.json bypasses the UI
             // validation, and 0 columns would shape zero-width paragraphs.
             line_length: settings.terminal_line_length.map(|len| len.clamp(20, 1000)),
+            link_tooltip_delay_ms: settings
+                .link_tooltip_delay_ms
+                .min(MAX_LINK_TOOLTIP_DELAY_MS),
             palette: Arc::new(effective_palette(settings)),
             theme_extended_colors: settings.theme_extended_colors,
             command_input_behavior: settings.command_input_behavior,
@@ -566,6 +578,7 @@ pub fn apply(settings: &Settings) {
     }
     let visually_equal = next.font == current.font
         && next.ligatures == current.ligatures
+        && next.bold_is_bright == current.bold_is_bright
         && next.font_size == current.font_size
         && next.line_height == current.line_height
         && next.line_length == current.line_length
@@ -685,7 +698,8 @@ pub fn app_theme() -> smudgy_theme::Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, TerminalPalette, palettes};
+    use super::{Color, TerminalPalette, TerminalPrefs, palettes};
+    use smudgy_core::models::settings::{MAX_LINK_TOOLTIP_DELAY_MS, Settings};
 
     fn assert_color_close(actual: Color, expected: Color) {
         const TOLERANCE: f32 = 0.000_1;
@@ -743,5 +757,31 @@ mod tests {
             palette.resolve(source, true),
             Color::from_rgb8(95, 135, 175)
         );
+    }
+
+    #[test]
+    fn tooltip_delay_defaults_immediately_and_clamps_hand_edits() {
+        assert_eq!(
+            TerminalPrefs::from_settings(&Settings::default(), 0).link_tooltip_delay_ms,
+            0
+        );
+        let settings = Settings {
+            link_tooltip_delay_ms: u64::MAX,
+            ..Settings::default()
+        };
+        assert_eq!(
+            TerminalPrefs::from_settings(&settings, 0).link_tooltip_delay_ms,
+            MAX_LINK_TOOLTIP_DELAY_MS
+        );
+    }
+
+    #[test]
+    fn bold_is_bright_follows_settings_and_defaults_on() {
+        assert!(TerminalPrefs::from_settings(&Settings::default(), 0).bold_is_bright);
+        let settings = Settings {
+            terminal_bold_is_bright: false,
+            ..Settings::default()
+        };
+        assert!(!TerminalPrefs::from_settings(&settings, 0).bold_is_bright);
     }
 }
