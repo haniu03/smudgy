@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use iced::event::{Event as IcedEvent, Status};
 use iced::keyboard::{self, key::Named};
-use iced::widget::{markdown, text_editor};
-use iced::{Subscription, Task};
+use iced::widget::{markdown, operation, text_editor};
+use iced::{Subscription, Task, window};
 use smudgy_cloud::cloud_api::FriendView;
 use smudgy_cloud::package_api::{
     CommentView, PackageDetail, PackageGrantView, PackageSearchResult, ResolvedPackageWire,
@@ -57,6 +57,14 @@ use packages::{
     ConsentPrompt, DetailSeq, FilePreview, ForkActivation, InstallResolution, InstallSeq,
     InstalledFileTab, ParamConfig, ParamPrompt, StaleInstallCheck, UpdateDelta,
 };
+
+/// Returns the traversal direction for an unconsumed, unmodified Tab press.
+/// `true` means backwards (Shift+Tab). Shortcut-modified Tabs remain
+/// available to the window manager/application.
+fn tab_traversal(modifiers: keyboard::Modifiers, status: Status) -> Option<bool> {
+    (status == Status::Ignored && !modifiers.control() && !modifiers.alt() && !modifiers.logo())
+        .then_some(modifiers.shift())
+}
 
 /// Convenience alias for this window's themed elements.
 pub(crate) type Elem<'a> = ThemedElement<'a, Message>;
@@ -490,6 +498,10 @@ pub enum Message {
     PaletteRun,
     PaletteRunItem(usize),
 
+    // ---- keyboard focus traversal -----------------------------------------
+    FocusNext(window::Id),
+    FocusPrevious(window::Id),
+
     // ---- toast -------------------------------------------------------------
     DismissToast(u64),
 
@@ -507,6 +519,7 @@ pub enum Message {
 
 /// The Automations window. One per (server, session) the user opens it for.
 pub struct AutomationsWindow {
+    window_id: window::Id,
     pub(super) server_name: String,
     pub(super) cloud: CloudHandles,
     pub(super) session_id: SessionId,
@@ -746,13 +759,19 @@ fn catalogue_stream(session_id: SessionId) -> impl iced::futures::Stream<Item = 
 }
 
 impl AutomationsWindow {
-    pub fn new(server_name: String, cloud: CloudHandles, session_id: SessionId) -> Self {
+    pub fn new(
+        window_id: window::Id,
+        server_name: String,
+        cloud: CloudHandles,
+        session_id: SessionId,
+    ) -> Self {
         let mud_host = server::load_server(&server_name)
             .ok()
             .map(|server| server.config.host);
         let advanced_features =
             smudgy_core::models::settings::load_settings().advanced_scripting_features;
         Self {
+            window_id,
             server_name,
             cloud,
             session_id,
@@ -860,7 +879,7 @@ impl AutomationsWindow {
     /// Navigation keys only act on events no focused widget captured, so they
     /// don't fight text inputs elsewhere.
     pub fn subscription(&self) -> Subscription<Message> {
-        let keyboard = iced::event::listen_with(|event, status, _window| {
+        let keyboard = iced::event::listen_with(|event, status, event_window| {
             let IcedEvent::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
             else {
                 return None;
@@ -879,6 +898,15 @@ impl AutomationsWindow {
                     Some(Message::PaletteMove(-1))
                 }
                 (keyboard::Key::Named(Named::Enter), Status::Ignored) => Some(Message::PaletteRun),
+                (keyboard::Key::Named(Named::Tab), status) => {
+                    tab_traversal(modifiers, status).map(|backwards| {
+                        if backwards {
+                            Message::FocusPrevious(event_window)
+                        } else {
+                            Message::FocusNext(event_window)
+                        }
+                    })
+                }
                 _ => None,
             }
         });
@@ -1029,6 +1057,15 @@ impl AutomationsWindow {
                 }
                 Update::none()
             }
+
+            // -------- keyboard focus traversal ----------------------------
+            Message::FocusNext(event_window) if event_window == self.window_id => {
+                Update::with_task(operation::focus_next())
+            }
+            Message::FocusPrevious(event_window) if event_window == self.window_id => {
+                Update::with_task(operation::focus_previous())
+            }
+            Message::FocusNext(_) | Message::FocusPrevious(_) => Update::none(),
 
             // -------- navigation -------------------------------------------
             Message::ShowDashboard => {
@@ -1759,5 +1796,37 @@ impl AutomationsWindow {
             col = col.push(text(err.clone()).size(13.0).style(common::danger));
         }
         col.width(Length::Fill).into()
+    }
+}
+
+#[cfg(test)]
+mod tab_traversal_tests {
+    use super::*;
+
+    #[test]
+    fn plain_and_shift_tab_choose_forward_and_backward_traversal() {
+        assert_eq!(
+            tab_traversal(keyboard::Modifiers::empty(), Status::Ignored),
+            Some(false)
+        );
+        assert_eq!(
+            tab_traversal(keyboard::Modifiers::SHIFT, Status::Ignored),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn captured_or_shortcut_modified_tabs_do_not_traverse() {
+        assert_eq!(
+            tab_traversal(keyboard::Modifiers::empty(), Status::Captured),
+            None
+        );
+        for modifier in [
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::ALT,
+            keyboard::Modifiers::LOGO,
+        ] {
+            assert_eq!(tab_traversal(modifier, Status::Ignored), None);
+        }
     }
 }

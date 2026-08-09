@@ -1239,6 +1239,7 @@ impl AutomationsWindow {
             crate::i18n::ts!("editor-shortcut"),
             Element::new(
                 HotkeyInput::new(&self.hotkey_state, true)
+                    .id(iced::widget::Id::new("automation-hotkey-shortcut"))
                     .height(Length::Fixed(34.0))
                     .on_action(Message::MarkHotkeyState),
             ),
