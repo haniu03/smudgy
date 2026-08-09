@@ -26,6 +26,7 @@ use smudgy_cloud::{
     LocalBackend, Mapper, PackageApiClient,
 };
 use smudgy_core::get_smudgy_home;
+use smudgy_core::models::input_history::{load_input_history, save_input_history};
 use smudgy_core::models::map_scopes::MapScopes;
 use smudgy_core::models::profile::load_profile;
 use smudgy_core::models::server::{ServerConfig, link_url_host, load_server, update_server};
@@ -707,6 +708,19 @@ impl ManagedSession {
         let map_store = MapStore::new();
         let text_store = TextEditorStore::new();
 
+        let input_history = match load_input_history(&server_name, &profile_name) {
+            Ok(history) => history,
+            Err(error) => {
+                log::warn!(
+                    "Failed to load input history for '{profile_name}' on '{server_name}': {error}"
+                );
+                Vec::new()
+            }
+        };
+        let input = session_input::SessionInput::new()
+            .with_terminal_buffer(terminal_buffer.clone())
+            .with_history(input_history);
+
         // The image store is process-global (entries are keyed by content source, shared
         // across sessions). Register this session's repaint waker so a completed load repaints
         // its widgets (the store pokes every live session on completion), and the package
@@ -764,7 +778,7 @@ impl ManagedSession {
             server_echo: false,
             server_name,
             profile_name,
-            input: session_input::SessionInput::new().with_terminal_buffer(terminal_buffer.clone()),
+            input,
             terminal_buffer: terminal_buffer.clone(),
             terminal_pane_selection: Rc::new(RefCell::new(Selection::default())),
             panes: HashMap::new(),
@@ -997,6 +1011,19 @@ impl ManagedSession {
     /// dropped session-event subscription owns the corresponding early
     /// shutdown signal instead.
     fn shutdown(&mut self) {
+        let history: Vec<String> = self
+            .input
+            .history_snapshot()
+            .iter()
+            .map(|entry| entry.as_str().to_string())
+            .collect();
+        if let Err(error) = save_input_history(&self.server_name, &self.profile_name, &history) {
+            log::warn!(
+                "Failed to save input history for '{}' on '{}': {error}",
+                self.profile_name,
+                self.server_name
+            );
+        }
         if let Some(tx) = self.runtime_tx.take() {
             tx.send(RuntimeAction::Shutdown).ok();
         }
