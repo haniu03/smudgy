@@ -496,7 +496,10 @@ pub fn run() -> anyhow::Result<()> {
         })
         .subscription(subscription)
         .font(assets::fonts::GEIST_VF_BYTES)
+        .font(assets::fonts::GEIST_ITALIC_VF_BYTES)
         .font(assets::fonts::GEIST_MONO_VF_BYTES)
+        .font(assets::fonts::GEIST_MONO_ITALIC_VF_BYTES)
+        .font(assets::fonts::GEIST_PIXEL_VF_BYTES)
         .font(assets::fonts::BOOTSTRAP_ICONS_BYTES)
         .font(assets::fonts::MONASPACE_ARGON_BYTES)
         .font(assets::fonts::MONASPACE_KRYPTON_BYTES)
@@ -2224,7 +2227,9 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         reference,
                         direction,
                         size_px,
-                    }) => relocate_script_pane(smudgy, session_id, key, reference, direction, size_px),
+                    }) => {
+                        relocate_script_pane(smudgy, session_id, key, reference, direction, size_px)
+                    }
                     Some(PaneFollowUp::TearOut { key, width, height }) => {
                         tear_out_script_pane(smudgy, session_id, key, width, height)
                     }
@@ -2651,9 +2656,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         // Same for the Discord toggle: enabling mid-session
                         // publishes the current game at once, disabling clears
                         // the activity from the user's profile.
-                        smudgy
-                            .discord
-                            .set_enabled(settings.discord_rich_presence);
+                        smudgy.discord.set_enabled(settings.discord_rich_presence);
                         refresh_discord_presence(smudgy);
                         // Swap the hot prefs snapshot (fonts/palette/line
                         // length take effect next frame) and fan the change
@@ -3226,14 +3229,16 @@ fn swap_script_panes(smudgy: &mut Smudgy, first: PaneRef, second: PaneRef) -> Ta
     if first == second {
         return Task::none();
     }
-    let first_window = smudgy
-        .smudgy_windows
-        .iter()
-        .find_map(|(id, window)| window.hosts_pane(first.session_id, first.key).then_some(*id));
-    let second_window = smudgy
-        .smudgy_windows
-        .iter()
-        .find_map(|(id, window)| window.hosts_pane(second.session_id, second.key).then_some(*id));
+    let first_window = smudgy.smudgy_windows.iter().find_map(|(id, window)| {
+        window
+            .hosts_pane(first.session_id, first.key)
+            .then_some(*id)
+    });
+    let second_window = smudgy.smudgy_windows.iter().find_map(|(id, window)| {
+        window
+            .hosts_pane(second.session_id, second.key)
+            .then_some(*id)
+    });
     let (Some(first_window), Some(second_window)) = (first_window, second_window) else {
         log::warn!("Dropping pane swap because one of its leaves is no longer hosted");
         return Task::none();

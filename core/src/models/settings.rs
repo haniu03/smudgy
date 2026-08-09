@@ -143,6 +143,93 @@ pub const DEFAULT_API_BASE_URL: &str = if is_dev_build() {
 /// redraw deadline.
 pub const MAX_LINK_TOOLTIP_DELAY_MS: u64 = 60_000;
 
+/// How an SGR bold attribute is presented in terminal output.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalBoldMode {
+    /// Increase the selected terminal font's weight without changing color.
+    Bold,
+    /// Use the bright ANSI palette without changing font weight.
+    Bright,
+    /// Increase font weight and use the bright ANSI palette.
+    BoldAndBright,
+}
+
+impl TerminalBoldMode {
+    pub const ALL: [Self; 3] = [Self::Bold, Self::Bright, Self::BoldAndBright];
+
+    #[must_use]
+    pub const fn uses_bold_weight(self) -> bool {
+        matches!(self, Self::Bold | Self::BoldAndBright)
+    }
+
+    #[must_use]
+    pub const fn uses_bright_palette(self) -> bool {
+        matches!(self, Self::Bright | Self::BoldAndBright)
+    }
+}
+
+impl Default for TerminalBoldMode {
+    fn default() -> Self {
+        Self::BoldAndBright
+    }
+}
+
+impl std::fmt::Display for TerminalBoldMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Bold => "Show bold as bold",
+            Self::Bright => "Show bold as bright",
+            Self::BoldAndBright => "Show bold as bold and bright",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for TerminalBoldMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BoldModeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BoldModeVisitor {
+            type Value = TerminalBoldMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a terminal bold mode or legacy boolean")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(if value {
+                    TerminalBoldMode::BoldAndBright
+                } else {
+                    TerminalBoldMode::Bold
+                })
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "bold" => Ok(TerminalBoldMode::Bold),
+                    "bright" => Ok(TerminalBoldMode::Bright),
+                    "bold_and_bright" | "bold-and-bright" => Ok(TerminalBoldMode::BoldAndBright),
+                    _ => Err(E::unknown_variant(
+                        value,
+                        &["bold", "bright", "bold_and_bright"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(BoldModeVisitor)
+    }
+}
+
 /// Represents the global application settings.
 ///
 /// Loaded from / saved to `settings.json` in the main smudgy config directory.
@@ -212,10 +299,11 @@ pub struct Settings {
     /// merging `=>` or `fi` into one glyph break column alignment.
     #[serde(default)]
     pub terminal_font_ligatures: bool,
-    /// Render SGR bold text with the bright ANSI palette as well as bold font
-    /// weight. Explicit bright-color codes remain bright when this is off.
-    #[serde(default = "default_true")]
-    pub terminal_bold_is_bright: bool,
+    /// Choose whether SGR bold changes the selected font's weight, promotes
+    /// ordinary ANSI foregrounds to the bright palette, or does both. The alias
+    /// migrates the former boolean (`false` = bold, `true` = both).
+    #[serde(default, alias = "terminal_bold_is_bright")]
+    pub terminal_bold_mode: TerminalBoldMode,
     /// Maximum terminal line length in columns; `None` wraps to the pane
     /// width. This is client-side wrapping only (no NAWS negotiation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -553,7 +641,7 @@ impl Default for Settings {
             terminal_font_family: default_terminal_font_family(),
             terminal_font_size: default_terminal_font_size(),
             terminal_font_ligatures: false,
-            terminal_bold_is_bright: true,
+            terminal_bold_mode: TerminalBoldMode::default(),
             terminal_line_length: None,
             link_tooltip_delay_ms: 0,
             theme: default_theme(),
@@ -876,18 +964,33 @@ mod tests {
     }
 
     #[test]
-    fn bold_is_bright_defaults_on_and_roundtrips_off() {
+    fn terminal_bold_mode_defaults_to_bold_and_bright_and_roundtrips() {
         let existing = r#"{ "scrollback_length": 5000 }"#;
         let settings: Settings = serde_json::from_str(existing).expect("existing settings parse");
-        assert!(settings.terminal_bold_is_bright);
+        assert_eq!(settings.terminal_bold_mode, TerminalBoldMode::BoldAndBright);
 
-        let configured = Settings {
-            terminal_bold_is_bright: false,
-            ..Settings::default()
-        };
-        let parsed: Settings =
-            serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
-        assert!(!parsed.terminal_bold_is_bright);
+        for mode in TerminalBoldMode::ALL {
+            let configured = Settings {
+                terminal_bold_mode: mode,
+                ..Settings::default()
+            };
+            let json = serde_json::to_string(&configured).unwrap();
+            assert!(json.contains("terminal_bold_mode"));
+            assert!(!json.contains("terminal_bold_is_bright"));
+            let parsed: Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.terminal_bold_mode, mode);
+        }
+    }
+
+    #[test]
+    fn legacy_bold_is_bright_boolean_migrates_without_changing_rendering() {
+        let enabled: Settings =
+            serde_json::from_str(r#"{"terminal_bold_is_bright":true}"#).unwrap();
+        assert_eq!(enabled.terminal_bold_mode, TerminalBoldMode::BoldAndBright);
+
+        let disabled: Settings =
+            serde_json::from_str(r#"{"terminal_bold_is_bright":false}"#).unwrap();
+        assert_eq!(disabled.terminal_bold_mode, TerminalBoldMode::Bold);
     }
 
     #[test]

@@ -1,5 +1,100 @@
+diff --git a/src/font/fallback/mod.rs b/src/font/fallback/mod.rs
+index 00b7218..3b9aaaf 100644
+--- a/src/font/fallback/mod.rs
++++ b/src/font/fallback/mod.rs
+@@ -282,7 +282,7 @@ impl<'a> FontFallbackIter<'a> {
+ 
+         self.font_match_keys
+             .iter()
+-            .filter(|m_key| m_key.font_weight_diff == 0)
++            .filter(|m_key| m_key.font_weight_diff == 0 || m_key.variable_weight_match)
+             .find(|m_key| self.face_contains_family(m_key.id, default_family_name))
+     }
+ 
+@@ -297,9 +297,9 @@ impl<'a> FontFallbackIter<'a> {
+         }
+ 
+         let font_match_keys_iter = |is_mono| {
+-            self.font_match_keys
+-                .iter()
+-                .filter(move |m_key| m_key.font_weight_diff == 0 || is_mono)
++            self.font_match_keys.iter().filter(move |m_key| {
++                m_key.font_weight_diff == 0 || m_key.variable_weight_match || is_mono
++            })
+         };
+ 
+         'DEF_FAM: while self.default_i < self.default_families.len() {
+diff --git a/src/font/system.rs b/src/font/system.rs
+index 7ec0cfe..e8362b4 100644
+--- a/src/font/system.rs
++++ b/src/font/system.rs
+@@ -6,8 +6,9 @@ use alloc::sync::Arc;
+ use alloc::vec::Vec;
+ use core::fmt;
+ use core::ops::{Deref, DerefMut};
+-use fontdb::Query;
++use fontdb::{FaceInfo, Query};
+ use skrifa::raw::{ReadError, TableProvider as _};
++use skrifa::MetadataProvider;
+ 
+ // re-export fontdb and harfrust
+ pub use fontdb;
+@@ -20,6 +21,27 @@ pub struct FontMatchKey {
+     pub(crate) font_weight_diff: u16,
+     pub(crate) font_weight: u16,
+     pub(crate) id: fontdb::ID,
++    pub(crate) variable_weight_match: bool,
++}
++
++impl FontMatchKey {
++    fn new(attrs: &Attrs<'_>, face: &FaceInfo, db: &fontdb::Database) -> Self {
++        let font_weight_diff = attrs.weight.0.abs_diff(face.weight.0);
++        let variable_weight_match = font_weight_diff != 0
++            && db.with_face_data(face.id, |font_data, face_index| {
++                let font_ref = skrifa::FontRef::from_index(font_data, face_index).ok()?;
++                let axis = font_ref.axes().get_by_tag(skrifa::Tag::new(b"wght"))?;
++                let weight = f32::from(attrs.weight.0);
++                Some(weight >= axis.min_value() && weight <= axis.max_value())
++            }) == Some(Some(true));
++
++        Self {
++            font_weight_diff,
++            font_weight: face.weight.0,
++            id: face.id,
++            variable_weight_match,
++        }
++    }
+ }
+ 
+ struct FontCachedCodepointSupportInfo {
+@@ -327,11 +349,7 @@ impl FontSystem {
+                     .db
+                     .faces()
+                     .filter(|face| attrs.matches(face))
+-                    .map(|face| FontMatchKey {
+-                        font_weight_diff: attrs.weight.0.abs_diff(face.weight.0),
+-                        font_weight: face.weight.0,
+-                        id: face.id,
+-                    })
++                    .map(|face| FontMatchKey::new(attrs, face, &self.db))
+                     .collect::<Vec<_>>();
+ 
+                 // Sort so we get the keys with weight_offset=0 first
+@@ -357,11 +375,7 @@ impl FontSystem {
+                         font_match_keys.insert(0, match_key);
+                     } else if let Some(face) = self.db.face(id) {
+                         // else insert in front
+-                        let match_key = FontMatchKey {
+-                            font_weight_diff: attrs.weight.0.abs_diff(face.weight.0),
+-                            font_weight: face.weight.0,
+-                            id,
+-                        };
++                        let match_key = FontMatchKey::new(attrs, face, &self.db);
+                         font_match_keys.insert(0, match_key);
+                     } else {
+                         log::error!("Could not get face from db, that should've been there.");
 diff --git a/src/shape.rs b/src/shape.rs
-index ff654b1..1c86990 100644
+index ff654b1..1dca5e8 100644
 --- a/src/shape.rs
 +++ b/src/shape.rs
 @@ -301,11 +301,41 @@ fn shape_run(
@@ -20,7 +115,7 @@ index ff654b1..1c86990 100644
 +        let family_name = db.family_name(&attrs.family);
 +        fonts
 +            .iter()
-+            .filter(|m_key| m_key.font_weight_diff == 0)
++            .filter(|m_key| m_key.font_weight_diff == 0 || m_key.variable_weight_match)
 +            .find(|m_key| {
 +                db.face(m_key.id).is_some_and(|face| {
 +                    face.families.iter().any(|(name, _)| name == family_name)

@@ -3211,6 +3211,7 @@ THE SOFTWARE IS PROVIDED "AS IS" AND ISC DISCLAIMS ALL WARRANTIES WITH REGARD TO
 
 Used by:
 
+- smudgy_core 0.5.3-rc
 - rustybuzz 0.20.1
 
 ~~~
@@ -3242,7 +3243,6 @@ Used by:
 
 Used by:
 
-- smudgy_core 0.5.3-rc
 - harfrust 0.3.2
 
 ~~~

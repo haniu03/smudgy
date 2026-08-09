@@ -239,6 +239,8 @@ pub enum Message {
     HandleTabCompletion,
     /// The input lost focus (used by the clear-on-blur behavior).
     FocusLost,
+    /// The input gained focus; the parent clears stale terminal link focus.
+    FocusGained,
     /// Escape pressed in a pane input: hand focus back to the main input.
     EscapePressed,
     /// The widget's caret (focus/cursor) changed.
@@ -258,6 +260,8 @@ pub enum Event {
     /// The user pressed Escape in a pane input; the parent should focus the
     /// session's main input.
     FocusMain,
+    /// The command editor received keyboard focus.
+    FocusGained,
 }
 
 /// Why an input is masked. The two causes are tracked separately and the
@@ -951,6 +955,7 @@ impl SessionInput {
                 }
                 Update::none()
             }
+            Message::FocusGained => Update::with_event(Event::FocusGained),
             Message::HotkeyTriggered(hotkey_id) => {
                 Update::with_event(Event::HotkeyTriggered(hotkey_id))
             }
@@ -1008,6 +1013,7 @@ impl SessionInput {
         .suppress_clipboard_writes(self.masked)
         .on_input(Message::InputChanged)
         .on_submit(Message::Submit)
+        .on_focus(Message::FocusGained)
         .on_unfocus(Message::FocusLost)
         .style(builtins::text_input::borderless)
         .width(Length::Fill)
@@ -1958,6 +1964,13 @@ mod tests {
 
         let main_input = SessionInput::new();
         assert!(!main_input.escape_to_main, "the main input never opts in");
+    }
+
+    #[test]
+    fn focus_gain_is_reported_to_the_parent() {
+        let mut input = SessionInput::new();
+        let update = input.update(Message::FocusGained);
+        assert!(matches!(update.event, Some(Event::FocusGained)));
     }
 
     #[test]

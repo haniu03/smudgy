@@ -257,6 +257,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Emoji variation selectors, joiners, and tag characters in OSC link labels now
+  reach the text shaper instead of appearing as literal `\u{...}` escapes;
+  invisible characters in disclosed link destinations remain escaped.
+- Concealed OSC spoilers now render one space per Unicode grapheme instead of
+  relying on foreground color, which could not hide color emoji glyphs. Click
+  and selection offsets remain aligned with the original text after concealment.
+- Clicking a terminal command link no longer panics when it tries to update
+  scrollback during event dispatch; script send links and OSC `send:` links now
+  defer their session work through the ordinary UI update path.
 - Dragging a pane divider immediately after the layout changed under it
   (a pane opened, closed, or moved in the same moment) could apply the
   resize to the wrong edge; stale divider targets are now rejected and
@@ -372,13 +381,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Mudlet's priority order. Tooltips, styled menu titles, context menus,
   disabled links, spoilers, timed/input/prompt/output visibility, radio and
   checkbox selection groups, compact keys, and session presets are supported;
+  styled tooltip text is announced through Smudgy's
+  `OSC_HYPERLINKS_TOOLTIP_SGR` capability extension;
   links can be traversed and activated from the keyboard. Incoming OSC 8 URIs
   are capped at 4096 bytes in the scanner, deceptive invisible controls are
   rendered visibly, and unapproved URI schemes are ignored. Script-authored
   links retain their existing unrestricted payload size.
+- **Configurable SGR bold presentation.** Terminal preferences now offer
+  weight-only, bright-color-only, and combined bold modes. Weight-only bold
+  preserves the selected regular font family and changes only its weight;
+  existing boolean settings migrate without changing their appearance.
 
 ### Fixed
 
+- **Bold variable terminal fonts stay in their selected family.** Requesting
+  bold from a variable font such as Geist Mono no longer falls through to a
+  proportional face just because the font file registers one default weight;
+  Smudgy now recognizes every weight covered by the font's `wght` axis.
+- **Async link tooltips show progress.** A script tooltip whose callback is
+  still resolving now opens with an animated loading indicator (and the honest
+  target disclosure, when available) instead of appearing empty or finished.
+- **Link clicks no longer hijack later command submissions.** Enter and Space
+  activate a terminal link only while its keyboard focus ring is visible, and
+  returning focus to a command editor clears the terminal's link-navigation
+  focus instead of replaying the last mouse-clicked OSC or script link.
+- **OSC 8 raw JSON and reserved query fields parse without URI ambiguity.**
+  Literal JSON may contain `#` colors and `&` text, encoded `config%3D` and
+  `preset%3D` fields are stripped like their literal forms, and real URL
+  fragments and ordinary query parameters remain intact.
 - **JSR packages can load slash-normalized dependencies.** Smudgy now accepts
   both `jsr:@scope/package` and the `jsr:/@scope/package` form emitted by Deno
   and found in published JSR packages, instead of rejecting the latter as an

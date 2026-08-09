@@ -284,6 +284,9 @@ pub enum Message {
     /// deliberately leaves presses uncaptured). Focuses the session input
     /// when the click didn't create a selection.
     TerminalClicked,
+    /// A terminal link activation, published by the widget and handled only
+    /// after its immutable scrollback borrow has been released.
+    LinkActivated(LinkClickEvent),
     /// Global settings changed: apply the scrollback limit and re-bake span
     /// styles here, and forward the runtime-relevant pieces to the session.
     ApplySettings(Settings),
@@ -620,6 +623,16 @@ pub fn title_bar_icon_button<M: Clone + 'static>(
     .into()
 }
 
+/// Build the terminal's event-only link callback once a session runtime exists.
+/// Keeping this callback free of session captures is what makes it safe to run
+/// while the terminal widget still holds its immutable scrollback borrow.
+fn link_activation_handler(
+    runtime_available: bool,
+) -> Option<Rc<dyn Fn(LinkClickEvent) -> Message>> {
+    runtime_available
+        .then(|| Rc::new(Message::LinkActivated) as Rc<dyn Fn(LinkClickEvent) -> Message>)
+}
+
 impl ManagedSession {
     /// Creates the session state for `server_name`/`profile_name`. With
     /// `auto_connect` the connection is established as soon as the runtime is
@@ -928,6 +941,17 @@ impl ManagedSession {
         self.panes.get(&key).map(|pane| &pane.def)
     }
 
+    /// Tell every terminal widget rendering `key` that its command editor
+    /// owns keyboard focus again. The widgets consume this epoch during
+    /// layout and discard any stale mouse/Tab link-navigation focus.
+    pub fn note_command_input_focus(&self, key: PaneKey) {
+        if key == MAIN_PANE_KEY {
+            self.terminal_buffer.borrow_mut().note_command_input_focus();
+        } else if let Some(buffer) = self.panes.get(&key).and_then(|pane| pane.buffer.as_ref()) {
+            buffer.borrow_mut().note_command_input_focus();
+        }
+    }
+
     /// The body of a script pane: the widget entries targeting it, stacked
     /// over the scrollback terminal on a terminal pane and standing alone on
     /// a widgets-only pane. Targets match by the interned pane name id, so a
@@ -1043,91 +1067,97 @@ impl ManagedSession {
         }))
     }
 
-    /// The link-click handler this session's terminal panes call: a command link
-    /// sends on THIS session (the one whose pane was clicked); a callback link is
-    /// addressed to the session/isolate that minted it — sent here too, and the
-    /// dispatch arm forwards it home when that is another session. Server-sent
-    /// links (OSC 8: browser URLs and `send:` commands) pass the per-server
-    /// trust gate first — ungranted ones stage the confirm dialog instead of
-    /// acting. `None` until the runtime is ready (links echoed that early
-    /// cannot exist anyway).
-    fn link_handler(&self) -> Option<Rc<dyn Fn(LinkClickEvent)>> {
-        let tx = self.runtime_tx.clone()?;
-        let server_config = self.server_config.clone();
-        let pending = self.pending_link_confirm.clone();
-        let terminal_buffer = self.terminal_buffer.clone();
-        Some(Rc::new(move |event: LinkClickEvent| {
-            let action = match event.action {
-                LinkAction::Send(command) => {
-                    terminal_buffer.borrow_mut().note_visibility_input();
-                    RuntimeAction::Send(Arc::new(command.to_string()))
-                }
-                LinkAction::Callback {
-                    session,
-                    isolate_token,
-                    id,
-                } => {
-                    let (isolate, instance) = IsolateId::from_widget_token(&isolate_token);
-                    RuntimeAction::InvokeLinkCallback {
-                        session,
-                        isolate,
-                        instance,
-                        id,
-                        shift: event.shift,
-                        ctrl: event.ctrl,
-                        alt: event.alt,
-                    }
-                }
-                LinkAction::OpenUrl(url) => {
-                    let host = link_url_host(&url);
-                    if server_config.borrow().allows_server_link(host.as_deref()) {
-                        open_url_in_browser(&url);
-                    } else {
-                        *pending.borrow_mut() = Some(PendingLinkConfirm {
-                            display: url.to_string(),
-                            action: LinkAction::OpenUrl(url),
-                            host,
-                            grant_host: false,
-                            grant_server: false,
-                        });
-                    }
-                    return;
-                }
-                LinkAction::ServerSend(command) => {
-                    if server_config.borrow().allows_server_link(None) {
-                        terminal_buffer.borrow_mut().note_visibility_input();
-                        RuntimeAction::Send(Arc::new(command.to_string()))
-                    } else {
-                        *pending.borrow_mut() = Some(PendingLinkConfirm {
-                            display: command.to_string(),
-                            action: LinkAction::ServerSend(command),
-                            host: None,
-                            grant_host: false,
-                            grant_server: false,
-                        });
-                        return;
-                    }
-                }
-                LinkAction::Prompt(text) => {
-                    for op in [InputOp::Replace(Arc::new(text.to_string())), InputOp::Focus] {
-                        if let Err(e) = tx.send(RuntimeAction::InputApply {
-                            key: MAIN_PANE_KEY,
-                            op,
-                        }) {
-                            log::error!("Failed to apply OSC prompt to session input: {e}");
-                            break;
-                        }
-                    }
-                    return;
-                }
-                // TerminalPane resolves configured primary actions and menu
-                // rows before dispatch. Treat an unexpected wrapper as inert.
-                LinkAction::Configured { .. } => return,
-            };
-            if let Err(e) = tx.send(action) {
-                log::error!("Failed to send link action to session runtime: {e}");
+    /// Map a terminal link click into the ordinary iced update path. This must
+    /// not mutate session state directly: terminal elements retain an immutable
+    /// `Ref<TerminalBuffer>` while dispatching widget events.
+    fn link_handler(&self) -> Option<Rc<dyn Fn(LinkClickEvent) -> Message>> {
+        link_activation_handler(self.runtime_tx.is_some())
+    }
+
+    /// Act on a link only after iced has dropped the terminal element that
+    /// published it. A command link sends on this pane's session; a callback
+    /// link retains the session/isolate address that minted it. Server OSC 8
+    /// actions pass the per-server trust gate first.
+    fn handle_link_activation(&mut self, event: LinkClickEvent) {
+        let action = match event.action {
+            LinkAction::Send(command) => {
+                self.terminal_buffer.borrow_mut().note_visibility_input();
+                RuntimeAction::Send(Arc::new(command.to_string()))
             }
-        }))
+            LinkAction::Callback {
+                session,
+                isolate_token,
+                id,
+            } => {
+                let (isolate, instance) = IsolateId::from_widget_token(&isolate_token);
+                RuntimeAction::InvokeLinkCallback {
+                    session,
+                    isolate,
+                    instance,
+                    id,
+                    shift: event.shift,
+                    ctrl: event.ctrl,
+                    alt: event.alt,
+                }
+            }
+            LinkAction::OpenUrl(url) => {
+                let host = link_url_host(&url);
+                if self
+                    .server_config
+                    .borrow()
+                    .allows_server_link(host.as_deref())
+                {
+                    open_url_in_browser(&url);
+                } else {
+                    *self.pending_link_confirm.borrow_mut() = Some(PendingLinkConfirm {
+                        display: url.to_string(),
+                        action: LinkAction::OpenUrl(url),
+                        host,
+                        grant_host: false,
+                        grant_server: false,
+                    });
+                }
+                return;
+            }
+            LinkAction::ServerSend(command) => {
+                if self.server_config.borrow().allows_server_link(None) {
+                    self.terminal_buffer.borrow_mut().note_visibility_input();
+                    RuntimeAction::Send(Arc::new(command.to_string()))
+                } else {
+                    *self.pending_link_confirm.borrow_mut() = Some(PendingLinkConfirm {
+                        display: command.to_string(),
+                        action: LinkAction::ServerSend(command),
+                        host: None,
+                        grant_host: false,
+                        grant_server: false,
+                    });
+                    return;
+                }
+            }
+            LinkAction::Prompt(text) => {
+                let Some(tx) = &self.runtime_tx else {
+                    log::warn!(
+                        "Session {}: dropping OSC prompt: session runtime not ready",
+                        self.id
+                    );
+                    return;
+                };
+                for op in [InputOp::Replace(Arc::new(text.to_string())), InputOp::Focus] {
+                    if let Err(e) = tx.send(RuntimeAction::InputApply {
+                        key: MAIN_PANE_KEY,
+                        op,
+                    }) {
+                        log::error!("Failed to apply OSC prompt to session input: {e}");
+                        break;
+                    }
+                }
+                return;
+            }
+            // TerminalPane resolves configured primary actions and menu rows
+            // before dispatch. Treat an unexpected wrapper as inert.
+            LinkAction::Configured { .. } => return,
+        };
+        self.send_runtime_action(action);
     }
 
     /// Route a lazy hover callback to the isolate that created the styled link.
@@ -1237,6 +1267,9 @@ impl ManagedSession {
             session_input::Event::HotkeyTriggered(id) => {
                 self.send_runtime_action(RuntimeAction::ExecHotkey { id });
             }
+            session_input::Event::FocusGained => {
+                self.note_command_input_focus(MAIN_PANE_KEY);
+            }
             // The main input never opts into Escape-to-main.
             session_input::Event::FocusMain => {}
         }
@@ -1263,7 +1296,14 @@ impl ManagedSession {
                 self.send_runtime_action(RuntimeAction::ExecHotkey { id });
                 Task::none()
             }
-            session_input::Event::FocusMain => operation::focus(self.input.input_id()),
+            session_input::Event::FocusGained => {
+                self.note_command_input_focus(key);
+                Task::none()
+            }
+            session_input::Event::FocusMain => {
+                self.note_command_input_focus(MAIN_PANE_KEY);
+                operation::focus(self.input.input_id())
+            }
         }
     }
 
@@ -1448,6 +1488,10 @@ impl ManagedSession {
                 let update = self.input.update(input_msg);
                 self.finish_main_input_update(update)
             }
+            Message::LinkActivated(event) => {
+                self.handle_link_activation(event);
+                Task::none()
+            }
             Message::PaneInput(key, input_msg) => {
                 // Deliberately not `input_for_mut`: a `PaneInput` message is
                 // minted only for pane-hosted inputs, so `main` must stay a
@@ -1475,6 +1519,7 @@ impl ManagedSession {
                 if pane.selection.borrow().blocks_focus() {
                     Task::none()
                 } else {
+                    self.note_command_input_focus(key);
                     operation::focus(input.input_id())
                 }
             }
@@ -1692,6 +1737,9 @@ impl ManagedSession {
                         // The op layer refuses targets without an input, so a
                         // miss here can only be a bug. Warn-and-drop like an
                         // AppendTo miss.
+                        if matches!(op, InputOp::Focus) {
+                            self.note_command_input_focus(key);
+                        }
                         if key == MAIN_PANE_KEY {
                             let update = self.input.apply_script_op(&op);
                             self.finish_main_input_update(update)
@@ -1803,6 +1851,7 @@ impl ManagedSession {
                 if self.terminal_pane_selection.borrow().blocks_focus() {
                     Task::none()
                 } else {
+                    self.note_command_input_focus(MAIN_PANE_KEY);
                     operation::focus(self.input.input_id())
                 }
             }
@@ -2253,6 +2302,42 @@ mod tests {
 
     fn atlas_target(n: u128) -> BindTarget {
         BindTarget::Atlas(AtlasId(smudgy_cloud::Uuid::from_u128(n)))
+    }
+
+    /// Link callbacks run during terminal event dispatch, while the widget's
+    /// immutable scrollback borrow is still live. They must only publish a
+    /// message; the subsequent update is where session mutation belongs.
+    #[test]
+    fn link_click_defers_activation_past_the_terminal_borrow() {
+        let buffer = RefCell::new(TerminalBuffer::new());
+        let render_borrow = buffer.borrow();
+        let handler = link_activation_handler(true).expect("a ready runtime enables links");
+        let event = LinkClickEvent {
+            action: LinkAction::ServerSend(Arc::from("look")),
+            shift: true,
+            ctrl: false,
+            alt: true,
+        };
+
+        let Message::LinkActivated(published) = handler(event.clone()) else {
+            panic!("the terminal callback must only publish LinkActivated");
+        };
+        assert_eq!(published.action, event.action);
+        assert_eq!(
+            (published.shift, published.ctrl, published.alt),
+            (event.shift, event.ctrl, event.alt)
+        );
+        assert!(
+            buffer.try_borrow_mut().is_err(),
+            "the render borrow intentionally remains live during the callback"
+        );
+
+        drop(render_borrow);
+        assert!(buffer.try_borrow_mut().is_ok());
+        assert!(
+            link_activation_handler(false).is_none(),
+            "links remain inert until the session runtime is available"
+        );
     }
 
     /// The input mirror feed's interest gate and coalescing: without interest

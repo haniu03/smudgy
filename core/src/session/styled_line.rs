@@ -488,6 +488,12 @@ impl LinkTooltipState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Whether the tooltip callback has been dispatched but has not resolved.
+    #[must_use]
+    pub fn is_loading(&self) -> bool {
+        self.status.load(Ordering::Acquire) == TOOLTIP_LOADING
+    }
 }
 
 /// The callback address and shared result cell for a lazy script tooltip.
@@ -596,6 +602,15 @@ impl LinkTooltip {
             return None;
         };
         callback.state.begin_request().then(|| callback.clone())
+    }
+
+    /// Whether this tooltip is currently waiting for its async callback.
+    #[must_use]
+    pub fn is_loading(&self) -> bool {
+        matches!(
+            &self.source,
+            LinkTooltipSource::Callback(callback) if callback.state.is_loading()
+        )
     }
 }
 
@@ -1770,5 +1785,27 @@ mod sanitize_tests {
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].begin_pos, 0);
         assert_eq!(line.spans[0].end_pos, line.text.len());
+    }
+}
+
+#[cfg(test)]
+mod tooltip_state_tests {
+    use super::{LinkTooltipState, LinkTooltipText};
+    use std::sync::Arc;
+
+    #[test]
+    fn async_tooltip_reports_loading_only_while_awaiting_resolution() {
+        let state = LinkTooltipState::default();
+        assert!(!state.is_loading());
+        assert!(state.begin_request());
+        assert!(state.is_loading());
+        assert!(!state.begin_request());
+
+        state.resolve(Some(LinkTooltipText::plain(Arc::from("ready"))));
+        assert!(!state.is_loading());
+        assert_eq!(
+            state.text().expect("resolved tooltip").text.as_ref(),
+            "ready"
+        );
     }
 }

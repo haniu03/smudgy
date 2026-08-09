@@ -25,8 +25,16 @@ pub use sgr::process as sgr_process;
 /// still displays, unlinked).
 const MAX_OSC8_URI_LEN: usize = 4096;
 
-fn dangerous_invisible(c: char, prose: bool) -> bool {
-    if prose && (matches!(c, '\u{200c}' | '\u{200d}') || ('\u{e0000}'..='\u{e007f}').contains(&c)) {
+fn dangerous_invisible(c: char, allow_shaping_controls: bool) -> bool {
+    // Joiners, variation selectors, and emoji tag characters are invisible on
+    // their own because they modify the glyph beside them. Preserve them in
+    // authored prose/link labels so sequences such as `🗝️` and ZWJ emoji shape
+    // normally. Destination disclosure keeps `allow_shaping_controls` false:
+    // an invisible character in a URL or command is still written explicitly.
+    if allow_shaping_controls
+        && (matches!(c, '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}')
+            || ('\u{e0000}'..='\u{e007f}').contains(&c))
+    {
         return false;
     }
     matches!(
@@ -285,11 +293,20 @@ fn style_field<'a>(
     style.get(full).or_else(|| style.get(compact))
 }
 
+fn link_background(value: &serde_json::Map<String, serde_json::Value>) -> Option<LinkColor> {
+    // Mudlet accepts both its compact `bg` spelling and the full CSS property.
+    // The full spelling is parsed last upstream, so it wins when both appear.
+    value
+        .get("background-color")
+        .or_else(|| value.get("bg"))
+        .and_then(link_color)
+}
+
 fn parse_link_text_style(value: &serde_json::Value) -> Option<LinkTextStyle> {
     let style = value.as_object()?;
     Some(LinkTextStyle {
         foreground: style_field(style, "color", "c").and_then(link_color),
-        background: style_field(style, "bg", "bg").and_then(link_color),
+        background: link_background(style),
         bold: style_field(style, "bold", "b").and_then(serde_json::Value::as_bool),
         italic: style_field(style, "italic", "i").and_then(serde_json::Value::as_bool),
         underline: style_field(style, "underline", "u").and_then(link_decoration),
@@ -397,33 +414,159 @@ fn deep_merge(base: &mut serde_json::Value, higher: serde_json::Value) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Osc8QueryFieldKind {
+    Config,
+    Preset,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Osc8QueryField<'a> {
+    raw: &'a str,
+    kind: Osc8QueryFieldKind,
+    value: Option<&'a str>,
+}
+
+fn encoded_equals_at(value: &str) -> Option<usize> {
+    value.as_bytes().windows(3).position(|window| {
+        window[0] == b'%' && window[1] == b'3' && matches!(window[2], b'd' | b'D')
+    })
+}
+
+fn osc8_query_field(raw: &str) -> Osc8QueryField<'_> {
+    let literal = raw.find('=').map(|index| (index, 1));
+    let encoded = encoded_equals_at(raw).map(|index| (index, 3));
+    let separator = match (literal, encoded) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (left, right) => left.or(right),
+    };
+    let (key, value) = separator.map_or((raw, None), |(index, width)| {
+        (&raw[..index], Some(&raw[index + width..]))
+    });
+    let kind = match key {
+        "config" => Osc8QueryFieldKind::Config,
+        "preset" => Osc8QueryFieldKind::Preset,
+        _ => Osc8QueryFieldKind::Other,
+    };
+    Osc8QueryField { raw, kind, value }
+}
+
+/// Return the byte length of one raw JSON object, including its closing brace.
+/// OSC 8 examples commonly leave JSON unescaped, so `#` colors and `&` inside
+/// strings must not be mistaken for URI delimiters.
+fn raw_json_object_len(value: &str) -> Option<usize> {
+    if !value.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string && byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn osc8_query_fields(query: &str) -> (Vec<Osc8QueryField<'_>>, Option<&str>) {
+    let mut fields = Vec::new();
+    let mut cursor = 0usize;
+    let bytes = query.as_bytes();
+    let mut fragment = None;
+
+    while cursor < query.len() {
+        if bytes[cursor] == b'#' {
+            fragment = Some(&query[cursor + 1..]);
+            break;
+        }
+
+        let provisional_end = query[cursor..]
+            .bytes()
+            .position(|byte| matches!(byte, b'&' | b'#'))
+            .map_or(query.len(), |offset| cursor + offset);
+        let probe = osc8_query_field(&query[cursor..provisional_end]);
+        let mut field_end = provisional_end;
+
+        if probe.kind == Osc8QueryFieldKind::Config
+            && let Some(value) = probe.value
+            && value.starts_with('{')
+        {
+            let value_start = cursor + probe.raw.len() - value.len();
+            field_end = raw_json_object_len(&query[value_start..])
+                .map_or(query.len(), |length| value_start + length);
+            if field_end < query.len() && !matches!(bytes[field_end], b'&' | b'#') {
+                field_end = query[field_end..]
+                    .bytes()
+                    .position(|byte| matches!(byte, b'&' | b'#'))
+                    .map_or(query.len(), |offset| field_end + offset);
+            }
+        }
+
+        fields.push(osc8_query_field(&query[cursor..field_end]));
+        if field_end == query.len() {
+            break;
+        }
+        match bytes[field_end] {
+            b'&' => cursor = field_end + 1,
+            b'#' => {
+                fragment = Some(&query[field_end + 1..]);
+                break;
+            }
+            _ => unreachable!("query scanner stops only at ASCII delimiters"),
+        }
+    }
+
+    (fields, fragment)
+}
+
 /// Extract the first valid Mudlet-compatible `config` tooltip and remove all
-/// literal `config` query fields from the actionable target. Smudgy advertises
+/// reserved query fields from the actionable target. Smudgy advertises
 /// `OSC_HYPERLINKS_TOOLTIP`, so the extension specification reserves this key;
 /// an ordinary URL can retain one by percent-encoding the key itself.
 fn osc8_config(uri: &str, presets: &HashMap<String, serde_json::Value>) -> (String, Osc8Config) {
-    let (before_fragment, fragment) = uri
-        .split_once('#')
-        .map_or((uri, None), |(head, tail)| (head, Some(tail)));
-    let Some((base, query)) = before_fragment.split_once('?') else {
+    let Some((base, query)) = uri.split_once('?') else {
         return (uri.to_string(), Osc8Config::default());
     };
-    if !query
-        .split('&')
-        .any(|field| field.starts_with("config=") || field.starts_with("preset="))
+    let (fields, fragment) = osc8_query_fields(query);
+    if !fields
+        .iter()
+        .any(|field| field.kind != Osc8QueryFieldKind::Other)
     {
         return (uri.to_string(), Osc8Config::default());
     }
-    let override_config = query.split('&').find_map(|field| {
-        let encoded = field.strip_prefix("config=")?;
-        let decoded = percent_decode(encoded);
+    let override_config = fields.iter().find_map(|field| {
+        (field.kind == Osc8QueryFieldKind::Config).then_some(())?;
+        let decoded = percent_decode(field.value?);
         serde_json::from_str::<serde_json::Value>(&decoded).ok()
     });
-    let preset = query.split('&').find_map(|field| {
-        field
-            .strip_prefix("preset=")
-            .map(percent_decode)
-            .and_then(|name| presets.get(&name).cloned())
+    let preset = fields.iter().find_map(|field| {
+        (field.kind == Osc8QueryFieldKind::Preset).then_some(())?;
+        let name = percent_decode(field.value?);
+        presets.get(&name).cloned()
     });
     let mut config = preset;
     if let Some(higher) = override_config {
@@ -433,9 +576,10 @@ fn osc8_config(uri: &str, presets: &HashMap<String, serde_json::Value>) -> (Stri
         }
     }
 
-    let kept: Vec<_> = query
-        .split('&')
-        .filter(|field| !field.starts_with("config=") && !field.starts_with("preset="))
+    let kept: Vec<_> = fields
+        .iter()
+        .filter(|field| field.kind == Osc8QueryFieldKind::Other)
+        .map(|field| field.raw)
         .collect();
     let mut target = String::with_capacity(uri.len());
     target.push_str(base);
@@ -1022,9 +1166,9 @@ impl VTActor for VtProcessor {
         if let Some(raw_mark) = self.pending_cr.take() {
             self.restart_open_line(raw_mark);
         }
-        if self.cursor_link.is_some() && dangerous_invisible(b, false) {
+        if self.cursor_link.is_some() && dangerous_invisible(b, true) {
             let mut escaped = String::new();
-            push_display_char(&mut escaped, b, false);
+            push_display_char(&mut escaped, b, true);
             self.buf.push_str(&escaped);
         } else {
             self.push_incoming_char(b);
@@ -1129,7 +1273,10 @@ impl VTActor for VtProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnsiColor, Color, MAX_OSC8_URI_LEN, VtProcessor, parse_link_tooltip_text};
+    use super::{
+        AnsiColor, Color, MAX_OSC8_URI_LEN, VtProcessor, menu_title, parse_link_tooltip_text,
+        sanitize_display_text,
+    };
     use crate::session::runtime::RuntimeAction;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use vtparse::VTParser;
@@ -1340,6 +1487,202 @@ mod tests {
     }
 
     #[test]
+    fn osc8_url_parameter_matrix_matches_mudlet() {
+        let cases = [
+            (
+                "\x1b]8;;https://example.com/?id=42&lang=en\x1b\\Link\x1b]8;;\x1b\\\n",
+                LinkAction::OpenUrl(std::sync::Arc::from("https://example.com/?id=42&lang=en")),
+            ),
+            (
+                "\x1b]8;;https://example.com/?config=%7B%22style%22%3A%7B%22color%22%3A%22red%22%7D%7D\x1b\\Styled\x1b]8;;\x1b\\\n",
+                LinkAction::OpenUrl(std::sync::Arc::from("https://example.com/")),
+            ),
+            (
+                "\x1b]8;;https://example.com/?page=1&preset=danger\x1b\\Link\x1b]8;;\x1b\\\n",
+                LinkAction::OpenUrl(std::sync::Arc::from("https://example.com/?page=1")),
+            ),
+            (
+                "\x1b]8;;https://example.com/?preset%3Ddefault&page=1\x1b\\Link\x1b]8;;\x1b\\\n",
+                LinkAction::OpenUrl(std::sync::Arc::from("https://example.com/?page=1")),
+            ),
+            (
+                "\x1b]8;;https://example.com/?config%3dvalue&foo=bar\x1b\\Link\x1b]8;;\x1b\\\n",
+                LinkAction::OpenUrl(std::sync::Arc::from("https://example.com/?foo=bar")),
+            ),
+            (
+                "\x1b]8;;https://example.com/?%63%6F%6E%66%69%67=value\x1b\\Link\x1b]8;;\x1b\\\n",
+                LinkAction::OpenUrl(std::sync::Arc::from(
+                    "https://example.com/?%63%6F%6E%66%69%67=value",
+                )),
+            ),
+            (
+                "\x1b]8;;send:attack?config=%7B%22style%22%3A%7B%22color%22%3A%22red%22%7D%7D\x1b\\Attack\x1b]8;;\x1b\\\n",
+                LinkAction::ServerSend(std::sync::Arc::from("attack")),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let mut h = harness();
+            h.feed(input.as_bytes());
+            let lines = committed_lines(&h.actions());
+            assert_eq!(lines.len(), 1, "input: {input:?}");
+            assert_eq!(lines[0].links.len(), 1, "input: {input:?}");
+            assert_eq!(lines[0].links[0].action, expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn osc8_raw_json_keeps_hash_colors_ampersands_and_url_fragments_distinct() {
+        let mut h = harness();
+        h.feed(
+            b"\x1b]8;;https://example.com/pay?x=1&config={\"style\":{\"color\":\"#0066ff\"},\"tooltip\":\"A & B\"}#receipt\x1b\\pay\x1b]8;;\x1b\\\n",
+        );
+        let lines = committed_lines(&h.actions());
+        let link = &lines[0].links[0];
+        assert_eq!(
+            link.action,
+            LinkAction::OpenUrl(std::sync::Arc::from("https://example.com/pay?x=1#receipt"))
+        );
+        assert_eq!(
+            link.style.as_ref().expect("raw JSON style").base.foreground,
+            Some(LinkColor {
+                red: 0,
+                green: 102,
+                blue: 255,
+                alpha: 255,
+            })
+        );
+        assert_eq!(
+            link.tooltip.as_ref().and_then(LinkTooltip::display),
+            Some((
+                std::sync::Arc::from("A & B"),
+                Some(std::sync::Arc::from("https://example.com/pay?x=1#receipt"))
+            ))
+        );
+    }
+
+    #[test]
+    fn osc8_menu_title_text_matrix_rejects_invalid_or_empty_copy() {
+        let cases = [
+            (
+                serde_json::json!("Lamb and Barley Stew"),
+                Some("Lamb and Barley Stew"),
+            ),
+            (
+                serde_json::json!({"text": "Style-less Title"}),
+                Some("Style-less Title"),
+            ),
+            (
+                serde_json::json!("Potion du Guerrier"),
+                Some("Potion du Guerrier"),
+            ),
+            (
+                serde_json::json!("Item <Rare> [+5] & More!"),
+                Some("Item <Rare> [+5] & More!"),
+            ),
+            (serde_json::json!(""), None),
+            (serde_json::json!({"text": ""}), None),
+            (serde_json::json!({"style": {"color": "red"}}), None),
+            (serde_json::json!(42), None),
+            (serde_json::json!(true), None),
+            (serde_json::json!(["a", "b"]), None),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(
+                menu_title(&value).as_ref().map(|title| title.text.as_ref()),
+                expected,
+                "value: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc8_menu_title_style_matrix_supports_css_and_decorations() {
+        let title = menu_title(&serde_json::json!({
+            "text": "Decorated Title",
+            "style": {
+                "color": "#ff0000",
+                "background-color": "#660000",
+                "bold": true,
+                "italic": true,
+                "underline": true,
+                "strikethrough": true,
+                "text-decoration-color": "#ff00ff"
+            }
+        }))
+        .expect("styled title");
+        let style = title.style.expect("title style");
+        assert_eq!(
+            style.foreground,
+            Some(LinkColor {
+                red: 255,
+                green: 0,
+                blue: 0,
+                alpha: 255,
+            })
+        );
+        assert_eq!(
+            style.background,
+            Some(LinkColor {
+                red: 102,
+                green: 0,
+                blue: 0,
+                alpha: 255,
+            })
+        );
+        assert_eq!(style.bold, Some(true));
+        assert_eq!(style.italic, Some(true));
+        assert_eq!(style.underline, Some(LinkDecoration::Solid));
+        assert_eq!(style.strikethrough, Some(LinkDecoration::Solid));
+        assert_eq!(
+            style.decoration_color,
+            Some(LinkColor {
+                red: 255,
+                green: 0,
+                blue: 255,
+                alpha: 255,
+            })
+        );
+
+        for (name, expected) in [
+            ("wavy", LinkDecoration::Wavy),
+            ("dotted", LinkDecoration::Dotted),
+            ("dashed", LinkDecoration::Dashed),
+        ] {
+            let title = menu_title(&serde_json::json!({
+                "text": "Underline",
+                "style": {"underline": name}
+            }))
+            .expect("underlined title");
+            assert_eq!(
+                title.style.expect("title style").underline,
+                Some(expected),
+                "underline: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc8_parses_at_every_packet_boundary() {
+        let input = b"before \x1b]8;;send:look?config={\"style\":{\"color\":\"#0066ff\"}}\x1b\\look\x1b]8;;\x1b\\ after\n";
+        for split in 0..=input.len() {
+            let mut h = harness();
+            h.feed(&input[..split]);
+            h.feed(&input[split..]);
+            let lines = committed_lines(&h.actions());
+            assert_eq!(lines.len(), 1, "split at byte {split}");
+            assert_eq!(lines[0].text, "before look after", "split at byte {split}");
+            assert_eq!(lines[0].links.len(), 1, "split at byte {split}");
+            assert_eq!(
+                lines[0].links[0].action,
+                LinkAction::ServerSend(std::sync::Arc::from("look")),
+                "split at byte {split}"
+            );
+        }
+    }
+
+    #[test]
     fn osc8_basic_style_parses_full_and_compact_properties() {
         let mut h = harness();
         h.feed(
@@ -1493,6 +1836,22 @@ mod tests {
         let lines = committed_lines(&h.actions());
         assert_eq!(lines[0].text, "safe\\u{202E}txt");
         assert_eq!(lines[0].links[0].end_pos, lines[0].text.len());
+    }
+
+    #[test]
+    fn osc8_link_copy_preserves_emoji_shaping_controls() {
+        let mut h = harness();
+        let label = "🗝️ 👩‍💻";
+        h.feed(format!("\x1b]8;;send:look\x1b\\{label}\x1b]8;;\x1b\\\n").as_bytes());
+        let lines = committed_lines(&h.actions());
+
+        assert_eq!(lines[0].text, label);
+        assert_eq!(lines[0].links[0].end_pos, label.len());
+        assert_eq!(
+            sanitize_display_text("send:look\u{fe0f}", false).as_ref(),
+            "send:look\\u{FE0F}",
+            "destination disclosure must still expose invisible shaping controls"
+        );
     }
 
     #[test]
