@@ -3430,6 +3430,7 @@ fn packed_echo_lines(
                 Some(StyledLink {
                     tooltip: link_context.tooltip(tooltip, &action)?,
                     action,
+                    style: None,
                 })
             } else {
                 None
@@ -3668,7 +3669,11 @@ fn wire_link_to_styled(
                 LinkTooltip::text(Arc::from(hint), tooltip_target(&action))
             })
         });
-    Ok(Some(StyledLink { action, tooltip }))
+    Ok(Some(StyledLink {
+        action,
+        tooltip,
+        style: None,
+    }))
 }
 
 impl StyledRunWire {

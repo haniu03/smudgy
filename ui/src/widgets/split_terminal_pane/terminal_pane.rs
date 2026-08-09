@@ -22,7 +22,8 @@ use iced::{
     window,
 };
 use smudgy_core::session::styled_line::{
-    LinkAction, LinkMenu, LinkMenuItem, LinkTooltip, LinkTooltipCallback, LinkTooltipText,
+    LinkAction, LinkDecoration, LinkMenu, LinkMenuItem, LinkTooltip, LinkTooltipCallback,
+    LinkTooltipText,
 };
 
 mod spans;
@@ -35,6 +36,68 @@ type Link = SpanMetadata;
 /// 100 '0's shaped once per prefs generation to measure the monospace cell
 /// advance for the column-based line-length clamp.
 const ADVANCE_PROBE: &str = "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
+fn draw_text_decoration<Renderer: advanced::Renderer>(
+    renderer: &mut Renderer,
+    region: Rectangle,
+    y: f32,
+    decoration: LinkDecoration,
+    color: iced::Color,
+    viewport: Rectangle,
+) {
+    let mut fill = |x: f32, y: f32, width: f32| {
+        let rect = Rectangle {
+            x,
+            y,
+            width: width.max(0.5),
+            height: 1.0,
+        };
+        if let Some(bounds) = rect.intersection(&viewport) {
+            renderer.fill_quad(
+                Quad {
+                    bounds,
+                    ..Default::default()
+                },
+                color,
+            );
+        }
+    };
+    match decoration {
+        LinkDecoration::None => {}
+        LinkDecoration::Solid => fill(region.x, y, region.width),
+        LinkDecoration::Double => {
+            fill(region.x, y - 2.0, region.width);
+            fill(region.x, y, region.width);
+        }
+        LinkDecoration::Dotted => {
+            let mut x = region.x;
+            while x < region.x + region.width {
+                fill(x, y, 1.0_f32.min(region.x + region.width - x));
+                x += 3.0;
+            }
+        }
+        LinkDecoration::Dashed => {
+            let mut x = region.x;
+            while x < region.x + region.width {
+                fill(x, y, 4.0_f32.min(region.x + region.width - x));
+                x += 6.0;
+            }
+        }
+        LinkDecoration::Wavy => {
+            let mut x = region.x;
+            let mut up = false;
+            while x < region.x + region.width {
+                fill(
+                    x,
+                    y + if up { -1.0 } else { 0.0 },
+                    2.0_f32.min(region.x + region.width - x),
+                );
+                up = !up;
+                x += 2.0;
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ParagraphCache<P: text::Paragraph> {
@@ -254,6 +317,7 @@ fn draw_link_tooltip<Renderer>(
                         &primary.text[span.begin_pos..span.end_pos],
                         span.style,
                         false,
+                        None,
                         prefs,
                     )
                 })
@@ -1024,15 +1088,20 @@ where
                 // renders glyphs only). Undecorated spans (the overwhelmingly
                 // common case) skip before any span_bounds work.
                 for (span_idx, span) in cache.spans.spans().iter().enumerate() {
-                    if span.highlight.is_none() && !span.underline && !span.strikethrough {
+                    let metadata = span.link.unwrap_or_default();
+                    if span.highlight.is_none()
+                        && metadata.underline == LinkDecoration::None
+                        && metadata.overline == LinkDecoration::None
+                        && metadata.strikethrough == LinkDecoration::None
+                    {
                         continue;
                     }
                     let regions = cache.paragraph.span_bounds(span_idx);
-                    let blink_hidden = span.link.is_some_and(|metadata| match metadata.blink {
+                    let blink_hidden = match metadata.blink {
                         smudgy_core::session::styled_line::Blink::None => false,
                         smudgy_core::session::styled_line::Blink::Slow => !state.slow_blink_visible,
                         smudgy_core::session::styled_line::Blink::Fast => !state.fast_blink_visible,
-                    });
+                    };
 
                     if let Some(highlight) = span.highlight {
                         for region in &regions {
@@ -1055,59 +1124,50 @@ where
                         }
                     }
 
-                    if span.underline && !blink_hidden {
+                    if !blink_hidden {
                         // Baseline placement per iced's rich_text: the underline
                         // sits at font size plus half the leading, nudged up by
                         // 8% of the font size.
                         let (font_size, line_height) = effective_metrics(&prefs, self.font_size);
                         let underline_y =
                             font_size + (line_height - font_size) / 2.0 - font_size * 0.08;
-                        let line_count =
-                            if span.link.is_some_and(|metadata| metadata.double_underline) {
-                                2
-                            } else {
-                                1
-                            };
-                        for line in 0..line_count {
-                            for region in &regions {
-                                let rect = Rectangle {
-                                    x: layout.bounds().x + region.x,
-                                    y: region.y + y + underline_y - line as f32 * 2.0,
-                                    width: region.width,
-                                    height: 1.0,
-                                };
-                                if let Some(bounds) = rect.intersection(&clipped_viewport) {
-                                    renderer.fill_quad(
-                                        Quad {
-                                            bounds,
-                                            ..Default::default()
-                                        },
-                                        span.color.unwrap_or(iced::Color::WHITE),
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    if span.strikethrough && !blink_hidden {
-                        let (font_size, line_height) = effective_metrics(&prefs, self.font_size);
                         let strike_y = (line_height - font_size) / 2.0 + font_size * 0.55;
+                        let overline_y = (line_height - font_size) / 2.0 + 1.0;
+                        let color = metadata
+                            .decoration_color
+                            .or(span.color)
+                            .unwrap_or(iced::Color::WHITE);
                         for region in &regions {
-                            let rect = Rectangle {
+                            let region = Rectangle {
                                 x: layout.bounds().x + region.x,
-                                y: region.y + y + strike_y,
+                                y: region.y + y,
                                 width: region.width,
-                                height: 1.0,
+                                height: region.height,
                             };
-                            if let Some(bounds) = rect.intersection(&clipped_viewport) {
-                                renderer.fill_quad(
-                                    Quad {
-                                        bounds,
-                                        ..Default::default()
-                                    },
-                                    span.color.unwrap_or(iced::Color::WHITE),
-                                );
-                            }
+                            draw_text_decoration(
+                                renderer,
+                                region,
+                                region.y + underline_y,
+                                metadata.underline,
+                                color,
+                                clipped_viewport,
+                            );
+                            draw_text_decoration(
+                                renderer,
+                                region,
+                                region.y + overline_y,
+                                metadata.overline,
+                                color,
+                                clipped_viewport,
+                            );
+                            draw_text_decoration(
+                                renderer,
+                                region,
+                                region.y + strike_y,
+                                metadata.strikethrough,
+                                color,
+                                clipped_viewport,
+                            );
                         }
                     }
                 }
@@ -1616,7 +1676,7 @@ mod tests {
             .color(iced::Color::WHITE)
             .link(SpanMetadata {
                 blink,
-                double_underline: false,
+                ..SpanMetadata::default()
             })
     }
 

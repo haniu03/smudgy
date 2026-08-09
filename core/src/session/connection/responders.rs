@@ -42,6 +42,7 @@ pub mod new_environ {
         (b"OSC_HYPERLINKS_MENU", b"1"),
         (b"OSC_HYPERLINKS_PROMPT", b"1"),
         (b"OSC_HYPERLINKS_SEND", b"1"),
+        (b"OSC_HYPERLINKS_STYLE_BASIC", b"1"),
         (b"OSC_HYPERLINKS_TOOLTIP", b"1"),
     ];
 
@@ -374,6 +375,7 @@ mod tests {
             b"OSC_HYPERLINKS_COMPACT".as_slice(),
             b"OSC_HYPERLINKS_DISABLED".as_slice(),
             b"OSC_HYPERLINKS_MENU".as_slice(),
+            b"OSC_HYPERLINKS_STYLE_BASIC".as_slice(),
         ] {
             assert!(
                 payload

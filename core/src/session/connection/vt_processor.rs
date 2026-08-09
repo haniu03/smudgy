@@ -6,8 +6,8 @@ use vtparse::{CsiParam, VTActor, VTParser};
 use crate::session::{
     runtime::RuntimeAction,
     styled_line::{
-        LinkAction, LinkMenu, LinkMenuItem, LinkSpan, LinkTooltip, LinkTooltipText, Style,
-        StyledLine, VtSpan,
+        LinkAction, LinkColor, LinkDecoration, LinkMenu, LinkMenuItem, LinkSpan, LinkStyle,
+        LinkTextStyle, LinkTooltip, LinkTooltipText, Style, StyledLine, VtSpan,
     },
 };
 
@@ -174,6 +174,7 @@ pub fn parse_link_tooltip_text(text: &str) -> Option<LinkTooltipText> {
 struct ParsedLink {
     action: LinkAction,
     tooltip: LinkTooltip,
+    style: Option<LinkStyle>,
 }
 
 #[derive(Default)]
@@ -181,6 +182,63 @@ struct Osc8Config {
     tooltip: Option<LinkTooltipText>,
     disabled: bool,
     menu: Option<LinkMenu>,
+    style: Option<LinkStyle>,
+}
+
+fn link_color(value: &serde_json::Value) -> Option<LinkColor> {
+    let canonical = smudgy_cloud::canonicalize_css_color(value.as_str()?.trim())?;
+    let hex = canonical.strip_prefix('#')?;
+    let byte = |start| u8::from_str_radix(hex.get(start..start + 2)?, 16).ok();
+    Some(LinkColor {
+        red: byte(0)?,
+        green: byte(2)?,
+        blue: byte(4)?,
+        alpha: if hex.len() == 8 { byte(6)? } else { u8::MAX },
+    })
+}
+
+fn link_decoration(value: &serde_json::Value) -> Option<LinkDecoration> {
+    if let Some(enabled) = value.as_bool() {
+        return Some(if enabled {
+            LinkDecoration::Solid
+        } else {
+            LinkDecoration::None
+        });
+    }
+    match value.as_str()?.to_ascii_lowercase().as_str() {
+        "none" | "false" => Some(LinkDecoration::None),
+        "solid" | "single" | "true" => Some(LinkDecoration::Solid),
+        "double" => Some(LinkDecoration::Double),
+        "dotted" => Some(LinkDecoration::Dotted),
+        "dashed" => Some(LinkDecoration::Dashed),
+        "wavy" => Some(LinkDecoration::Wavy),
+        _ => None,
+    }
+}
+
+fn style_field<'a>(
+    style: &'a serde_json::Map<String, serde_json::Value>,
+    full: &str,
+    compact: &str,
+) -> Option<&'a serde_json::Value> {
+    style.get(full).or_else(|| style.get(compact))
+}
+
+fn parse_link_style(value: &serde_json::Value) -> Option<LinkStyle> {
+    let style = value.as_object()?;
+    Some(LinkStyle {
+        base: LinkTextStyle {
+            foreground: style_field(style, "color", "c").and_then(link_color),
+            background: style_field(style, "bg", "bg").and_then(link_color),
+            bold: style_field(style, "bold", "b").and_then(serde_json::Value::as_bool),
+            italic: style_field(style, "italic", "i").and_then(serde_json::Value::as_bool),
+            underline: style_field(style, "underline", "u").and_then(link_decoration),
+            overline: style_field(style, "overline", "o").and_then(link_decoration),
+            strikethrough: style_field(style, "strikethrough", "st").and_then(link_decoration),
+            decoration_color: style_field(style, "text-decoration-color", "tdc")
+                .and_then(link_color),
+        },
+    })
 }
 
 /// Extract the first valid Mudlet-compatible `config` tooltip and remove all
@@ -238,12 +296,17 @@ fn osc8_config(uri: &str) -> (String, Osc8Config) {
         .get("menu")
         .or_else(|| config.get("m"))
         .and_then(|menu| parse_menu(menu, title));
+    let style = config
+        .get("style")
+        .or_else(|| config.get("s"))
+        .and_then(parse_link_style);
     (
         target,
         Osc8Config {
             tooltip,
             disabled,
             menu,
+            style,
         },
     )
 }
@@ -352,7 +415,11 @@ fn link_action_for_uri(uri: &str) -> Option<ParsedLink> {
     } else {
         primary
     };
-    Some(ParsedLink { action, tooltip })
+    Some(ParsedLink {
+        action,
+        tooltip,
+        style: config.style,
+    })
 }
 
 /// Decode `%XX` escapes (RFC 3986); anything malformed passes through
@@ -482,6 +549,7 @@ impl VtProcessor {
                     end_pos: self.buf.len(),
                     action: link.action.clone(),
                     tooltip: Some(link.tooltip.clone()),
+                    style: link.style.clone(),
                 });
             }
             if !keep_active {
@@ -884,7 +952,9 @@ mod tests {
         assert_eq!(transcript(&h.actions()), ["partial:> ", "line:ok"]);
     }
 
-    use crate::session::styled_line::{LinkAction, LinkMenuItem, LinkTooltip, StyledLine};
+    use crate::session::styled_line::{
+        LinkAction, LinkColor, LinkDecoration, LinkMenuItem, LinkTooltip, StyledLine,
+    };
 
     fn committed_lines(actions: &[RuntimeAction]) -> Vec<std::sync::Arc<StyledLine>> {
         actions
@@ -916,6 +986,60 @@ mod tests {
                 .and_then(LinkTooltip::display),
             Some((std::sync::Arc::from("https://example.com"), None))
         );
+    }
+
+    #[test]
+    fn osc8_basic_style_parses_full_and_compact_properties() {
+        let mut h = harness();
+        h.feed(
+            b"\x1b]8;;send:look?config=%7B%22s%22%3A%7B%22c%22%3A%22red%22%2C%22bg%22%3A%22%2301020380%22%2C%22b%22%3Afalse%2C%22i%22%3Atrue%2C%22u%22%3Afalse%2C%22o%22%3A%22dotted%22%2C%22st%22%3A%22wavy%22%2C%22tdc%22%3A%22blue%22%7D%7D\x1b\\styled\x1b]8;;\x1b\\\n",
+        );
+        let lines = committed_lines(&h.actions());
+        let style = &lines[0].links[0]
+            .style
+            .as_ref()
+            .expect("authored style")
+            .base;
+        assert_eq!(
+            style.foreground,
+            Some(LinkColor {
+                red: 255,
+                green: 0,
+                blue: 0,
+                alpha: 255,
+            })
+        );
+        assert_eq!(
+            style.background,
+            Some(LinkColor {
+                red: 1,
+                green: 2,
+                blue: 3,
+                alpha: 128,
+            })
+        );
+        assert_eq!(style.bold, Some(false));
+        assert_eq!(style.italic, Some(true));
+        assert_eq!(style.underline, Some(LinkDecoration::None));
+        assert_eq!(style.overline, Some(LinkDecoration::Dotted));
+        assert_eq!(style.strikethrough, Some(LinkDecoration::Wavy));
+        assert_eq!(
+            style.decoration_color,
+            Some(LinkColor {
+                red: 0,
+                green: 0,
+                blue: 255,
+                alpha: 255,
+            })
+        );
+    }
+
+    #[test]
+    fn osc8_empty_authored_style_is_retained() {
+        let mut h = harness();
+        h.feed(b"\x1b]8;;send:look?config=%7B%22style%22%3A%7B%7D%7D\x1b\\look\x1b]8;;\x1b\\\n");
+        let lines = committed_lines(&h.actions());
+        assert!(lines[0].links[0].style.is_some());
     }
 
     #[test]

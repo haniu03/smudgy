@@ -364,7 +364,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (or the first command link) opens a confirmation showing the exact
   destination — nothing the server sends can disguise it — where you can also
   choose to always allow that site or always trust every link from that
-  server. Other URI schemes are ignored.
+  server. Mudlet-compatible OSC styling now controls link colors, bold,
+  italic, underline/overline/strikethrough forms, and decoration color;
+  unstyled links retain Smudgy's underline and subtle wash, while an authored
+  style (including `underline: false`) takes precedence. Other URI schemes are
+  ignored.
 
 ### Fixed
 

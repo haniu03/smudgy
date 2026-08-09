@@ -133,7 +133,8 @@ impl LineOperation {
                                 if may_merge
                                     && prev.end_pos == cursor
                                     && prev.action == link.action
-                                    && prev.tooltip == link.tooltip =>
+                                    && prev.tooltip == link.tooltip
+                                    && prev.style == link.style =>
                             {
                                 prev.end_pos = run_end;
                             }
@@ -142,6 +143,7 @@ impl LineOperation {
                                 end_pos: run_end,
                                 action: link.action.clone(),
                                 tooltip: link.tooltip.clone(),
+                                style: link.style.clone(),
                             }),
                         }
                     }
@@ -211,6 +213,7 @@ mod tests {
         StyledLink {
             action,
             tooltip: None,
+            style: None,
         }
     }
 
@@ -260,6 +263,7 @@ mod tests {
                 end_pos: 8,
                 action: link,
                 tooltip: None,
+                style: None,
             }]
         );
     }
@@ -380,6 +384,7 @@ mod tests {
             end_pos: 8,
             action: action.clone(),
             tooltip: None,
+            style: None,
         });
         let line = Arc::new(inner);
 
@@ -405,12 +410,14 @@ mod tests {
                     end_pos: 8,
                     action: action.clone(),
                     tooltip: None,
+                    style: None,
                 },
                 LinkSpan {
                     begin_pos: 8,
                     end_pos: 9,
                     action,
                     tooltip: None,
+                    style: None,
                 },
             ]
         );
@@ -431,6 +438,7 @@ mod tests {
             end_pos: 8,
             action: LinkAction::Send(std::sync::Arc::from("north")),
             tooltip: None,
+            style: None,
         });
         let line = Arc::new(inner);
 

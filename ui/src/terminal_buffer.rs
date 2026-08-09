@@ -8,16 +8,20 @@ use std::sync::Arc;
 use crate::prefs::TerminalPrefs;
 use smudgy_core::session::runtime::line_operation::LineOperation;
 use smudgy_core::session::styled_line::{
-    Blink, Color, LinkAction, LinkTooltip, Style, StyledLine, Underline,
+    Blink, Color, LinkAction, LinkColor, LinkDecoration, LinkStyle, LinkTooltip, Style, StyledLine,
+    Underline,
 };
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
 
 #[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SpanMetadata {
     pub blink: Blink,
-    pub double_underline: bool,
+    pub underline: LinkDecoration,
+    pub overline: LinkDecoration,
+    pub strikethrough: LinkDecoration,
+    pub decoration_color: Option<iced::Color>,
 }
 
 type Link = SpanMetadata;
@@ -48,9 +52,17 @@ pub(crate) fn make_span(
     text: &str,
     style: Style,
     linked: bool,
+    link_style: Option<&LinkStyle>,
     prefs: &TerminalPrefs,
 ) -> Span<'static, Link> {
-    let attributes = style.attributes;
+    let mut attributes = style.attributes;
+    let authored = link_style.map(|style| &style.base);
+    if let Some(value) = authored.and_then(|style| style.bold) {
+        attributes.bold = value;
+    }
+    if let Some(value) = authored.and_then(|style| style.italic) {
+        attributes.italic = value;
+    }
     let logical_fg = if attributes.bold && prefs.bold_is_bright {
         match style.fg {
             Color::Ansi { color, bold: false } => Color::Ansi { color, bold: true },
@@ -60,14 +72,32 @@ pub(crate) fn make_span(
     } else {
         style.fg
     };
-    let (semantic_fg, semantic_bg, explicit_background) = if attributes.reverse {
-        (style.bg, logical_fg, true)
-    } else {
-        (logical_fg, style.bg, style.bg != Color::DefaultBackground)
-    };
-    let mut fg = match semantic_fg {
+    let terminal_color = |color| match color {
         Color::DefaultBackground => prefs.palette.background,
         other => prefs.resolve(other),
+    };
+    let authored_color = |color: LinkColor| {
+        iced::Color::from_rgba8(
+            color.red,
+            color.green,
+            color.blue,
+            f32::from(color.alpha) / 255.0,
+        )
+    };
+    let logical_fg = authored
+        .and_then(|style| style.foreground)
+        .map_or_else(|| terminal_color(logical_fg), authored_color);
+    let logical_bg = authored
+        .and_then(|style| style.background)
+        .map(authored_color)
+        .or_else(|| (style.bg != Color::DefaultBackground).then(|| terminal_color(style.bg)));
+    let (mut fg, background) = if attributes.reverse {
+        (
+            logical_bg.unwrap_or(prefs.palette.background),
+            Some(logical_fg),
+        )
+    } else {
+        (logical_fg, logical_bg)
     };
     if attributes.faint {
         fg.a *= 0.5;
@@ -79,30 +109,54 @@ pub(crate) fn make_span(
     if attributes.italic {
         font.style = iced::font::Style::Italic;
     }
+    let sgr_underline = match attributes.underline {
+        Underline::None => LinkDecoration::None,
+        Underline::Single => LinkDecoration::Solid,
+        Underline::Double => LinkDecoration::Double,
+    };
+    let mut underline = authored
+        .and_then(|style| style.underline)
+        .unwrap_or(sgr_underline);
+    if linked && link_style.is_none() && underline == LinkDecoration::None {
+        underline = LinkDecoration::Solid;
+    }
+    let overline = authored
+        .and_then(|style| style.overline)
+        .unwrap_or(LinkDecoration::None);
+    let strikethrough =
+        authored
+            .and_then(|style| style.strikethrough)
+            .unwrap_or(if attributes.crossed_out {
+                LinkDecoration::Solid
+            } else {
+                LinkDecoration::None
+            });
+    let decoration_color = authored
+        .and_then(|style| style.decoration_color)
+        .map(authored_color);
     let mut span = Span::<'static, Link>::new(Cow::Owned(text.to_string()))
         .color(fg)
         .font(font)
-        .underline(linked || attributes.underline != Underline::None)
-        .strikethrough(attributes.crossed_out);
+        .underline(underline != LinkDecoration::None)
+        .strikethrough(strikethrough != LinkDecoration::None);
     // Only a meaningful background sets the span highlight: the widget draws a
     // quad per highlighted span region, so the (overwhelmingly common) default
     // background must stay decoration-free rather than painting a quad of the
     // pane's own color under every span.
-    if linked && !explicit_background {
+    if linked && link_style.is_none() && background.is_none() {
         span = span.background(Background::Color(iced::Color {
             a: LINK_WASH_ALPHA,
             ..fg
         }));
-    } else if explicit_background {
-        let bg = match semantic_bg {
-            Color::DefaultBackground => prefs.palette.background,
-            other => prefs.resolve(other),
-        };
+    } else if let Some(bg) = background {
         span = span.background(Background::Color(bg));
     }
     let metadata = SpanMetadata {
         blink: attributes.blink,
-        double_underline: attributes.underline == Underline::Double,
+        underline,
+        overline,
+        strikethrough,
+        decoration_color,
     };
     if metadata == SpanMetadata::default() {
         span
@@ -124,6 +178,7 @@ fn to_spans(styled_line: &Arc<StyledLine>, prefs: &TerminalPrefs) -> Rc<Vec<Span
                 &styled_line.text[begin..end],
                 span_info.style,
                 false,
+                None,
                 prefs,
             ));
             continue;
@@ -144,6 +199,7 @@ fn to_spans(styled_line: &Arc<StyledLine>, prefs: &TerminalPrefs) -> Rc<Vec<Span
                     &styled_line.text[cursor..linked_begin],
                     span_info.style,
                     false,
+                    None,
                     prefs,
                 ));
             }
@@ -152,6 +208,7 @@ fn to_spans(styled_line: &Arc<StyledLine>, prefs: &TerminalPrefs) -> Rc<Vec<Span
                 &styled_line.text[linked_begin..linked_end],
                 span_info.style,
                 true,
+                link.style.as_ref(),
                 prefs,
             ));
             cursor = linked_end;
@@ -161,6 +218,7 @@ fn to_spans(styled_line: &Arc<StyledLine>, prefs: &TerminalPrefs) -> Rc<Vec<Span
                 &styled_line.text[cursor..end],
                 span_info.style,
                 false,
+                None,
                 prefs,
             ));
         }
@@ -923,6 +981,7 @@ mod tests {
             end_pos: end,
             action: LinkAction::Send(Arc::from("north")),
             tooltip: None,
+            style: None,
         });
         Arc::new(line)
     }
@@ -943,7 +1002,7 @@ mod tests {
         };
 
         prefs.bold_is_bright = true;
-        let bright = make_span("bold", style, false, &prefs);
+        let bright = make_span("bold", style, false, None, &prefs);
         assert_eq!(
             bright.font.map(|font| font.weight),
             Some(iced::font::Weight::Bold)
@@ -957,7 +1016,7 @@ mod tests {
         );
 
         prefs.bold_is_bright = false;
-        let normal = make_span("bold", style, false, &prefs);
+        let normal = make_span("bold", style, false, None, &prefs);
         assert_eq!(
             normal.font.map(|font| font.weight),
             Some(iced::font::Weight::Bold)
@@ -980,6 +1039,7 @@ mod tests {
                 ..style
             },
             false,
+            None,
             &prefs,
         );
         assert_eq!(explicit_bright.color, bright.color);
@@ -1009,7 +1069,7 @@ mod tests {
                 ..TextAttributes::DEFAULT
             },
         };
-        let span = make_span("styled", style, false, &prefs);
+        let span = make_span("styled", style, false, None, &prefs);
         let mut reversed_fg = prefs.resolve(style.bg);
         reversed_fg.a *= 0.5;
         assert_eq!(span.color, Some(reversed_fg));
@@ -1027,7 +1087,9 @@ mod tests {
             span.link,
             Some(SpanMetadata {
                 blink: Blink::Fast,
-                double_underline: true,
+                underline: LinkDecoration::Double,
+                strikethrough: LinkDecoration::Solid,
+                ..SpanMetadata::default()
             })
         );
     }
@@ -1066,6 +1128,63 @@ mod tests {
     }
 
     #[test]
+    fn authored_osc_style_suppresses_fallback_link_affordance() {
+        let prefs = crate::prefs::current();
+        let authored = LinkStyle::default();
+        let span = make_span("link", Style::DEFAULT, true, Some(&authored), &prefs);
+        assert!(
+            !span.underline,
+            "an empty authored style is not auto-underlined"
+        );
+        assert!(
+            span.highlight.is_none(),
+            "an authored style gets no fallback wash"
+        );
+    }
+
+    #[test]
+    fn authored_osc_false_values_override_active_sgr_attributes() {
+        use smudgy_core::session::styled_line::{LinkTextStyle, TextAttributes};
+
+        let prefs = crate::prefs::current();
+        let authored = LinkStyle {
+            base: LinkTextStyle {
+                bold: Some(false),
+                italic: Some(false),
+                underline: Some(LinkDecoration::None),
+                strikethrough: Some(LinkDecoration::None),
+                ..LinkTextStyle::default()
+            },
+        };
+        let span = make_span(
+            "link",
+            Style {
+                attributes: TextAttributes {
+                    bold: true,
+                    italic: true,
+                    underline: Underline::Single,
+                    crossed_out: true,
+                    ..TextAttributes::DEFAULT
+                },
+                ..Style::DEFAULT
+            },
+            true,
+            Some(&authored),
+            &prefs,
+        );
+        assert_ne!(
+            span.font.map(|font| font.weight),
+            Some(iced::font::Weight::Bold)
+        );
+        assert_ne!(
+            span.font.map(|font| font.style),
+            Some(iced::font::Style::Italic)
+        );
+        assert!(!span.underline);
+        assert!(!span.strikethrough);
+    }
+
+    #[test]
     fn to_spans_keeps_explicit_background_under_a_link() {
         use smudgy_core::session::styled_line::{LinkSpan, VtSpan};
         let style = Style {
@@ -1090,6 +1209,7 @@ mod tests {
             end_pos: 5,
             action: LinkAction::Send(Arc::from("north")),
             tooltip: None,
+            style: None,
         });
         let prefs = crate::prefs::current();
         let spans = to_spans(&Arc::new(line), &prefs);

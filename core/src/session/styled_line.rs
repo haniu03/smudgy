@@ -78,6 +78,52 @@ pub struct VtSpan {
     pub end_pos: usize,
 }
 
+/// RGBA color authored by an OSC 8 link configuration. This stays separate
+/// from terminal [`Color`]: OSC colors may carry alpha and must not be mapped
+/// through the active ANSI palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+/// Line decoration requested by Mudlet's OSC 8 styling extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LinkDecoration {
+    #[default]
+    None,
+    Solid,
+    Double,
+    Dotted,
+    Dashed,
+    Wavy,
+}
+
+/// Optional overrides in one OSC 8 style object. `Option<bool>` is
+/// intentional: an authored `false` must be able to turn off an SGR attribute
+/// already active where the link begins.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LinkTextStyle {
+    pub foreground: Option<LinkColor>,
+    pub background: Option<LinkColor>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub underline: Option<LinkDecoration>,
+    pub overline: Option<LinkDecoration>,
+    pub strikethrough: Option<LinkDecoration>,
+    pub decoration_color: Option<LinkColor>,
+}
+
+/// Authored visual style for a link. The wrapper exists even when every
+/// property is absent: `{ "style": {} }` is still an authored style and must
+/// suppress Smudgy's fallback underline/wash.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LinkStyle {
+    pub base: LinkTextStyle,
+}
+
 /// What a click on a linked range of a line does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkAction {
@@ -409,6 +455,10 @@ pub struct LinkSpan {
     pub end_pos: usize,
     pub action: LinkAction,
     pub tooltip: Option<LinkTooltip>,
+    /// `None` means no OSC-authored style and enables Smudgy's fallback link
+    /// affordance. `Some`, including an empty style, follows authored OSC
+    /// semantics exactly.
+    pub style: Option<LinkStyle>,
 }
 
 /// Link metadata on one styled-text run before its byte range is known.
@@ -416,6 +466,7 @@ pub struct LinkSpan {
 pub struct StyledLink {
     pub action: LinkAction,
     pub tooltip: Option<LinkTooltip>,
+    pub style: Option<LinkStyle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,6 +527,7 @@ impl StyledLine {
                     end_pos: link.end_pos + self.text.len(),
                     action: link.action.clone(),
                     tooltip: link.tooltip.clone(),
+                    style: link.style.clone(),
                 }))
                 .collect(),
             raw: match self.raw {
@@ -516,6 +568,7 @@ impl StyledLine {
                         end_pos: clipped_end,
                         action: link.action.clone(),
                         tooltip: link.tooltip.clone(),
+                        style: link.style.clone(),
                     });
                 }
             }
@@ -529,6 +582,7 @@ impl StyledLine {
                         end_pos,
                         action: link.action.clone(),
                         tooltip: link.tooltip.clone(),
+                        style: link.style.clone(),
                     });
                 }
             }
@@ -758,6 +812,7 @@ impl StyledLine {
                     action.clone().map(|action| StyledLink {
                         action,
                         tooltip: None,
+                        style: None,
                     }),
                 )
             })
@@ -796,6 +851,7 @@ impl StyledLine {
                     Some(prev)
                         if prev.action == link.action
                             && prev.tooltip == link.tooltip
+                            && prev.style == link.style
                             && prev.end_pos == begin =>
                     {
                         prev.end_pos = text.len();
@@ -805,6 +861,7 @@ impl StyledLine {
                         end_pos: text.len(),
                         action: link.action.clone(),
                         tooltip: link.tooltip.clone(),
+                        style: link.style.clone(),
                     }),
                 }
             }
@@ -1361,6 +1418,7 @@ mod tests {
                 end_pos: 8,
                 action: send_link("north"),
                 tooltip: None,
+                style: None,
             }]
         );
     }
@@ -1383,6 +1441,7 @@ mod tests {
                 end_pos: 6,
                 action: send_link("go"),
                 tooltip: None,
+                style: None,
             }]
         );
 
@@ -1404,12 +1463,14 @@ mod tests {
                     end_pos: 5,
                     action: send_link("go"),
                     tooltip: None,
+                    style: None,
                 },
                 LinkSpan {
                     begin_pos: 6,
                     end_pos: 7,
                     action: send_link("go"),
                     tooltip: None,
+                    style: None,
                 },
             ]
         );

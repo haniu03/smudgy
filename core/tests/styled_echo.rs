@@ -418,6 +418,7 @@ async fn styled_splice_edits_incoming_lines() {
             end_pos: 20,
             action: LinkAction::Send(Arc::from("north")),
             tooltip: None,
+            style: None,
         }]
     );
     assert_eq!(style_at(exits, 14), rgb);
@@ -601,6 +602,7 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
             end_pos: 11,
             action: LinkAction::Send(Arc::from("north")),
             tooltip: None,
+            style: None,
         }]
     );
 
