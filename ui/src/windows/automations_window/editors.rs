@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use iced::alignment::Vertical;
 use iced::widget::{
-    Column, button, column, container, pick_list, radio, row, text, text_editor, text_input,
+    Column, Space, button, column, container, pick_list, radio, row, text, text_editor, text_input,
 };
 use iced::{Element, Font, Length, Padding};
 
@@ -1289,13 +1289,15 @@ impl AutomationsWindow {
         )]
         .spacing(16.0);
 
-        if let Some(error) = &state.error {
-            body = body.push(error_bar(error));
-        } else if any_invalid {
-            body = body.push(error_bar(
-                crate::i18n::ts!("editor-patterns-invalid"),
-            ));
-        }
+        // Keep this slot mounted while a pattern crosses the valid/invalid
+        // boundary. Inserting the banner ahead of the form used to shift the
+        // focused text input to a different iced tree position, resetting its
+        // state after the first character that made the regex invalid.
+        let error = state
+            .error
+            .as_deref()
+            .or_else(|| any_invalid.then(|| crate::i18n::ts!("editor-patterns-invalid")));
+        body = body.push(error_slot(error));
 
         body = body.push(field_row(
             crate::i18n::ts!("editor-name"),
@@ -1822,6 +1824,20 @@ fn error_bar<'a>(message: &str) -> Elem<'a> {
     .into()
 }
 
+/// A stable editor-tree position for an optional error banner.
+///
+/// The outer container is always present, even when its zero-height child is
+/// empty. This matters for errors derived live from an input: conditionally
+/// inserting a column child ahead of that input makes iced reconcile its
+/// focus state against the wrong child on the next frame.
+fn error_slot<'a>(message: Option<&str>) -> Elem<'a> {
+    let content: Elem<'a> = match message {
+        Some(message) => error_bar(message),
+        None => Space::new().height(0).into(),
+    };
+    container(content).into()
+}
+
 fn verdict_style(status: NodeStatus) -> fn(&Theme) -> iced::widget::text::Style {
     match status {
         NodeStatus::Ok => common::success,
@@ -1866,4 +1882,39 @@ pub(super) fn pane_scroll<'a>(body: Column<'a, Message, Theme>) -> Elem<'a> {
         })
         .width(Length::Fill)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use iced::advanced::Widget;
+    use iced::advanced::widget::tree::Tree;
+
+    use super::*;
+
+    #[test]
+    fn live_error_slot_keeps_following_input_focus_state() {
+        let value = String::new();
+        let valid = iced::widget::column![
+            error_slot(None),
+            text_input("pattern", &value).on_input(Message::SetAliasPattern)
+        ];
+        let mut tree = Tree::new(&valid as &dyn Widget<Message, Theme, iced::Renderer>);
+
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        let input_state = tree.children[1]
+            .state
+            .downcast_mut::<iced::widget::text_input::State<Paragraph>>();
+        input_state.focus();
+
+        let invalid = iced::widget::column![
+            error_slot(Some("invalid regular expression")),
+            text_input("pattern", &value).on_input(Message::SetAliasPattern)
+        ];
+        tree.diff(&invalid as &dyn Widget<Message, Theme, iced::Renderer>);
+
+        let input_state = tree.children[1]
+            .state
+            .downcast_ref::<iced::widget::text_input::State<Paragraph>>();
+        assert!(input_state.is_focused());
+    }
 }
