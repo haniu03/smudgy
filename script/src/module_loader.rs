@@ -722,6 +722,10 @@ impl JsrVersionMeta {
 
 fn parse_jsr_specifier(specifier: &ModuleSpecifier) -> Result<JsrRequest, ModuleLoaderError> {
     let raw = specifier.as_str().trim_start_matches("jsr:");
+    // Deno and packages published by JSR may serialize the scheme path with a
+    // leading slash (`jsr:/@scope/package`) even though the canonical spelling
+    // omits it. Accept both forms while preserving the scoped-package check.
+    let raw = raw.strip_prefix('/').unwrap_or(raw);
     if !raw.starts_with('@') {
         return Err(generic_loader_error(format!(
             "jsr package must be scoped: {specifier}"
@@ -749,6 +753,31 @@ fn parse_jsr_specifier(specifier: &ModuleSpecifier) -> Result<JsrRequest, Module
         range: range.to_string(),
         export: export.to_string(),
     })
+}
+
+#[cfg(test)]
+mod jsr_specifier_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_canonical_and_slash_normalized_specifiers() {
+        for specifier in ["jsr:@std/fmt@^1.0.6/colors", "jsr:/@std/fmt@^1.0.6/colors"] {
+            let specifier = ModuleSpecifier::parse(specifier).unwrap();
+            let request = parse_jsr_specifier(&specifier).unwrap();
+            assert_eq!(request.package, "@std/fmt");
+            assert_eq!(request.range, "^1.0.6");
+            assert_eq!(request.export, "colors");
+        }
+    }
+
+    #[test]
+    fn still_rejects_unscoped_packages() {
+        for specifier in ["jsr:fmt", "jsr:/fmt"] {
+            let specifier = ModuleSpecifier::parse(specifier).unwrap();
+            let error = parse_jsr_specifier(&specifier).unwrap_err().to_string();
+            assert!(error.contains("jsr package must be scoped"), "{error}");
+        }
+    }
 }
 
 fn export_value_to_path(value: &Value) -> Option<String> {

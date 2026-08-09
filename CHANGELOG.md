@@ -368,6 +368,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **JSR packages can load slash-normalized dependencies.** Smudgy now accepts
+  both `jsr:@scope/package` and the `jsr:/@scope/package` form emitted by Deno
+  and found in published JSR packages, instead of rejecting the latter as an
+  unscoped package.
 - **Map preferences stop retrying maps that can't sync.** A map disabled
   locally that the cloud can't store a preference for (a local-only map, or
   one you no longer have access to) was re-pushed on every 90-second sync
