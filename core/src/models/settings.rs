@@ -207,6 +207,10 @@ pub struct Settings {
     /// merging `=>` or `fi` into one glyph break column alignment.
     #[serde(default)]
     pub terminal_font_ligatures: bool,
+    /// Render SGR bold text with the bright ANSI palette as well as bold font
+    /// weight. Explicit bright-color codes remain bright when this is off.
+    #[serde(default = "default_true")]
+    pub terminal_bold_is_bright: bool,
     /// Maximum terminal line length in columns; `None` wraps to the pane
     /// width. This is client-side wrapping only (no NAWS negotiation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -540,6 +544,7 @@ impl Default for Settings {
             terminal_font_family: default_terminal_font_family(),
             terminal_font_size: default_terminal_font_size(),
             terminal_font_ligatures: false,
+            terminal_bold_is_bright: true,
             terminal_line_length: None,
             theme: default_theme(),
             theme_extended_colors: true,
@@ -867,6 +872,21 @@ mod tests {
         let parsed: Settings =
             serde_json::from_str(&serde_json::to_string(&literal).unwrap()).unwrap();
         assert!(!parsed.theme_extended_colors);
+    }
+
+    #[test]
+    fn bold_is_bright_defaults_on_and_roundtrips_off() {
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("existing settings parse");
+        assert!(settings.terminal_bold_is_bright);
+
+        let configured = Settings {
+            terminal_bold_is_bright: false,
+            ..Settings::default()
+        };
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
+        assert!(!parsed.terminal_bold_is_bright);
     }
 
     #[test]

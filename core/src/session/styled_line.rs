@@ -5,10 +5,68 @@ use super::connection::vt_processor;
 
 pub use vt_processor::Color;
 
+/// The underline form carried by terminal text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Underline {
+    #[default]
+    None,
+    Single,
+    Double,
+}
+
+/// The blink rate carried by terminal text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Blink {
+    #[default]
+    None,
+    Slow,
+    Fast,
+}
+
+/// Non-color attributes applied to one terminal text run.
+#[allow(clippy::struct_excessive_bools)] // These are independent ECMA-48 toggles, not one state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TextAttributes {
+    pub bold: bool,
+    pub faint: bool,
+    pub italic: bool,
+    pub underline: Underline,
+    pub blink: Blink,
+    pub crossed_out: bool,
+    pub reverse: bool,
+}
+
+impl TextAttributes {
+    pub const DEFAULT: Self = Self {
+        bold: false,
+        faint: false,
+        italic: false,
+        underline: Underline::None,
+        blink: Blink::None,
+        crossed_out: false,
+        reverse: false,
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Style {
     pub fg: vt_processor::Color,
     pub bg: vt_processor::Color,
+    pub attributes: TextAttributes,
+}
+
+impl Style {
+    pub const DEFAULT: Self = Self {
+        fg: Color::DefaultForeground { bold: false },
+        bg: Color::DefaultBackground,
+        attributes: TextAttributes::DEFAULT,
+    };
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,6 +505,7 @@ impl StyledLine {
                 style: Style {
                     fg,
                     bg: Color::DefaultBackground,
+                    ..Style::DEFAULT
                 },
             }],
             text: text.into_owned(),
@@ -512,6 +571,7 @@ mod tests {
                 bold,
             },
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         }
     }
 

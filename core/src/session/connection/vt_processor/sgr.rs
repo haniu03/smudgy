@@ -1,6 +1,6 @@
 use vtparse::CsiParam;
 
-use crate::session::styled_line::Style;
+use crate::session::styled_line::{Blink, Style, Underline};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AnsiColor {
@@ -16,30 +16,28 @@ pub enum AnsiColor {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Color {
-    Ansi { color: AnsiColor, bold: bool },
-    Rgb { r: u8, g: u8, b: u8 },
+    Ansi {
+        color: AnsiColor,
+        /// Selects the bright half of the ANSI palette. SGR bold font weight
+        /// is carried independently by `Style`.
+        bold: bool,
+    },
+    Rgb {
+        r: u8,
+        g: u8,
+        b: u8,
+    },
     Echo,
     Output,
     Warn,
     /// The theme's default text color — distinct from ANSI white so light
-    /// color schemes can render plain server text readably. Bold is carried
-    /// orthogonally (SGR 1 brightens *default-ness* rather than collapsing
-    /// onto a fixed palette slot), so themes decide what "bright default"
-    /// looks like and `ESC[1;31m` still yields bright red.
-    DefaultForeground { bold: bool },
+    /// color schemes can render plain server text readably. `bold` selects the
+    /// bright-default palette value; SGR font weight lives independently in
+    /// `Style`.
+    DefaultForeground {
+        bold: bool,
+    },
     DefaultBackground,
-}
-
-impl Color {
-    /// The bold/bright intensity carried by this foreground color, used when
-    /// a subsequent SGR 30-37 inherits intensity per ECMA-48.
-    #[must_use]
-    pub const fn is_bold(self) -> bool {
-        matches!(
-            self,
-            Self::Ansi { bold: true, .. } | Self::DefaultForeground { bold: true }
-        )
-    }
 }
 
 /// One semicolon-delimited SGR parameter together with its colon
@@ -188,28 +186,11 @@ fn extended_color_from_slots(rest: &[Slot]) -> (Option<Color>, usize) {
     }
 }
 
-const fn brightened(fg: Color) -> Color {
-    match fg {
-        Color::Ansi { color, .. } => Color::Ansi { color, bold: true },
-        Color::DefaultForeground { .. } => Color::DefaultForeground { bold: true },
-        other => other,
-    }
-}
-
-const fn dimmed(fg: Color) -> Color {
-    match fg {
-        Color::Ansi { color, .. } => Color::Ansi { color, bold: false },
-        Color::DefaultForeground { .. } => Color::DefaultForeground { bold: false },
-        other => other,
-    }
-}
-
 /// Interprets one SGR (`CSI … m`) parameter list against `initial_style`,
 /// returning the style the terminal cursor carries afterward.
 ///
 /// Parameters apply independently, left to right, per ECMA-48: a directive
-/// with no `Style` representation (underline, italic, blink, …) or an
-/// unknown code skips only itself, so `ESC[1;4;31m` still yields bright red.
+/// with no `Style` representation or an unknown code skips only itself.
 /// An empty parameter is the directive's default — in particular `ESC[m`
 /// resets. Only sequences carrying non-SGR parameter bytes (private markers)
 /// leave the style entirely untouched.
@@ -227,9 +208,8 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
 
         if slot.len() > 1 {
             // Colon form: the directive is self-contained in its slot. Only
-            // extended colors have a Style representation; other colon
-            // directives (underline styles, …) are recognized shapes with
-            // nothing to apply.
+            // extended colors and the standard underline variants currently
+            // have a Style representation.
             if (code == 38 || code == 48)
                 && let Some(color) = extended_color_from_subparams(&slot[1..])
             {
@@ -238,6 +218,12 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
                 } else {
                     style.bg = color;
                 }
+            } else if code == 4 {
+                style.attributes.underline = match slot.get(1).copied().flatten().unwrap_or(1) {
+                    0 => Underline::None,
+                    2 => Underline::Double,
+                    _ => Underline::Single,
+                };
             }
             i += 1;
             continue;
@@ -245,19 +231,36 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
 
         match code {
             0 => {
-                style = Style {
-                    fg: Color::DefaultForeground { bold: false },
-                    bg: Color::DefaultBackground,
-                };
+                style = Style::default();
             }
-            1 => style.fg = brightened(style.fg),
-            // Faint has no distinct representation; like SGR 22 it clears
-            // the intensity bit.
-            2 | 22 => style.fg = dimmed(style.fg),
+            1 => {
+                style.attributes.bold = true;
+                style.attributes.faint = false;
+            }
+            2 => {
+                style.attributes.bold = false;
+                style.attributes.faint = true;
+            }
+            3 => style.attributes.italic = true,
+            4 => style.attributes.underline = Underline::Single,
+            5 => style.attributes.blink = Blink::Slow,
+            6 => style.attributes.blink = Blink::Fast,
+            7 => style.attributes.reverse = true,
+            9 => style.attributes.crossed_out = true,
+            21 => style.attributes.underline = Underline::Double,
+            22 => {
+                style.attributes.bold = false;
+                style.attributes.faint = false;
+            }
+            23 => style.attributes.italic = false,
+            24 => style.attributes.underline = Underline::None,
+            25 => style.attributes.blink = Blink::None,
+            27 => style.attributes.reverse = false,
+            29 => style.attributes.crossed_out = false,
             30..=37 => {
                 style.fg = Color::Ansi {
                     color: ansi_color(code - 30),
-                    bold: style.fg.is_bold(),
+                    bold: false,
                 };
             }
             38 | 48 => {
@@ -271,12 +274,8 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
                 }
                 i += consumed;
             }
-            // 39 resets the color, not the intensity (ECMA-48).
-            39 => {
-                style.fg = Color::DefaultForeground {
-                    bold: style.fg.is_bold(),
-                };
-            }
+            // 39 resets the color, not the text intensity (ECMA-48).
+            39 => style.fg = Color::DefaultForeground { bold: false },
             40..=47 => {
                 style.bg = Color::Ansi {
                     color: ansi_color(code - 40),
@@ -296,9 +295,7 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
                     bold: true,
                 };
             }
-            // Everything else — attributes without a Style representation
-            // (3-9, 21, 23-29, 53, 55, …) and unknown codes — skips only
-            // its own slot.
+            // Unsupported attributes and unknown codes skip only their own slot.
             _ => {}
         }
         i += 1;
@@ -309,7 +306,7 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
 #[cfg(test)]
 mod tests {
     use super::{AnsiColor, Color, color_256, process};
-    use crate::session::styled_line::Style;
+    use crate::session::styled_line::{Blink, Style, TextAttributes, Underline};
     use vtparse::CsiParam;
 
     /// Build a `CsiParam` stream from the text between `CSI` and `m`,
@@ -339,10 +336,7 @@ mod tests {
     }
 
     fn default_style() -> Style {
-        Style {
-            fg: Color::DefaultForeground { bold: false },
-            bg: Color::DefaultBackground,
-        }
+        Style::DEFAULT
     }
 
     fn apply(initial: Style, s: &str) -> Style {
@@ -366,21 +360,25 @@ mod tests {
                 color: AnsiColor::Blue,
                 bold: false,
             },
+            ..Style::DEFAULT
         };
         assert_eq!(process(loud, &[]), default_style());
     }
 
     #[test]
-    fn unsupported_attribute_does_not_poison_colors() {
+    fn text_attributes_do_not_poison_colors() {
         let got = apply(default_style(), "1;4;31");
-        assert_eq!(got.fg, BRIGHT_RED);
+        assert_eq!(got.fg, RED);
         assert_eq!(got.bg, Color::DefaultBackground);
+        assert!(got.attributes.bold);
+        assert_eq!(got.attributes.underline, Underline::Single);
     }
 
     #[test]
     fn unknown_code_skips_only_itself() {
         let got = apply(default_style(), "7;31;53");
         assert_eq!(got.fg, RED);
+        assert!(got.attributes.reverse);
     }
 
     #[test]
@@ -491,26 +489,77 @@ mod tests {
     }
 
     #[test]
-    fn faint_and_normal_intensity_clear_bold() {
-        let bright = apply(default_style(), "1;31");
-        assert_eq!(bright.fg, BRIGHT_RED);
-        assert_eq!(apply(bright, "2").fg, RED);
-        assert_eq!(apply(bright, "22").fg, RED);
+    fn bold_faint_and_normal_intensity_are_distinct_attributes() {
+        let bold = apply(default_style(), "1;31");
+        assert_eq!(bold.fg, RED);
+        assert!(bold.attributes.bold);
+        assert!(!bold.attributes.faint);
+
+        let faint = apply(bold, "2");
+        assert_eq!(faint.fg, RED);
+        assert!(!faint.attributes.bold);
+        assert!(faint.attributes.faint);
+
+        let normal = apply(faint, "22");
+        assert_eq!(normal.fg, RED);
+        assert!(!normal.attributes.bold);
+        assert!(!normal.attributes.faint);
     }
 
     #[test]
-    fn color_inherits_intensity_per_ecma() {
+    fn bold_is_independent_from_palette_brightness() {
         let got = apply(default_style(), "1;33");
         assert_eq!(
             got.fg,
             Color::Ansi {
                 color: AnsiColor::Yellow,
-                bold: true
+                bold: false
             }
         );
-        // 39 keeps intensity; a later 30-37 inherits it.
+        assert!(got.attributes.bold);
+        // 39 resets only the color; the bold text attribute survives.
         let kept = apply(got, "39");
-        assert_eq!(kept.fg, Color::DefaultForeground { bold: true });
+        assert_eq!(kept.fg, Color::DefaultForeground { bold: false });
+        assert!(kept.attributes.bold);
+
+        // Explicit bright color remains bright when normal intensity clears
+        // the font-weight attribute.
+        let explicit = apply(default_style(), "1;91;22");
+        assert_eq!(explicit.fg, BRIGHT_RED);
+        assert!(!explicit.attributes.bold);
+    }
+
+    #[test]
+    fn supported_attributes_set_and_reset_independently() {
+        let styled = apply(default_style(), "1;3;4;5;7;9");
+        assert_eq!(
+            styled.attributes,
+            TextAttributes {
+                bold: true,
+                italic: true,
+                underline: Underline::Single,
+                blink: Blink::Slow,
+                crossed_out: true,
+                reverse: true,
+                ..TextAttributes::DEFAULT
+            }
+        );
+
+        let reset = apply(styled, "22;23;24;25;27;29");
+        assert_eq!(reset.attributes, TextAttributes::DEFAULT);
+    }
+
+    #[test]
+    fn fast_blink_and_double_underline_replace_related_modes() {
+        let styled = apply(default_style(), "5;6;4;21");
+        assert_eq!(styled.attributes.blink, Blink::Fast);
+        assert_eq!(styled.attributes.underline, Underline::Double);
+
+        assert_eq!(
+            apply(default_style(), "4:2").attributes.underline,
+            Underline::Double
+        );
+        assert_eq!(apply(styled, "4:0").attributes.underline, Underline::None);
     }
 
     #[test]
@@ -569,6 +618,7 @@ mod tests {
         let red = Style {
             fg: RED,
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let stream = [CsiParam::P(b'?'), CsiParam::Integer(25)];
         assert_eq!(process(red, &stream), red);

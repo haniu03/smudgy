@@ -42,6 +42,7 @@ echo("SE_DONE");
 const ECHO_STYLE: Style = Style {
     fg: Color::Echo,
     bg: Color::DefaultBackground,
+    ..Style::DEFAULT
 };
 
 const fn bright(color: AnsiColor) -> Color {
@@ -148,7 +149,8 @@ async fn styled_echo_spans_reach_the_buffer() {
                 9,
                 Style {
                     fg: bright(AnsiColor::Red),
-                    bg: Color::DefaultBackground
+                    bg: Color::DefaultBackground,
+                    ..Style::DEFAULT
                 }
             ),
             (9, 14, ECHO_STYLE),
@@ -166,7 +168,8 @@ async fn styled_echo_spans_reach_the_buffer() {
                 3,
                 Style {
                     fg: Color::Rgb { r: 10, g: 20, b: 30 },
-                    bg: bright(AnsiColor::Blue)
+                    bg: bright(AnsiColor::Blue),
+                    ..Style::DEFAULT
                 }
             ),
             (3, 5, ECHO_STYLE),
@@ -178,6 +181,7 @@ async fn styled_echo_spans_reach_the_buffer() {
     let on_blue = |fg: Color| Style {
         fg,
         bg: bright(AnsiColor::Blue),
+        ..Style::DEFAULT
     };
     assert_eq!(
         spans_of(three),
@@ -198,7 +202,8 @@ async fn styled_echo_spans_reach_the_buffer() {
                 text.len(),
                 Style {
                     fg: bright(AnsiColor::Green),
-                    bg: Color::DefaultBackground
+                    bg: Color::DefaultBackground,
+                    ..Style::DEFAULT
                 }
             )]
         );
@@ -222,7 +227,8 @@ async fn styled_echo_spans_reach_the_buffer() {
             8,
             Style {
                 fg: bright(AnsiColor::Red),
-                bg: Color::DefaultBackground
+                bg: Color::DefaultBackground,
+                ..Style::DEFAULT
             }
         )]
     );
@@ -308,6 +314,7 @@ async fn styled_splice_edits_incoming_lines() {
     let rgb = Style {
         fg: Color::Rgb { r: 10, g: 20, b: 30 },
         bg: Color::DefaultBackground,
+        ..Style::DEFAULT
     };
     let incoming = |text: &str| {
         Arc::new(StyledLine::new(

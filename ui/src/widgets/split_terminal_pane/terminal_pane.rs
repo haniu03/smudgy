@@ -3,7 +3,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer};
+use crate::terminal_buffer::{LinkClickEvent, SpanMetadata, TerminalBuffer};
 use iced::{
     Background, Event, Pixels, Rectangle,
     advanced::{
@@ -14,8 +14,11 @@ use iced::{
         text::{self, Paragraph},
         widget::{Tree, tree},
     },
-    alignment, touch,
+    alignment,
+    time::{Duration, Instant},
+    touch,
     widget::text::LineHeight,
+    window,
 };
 
 mod spans;
@@ -23,7 +26,7 @@ mod spans;
 use crate::terminal_buffer::selection::{BufferPosition, LineSelection, Selection};
 use spans::Spans;
 
-type Link = ();
+type Link = SpanMetadata;
 
 /// 100 '0's shaped once per prefs generation to measure the monospace cell
 /// advance for the column-based line-length clamp.
@@ -33,6 +36,10 @@ const ADVANCE_PROBE: &str = "000000000000000000000000000000000000000000000000000
 struct ParagraphCache<P: text::Paragraph> {
     spans: Spans<Link>,
     paragraph: P,
+    slow_blink_hidden: Option<P>,
+    fast_blink_hidden: Option<P>,
+    all_blink_hidden: Option<P>,
+    blink_modes: u8,
     max_valid_width: f32,
     selection: LineSelection,
     /// The prefs generation this paragraph was shaped with; a mismatch is a
@@ -42,6 +49,52 @@ struct ParagraphCache<P: text::Paragraph> {
     /// override composes with the generation (an override change re-shapes
     /// without a prefs bump).
     font_size: f32,
+}
+
+const SLOW_BLINK: u8 = 1;
+const FAST_BLINK: u8 = 2;
+const SLOW_BLINK_HALF_PERIOD_MS: u128 = 500;
+const FAST_BLINK_HALF_PERIOD_MS: u128 = 250;
+
+impl<P: text::Paragraph> ParagraphCache<P> {
+    fn displayed_paragraph(&self, slow_visible: bool, fast_visible: bool) -> &P {
+        match (slow_visible, fast_visible) {
+            (true, true) => &self.paragraph,
+            (false, true) => self.slow_blink_hidden.as_ref().unwrap_or(&self.paragraph),
+            (true, false) => self.fast_blink_hidden.as_ref().unwrap_or(&self.paragraph),
+            (false, false) => self
+                .all_blink_hidden
+                .as_ref()
+                .or(self.slow_blink_hidden.as_ref())
+                .or(self.fast_blink_hidden.as_ref())
+                .unwrap_or(&self.paragraph),
+        }
+    }
+}
+
+fn hidden_blink_spans(
+    spans: &[iced::widget::text::Span<'static, Link>],
+    hide_slow: bool,
+    hide_fast: bool,
+) -> Option<Vec<iced::widget::text::Span<'static, Link>>> {
+    let mut changed = false;
+    let hidden = spans
+        .iter()
+        .cloned()
+        .map(|mut span| {
+            let hide = span.link.is_some_and(|metadata| match metadata.blink {
+                smudgy_core::session::styled_line::Blink::None => false,
+                smudgy_core::session::styled_line::Blink::Slow => hide_slow,
+                smudgy_core::session::styled_line::Blink::Fast => hide_fast,
+            });
+            if hide {
+                changed = true;
+                span.color = Some(iced::Color::TRANSPARENT);
+            }
+            span
+        })
+        .collect();
+    changed.then_some(hidden)
 }
 
 /// The effective text metrics for a pane: its font override (line height by
@@ -76,6 +129,10 @@ pub(super) struct State<P: text::Paragraph> {
     /// release first and flips `Selecting` → `Selected`, so selection state alone
     /// cannot tell this pane a click just ended on it.
     pub pressed_cell: Option<BufferPosition>,
+    /// Common timebase and current visibility phases for SGR 5/6 text.
+    blink_epoch: Instant,
+    slow_blink_visible: bool,
+    fast_blink_visible: bool,
 }
 
 impl<P: text::Paragraph> Default for State<P> {
@@ -87,6 +144,9 @@ impl<P: text::Paragraph> Default for State<P> {
             advance: None,
             modifiers: keyboard::Modifiers::default(),
             pressed_cell: None,
+            blink_epoch: Instant::now(),
+            slow_blink_visible: true,
+            fast_blink_visible: true,
         }
     }
 }
@@ -310,6 +370,15 @@ where
                         || text_bounds.width < cache.paragraph.min_bounds().width
                     {
                         cache.paragraph.resize(text_bounds);
+                        if let Some(paragraph) = &mut cache.slow_blink_hidden {
+                            paragraph.resize(text_bounds);
+                        }
+                        if let Some(paragraph) = &mut cache.fast_blink_hidden {
+                            paragraph.resize(text_bounds);
+                        }
+                        if let Some(paragraph) = &mut cache.all_blink_hidden {
+                            paragraph.resize(text_bounds);
+                        }
                         cache.max_valid_width = text_bounds.width;
                     }
 
@@ -325,25 +394,42 @@ where
 
             let spans_vec = spans.spans();
 
-            let text = iced::advanced::text::Text {
-                content: Vec::as_ref(&spans_vec),
-                bounds: text_bounds,
-                size: Pixels(font_size),
-                font: prefs.font,
-                line_height: LineHeight::Absolute(Pixels(line_height)),
-                align_x: text::Alignment::Left,
-                align_y: alignment::Vertical::Top,
-                shaping: text::Shaping::Advanced,
-                wrapping: text::Wrapping::WordOrGlyph,
+            let make_paragraph = |content: &[iced::widget::text::Span<'static, Link>]| {
+                Renderer::Paragraph::with_spans(iced::advanced::text::Text {
+                    content,
+                    bounds: text_bounds,
+                    size: Pixels(font_size),
+                    font: prefs.font,
+                    line_height: LineHeight::Absolute(Pixels(line_height)),
+                    align_x: text::Alignment::Left,
+                    align_y: alignment::Vertical::Top,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::WordOrGlyph,
+                })
             };
-
-            let paragraph = Renderer::Paragraph::with_spans(text);
+            let slow_hidden_spans = hidden_blink_spans(&spans_vec, true, false);
+            let fast_hidden_spans = hidden_blink_spans(&spans_vec, false, true);
+            let all_hidden_spans = if slow_hidden_spans.is_some() && fast_hidden_spans.is_some() {
+                hidden_blink_spans(&spans_vec, true, true)
+            } else {
+                None
+            };
+            let blink_modes = (u8::from(slow_hidden_spans.is_some()) * SLOW_BLINK)
+                | (u8::from(fast_hidden_spans.is_some()) * FAST_BLINK);
+            let slow_blink_hidden = slow_hidden_spans.as_deref().map(&make_paragraph);
+            let fast_blink_hidden = fast_hidden_spans.as_deref().map(&make_paragraph);
+            let all_blink_hidden = all_hidden_spans.as_deref().map(&make_paragraph);
+            let paragraph = make_paragraph(&spans_vec);
 
             available_y -= paragraph.min_height();
 
             new_cache.push(ParagraphCache {
                 spans,
                 paragraph,
+                slow_blink_hidden,
+                fast_blink_hidden,
+                all_blink_hidden,
+                blink_modes,
                 max_valid_width: text_bounds.width,
                 selection: line_selection,
                 generation: prefs.generation,
@@ -379,10 +465,15 @@ where
                 // renders glyphs only). Undecorated spans (the overwhelmingly
                 // common case) skip before any span_bounds work.
                 for (span_idx, span) in cache.spans.spans().iter().enumerate() {
-                    if span.highlight.is_none() && !span.underline {
+                    if span.highlight.is_none() && !span.underline && !span.strikethrough {
                         continue;
                     }
                     let regions = cache.paragraph.span_bounds(span_idx);
+                    let blink_hidden = span.link.is_some_and(|metadata| match metadata.blink {
+                        smudgy_core::session::styled_line::Blink::None => false,
+                        smudgy_core::session::styled_line::Blink::Slow => !state.slow_blink_visible,
+                        smudgy_core::session::styled_line::Blink::Fast => !state.fast_blink_visible,
+                    });
 
                     if let Some(highlight) = span.highlight {
                         for region in &regions {
@@ -405,17 +496,47 @@ where
                         }
                     }
 
-                    if span.underline {
+                    if span.underline && !blink_hidden {
                         // Baseline placement per iced's rich_text: the underline
                         // sits at font size plus half the leading, nudged up by
                         // 8% of the font size.
                         let (font_size, line_height) = effective_metrics(&prefs, self.font_size);
                         let underline_y =
                             font_size + (line_height - font_size) / 2.0 - font_size * 0.08;
+                        let line_count =
+                            if span.link.is_some_and(|metadata| metadata.double_underline) {
+                                2
+                            } else {
+                                1
+                            };
+                        for line in 0..line_count {
+                            for region in &regions {
+                                let rect = Rectangle {
+                                    x: layout.bounds().x + region.x,
+                                    y: region.y + y + underline_y - line as f32 * 2.0,
+                                    width: region.width,
+                                    height: 1.0,
+                                };
+                                if let Some(bounds) = rect.intersection(&clipped_viewport) {
+                                    renderer.fill_quad(
+                                        Quad {
+                                            bounds,
+                                            ..Default::default()
+                                        },
+                                        span.color.unwrap_or(iced::Color::WHITE),
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if span.strikethrough && !blink_hidden {
+                        let (font_size, line_height) = effective_metrics(&prefs, self.font_size);
+                        let strike_y = (line_height - font_size) / 2.0 + font_size * 0.55;
                         for region in &regions {
                             let rect = Rectangle {
                                 x: layout.bounds().x + region.x,
-                                y: region.y + y + underline_y,
+                                y: region.y + y + strike_y,
                                 width: region.width,
                                 height: 1.0,
                             };
@@ -455,7 +576,7 @@ where
                 }
 
                 renderer.fill_paragraph(
-                    &cache.paragraph,
+                    cache.displayed_paragraph(state.slow_blink_visible, state.fast_blink_visible),
                     iced::Point::new(layout.bounds().x, y),
                     iced::Color::WHITE,
                     clipped_viewport,
@@ -506,6 +627,32 @@ where
         shell: &mut advanced::Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
+        if let Event::Window(window::Event::RedrawRequested(now)) = event {
+            let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+            let blink_modes = state
+                .cache
+                .iter()
+                .fold(0, |modes, cache| modes | cache.blink_modes);
+            if blink_modes != 0 {
+                let elapsed_ms = now.saturating_duration_since(state.blink_epoch).as_millis();
+                let mut next_ms = u128::MAX;
+                if blink_modes & SLOW_BLINK != 0 {
+                    state.slow_blink_visible =
+                        (elapsed_ms / SLOW_BLINK_HALF_PERIOD_MS).is_multiple_of(2);
+                    next_ms = next_ms
+                        .min(SLOW_BLINK_HALF_PERIOD_MS - elapsed_ms % SLOW_BLINK_HALF_PERIOD_MS);
+                }
+                if blink_modes & FAST_BLINK != 0 {
+                    state.fast_blink_visible =
+                        (elapsed_ms / FAST_BLINK_HALF_PERIOD_MS).is_multiple_of(2);
+                    next_ms = next_ms
+                        .min(FAST_BLINK_HALF_PERIOD_MS - elapsed_ms % FAST_BLINK_HALF_PERIOD_MS);
+                }
+                shell.request_redraw_at(
+                    *now + Duration::from_millis(u64::try_from(next_ms).unwrap_or(1)),
+                );
+            }
+        }
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerPressed { .. }) => {
@@ -655,4 +802,37 @@ pub fn terminal_pane<'a>(
     selection: Rc<RefCell<Selection>>,
 ) -> TerminalPane<'a> {
     TerminalPane::new(buffer, selection)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smudgy_core::session::styled_line::Blink;
+
+    fn blinking_span(blink: Blink) -> iced::widget::text::Span<'static, Link> {
+        iced::widget::text::Span::new("blink")
+            .color(iced::Color::WHITE)
+            .link(SpanMetadata {
+                blink,
+                double_underline: false,
+            })
+    }
+
+    #[test]
+    fn blink_variants_hide_only_the_requested_rates() {
+        let spans = [blinking_span(Blink::Slow), blinking_span(Blink::Fast)];
+        let slow = hidden_blink_spans(&spans, true, false).expect("slow variant");
+        assert_eq!(slow[0].color, Some(iced::Color::TRANSPARENT));
+        assert_eq!(slow[1].color, Some(iced::Color::WHITE));
+
+        let fast = hidden_blink_spans(&spans, false, true).expect("fast variant");
+        assert_eq!(fast[0].color, Some(iced::Color::WHITE));
+        assert_eq!(fast[1].color, Some(iced::Color::TRANSPARENT));
+
+        let all = hidden_blink_spans(&spans, true, true).expect("combined variant");
+        assert!(
+            all.iter()
+                .all(|span| span.color == Some(iced::Color::TRANSPARENT))
+        );
+    }
 }

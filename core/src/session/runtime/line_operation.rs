@@ -68,6 +68,7 @@ fn splice_style_at(line: &StyledLine, position: usize) -> Style {
             Style {
                 fg: Color::DefaultForeground { bold: false },
                 bg: Color::DefaultBackground,
+                ..Style::DEFAULT
             },
             |span| span.style,
         )
@@ -114,6 +115,7 @@ impl LineOperation {
                     let style = Style {
                         fg: run.fg.unwrap_or(base_style.fg),
                         bg: run.bg.unwrap_or(base_style.bg),
+                        attributes: base_style.attributes,
                     };
                     if style != base_style {
                         result = result.highlight(cursor, run_end, style);
@@ -168,6 +170,7 @@ mod tests {
                 b: 30,
             },
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         }
     }
 
@@ -233,7 +236,8 @@ mod tests {
             style_at(&result, 4),
             Style {
                 fg: bright(AnsiColor::Red),
-                bg: Color::DefaultBackground
+                bg: Color::DefaultBackground,
+                ..Style::DEFAULT
             }
         );
         assert_eq!(style_at(&result, 9), base_style());
@@ -256,10 +260,12 @@ mod tests {
         let red = Style {
             fg: bright(AnsiColor::Red),
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let green = Style {
             fg: bright(AnsiColor::Green),
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let line = Arc::new(StyledLine::new(
             text,
@@ -298,14 +304,17 @@ mod tests {
         let default = Style {
             fg: Color::DefaultForeground { bold: false },
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let green = Style {
             fg: bright(AnsiColor::Green),
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let red = Style {
             fg: bright(AnsiColor::Red),
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let line = Arc::new(StyledLine::new(
             "beforefooafter",

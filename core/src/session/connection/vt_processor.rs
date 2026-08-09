@@ -117,6 +117,7 @@ impl VtProcessor {
             cursor_style: Style {
                 fg: Color::DefaultForeground { bold: false },
                 bg: Color::DefaultBackground,
+                ..Style::DEFAULT
             },
             buf: String::with_capacity(INPUT_BUFFER_CAPACITY),
             buf_raw: Vec::with_capacity(INPUT_BUFFER_CAPACITY),

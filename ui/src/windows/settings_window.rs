@@ -115,6 +115,7 @@ pub enum Message {
 
     PrefFontSelected(String),
     PrefFontLigaturesToggled(bool),
+    PrefBoldIsBrightToggled(bool),
     PrefLocaleSelected(LocaleChoice),
     PrefFontSizeChanged(String),
     PrefFontSizeSubmitted,
@@ -611,6 +612,10 @@ impl SettingsWindow {
             }
             Message::PrefFontLigaturesToggled(enabled) => {
                 self.settings.terminal_font_ligatures = enabled;
+                self.settings_changed()
+            }
+            Message::PrefBoldIsBrightToggled(enabled) => {
+                self.settings.terminal_bold_is_bright = enabled;
                 self.settings_changed()
             }
             Message::PrefLocaleSelected(locale) => {
@@ -1280,6 +1285,15 @@ impl SettingsWindow {
             checkbox(self.settings.terminal_font_ligatures)
                 .label(t!("preferences-font-ligatures"))
                 .on_toggle(Message::PrefFontLigaturesToggled),
+        );
+        col = col.push(
+            column![
+                checkbox(self.settings.terminal_bold_is_bright)
+                    .label(t!("preferences-bold-is-bright"))
+                    .on_toggle(Message::PrefBoldIsBrightToggled),
+                dim_text_owned(t!("preferences-bold-is-bright-help")),
+            ]
+            .spacing(2),
         );
         col = col.push(pref_input(
             t!("preferences-font-size"),

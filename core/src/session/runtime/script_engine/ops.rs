@@ -13,7 +13,9 @@ use crate::session::runtime::{
     ActionQueue, AutomationKind, IsolateId, MAX_EVENT_DEPTH, Origin, RuntimeAction, SingletonKey,
     SingletonRegistry,
 };
-use crate::session::styled_line::{Color, LinkAction, Style, StyledLine, sanitize_display_text};
+use crate::session::styled_line::{
+    Color, LinkAction, Style, StyledLine, TextAttributes, sanitize_display_text,
+};
 use crate::session::{SessionId, registry};
 
 use std::cell::{Cell, RefCell};
@@ -3157,6 +3159,7 @@ fn packed_echo_lines(
             let style = Style {
                 fg: packed_color(reader.next()?)?.unwrap_or(default_style.fg),
                 bg: packed_color(reader.next()?)?.map_or(default_style.bg, normalize_bg),
+                attributes: default_style.attributes,
             };
             let link = match packed_link(reader.next()?)? {
                 PackedLink::None => None,
@@ -3335,6 +3338,7 @@ impl StyledRunWire {
 const ECHO_DEFAULT_STYLE: Style = Style {
     fg: Color::Echo,
     bg: Color::DefaultBackground,
+    attributes: TextAttributes::DEFAULT,
 };
 
 /// Convert and register the splice payload the two splice ops share: the runs of ONE
@@ -4217,7 +4221,11 @@ fn parse_style_from_js(
         None => Color::DefaultBackground,
     };
 
-    Ok(Style { fg, bg })
+    Ok(Style {
+        fg,
+        bg,
+        ..Style::DEFAULT
+    })
 }
 
 #[op2(fast)]

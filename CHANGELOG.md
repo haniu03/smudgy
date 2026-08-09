@@ -380,11 +380,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at both ends — the codes were dropped during ingest, and the terminal
   never painted span backgrounds (which also kept link chips and underlines
   from rendering).
-- **One unsupported ANSI code no longer discards a whole style sequence.**
-  Codes smudgy doesn't render (underline, italic, blink, …) used to poison
-  every color that shared their sequence — `ESC[1;4;31m` displayed as plain
-  text instead of bright red. Each code now applies independently, the
-  bare-reset form `ESC[m` resets, colon-form extended colors
+- **ANSI text attributes display.** Bold is now real font weight, and faint,
+  italic, underline, double underline, slow/fast blink, reverse video, and
+  crossed-out text render instead of being discarded. A new preference,
+  enabled by default for compatibility, controls whether bold text also uses
+  the bright ANSI palette; explicit bright-color codes stay bright either
+  way. Attribute set/reset codes apply independently, unknown codes no longer
+  poison colors beside them, bare `ESC[m` resets, colon-form extended colors
   (`38:2::r:g:b`) parse, and out-of-range color components clamp instead of
   wrapping around.
 - **Progress bars that redraw with a bare carriage return display as one

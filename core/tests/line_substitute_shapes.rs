@@ -43,6 +43,7 @@ fn plain_line(text: &str) -> Arc<StyledLine> {
         style: Style {
             fg: Color::DefaultForeground { bold: false },
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         },
         begin_pos: 0,
         end_pos: text.len(),

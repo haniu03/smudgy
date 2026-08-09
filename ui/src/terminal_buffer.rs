@@ -7,11 +7,20 @@ use std::sync::Arc;
 
 use crate::prefs::TerminalPrefs;
 use smudgy_core::session::runtime::line_operation::LineOperation;
-use smudgy_core::session::styled_line::{Color, LinkAction, Style, StyledLine};
+use smudgy_core::session::styled_line::{
+    Blink, Color, LinkAction, Style, StyledLine, Underline,
+};
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
 
-type Link = ();
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpanMetadata {
+    pub blink: Blink,
+    pub double_underline: bool,
+}
+
+type Link = SpanMetadata;
 
 pub mod selection;
 
@@ -35,22 +44,71 @@ const LINK_WASH_ALPHA: f32 = 0.14;
 /// `DefaultBackground` at the op boundary and so still washes, while a background
 /// literally painted the theme's background color counts as explicit and doesn't.
 #[inline]
-fn make_span(text: &str, style: Style, linked: bool, prefs: &TerminalPrefs) -> Span<'static, Link> {
-    let fg = prefs.resolve(style.fg);
-    let mut span = Span::<'static, Link>::new(Cow::Owned(text.to_string())).color(fg);
+pub(crate) fn make_span(
+    text: &str,
+    style: Style,
+    linked: bool,
+    prefs: &TerminalPrefs,
+) -> Span<'static, Link> {
+    let attributes = style.attributes;
+    let logical_fg = if attributes.bold && prefs.bold_is_bright {
+        match style.fg {
+            Color::Ansi { color, bold: false } => Color::Ansi { color, bold: true },
+            Color::DefaultForeground { bold: false } => Color::DefaultForeground { bold: true },
+            other => other,
+        }
+    } else {
+        style.fg
+    };
+    let (semantic_fg, semantic_bg, explicit_background) = if attributes.reverse {
+        (style.bg, logical_fg, true)
+    } else {
+        (logical_fg, style.bg, style.bg != Color::DefaultBackground)
+    };
+    let mut fg = match semantic_fg {
+        Color::DefaultBackground => prefs.palette.background,
+        other => prefs.resolve(other),
+    };
+    if attributes.faint {
+        fg.a *= 0.5;
+    }
+    let mut font = prefs.font;
+    if attributes.bold {
+        font.weight = iced::font::Weight::Bold;
+    }
+    if attributes.italic {
+        font.style = iced::font::Style::Italic;
+    }
+    let mut span = Span::<'static, Link>::new(Cow::Owned(text.to_string()))
+        .color(fg)
+        .font(font)
+        .underline(linked || attributes.underline != Underline::None)
+        .strikethrough(attributes.crossed_out);
     // Only a meaningful background sets the span highlight: the widget draws a
     // quad per highlighted span region, so the (overwhelmingly common) default
     // background must stay decoration-free rather than painting a quad of the
     // pane's own color under every span.
-    if linked && style.bg == Color::DefaultBackground {
+    if linked && !explicit_background {
         span = span.background(Background::Color(iced::Color {
             a: LINK_WASH_ALPHA,
             ..fg
         }));
-    } else if style.bg != Color::DefaultBackground {
-        span = span.background(Background::Color(prefs.resolve(style.bg)));
+    } else if explicit_background {
+        let bg = match semantic_bg {
+            Color::DefaultBackground => prefs.palette.background,
+            other => prefs.resolve(other),
+        };
+        span = span.background(Background::Color(bg));
     }
-    if linked { span.underline(true) } else { span }
+    let metadata = SpanMetadata {
+        blink: attributes.blink,
+        double_underline: attributes.underline == Underline::Double,
+    };
+    if metadata == SpanMetadata::default() {
+        span
+    } else {
+        span.link(metadata)
+    }
 }
 
 /// Bakes a styled line's semantic colors into renderable spans using the
@@ -138,8 +196,8 @@ fn strip_possessive_suffix(word: &str) -> &str {
     }
 }
 
-impl AsRef<[Span<'static, ()>]> for BufferLine {
-    fn as_ref(&self) -> &[Span<'static, ()>] {
+impl AsRef<[Span<'static, Link>]> for BufferLine {
+    fn as_ref(&self) -> &[Span<'static, Link>] {
         self.spans().as_slice()
     }
 }
@@ -152,7 +210,7 @@ pub struct BufferLine {
     /// window, scrollback eviction) never pays `to_spans` at all; only lines
     /// the pane actually lays out are baked. Cleared — not eagerly rebaked —
     /// on palette changes and line edits.
-    spans: std::cell::OnceCell<Rc<Vec<Span<'static, ()>>>>,
+    spans: std::cell::OnceCell<Rc<Vec<Span<'static, Link>>>>,
 }
 
 impl PartialEq for BufferLine {
@@ -175,7 +233,7 @@ impl BufferLine {
     /// first access. The returned `Rc` is pointer-stable until the spans are
     /// invalidated (palette change, line edit) — the pane's paragraph cache
     /// keys on that identity.
-    pub fn spans(&self) -> &Rc<Vec<Span<'static, ()>>> {
+    pub fn spans(&self) -> &Rc<Vec<Span<'static, Link>>> {
         self.spans.get_or_init(|| {
             let prefs = crate::prefs::current();
             to_spans(&self.styled_line, &prefs)
@@ -633,7 +691,10 @@ impl TerminalBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smudgy_core::session::styled_line::{StyledLine, VtSpan};
+    use smudgy_core::session::connection::vt_processor::AnsiColor;
+    use smudgy_core::session::styled_line::{
+        Blink, StyledLine, TextAttributes, Underline, VtSpan,
+    };
     use std::num::NonZeroUsize; // Assuming VtSpan is needed for StyledLine::new
 
     // Helper to create Arc<StyledLine> for tests
@@ -833,6 +894,7 @@ mod tests {
                 b: 10,
             },
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let mut line = StyledLine::new(
             text,
@@ -848,6 +910,111 @@ mod tests {
             action: LinkAction::Send(Arc::from("north")),
         });
         Arc::new(line)
+    }
+
+    #[test]
+    fn bold_weight_is_independent_from_bright_color_preference() {
+        let mut prefs = (*crate::prefs::current()).clone();
+        let style = Style {
+            fg: Color::Ansi {
+                color: AnsiColor::Red,
+                bold: false,
+            },
+            attributes: TextAttributes {
+                bold: true,
+                ..TextAttributes::DEFAULT
+            },
+            ..Style::DEFAULT
+        };
+
+        prefs.bold_is_bright = true;
+        let bright = make_span("bold", style, false, &prefs);
+        assert_eq!(
+            bright.font.map(|font| font.weight),
+            Some(iced::font::Weight::Bold)
+        );
+        assert_eq!(
+            bright.color,
+            Some(prefs.resolve(Color::Ansi {
+                color: AnsiColor::Red,
+                bold: true,
+            }))
+        );
+
+        prefs.bold_is_bright = false;
+        let normal = make_span("bold", style, false, &prefs);
+        assert_eq!(
+            normal.font.map(|font| font.weight),
+            Some(iced::font::Weight::Bold)
+        );
+        assert_eq!(
+            normal.color,
+            Some(prefs.resolve(Color::Ansi {
+                color: AnsiColor::Red,
+                bold: false,
+            }))
+        );
+
+        let explicit_bright = make_span(
+            "bright",
+            Style {
+                fg: Color::Ansi {
+                    color: AnsiColor::Red,
+                    bold: true,
+                },
+                ..style
+            },
+            false,
+            &prefs,
+        );
+        assert_eq!(explicit_bright.color, bright.color);
+    }
+
+    #[test]
+    fn make_span_renders_sgr_attributes_and_reverse_colors() {
+        let prefs = crate::prefs::current();
+        let style = Style {
+            fg: Color::Rgb {
+                r: 10,
+                g: 20,
+                b: 30,
+            },
+            bg: Color::Rgb {
+                r: 40,
+                g: 50,
+                b: 60,
+            },
+            attributes: TextAttributes {
+                faint: true,
+                italic: true,
+                underline: Underline::Double,
+                blink: Blink::Fast,
+                crossed_out: true,
+                reverse: true,
+                ..TextAttributes::DEFAULT
+            },
+        };
+        let span = make_span("styled", style, false, &prefs);
+        let mut reversed_fg = prefs.resolve(style.bg);
+        reversed_fg.a *= 0.5;
+        assert_eq!(span.color, Some(reversed_fg));
+        assert_eq!(
+            span.highlight.map(|highlight| highlight.background),
+            Some(Background::Color(prefs.resolve(style.fg)))
+        );
+        assert_eq!(
+            span.font.map(|font| font.style),
+            Some(iced::font::Style::Italic)
+        );
+        assert!(span.underline);
+        assert!(span.strikethrough);
+        assert_eq!(
+            span.link,
+            Some(SpanMetadata {
+                blink: Blink::Fast,
+                double_underline: true,
+            })
+        );
     }
 
     #[test]
@@ -893,6 +1060,7 @@ mod tests {
                 b: 10,
             },
             bg: Color::Rgb { r: 1, g: 2, b: 3 },
+            ..Style::DEFAULT
         };
         let mut line = StyledLine::new(
             "north",
