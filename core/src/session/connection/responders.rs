@@ -48,6 +48,9 @@ pub mod new_environ {
         (b"OSC_HYPERLINKS_STYLE_BASIC", b"1"),
         (b"OSC_HYPERLINKS_STYLE_STATES", b"1"),
         (b"OSC_HYPERLINKS_TOOLTIP", b"1"),
+        // Smudgy extension: tooltip text accepts the safe SGR subset parsed by
+        // `parse_link_tooltip_text`; active terminal controls are discarded.
+        (b"OSC_HYPERLINKS_TOOLTIP_SGR", b"1"),
         (b"OSC_HYPERLINKS_VISIBILITY", b"1"),
     ];
 
@@ -385,6 +388,7 @@ mod tests {
             b"OSC_HYPERLINKS_SPOILER".as_slice(),
             b"OSC_HYPERLINKS_STYLE_BASIC".as_slice(),
             b"OSC_HYPERLINKS_STYLE_STATES".as_slice(),
+            b"OSC_HYPERLINKS_TOOLTIP_SGR".as_slice(),
             b"OSC_HYPERLINKS_VISIBILITY".as_slice(),
         ] {
             assert!(
@@ -409,6 +413,23 @@ mod tests {
             [
                 &[new_environ::IS, 3][..],
                 b"OSC_HYPERLINKS_TOOLTIP",
+                &[1, b'1'],
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn new_environ_selectively_advertises_the_smudgy_tooltip_sgr_extension() {
+        let request = [&[3][..], b"OSC_HYPERLINKS_TOOLTIP_SGR"].concat();
+        let mut replies = Vec::new();
+        new_environ::answer_send(&request, &mut replies);
+        let (_, payload) = unframe(&replies);
+        assert_eq!(
+            payload,
+            [
+                &[new_environ::IS, 3][..],
+                b"OSC_HYPERLINKS_TOOLTIP_SGR",
                 &[1, b'1'],
             ]
             .concat()

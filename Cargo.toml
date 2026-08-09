@@ -116,8 +116,10 @@ unic-langid = "0.9.6"
 #   OpenType feature control that upstream iced lacks — the terminal opts its
 #   font family out of ligatures (liga/clig/calt/dlig), which break monospace
 #   column alignment, while UI text keeps them.
-# - `cosmic-text` (patches/cosmic-text+0.15.0.patch): upstream's
-#   `monospace_fallback` machinery only engages for the generic
+# - `cosmic-text` (patches/cosmic-text+0.15.0.patch): variable faces are
+#   accepted at every requested weight covered by their `wght` axis (backport
+#   of upstream pop-os/cosmic-text#486). Also, upstream's `monospace_fallback`
+#   machinery only engages for the generic
 #   `Family::Monospace` request, which iced never issues (it always names a
 #   concrete family). The patch appends Monospace as a second default family
 #   whenever the named primary resolves to a monospace face, so missing

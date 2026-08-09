@@ -49,6 +49,7 @@ where
     hooks: HashMap<keyboard::Key, Message>,
     text_input: TextInput<'a, Message, Theme, Renderer>,
     on_match: Option<Box<dyn Fn(HotkeyId) -> Message>>,
+    on_focus: Option<Message>,
     on_unfocus: Option<Message>,
     on_caret_change: Option<Box<dyn Fn(CaretState) -> Message>>,
     suppress_clipboard_writes: bool,
@@ -72,6 +73,7 @@ where
             hooks: HashMap::new(),
             text_input: TextInput::<'a, Message, Theme, Renderer>::new(placeholder, value),
             on_match: None,
+            on_focus: None,
             on_unfocus: None,
             on_caret_change: None,
             suppress_clipboard_writes: false,
@@ -82,6 +84,13 @@ where
     /// Set the callback for when a hotkey is captured
     pub fn on_match(mut self, f: impl Fn(HotkeyId) -> Message + 'static) -> Self {
         self.on_match = Some(Box::new(f));
+        self
+    }
+
+    /// Set the message published when the input transitions from unfocused to
+    /// focused.
+    pub fn on_focus(mut self, message: Message) -> Self {
+        self.on_focus = Some(message);
         self
     }
 
@@ -349,15 +358,15 @@ where
             viewport,
         );
 
-        // Fire `on_unfocus` when the input gives up focus, in either of two
-        // ways:
+        // Publish focus transitions after the wrapped widget processes the
+        // event. `on_unfocus` also fires when the OS window loses focus:
         //  (a) the focused→unfocused edge — a click away, Escape, or a focus
         //      operation pointing elsewhere, after which `is_focused` is None;
         //  (b) the OS window losing focus while the input still holds it. iced
         //      keeps `is_focused` Some on `Window::Unfocused` (only an internal
         //      blink flag flips), so the edge in (a) never trips when the user
         //      alt-tabs to another application — so match that event directly.
-        if let Some(on_unfocus) = self.on_unfocus.as_ref() {
+        if self.on_focus.is_some() || self.on_unfocus.is_some() {
             let now_focused = tree.children[0]
                 .state
                 .downcast_ref::<text_input::State<Renderer::Paragraph>>()
@@ -365,7 +374,15 @@ where
             let window_blurred =
                 matches!(event, iced::Event::Window(iced::window::Event::Unfocused));
             let state = tree.state.downcast_mut::<State>();
-            if (state.was_focused && !now_focused) || (window_blurred && now_focused) {
+            if !state.was_focused
+                && now_focused
+                && let Some(on_focus) = self.on_focus.as_ref()
+            {
+                shell.publish(on_focus.clone());
+            }
+            if ((state.was_focused && !now_focused) || (window_blurred && now_focused))
+                && let Some(on_unfocus) = self.on_unfocus.as_ref()
+            {
                 shell.publish(on_unfocus.clone());
             }
             state.was_focused = now_focused;

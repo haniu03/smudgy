@@ -13,7 +13,8 @@ use arc_swap::ArcSwap;
 use iced::{Background, Color, Font};
 use smudgy_cloud::parse_css_color;
 use smudgy_core::models::settings::{
-    CommandInputBehavior, MAX_LINK_TOOLTIP_DELAY_MS, ScriptPalette, Settings, ThemeTweaks,
+    CommandInputBehavior, MAX_LINK_TOOLTIP_DELAY_MS, ScriptPalette, Settings, TerminalBoldMode,
+    ThemeTweaks,
 };
 use smudgy_core::session::connection::vt_processor::AnsiColor;
 use smudgy_core::session::styled_line::Color as VtColor;
@@ -293,9 +294,8 @@ pub struct TerminalPrefs {
     /// kept in the snapshot so a toggle bumps `generation` and re-shapes
     /// every cached paragraph.
     pub ligatures: bool,
-    /// Whether SGR bold also promotes ordinary/default ANSI foregrounds to
-    /// their bright palette equivalents.
-    pub bold_is_bright: bool,
+    /// Whether SGR bold changes font weight, ANSI palette brightness, or both.
+    pub bold_mode: TerminalBoldMode,
     pub line_height: f32,
     /// Maximum line length in columns; `None` wraps at the pane width.
     pub line_length: Option<u16>,
@@ -372,7 +372,7 @@ impl TerminalPrefs {
             font: font_for_family(&settings.terminal_font_family),
             font_size,
             ligatures: settings.terminal_font_ligatures,
-            bold_is_bright: settings.terminal_bold_is_bright,
+            bold_mode: settings.terminal_bold_mode,
             line_height: (font_size * 1.25).round(),
             // Clamp here too: hand-edited settings.json bypasses the UI
             // validation, and 0 columns would shape zero-width paragraphs.
@@ -578,7 +578,7 @@ pub fn apply(settings: &Settings) {
     }
     let visually_equal = next.font == current.font
         && next.ligatures == current.ligatures
-        && next.bold_is_bright == current.bold_is_bright
+        && next.bold_mode == current.bold_mode
         && next.font_size == current.font_size
         && next.line_height == current.line_height
         && next.line_length == current.line_length
@@ -699,7 +699,7 @@ pub fn app_theme() -> smudgy_theme::Theme {
 #[cfg(test)]
 mod tests {
     use super::{Color, TerminalPalette, TerminalPrefs, palettes};
-    use smudgy_core::models::settings::{MAX_LINK_TOOLTIP_DELAY_MS, Settings};
+    use smudgy_core::models::settings::{MAX_LINK_TOOLTIP_DELAY_MS, Settings, TerminalBoldMode};
 
     fn assert_color_close(actual: Color, expected: Color) {
         const TOLERANCE: f32 = 0.000_1;
@@ -776,12 +776,17 @@ mod tests {
     }
 
     #[test]
-    fn bold_is_bright_follows_settings_and_defaults_on() {
-        assert!(TerminalPrefs::from_settings(&Settings::default(), 0).bold_is_bright);
-        let settings = Settings {
-            terminal_bold_is_bright: false,
-            ..Settings::default()
-        };
-        assert!(!TerminalPrefs::from_settings(&settings, 0).bold_is_bright);
+    fn terminal_bold_mode_follows_settings_and_defaults_to_both() {
+        assert_eq!(
+            TerminalPrefs::from_settings(&Settings::default(), 0).bold_mode,
+            TerminalBoldMode::BoldAndBright
+        );
+        for mode in TerminalBoldMode::ALL {
+            let settings = Settings {
+                terminal_bold_mode: mode,
+                ..Settings::default()
+            };
+            assert_eq!(TerminalPrefs::from_settings(&settings, 0).bold_mode, mode);
+        }
     }
 }

@@ -1662,6 +1662,7 @@ impl SmudgyWindow {
             return Task::none();
         }
         if let Some(session) = sessions.get(session_id) {
+            session.note_command_input_focus(MAIN_PANE_KEY);
             let input_id = session.input.input_id();
             operation::focus(input_id)
         } else {
@@ -1727,6 +1728,7 @@ impl SmudgyWindow {
                 // every other holder) without re-focusing it when it already
                 // holds focus — the stock focus operation would move its
                 // caret to the end.
+                session.note_command_input_focus(MAIN_PANE_KEY);
                 focus_task = components::session_input::focus_target(session.input.input_id());
             } else if rendered.is_none_or(|slot| slot.key != MAIN_PANE_KEY) {
                 // The newly rendered pane offers no main input to hand focus
@@ -3390,15 +3392,13 @@ impl SmudgyWindow {
                 column![
                     chip,
                     text(crate::i18n::t!("shell-no-sessions")).size(22),
-                    text(crate::i18n::t!("shell-connect-help"))
-                        .style(theme::builtins::text::muted),
+                    text(crate::i18n::t!("shell-connect-help")).style(theme::builtins::text::muted),
                     iced::widget::button(
-                        text(crate::i18n::t!("shell-connect-action"))
-                            .font(assets::fonts::GEIST_VF)
+                        text(crate::i18n::t!("shell-connect-action")).font(assets::fonts::GEIST_VF)
                     )
-                        .style(theme::builtins::button::primary)
-                        .padding([10, 22])
-                        .on_press(Message::ToolbarAction(toolbar::Message::ConnectPressed)),
+                    .style(theme::builtins::button::primary)
+                    .padding([10, 22])
+                    .on_press(Message::ToolbarAction(toolbar::Message::ConnectPressed)),
                 ]
                 .spacing(16)
                 .align_x(Horizontal::Center),
@@ -3445,8 +3445,7 @@ impl SmudgyWindow {
             snapshot.show_upgrade_banner().then(|| {
                 container(
                     row![
-                        text(crate::i18n::t!("shell-client-outdated"))
-                        .size(13),
+                        text(crate::i18n::t!("shell-client-outdated")).size(13),
                         iced::widget::button(
                             text(crate::i18n::t!(
                                 "shell-download-at",

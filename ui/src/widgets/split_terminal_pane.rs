@@ -22,16 +22,16 @@ mod terminal_pane;
 
 use terminal_pane::{TerminalPane, terminal_pane};
 
-struct SplitTerminalPane<'a> {
+struct SplitTerminalPane<'a, Message> {
     pub selection: Rc<RefCell<Selection>>,
     pub buffer: Ref<'a, TerminalBuffer>,
-    pub on_link: Option<Rc<dyn Fn(LinkClickEvent)>>,
+    pub on_link: Option<Rc<dyn Fn(LinkClickEvent) -> Message>>,
     pub on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
     /// Called with `(cols, rows)` when the pane's character grid changes — the full
     /// terminal region in cells, quantized so it only fires on actual grid changes.
-    /// A plain callback for the same reason as `on_link`: the pane stays
-    /// `Message`-agnostic, and the handler sends the runtime action itself (the
-    /// session's NAWS report — wired only for the session's main terminal).
+    /// A plain callback is sufficient because this report does not mutate UI
+    /// state; it sends the session's NAWS runtime action directly and is wired
+    /// only for the main terminal.
     pub on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
     /// Per-pane font override (`docs/panes.md`); `None` follows the global
     /// preference. This widget applies it to scrollback; the pane composition
@@ -39,7 +39,7 @@ struct SplitTerminalPane<'a> {
     pub font_size: Option<f32>,
 }
 
-impl<'a> SplitTerminalPane<'a> {
+impl<'a, Message> SplitTerminalPane<'a, Message> {
     pub fn new(buffer: Ref<'a, TerminalBuffer>, selection: Rc<RefCell<Selection>>) -> Self {
         Self {
             selection,
@@ -51,7 +51,7 @@ impl<'a> SplitTerminalPane<'a> {
         }
     }
 
-    fn terminal_pane(&self) -> TerminalPane<'a> {
+    fn terminal_pane(&self) -> TerminalPane<'a, Message> {
         terminal_pane(Ref::clone(&self.buffer), self.selection.clone())
             .on_link(self.on_link.clone())
             .on_link_tooltip(self.on_link_tooltip.clone())
@@ -64,7 +64,7 @@ impl<'a> SplitTerminalPane<'a> {
         terminal_pane::effective_metrics(&crate::prefs::current(), self.font_size).1
     }
 
-    fn scroll_bar_element<Message, Theme, Renderer: iced::advanced::Renderer>(
+    fn scroll_bar_element<Theme, Renderer: iced::advanced::Renderer>(
         &self,
         visible_lines: f32,
         state: Option<rc::Weak<RefCell<State>>>,
@@ -126,7 +126,7 @@ impl<'a> SplitTerminalPane<'a> {
     /// past the top or bottom edge, scroll toward the cursor on every redraw
     /// tick — driven by a self-sustaining `request_redraw` loop rather than
     /// mouse events, so scrolling continues while the mouse is held still.
-    fn drag_autoscroll<P, Message>(
+    fn drag_autoscroll<P>(
         &self,
         tree: &Tree,
         event: &Event,
@@ -328,7 +328,8 @@ impl State {
     }
 }
 
-impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer> for SplitTerminalPane<'a>
+impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for SplitTerminalPane<'a, Message>
 where
     Renderer: iced::advanced::Renderer + iced::advanced::text::Renderer<Font = iced::Font> + 'a,
     Renderer::Paragraph:
@@ -337,9 +338,13 @@ where
 {
     fn children(&self) -> Vec<tree::Tree> {
         vec![
-            Tree::new(Element::<(), Theme, Renderer>::new(self.terminal_pane())),
-            Tree::new(Element::<(), Theme, Renderer>::new(self.terminal_pane())),
-            Tree::new::<(), Theme, Renderer>(&self.scroll_bar_element(0.0, None)),
+            Tree::new(Element::<Message, Theme, Renderer>::new(
+                self.terminal_pane(),
+            )),
+            Tree::new(Element::<Message, Theme, Renderer>::new(
+                self.terminal_pane(),
+            )),
+            Tree::new::<Message, Theme, Renderer>(&self.scroll_bar_element(0.0, None)),
         ]
     }
 
@@ -380,18 +385,19 @@ where
         let (main_pane_node, scrollback_pane_node) = if state.borrow().is_split() {
             let main_pane_limits = terminal_pane_limits.loose().max_height(200.0);
 
-            let mut main_pane_node = <TerminalPane<'_> as Widget<Message, Theme, Renderer>>::layout(
-                &mut self.terminal_pane(),
-                main_pane_tree,
-                renderer,
-                &main_pane_limits,
-            );
+            let mut main_pane_node =
+                <TerminalPane<'_, Message> as Widget<Message, Theme, Renderer>>::layout(
+                    &mut self.terminal_pane(),
+                    main_pane_tree,
+                    renderer,
+                    &main_pane_limits,
+                );
 
             let scrollback_pane_limits =
                 terminal_pane_limits.shrink(Size::new(0.0, main_pane_node.bounds().height));
 
             let scrollback_pane_node =
-                <TerminalPane<'_> as Widget<Message, Theme, Renderer>>::layout(
+                <TerminalPane<'_, Message> as Widget<Message, Theme, Renderer>>::layout(
                     &mut self
                         .terminal_pane()
                         .last_line_number(state.borrow().scroll_bar_value as usize),
@@ -405,12 +411,13 @@ where
 
             (main_pane_node, scrollback_pane_node)
         } else {
-            let main_pane_node = <TerminalPane<'_> as Widget<Message, Theme, Renderer>>::layout(
-                &mut self.terminal_pane(),
-                main_pane_tree,
-                renderer,
-                &terminal_pane_limits,
-            );
+            let main_pane_node =
+                <TerminalPane<'_, Message> as Widget<Message, Theme, Renderer>>::layout(
+                    &mut self.terminal_pane(),
+                    main_pane_tree,
+                    renderer,
+                    &terminal_pane_limits,
+                );
 
             (main_pane_node, Node::new(Size::new(0.0, 0.0)))
         };
@@ -423,10 +430,7 @@ where
         let visible_lines = terminal_pane_limits.max().height / line_height;
 
         let scrollbar_node = self
-            .scroll_bar_element::<Message, Theme, Renderer>(
-                visible_lines,
-                Some(Rc::downgrade(state)),
-            )
+            .scroll_bar_element::<Theme, Renderer>(visible_lines, Some(Rc::downgrade(state)))
             .as_widget_mut()
             .layout(scrollbar_tree, renderer, &scrollbar_limits);
 
@@ -488,7 +492,7 @@ where
         let scrollbar_layout = children.next().unwrap();
 
         if state.borrow().is_split() {
-            <TerminalPane<'_> as Widget<Message, Theme, Renderer>>::draw(
+            <TerminalPane<'_, Message> as Widget<Message, Theme, Renderer>>::draw(
                 &self.terminal_pane(),
                 scrollback_pane_tree,
                 renderer,
@@ -500,7 +504,7 @@ where
             );
         }
 
-        <TerminalPane<'_> as Widget<Message, Theme, Renderer>>::draw(
+        <TerminalPane<'_, Message> as Widget<Message, Theme, Renderer>>::draw(
             &self.terminal_pane(),
             main_pane_tree,
             renderer,
@@ -511,7 +515,7 @@ where
             viewport,
         );
 
-        self.scroll_bar_element::<Message, Theme, Renderer>(
+        self.scroll_bar_element::<Theme, Renderer>(
             state.borrow().visible_lines,
             Some(Rc::downgrade(state)),
         )
@@ -610,7 +614,7 @@ where
             return;
         }
 
-        self.drag_autoscroll::<Renderer::Paragraph, Message>(tree, event, layout, cursor, shell);
+        self.drag_autoscroll::<Renderer::Paragraph>(tree, event, layout, cursor, shell);
 
         let mut scroll_bar =
             self.scroll_bar_element(state.borrow().visible_lines, Some(Rc::downgrade(state)));
@@ -635,7 +639,7 @@ where
 pub fn split_terminal_pane<'a, Message, Theme, Renderer>(
     buffer: Ref<'a, TerminalBuffer>,
     selection: Rc<RefCell<Selection>>,
-    on_link: Option<Rc<dyn Fn(LinkClickEvent)>>,
+    on_link: Option<Rc<dyn Fn(LinkClickEvent) -> Message>>,
     on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
     on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
     font_size: Option<f32>,

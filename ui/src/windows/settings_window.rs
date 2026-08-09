@@ -16,7 +16,7 @@ use iced::{Alignment, Background, Color, Length, Task};
 use smudgy_cloud::cloud_api::{ApiKeyInfo, AuthSession, CreatedApiKey, SessionInfo, UserProfile};
 use smudgy_cloud::{CloudError, Uuid};
 use smudgy_core::models::settings::{
-    CommandInputBehavior, MAX_LINK_TOOLTIP_DELAY_MS, Settings, ThemeTweaks,
+    CommandInputBehavior, MAX_LINK_TOOLTIP_DELAY_MS, Settings, TerminalBoldMode, ThemeTweaks,
     clear_update_check_seed, load_settings,
 };
 
@@ -116,7 +116,7 @@ pub enum Message {
 
     PrefFontSelected(String),
     PrefFontLigaturesToggled(bool),
-    PrefBoldIsBrightToggled(bool),
+    PrefBoldModeSelected(TerminalBoldMode),
     PrefLocaleSelected(LocaleChoice),
     PrefFontSizeChanged(String),
     PrefFontSizeSubmitted,
@@ -620,8 +620,8 @@ impl SettingsWindow {
                 self.settings.terminal_font_ligatures = enabled;
                 self.settings_changed()
             }
-            Message::PrefBoldIsBrightToggled(enabled) => {
-                self.settings.terminal_bold_is_bright = enabled;
+            Message::PrefBoldModeSelected(mode) => {
+                self.settings.terminal_bold_mode = mode;
                 self.settings_changed()
             }
             Message::PrefLocaleSelected(locale) => {
@@ -1306,9 +1306,14 @@ impl SettingsWindow {
         );
         col = col.push(
             column![
-                checkbox(self.settings.terminal_bold_is_bright)
-                    .label(t!("preferences-bold-is-bright"))
-                    .on_toggle(Message::PrefBoldIsBrightToggled),
+                dim_text_owned(t!("preferences-bold-is-bright")),
+                pick_list(
+                    TerminalBoldMode::ALL,
+                    Some(self.settings.terminal_bold_mode),
+                    Message::PrefBoldModeSelected,
+                )
+                .text_size(13)
+                .width(280),
                 dim_text_owned(t!("preferences-bold-is-bright-help")),
             ]
             .spacing(2),

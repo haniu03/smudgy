@@ -56,7 +56,7 @@ use smudgy_core::session::{
         vt_processor::{AnsiColor, VtProcessor, sgr_process},
     },
     runtime::RuntimeAction,
-    styled_line::{Color, Style, StyledLine, VtSpan},
+    styled_line::{Color, Style, StyledLine, Underline, VtSpan},
 };
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use vtparse::{CsiParam, VTActor, VTParser};
@@ -500,10 +500,9 @@ fn sanity_check(lines: &[String]) {
         sgr_process(default_style(), &parse_sgr_params(b"\x1b[31m")).fg,
         red(false)
     );
-    assert_eq!(
-        sgr_process(default_style(), &parse_sgr_params(b"\x1b[1;31m")).fg,
-        red(true)
-    );
+    let bold_red = sgr_process(default_style(), &parse_sgr_params(b"\x1b[1;31m"));
+    assert_eq!(bold_red.fg, red(false));
+    assert!(bold_red.attributes.bold);
     assert_eq!(
         sgr_process(default_style(), &parse_sgr_params(b"\x1b[38;2;1;2;3m")).fg,
         Color::Rgb { r: 1, g: 2, b: 3 }
@@ -521,16 +520,15 @@ fn sanity_check(lines: &[String]) {
         sgr_process(styled, &parse_sgr_params(b"\x1b[0m")),
         default_style()
     );
-    // Backgrounds apply, and a directive with no Style representation skips
-    // only itself — co-located colors still land.
+    // Backgrounds apply, and text attributes coexist with co-located colors.
     assert_eq!(
         sgr_process(default_style(), &parse_sgr_params(b"\x1b[41m")).bg,
         red(false)
     );
-    assert_eq!(
-        sgr_process(default_style(), &parse_sgr_params(b"\x1b[1;4;31m")).fg,
-        red(true)
-    );
+    let bold_underlined_red = sgr_process(default_style(), &parse_sgr_params(b"\x1b[1;4;31m"));
+    assert_eq!(bold_underlined_red.fg, red(false));
+    assert!(bold_underlined_red.attributes.bold);
+    assert_eq!(bold_underlined_red.attributes.underline, Underline::Single);
 
     eprintln!(
         "sanity: telnet decoded {} data bytes / {} prompts / {} subnegotiations; \

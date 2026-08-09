@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::terminal_buffer::{
-    LinkClickEvent, LinkRenderStyle, SpanMetadata, TerminalBuffer, make_span,
+    LinkClickEvent, LinkRenderStyle, RenderedOffsets, SpanMetadata, TerminalBuffer, make_span,
 };
 use iced::{
     Background, Border, Event, Pixels, Point, Rectangle, Size,
@@ -108,6 +108,7 @@ struct ParagraphCache<P: text::Paragraph> {
     line_number: usize,
     source: Arc<StyledLine>,
     spans: Spans<Link>,
+    offsets: RenderedOffsets,
     paragraph: P,
     slow_blink_hidden: Option<P>,
     fast_blink_hidden: Option<P>,
@@ -129,6 +130,8 @@ const SLOW_BLINK: u8 = 1;
 const FAST_BLINK: u8 = 2;
 const SLOW_BLINK_HALF_PERIOD_MS: u128 = 500;
 const FAST_BLINK_HALF_PERIOD_MS: u128 = 250;
+const TOOLTIP_SPINNER_FRAME_MS: u64 = 100;
+const TOOLTIP_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct LinkKey {
@@ -145,6 +148,23 @@ impl LinkKey {
             end: link.end_pos,
         }
     }
+}
+
+fn link_navigation_index(
+    link_count: usize,
+    current: Option<usize>,
+    backwards: bool,
+) -> Option<usize> {
+    if link_count == 0 {
+        return None;
+    }
+    Some(if backwards {
+        current.map_or(link_count - 1, |index| {
+            index.checked_sub(1).unwrap_or(link_count - 1)
+        })
+    } else {
+        current.map_or(0, |index| (index + 1) % link_count)
+    })
 }
 
 fn append_query_flag(value: &str, name: &str, enabled: bool) -> Arc<str> {
@@ -337,6 +357,18 @@ fn clipped_tooltip_text(text: &LinkTooltipText) -> LinkTooltipText {
     }
 }
 
+fn loading_tooltip_display(
+    spinner_frame: usize,
+    target: Option<Arc<str>>,
+) -> (LinkTooltipText, Option<Arc<str>>) {
+    let indicator = TOOLTIP_SPINNER_FRAMES[spinner_frame % TOOLTIP_SPINNER_FRAMES.len()];
+    let text = format!(
+        "{indicator} {}",
+        crate::i18n::translate("link-tooltip-loading")
+    );
+    (LinkTooltipText::plain(Arc::from(text)), target)
+}
+
 #[derive(Debug, Clone)]
 struct LinkTooltipParagraphCache<P: text::Paragraph> {
     text: LinkTooltipText,
@@ -351,8 +383,8 @@ fn draw_link_tooltip<Renderer>(
     prefs: &crate::prefs::TerminalPrefs,
     viewport: Rectangle,
     cursor: mouse::Cursor,
-    action: &LinkAction,
-    tooltip: &LinkTooltip,
+    link: &HoveredLinkTooltip,
+    spinner_frame: usize,
     paragraph_cache: &RefCell<Option<LinkTooltipParagraphCache<Renderer::Paragraph>>>,
 ) where
     Renderer: text::Renderer<Font = iced::Font>,
@@ -361,10 +393,19 @@ fn draw_link_tooltip<Renderer>(
     let Some(cursor) = cursor.position() else {
         return;
     };
-    let Some((primary, secondary)) = tooltip.display_styled() else {
+    let tooltip = &link.tooltip;
+    let display = if tooltip.is_loading() {
+        Some(loading_tooltip_display(
+            spinner_frame,
+            tooltip.target.clone(),
+        ))
+    } else {
+        tooltip.display_styled()
+    };
+    let Some((primary, secondary)) = display else {
         return;
     };
-    let target = action_target(action);
+    let target = action_target(&link.action);
     let primary = if secondary.is_none() && target.as_deref() == Some(primary.text.as_ref()) {
         LinkTooltipText::plain(Arc::from(safe_link_target(primary.text.as_ref())))
     } else {
@@ -574,13 +615,6 @@ impl LinkTooltipHover {
 
     fn is_open(&self) -> bool {
         matches!(self, Self::Open(_))
-    }
-
-    fn is_open_for(&self, action: &LinkAction, tooltip: &LinkTooltip) -> bool {
-        matches!(
-            self,
-            Self::Open(link) if link.action == *action && link.tooltip == *tooltip
-        )
     }
 }
 
@@ -918,6 +952,7 @@ pub(super) struct State<P: text::Paragraph> {
     revealed_spoilers: HashSet<LinkKey>,
     visibility: HashMap<LinkKey, VisibilityState>,
     visual_generation: u64,
+    seen_link_navigation_reset_epoch: u64,
     seen_input_epoch: u64,
     seen_prompt_epoch: u64,
     seen_output_epoch: u64,
@@ -948,6 +983,7 @@ impl<P: text::Paragraph> Default for State<P> {
             revealed_spoilers: HashSet::new(),
             visibility: HashMap::new(),
             visual_generation: 0,
+            seen_link_navigation_reset_epoch: 0,
             seen_input_epoch: 0,
             seen_prompt_epoch: 0,
             seen_output_epoch: 0,
@@ -1039,6 +1075,25 @@ impl<P: text::Paragraph> State<P> {
         if self.focused_link.is_some_and(|key| !live.contains(&key)) {
             self.focused_link = None;
             self.focus_visible = false;
+        }
+    }
+
+    fn keyboard_focused_link(&self) -> Option<LinkKey> {
+        self.focus_visible.then_some(self.focused_link).flatten()
+    }
+
+    fn process_link_navigation_reset(&mut self, epoch: u64) {
+        if epoch == self.seen_link_navigation_reset_epoch {
+            return;
+        }
+        self.seen_link_navigation_reset_epoch = epoch;
+
+        let changed = self.is_focused || self.focused_link.is_some() || self.focus_visible;
+        self.is_focused = false;
+        self.focused_link = None;
+        self.focus_visible = false;
+        if changed {
+            self.invalidate_link_styles();
         }
     }
 
@@ -1188,7 +1243,7 @@ impl<P: text::Paragraph> State<P> {
                 return match line.paragraph.hit_test(point_in_paragraph) {
                     Some(hit) => Some(BufferPosition {
                         line: line_number,
-                        column: hit.cursor(),
+                        column: line.offsets.rendered_to_source(hit.cursor()),
                     }),
                     None => {
                         // The point is not in the paragraph, but it is to the left or right of it, let's snap to it
@@ -1215,14 +1270,17 @@ impl<P: text::Paragraph> State<P> {
                                         .map(|span_bounds| (*span_bounds, idx))
                                 })
                                 .reduce(|acc, item| if acc.0.x > item.0.x { acc } else { item })
-                                .map(|(_, idx)| BufferPosition {
-                                    line: line_number,
-                                    column: line
+                                .map(|(_, idx)| {
+                                    let rendered_column = line
                                         .spans
                                         .spans()
                                         .iter()
                                         .take(idx + 1)
-                                        .fold(0, |acc, span| acc + span.text.len()),
+                                        .fold(0, |acc, span| acc + span.text.len());
+                                    BufferPosition {
+                                        line: line_number,
+                                        column: line.offsets.rendered_to_source(rendered_column),
+                                    }
                                 })
                         }
                     }
@@ -1233,14 +1291,14 @@ impl<P: text::Paragraph> State<P> {
     }
 }
 
-pub struct TerminalPane<'a> {
+pub struct TerminalPane<'a, Message> {
     terminal_buffer: Ref<'a, TerminalBuffer>,
     selection: Rc<RefCell<Selection>>,
     last_line_number: Option<usize>,
-    /// Called with the action of a clicked link span. A plain callback rather than a
-    /// shell message so the pane stays `Message`-agnostic (it is instantiated under
-    /// several message types); the handler sends the resulting runtime action itself.
-    on_link: Option<Rc<dyn Fn(LinkClickEvent)>>,
+    /// Maps a clicked link span into the hosting session's message. Publishing
+    /// through the widget shell defers session mutation until the terminal's
+    /// immutable scrollback borrow has been released.
+    on_link: Option<Rc<dyn Fn(LinkClickEvent) -> Message>>,
     /// Routes the one lazy first-hover request for script-authored tooltip copy.
     on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
     /// Per-pane terminal font override (`docs/panes.md`); `None` follows the
@@ -1248,7 +1306,7 @@ pub struct TerminalPane<'a> {
     font_size: Option<f32>,
 }
 
-impl<'a> TerminalPane<'a> {
+impl<'a, Message> TerminalPane<'a, Message> {
     pub fn new(buffer: Ref<'a, TerminalBuffer>, selection: Rc<RefCell<Selection>>) -> Self {
         log::debug!("TerminalPane::new() called");
         Self {
@@ -1266,7 +1324,7 @@ impl<'a> TerminalPane<'a> {
         self
     }
 
-    pub fn on_link(mut self, on_link: Option<Rc<dyn Fn(LinkClickEvent)>>) -> Self {
+    pub fn on_link(mut self, on_link: Option<Rc<dyn Fn(LinkClickEvent) -> Message>>) -> Self {
         self.on_link = on_link;
         self
     }
@@ -1285,7 +1343,7 @@ impl<'a> TerminalPane<'a> {
     }
 }
 
-impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer> for TerminalPane<'a>
+impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer> for TerminalPane<'a, Message>
 where
     Renderer: text::Renderer<Font = iced::Font> + 'a,
     Renderer::Paragraph:
@@ -1322,6 +1380,7 @@ where
             .map(|(line, link)| LinkKey::new(*line, link))
             .collect();
         state.prune_link_instances(&live_links);
+        state.process_link_navigation_reset(self.terminal_buffer.link_navigation_reset_epoch());
         state.process_visibility_epochs(self.terminal_buffer.visibility_epochs());
         let selection = self.selection.borrow();
         let prefs = crate::prefs::current();
@@ -1417,7 +1476,10 @@ where
                             cache.spans.select_all();
                         }
                         Some((from, to)) => {
-                            cache.spans.select_range(from, to);
+                            cache.spans.select_range(
+                                cache.offsets.source_to_rendered(from),
+                                cache.offsets.source_to_rendered(to),
+                            );
                         }
                     }
                 } else {
@@ -1451,7 +1513,7 @@ where
                                 .is_some_and(|visibility| visibility.concealed)
                     })
             });
-            let rendered_spans = if dynamic_links {
+            let rendered = if dynamic_links {
                 line.spans_with_link_state(&prefs, line_hidden, |link| {
                     let key = LinkKey::new(line_number, link);
                     let protocol = link.action.protocol();
@@ -1486,9 +1548,10 @@ where
                     }
                 })
             } else {
-                line.spans().clone()
+                line.rendered_spans()
             };
-            let spans = Spans::with_selection(rendered_spans, line_selection);
+            let rendered_selection = rendered.offsets.map_selection(line_selection);
+            let spans = Spans::with_selection(rendered.spans, rendered_selection);
 
             let spans_vec = spans.spans();
             let make_paragraph = |content: &[iced::widget::text::Span<'static, Link>]| {
@@ -1524,6 +1587,7 @@ where
                 line_number,
                 source: line.styled_line.clone(),
                 spans,
+                offsets: rendered.offsets,
                 paragraph,
                 slow_blink_hidden,
                 fast_blink_hidden,
@@ -1689,18 +1753,21 @@ where
                 && let Some(tooltip) = self
                     .terminal_buffer
                     .link_tooltip_at(buffer_position.line, buffer_position.column)
-                && state
-                    .link_tooltip_hover
-                    .as_ref()
-                    .is_some_and(|hover| hover.is_open_for(&action, &tooltip))
+                && let Some(LinkTooltipHover::Open(link)) = state.link_tooltip_hover.as_ref()
+                && link.action == action
+                && link.tooltip == tooltip
             {
                 draw_link_tooltip(
                     renderer,
                     &prefs,
                     clipped_viewport,
                     cursor,
-                    &action,
-                    &tooltip,
+                    link,
+                    usize::try_from(
+                        state.blink_epoch.elapsed().as_millis()
+                            / u128::from(TOOLTIP_SPINNER_FRAME_MS),
+                    )
+                    .unwrap_or(0),
                     &state.link_tooltip_paragraph,
                 );
             }
@@ -1765,6 +1832,13 @@ where
             let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
             if let Some(next) = state.update_visibility_timers(*now) {
                 shell.request_redraw_at(next);
+            }
+            if state
+                .link_tooltip_hover
+                .as_ref()
+                .is_some_and(|hover| hover.is_open() && hover.link().tooltip.is_loading())
+            {
+                shell.request_redraw_at(*now + Duration::from_millis(TOOLTIP_SPINNER_FRAME_MS));
             }
             let blink_modes = state
                 .cache
@@ -1907,12 +1981,12 @@ where
                         state.invalidate_link_styles();
                     }
                     if let Some(on_link) = self.on_link.as_ref() {
-                        on_link(LinkClickEvent {
+                        shell.publish(on_link(LinkClickEvent {
                             action,
                             shift: state.modifiers.shift(),
                             ctrl: state.modifiers.control(),
                             alt: state.modifiers.alt(),
-                        });
+                        }));
                     }
                     shell.capture_event();
                     return;
@@ -2077,17 +2151,12 @@ where
                             primary = with_selected_callback(primary, selected);
                         }
                         state.mark_visited(&link.action);
-                        on_link(LinkClickEvent {
+                        shell.publish(on_link(LinkClickEvent {
                             action: primary,
                             shift: state.modifiers.shift(),
                             ctrl: state.modifiers.control(),
                             alt: state.modifiers.alt(),
-                        });
-                        // The handler may have staged UI state (the link-trust
-                        // confirm dialog slot) rather than publishing a message;
-                        // invalidate so it renders this frame, like the
-                        // selection updates above.
-                        shell.invalidate_layout();
+                        }));
                     } else if !reveal_only
                         && link.action.opens_menu_on_left_click()
                         && let Some(menu) = link.action.menu().cloned()
@@ -2225,13 +2294,9 @@ where
                                         LinkKey::new(*line, link) == focused
                                     })
                                 });
-                                let index = if modifiers.shift() {
-                                    current.map_or(links.len() - 1, |index| {
-                                        index.checked_sub(1).unwrap_or(links.len() - 1)
-                                    })
-                                } else {
-                                    current.map_or(0, |index| (index + 1) % links.len())
-                                };
+                                let index =
+                                    link_navigation_index(links.len(), current, modifiers.shift())
+                                        .expect("the link list was checked as non-empty");
                                 let (line, link) = &links[index];
                                 let focused = LinkKey::new(*line, link);
                                 state.focused_link = Some(focused);
@@ -2250,6 +2315,13 @@ where
                                             },
                                         ))
                                     });
+                                if state.link_tooltip_hover.is_some()
+                                    && let Some(request) =
+                                        link.tooltip.as_ref().and_then(LinkTooltip::request)
+                                    && let Some(on_tooltip) = self.on_link_tooltip.as_ref()
+                                {
+                                    on_tooltip(request);
+                                }
                                 state.invalidate_link_styles();
                                 shell.invalidate_layout();
                                 shell.request_redraw();
@@ -2258,7 +2330,7 @@ where
                         }
                         keyboard::Key::Named(
                             keyboard::key::Named::Enter | keyboard::key::Named::Space,
-                        ) if let Some(focused) = state.focused_link
+                        ) if let Some(focused) = state.keyboard_focused_link()
                             && let Some((_, link)) = self
                                 .terminal_buffer
                                 .all_link_spans()
@@ -2294,12 +2366,12 @@ where
                                     primary = with_selected_callback(primary, selected);
                                 }
                                 state.mark_visited(&link.action);
-                                on_link(LinkClickEvent {
+                                shell.publish(on_link(LinkClickEvent {
                                     action: primary,
                                     shift: modifiers.shift(),
                                     ctrl: modifiers.control(),
                                     alt: modifiers.alt(),
-                                });
+                                }));
                             }
                             state.invalidate_link_styles();
                             shell.invalidate_layout();
@@ -2312,7 +2384,7 @@ where
                                 key.as_ref(),
                                 keyboard::Key::Named(keyboard::key::Named::ContextMenu)
                             ) || modifiers.shift())
-                                && let Some(focused) = state.focused_link
+                                && let Some(focused) = state.keyboard_focused_link()
                                 && let Some((_, link)) =
                                     self.terminal_buffer.all_link_spans().into_iter().find(
                                         |(line, link)| LinkKey::new(*line, link) == focused,
@@ -2348,10 +2420,10 @@ where
     }
 }
 
-pub fn terminal_pane<'a>(
+pub fn terminal_pane<'a, Message>(
     buffer: Ref<'a, TerminalBuffer>,
     selection: Rc<RefCell<Selection>>,
-) -> TerminalPane<'a> {
+) -> TerminalPane<'a, Message> {
     TerminalPane::new(buffer, selection)
 }
 
@@ -2397,6 +2469,98 @@ mod tests {
             action,
             LinkAction::ServerSend(Arc::from("vote?choice=yes&selected=true#receipt"))
         );
+    }
+
+    #[test]
+    fn loading_tooltip_animates_and_retains_the_disclosed_target() {
+        let target: Arc<str> = Arc::from("send:inspect");
+        let (first, first_target) = loading_tooltip_display(0, Some(target.clone()));
+        let (second, second_target) = loading_tooltip_display(1, Some(target.clone()));
+
+        assert!(first.text.starts_with("| "));
+        assert!(second.text.starts_with("/ "));
+        assert_ne!(first.text, second.text);
+        assert_eq!(first_target.as_deref(), Some(target.as_ref()));
+        assert_eq!(second_target.as_deref(), Some(target.as_ref()));
+    }
+
+    #[test]
+    fn keyboard_activation_requires_visible_link_focus_and_editor_focus_clears_it() {
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+
+        let key = LinkKey {
+            line: 7,
+            begin: 3,
+            end: 9,
+        };
+        let mut state = State::<Paragraph> {
+            is_focused: true,
+            focused_link: Some(key),
+            focus_visible: false,
+            ..State::default()
+        };
+
+        assert_eq!(state.keyboard_focused_link(), None);
+        state.focus_visible = true;
+        assert_eq!(state.keyboard_focused_link(), Some(key));
+
+        let generation = state.visual_generation;
+        state.process_link_navigation_reset(1);
+        assert!(!state.is_focused);
+        assert_eq!(state.focused_link, None);
+        assert!(!state.focus_visible);
+        assert_ne!(state.visual_generation, generation);
+    }
+
+    #[test]
+    fn keyboard_link_navigation_skips_current_and_wraps_in_both_directions() {
+        assert_eq!(link_navigation_index(0, None, false), None);
+        assert_eq!(link_navigation_index(2, None, false), Some(0));
+        assert_eq!(link_navigation_index(2, Some(0), false), Some(1));
+        assert_eq!(link_navigation_index(2, Some(1), false), Some(0));
+
+        assert_eq!(link_navigation_index(2, None, true), Some(1));
+        assert_eq!(link_navigation_index(2, Some(1), true), Some(0));
+        assert_eq!(link_navigation_index(2, Some(0), true), Some(1));
+    }
+
+    #[test]
+    fn visited_and_selection_state_are_semantic_and_stable() {
+        use smudgy_core::session::styled_line::{LinkProtocol, LinkSelection};
+
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        let selection = LinkSelection {
+            group: Arc::from("difficulty"),
+            value: Arc::from("hard"),
+            toggle: true,
+            selected: false,
+            exclusive: true,
+            disabled: false,
+        };
+        let action = LinkAction::Configured {
+            primary: Some(Box::new(LinkAction::ServerSend(Arc::from("hard")))),
+            disabled: false,
+            primary_enabled: true,
+            menu: None,
+            menu_on_left_click: false,
+            protocol: Some(LinkProtocol {
+                selection: Some(selection.clone()),
+                ..LinkProtocol::default()
+            }),
+        };
+        let mut state = State::<Paragraph>::default();
+
+        assert!(!state.visited(&action));
+        state.mark_visited(&action);
+        state.mark_visited(&action);
+        assert!(state.visited(&action));
+        assert_eq!(state.visited_actions.len(), 1);
+
+        assert!(!state.selected(&selection));
+        assert_eq!(state.toggle_link_selection(&action), Some(true));
+        assert!(state.selected(&selection));
+        assert_eq!(state.toggle_link_selection(&action), Some(false));
+        assert!(!state.selected(&selection));
     }
 
     #[test]

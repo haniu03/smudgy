@@ -14,6 +14,7 @@ use smudgy_core::session::styled_line::{
 };
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
+use unicode_segmentation::UnicodeSegmentation;
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -65,6 +66,163 @@ impl LinkRenderStyle {
     }
 }
 
+/// Bidirectional byte-offset mapping between the immutable source line and the
+/// text actually shaped by the renderer. Most lines are identity-mapped;
+/// concealed spoilers need a real map because one grapheme becomes one space.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum RenderedOffsets {
+    #[default]
+    Identity,
+    Mapped {
+        source: Rc<[usize]>,
+        rendered: Rc<[usize]>,
+    },
+}
+
+impl RenderedOffsets {
+    fn map(offset: usize, from: &[usize], to: &[usize]) -> usize {
+        if offset == usize::MAX {
+            return usize::MAX;
+        }
+        match from.binary_search(&offset) {
+            Ok(index) => to[index],
+            Err(0) => 0,
+            Err(index) if index == from.len() => *to.last().unwrap_or(&0),
+            Err(index) => {
+                let from_start = from[index - 1];
+                let from_end = from[index];
+                let to_start = to[index - 1];
+                let to_end = to[index];
+                if from_end - from_start == to_end - to_start {
+                    to_start + offset - from_start
+                } else {
+                    // Selection/link offsets should land on grapheme boundaries.
+                    // If an external edit leaves one inside a concealed cluster,
+                    // snap to its beginning rather than exposing partial text.
+                    to_start
+                }
+            }
+        }
+    }
+
+    pub(crate) fn source_to_rendered(&self, offset: usize) -> usize {
+        match self {
+            Self::Identity => offset,
+            Self::Mapped { source, rendered } => Self::map(offset, source, rendered),
+        }
+    }
+
+    pub(crate) fn rendered_to_source(&self, offset: usize) -> usize {
+        match self {
+            Self::Identity => offset,
+            Self::Mapped { source, rendered } => Self::map(offset, rendered, source),
+        }
+    }
+
+    pub(crate) fn map_selection(
+        &self,
+        selection: Option<(usize, usize)>,
+    ) -> Option<(usize, usize)> {
+        selection.map(|(from, to)| (self.source_to_rendered(from), self.source_to_rendered(to)))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RenderedSpans {
+    pub(crate) spans: Rc<Vec<Span<'static, Link>>>,
+    pub(crate) offsets: RenderedOffsets,
+}
+
+#[derive(Debug)]
+struct RenderedOffsetsBuilder {
+    source: Vec<usize>,
+    rendered: Vec<usize>,
+    source_end: usize,
+    rendered_end: usize,
+}
+
+impl Default for RenderedOffsetsBuilder {
+    fn default() -> Self {
+        Self {
+            source: vec![0],
+            rendered: vec![0],
+            source_end: 0,
+            rendered_end: 0,
+        }
+    }
+}
+
+impl RenderedOffsetsBuilder {
+    fn push(&mut self, source: &str, rendered: &str) {
+        let mut rendered_graphemes = rendered.graphemes(true);
+        for source_grapheme in source.graphemes(true) {
+            let rendered_grapheme = rendered_graphemes
+                .next()
+                .expect("rendered terminal text preserves grapheme count");
+            self.source_end += source_grapheme.len();
+            self.rendered_end += rendered_grapheme.len();
+            self.source.push(self.source_end);
+            self.rendered.push(self.rendered_end);
+        }
+        debug_assert!(rendered_graphemes.next().is_none());
+    }
+
+    fn finish(self) -> RenderedOffsets {
+        if self.source == self.rendered {
+            RenderedOffsets::Identity
+        } else {
+            RenderedOffsets::Mapped {
+                source: self.source.into(),
+                rendered: self.rendered.into(),
+            }
+        }
+    }
+}
+
+struct RenderedSpansBuilder<'a> {
+    spans: Vec<Span<'static, Link>>,
+    offsets: RenderedOffsetsBuilder,
+    prefs: &'a TerminalPrefs,
+    line_hidden: bool,
+}
+
+impl<'a> RenderedSpansBuilder<'a> {
+    fn new(capacity: usize, prefs: &'a TerminalPrefs, line_hidden: bool) -> Self {
+        Self {
+            spans: Vec::with_capacity(capacity),
+            offsets: RenderedOffsetsBuilder::default(),
+            prefs,
+            line_hidden,
+        }
+    }
+
+    fn push(
+        &mut self,
+        text: &str,
+        style: Style,
+        linked: bool,
+        link_style: Option<&LinkRenderStyle>,
+    ) {
+        let span = make_resolved_span(
+            text,
+            style,
+            linked,
+            link_style,
+            self.line_hidden,
+            self.prefs,
+        );
+        self.offsets.push(text, span.text.as_ref());
+        self.spans.push(span);
+    }
+
+    fn finish(self) -> RenderedSpans {
+        RenderedSpans {
+            spans: Rc::new(self.spans),
+            offsets: self.offsets.finish(),
+        }
+    }
+}
+
 /// One renderable segment: underlined over the foreground wash when linked (unless
 /// the span sets an explicit background, which wins — the underline stays).
 /// "Explicit" is judged by the resolved color model: `bg: "default"` normalizes to
@@ -98,13 +256,19 @@ fn make_resolved_span(
 ) -> Span<'static, Link> {
     let mut attributes = style.attributes;
     let authored = link_style.map(|style| &style.style);
-    if let Some(value) = authored.and_then(|style| style.bold) {
-        attributes.bold = value;
-    }
+    let sgr_bold = attributes.bold;
+    let authored_bold = authored.and_then(|style| style.bold);
+    // OSC-authored bold is literal styling. The preference only controls how
+    // an SGR bold attribute is presented, and an authored `bold: false`
+    // suppresses both of that SGR attribute's visual effects.
+    let bold_weight =
+        authored_bold.unwrap_or_else(|| sgr_bold && prefs.bold_mode.uses_bold_weight());
+    let bold_brightness =
+        sgr_bold && authored_bold != Some(false) && prefs.bold_mode.uses_bright_palette();
     if let Some(value) = authored.and_then(|style| style.italic) {
         attributes.italic = value;
     }
-    let logical_fg = if attributes.bold && prefs.bold_is_bright {
+    let logical_fg = if bold_brightness {
         match style.fg {
             Color::Ansi { color, bold: false } => Color::Ansi { color, bold: true },
             Color::DefaultForeground { bold: false } => Color::DefaultForeground { bold: true },
@@ -144,7 +308,7 @@ fn make_resolved_span(
         fg.a *= 0.5;
     }
     let mut font = prefs.font;
-    if attributes.bold {
+    if bold_weight {
         font.weight = iced::font::Weight::Bold;
     }
     if attributes.italic {
@@ -181,21 +345,6 @@ fn make_resolved_span(
     let hidden = line_hidden || link_style.is_some_and(|style| style.hidden);
     let spoiler_concealed = link_style.is_some_and(|style| style.spoiler_concealed);
     if spoiler_concealed {
-        let base = background.unwrap_or(prefs.palette.background);
-        let luminance = 0.2126 * base.r + 0.7152 * base.g + 0.0722 * base.b;
-        let cover = if luminance < 0.1 {
-            iced::Color::from_rgb8(40, 40, 40)
-        } else if luminance < 0.5 {
-            iced::Color::from_rgb(
-                (base.r * 1.4).min(1.0),
-                (base.g * 1.4).min(1.0),
-                (base.b * 1.4).min(1.0),
-            )
-        } else {
-            iced::Color::from_rgb(base.r / 1.4, base.g / 1.4, base.b / 1.4)
-        };
-        fg = cover;
-        background = Some(cover);
         underline = LinkDecoration::None;
     }
     if hidden {
@@ -216,7 +365,17 @@ fn make_resolved_span(
     let decoration_color = (!hidden && !spoiler_concealed)
         .then_some(decoration_color)
         .flatten();
-    let mut span = Span::<'static, Link>::new(Cow::Owned(text.to_string()))
+    // Color emoji glyphs do not necessarily honor a span foreground, so
+    // painting foreground and background alike cannot reliably conceal them.
+    // Shape one ordinary space per grapheme instead; reveal re-bakes the
+    // original text, while the offset map keeps hit-testing and selection tied
+    // to the immutable source line.
+    let rendered_text = if spoiler_concealed {
+        text.graphemes(true).map(|_| ' ').collect()
+    } else {
+        text.to_string()
+    };
+    let mut span = Span::<'static, Link>::new(Cow::Owned(rendered_text))
         .color(fg)
         .font(font)
         .underline(underline != LinkDecoration::None)
@@ -257,7 +416,7 @@ fn make_resolved_span(
 /// the link affordance without disturbing the line's own colors.
 #[inline]
 fn to_spans(styled_line: &Arc<StyledLine>, prefs: &TerminalPrefs) -> Rc<Vec<Span<'static, Link>>> {
-    to_spans_with(styled_line, prefs, false, LinkRenderStyle::base)
+    to_spans_with(styled_line, prefs, false, LinkRenderStyle::base).spans
 }
 
 fn to_spans_with(
@@ -265,19 +424,12 @@ fn to_spans_with(
     prefs: &TerminalPrefs,
     line_hidden: bool,
     resolve: impl Fn(&LinkSpan) -> LinkRenderStyle,
-) -> Rc<Vec<Span<'static, Link>>> {
-    let mut spans = Vec::with_capacity(styled_line.spans.len());
+) -> RenderedSpans {
+    let mut rendered = RenderedSpansBuilder::new(styled_line.spans.len(), prefs, line_hidden);
     for span_info in &styled_line.spans {
         let (begin, end) = (span_info.begin_pos, span_info.end_pos);
         if styled_line.links.is_empty() || begin == end {
-            spans.push(make_resolved_span(
-                &styled_line.text[begin..end],
-                span_info.style,
-                false,
-                None,
-                line_hidden,
-                prefs,
-            ));
+            rendered.push(&styled_line.text[begin..end], span_info.style, false, None);
             continue;
         }
         // Links are sorted and non-overlapping; walk the ones intersecting this span,
@@ -292,39 +444,28 @@ fn to_spans_with(
             }
             let linked_begin = link.begin_pos.max(cursor);
             if linked_begin > cursor {
-                spans.push(make_resolved_span(
+                rendered.push(
                     &styled_line.text[cursor..linked_begin],
                     span_info.style,
                     false,
                     None,
-                    line_hidden,
-                    prefs,
-                ));
+                );
             }
             let linked_end = link.end_pos.min(end);
             let resolved = resolve(link);
-            spans.push(make_resolved_span(
+            rendered.push(
                 &styled_line.text[linked_begin..linked_end],
                 span_info.style,
                 true,
                 Some(&resolved),
-                line_hidden,
-                prefs,
-            ));
+            );
             cursor = linked_end;
         }
         if cursor < end {
-            spans.push(make_resolved_span(
-                &styled_line.text[cursor..end],
-                span_info.style,
-                false,
-                None,
-                line_hidden,
-                prefs,
-            ));
+            rendered.push(&styled_line.text[cursor..end], span_info.style, false, None);
         }
     }
-    Rc::new(spans)
+    rendered.finish()
 }
 
 /// Clamp a byte offset to `text`'s length and snap it down to the nearest char
@@ -404,8 +545,15 @@ impl BufferLine {
         prefs: &TerminalPrefs,
         line_hidden: bool,
         resolve: impl Fn(&LinkSpan) -> LinkRenderStyle,
-    ) -> Rc<Vec<Span<'static, SpanMetadata>>> {
+    ) -> RenderedSpans {
         to_spans_with(&self.styled_line, prefs, line_hidden, resolve)
+    }
+
+    pub(crate) fn rendered_spans(&self) -> RenderedSpans {
+        RenderedSpans {
+            spans: self.spans().clone(),
+            offsets: RenderedOffsets::Identity,
+        }
     }
 
     /// Drop the baked spans so the next access re-bakes them (and downstream
@@ -428,6 +576,10 @@ pub struct TerminalBuffer {
     /// mutation — so the per-frame hover path can skip hit testing entirely on
     /// the (overwhelmingly common) linkless buffer via [`Self::has_links`].
     lines_with_links: usize,
+    /// Bumped whenever keyboard focus returns to this pane's command editor.
+    /// Terminal widget instances observe the epoch and drop their independent
+    /// link-navigation focus before processing further keyboard input.
+    link_navigation_reset_epoch: u64,
     visibility_input_epoch: u64,
     visibility_prompt_epoch: u64,
     visibility_output_epoch: u64,
@@ -464,6 +616,7 @@ impl TerminalBuffer {
             last_line_number: 0,
             span_generation: crate::prefs::current().generation,
             lines_with_links: 0,
+            link_navigation_reset_epoch: 0,
             visibility_input_epoch: 0,
             visibility_prompt_epoch: 0,
             visibility_output_epoch: 0,
@@ -473,6 +626,14 @@ impl TerminalBuffer {
 
     pub fn note_visibility_input(&mut self) {
         self.visibility_input_epoch = self.visibility_input_epoch.wrapping_add(1);
+    }
+
+    pub fn note_command_input_focus(&mut self) {
+        self.link_navigation_reset_epoch = self.link_navigation_reset_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn link_navigation_reset_epoch(&self) -> u64 {
+        self.link_navigation_reset_epoch
     }
 
     pub fn note_visibility_prompt(&mut self) {
@@ -1148,8 +1309,11 @@ mod tests {
     }
 
     #[test]
-    fn bold_weight_is_independent_from_bright_color_preference() {
+    fn sgr_bold_modes_preserve_the_regular_font_and_choose_weight_and_color() {
+        use smudgy_core::models::settings::TerminalBoldMode;
+
         let mut prefs = (*crate::prefs::current()).clone();
+        let regular_font = prefs.font;
         let style = Style {
             fg: Color::Ansi {
                 color: AnsiColor::Red,
@@ -1162,12 +1326,26 @@ mod tests {
             ..Style::DEFAULT
         };
 
-        prefs.bold_is_bright = true;
-        let bright = make_span("bold", style, false, None, &prefs);
+        prefs.bold_mode = TerminalBoldMode::Bold;
+        let bold = make_span("bold", style, false, None, &prefs);
         assert_eq!(
-            bright.font.map(|font| font.weight),
-            Some(iced::font::Weight::Bold)
+            bold.font,
+            Some(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..regular_font
+            })
         );
+        assert_eq!(
+            bold.color,
+            Some(prefs.resolve(Color::Ansi {
+                color: AnsiColor::Red,
+                bold: false,
+            }))
+        );
+
+        prefs.bold_mode = TerminalBoldMode::Bright;
+        let bright = make_span("bold", style, false, None, &prefs);
+        assert_eq!(bright.font, Some(regular_font));
         assert_eq!(
             bright.color,
             Some(prefs.resolve(Color::Ansi {
@@ -1176,20 +1354,18 @@ mod tests {
             }))
         );
 
-        prefs.bold_is_bright = false;
-        let normal = make_span("bold", style, false, None, &prefs);
+        prefs.bold_mode = TerminalBoldMode::BoldAndBright;
+        let both = make_span("bold", style, false, None, &prefs);
         assert_eq!(
-            normal.font.map(|font| font.weight),
-            Some(iced::font::Weight::Bold)
+            both.font,
+            Some(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..regular_font
+            })
         );
-        assert_eq!(
-            normal.color,
-            Some(prefs.resolve(Color::Ansi {
-                color: AnsiColor::Red,
-                bold: false,
-            }))
-        );
+        assert_eq!(both.color, bright.color);
 
+        prefs.bold_mode = TerminalBoldMode::Bold;
         let explicit_bright = make_span(
             "bright",
             Style {
@@ -1327,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn spoiler_cover_matches_foreground_and_background() {
+    fn concealed_spoiler_replaces_each_grapheme_with_a_space() {
         let prefs = crate::prefs::current();
         let resolved = LinkRenderStyle {
             authored: false,
@@ -1336,19 +1512,40 @@ mod tests {
             hidden: false,
         };
         let span = make_resolved_span(
-            "secret",
+            "🔮💀🗝️",
             Style::DEFAULT,
             true,
             Some(&resolved),
             false,
             &prefs,
         );
-        let foreground = span.color.expect("foreground");
-        let Background::Color(background) = span.highlight.expect("cover").background else {
-            panic!("spoiler cover must be a color");
-        };
-        assert_eq!(foreground, background);
+        assert_eq!(span.text, "   ");
+        assert!(span.highlight.is_none());
         assert!(!span.underline);
+    }
+
+    #[test]
+    fn concealed_spoiler_offsets_map_back_to_the_source_line() {
+        let prefs = crate::prefs::current();
+        let line = linked_line("A🗝️B", 1, 8);
+        let rendered = to_spans_with(&line, &prefs, false, |_| LinkRenderStyle {
+            authored: false,
+            style: LinkTextStyle::default(),
+            spoiler_concealed: true,
+            hidden: false,
+        });
+        let text: String = rendered
+            .spans
+            .iter()
+            .flat_map(|span| span.text.chars())
+            .collect();
+
+        assert_eq!(text, "A B");
+        assert_eq!(rendered.offsets.source_to_rendered(1), 1);
+        assert_eq!(rendered.offsets.source_to_rendered(8), 2);
+        assert_eq!(rendered.offsets.rendered_to_source(1), 1);
+        assert_eq!(rendered.offsets.rendered_to_source(2), 8);
+        assert_eq!(rendered.offsets.rendered_to_source(3), 9);
     }
 
     #[test]

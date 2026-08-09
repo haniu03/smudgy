@@ -1639,6 +1639,8 @@ mod tests {
         let requested = [
             &[responders::new_environ::SEND, 3][..],
             b"OSC_HYPERLINKS_TOOLTIP",
+            &[3][..],
+            b"OSC_HYPERLINKS_TOOLTIP_SGR",
         ]
         .concat();
         let mut input = vec![command::IAC, command::DO, option];
@@ -1653,6 +1655,11 @@ mod tests {
             replies
                 .windows(b"OSC_HYPERLINKS_TOOLTIP".len())
                 .any(|window| window == b"OSC_HYPERLINKS_TOOLTIP")
+        );
+        assert!(
+            replies
+                .windows(b"OSC_HYPERLINKS_TOOLTIP_SGR".len())
+                .any(|window| window == b"OSC_HYPERLINKS_TOOLTIP_SGR")
         );
     }
 
