@@ -29,7 +29,7 @@ use super::persistence::write_atomic;
 
 pub use smudgy_script::{
     ImportPolicy, ParamKind, ParamOption, PackageManifest, PackageParameter, PackagePermissions,
-    SmudgyCapabilities,
+    SmudgyCapabilities, is_any_host_net_entry,
 };
 
 use crate::get_smudgy_home;

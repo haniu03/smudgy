@@ -3139,7 +3139,8 @@ fn local_manifest_permissions(server_name: &str, name: &str) -> PackagePermissio
 /// # Errors
 /// Returns an error if `deno_permissions` rejects a descriptor (e.g. a malformed `net`
 /// `host:port`, an unknown `sys` kind, or an empty `run` program name); the caller skips the
-/// package rather than run it ungated.
+/// package rather than run it ungated. The pinned `deno_permissions` patch accepts `*` as an
+/// any-host descriptor, retaining an optional `*:port` restriction across every deno network op.
 fn build_restricted_container(
     union: &PackagePermissions,
     data_dir: &std::path::Path,

@@ -391,6 +391,59 @@ async fn sandboxed_package_net_grant_is_enforced() {
     );
 }
 
+/// A manifest `net:["*:port"]` grant reaches the real package isolate as an any-host descriptor:
+/// the named local peer is allowed on that port, while another port is still rejected at the gate.
+#[tokio::test]
+async fn sandboxed_package_any_host_grant_respects_port_scope() {
+    let (allowed_port, _server) = spawn_http_200_server();
+    let denied_port = (1..=u16::MAX)
+        .find(|port| *port != allowed_port)
+        .expect("there is always another port");
+    prepare_server("pi_enf_net_any_host");
+
+    let src = r#"
+        import { echo } from "smudgy:core";
+        try {
+          const res = await fetch("http://127.0.0.1:__ALLOWED__/");
+          echo("NET_ANY_ALLOWED:" + res.status + ":" + (await res.text()));
+        } catch (e) { echo("NET_ANY_ALLOWED_ERR:" + (e?.name ?? String(e))); }
+        try {
+          await fetch("http://127.0.0.1:__DENIED__/");
+          echo("NET_ANY_OTHER:NO_ERROR");
+        } catch (e) {
+          echo("NET_ANY_OTHER_ERR:" + (e?.name ?? String(e)) + ":" + (e?.message ?? ""));
+        }
+        echo("DONE");
+    "#
+    .replace("__ALLOWED__", &allowed_port.to_string())
+    .replace("__DENIED__", &denied_port.to_string());
+
+    let pkg = make_package(
+        "wbk",
+        "wildcard-fetcher",
+        "1.0.0",
+        &format!(r#", "permissions": {{ "net": ["*:{allowed_port}"] }}"#),
+        &src,
+    );
+    let lines = collect_session_lines(
+        9420,
+        "pi_enf_net_any_host",
+        &["smudgy://wbk/wildcard-fetcher"],
+        factory_for(vec![pkg]),
+    )
+    .await;
+
+    assert!(
+        has_line(&lines, "NET_ANY_ALLOWED:200:ok"),
+        "*:port must allow the named peer on that port; transcript:\n{lines:#?}"
+    );
+    assert!(
+        has_line(&lines, "NET_ANY_OTHER_ERR:NotCapable") && has_line(&lines, "net access"),
+        "*:port must deny another port at the permission gate; transcript:\n{lines:#?}"
+    );
+    assert!(!has_line(&lines, "NET_ANY_OTHER:NO_ERROR"));
+}
+
 /// net deny by default: a sandboxed package declaring **no** `permissions` has an
 /// empty closure union, so its container denies all net; any `fetch` rejects `NotCapable`.
 /// This is the regression guard for the empty-allowlist recipe: the union maps an empty

@@ -668,7 +668,8 @@ impl ImportPolicy {
 /// Requested permissions, enforced per sandboxed package isolate. The deno-native fields
 /// (`net`/`read`/`write`/`env`/`run`/`ffi`/`sys`, `script/PACKAGE-ISOLATES-ENFORCEMENT.md`) are
 /// each a deny-by-default allowlist: an absent/empty field denies that kind entirely. Value
-/// formats: `net` entries are `host:port` (only that port) or bare `host` (any port);
+/// formats: `net` entries are `host:port` (only that port), bare `host` (any port), `*` (any
+/// host/port), or `*:port` (any host on only that port);
 /// `read`/`write` are paths whose directory grants cover the whole subtree (and may use the
 /// `$DATA` placeholder, host-expanded before enforcement); `env` are exact var names; `run` are
 /// program names (PATH-resolved at container build) or absolute paths; `ffi` are dynamic-library
@@ -771,7 +772,8 @@ impl PackagePermissions {
     ///
     /// "Covered" is the same per-field containment [`is_within`](Self::is_within) uses, mirroring
     /// deno's permission descriptors (`PACKAGE-ISOLATES-ENFORCEMENT.md`): a consented bare `net`
-    /// host covers any `host:port` on it (an exact `host:port` only itself), a consented
+    /// host covers any `host:port` on it (an exact `host:port` only itself), `*` covers every
+    /// host/port (`*:port` covers that port on every host), a consented
     /// `read`/`write` path covers its whole subtree (path-prefix), and `env` is an exact (trimmed)
     /// name match. So a re-ordered, re-cased, narrower-port, or deeper-path entry is not a spurious
     /// "added". An all-empty result means the new union only shrank or stayed within the grant (no
@@ -798,7 +800,8 @@ impl PackagePermissions {
     /// Whether `self` grants **nothing beyond** `ceiling` — every entry of `self` is **covered** by
     /// some entry of `ceiling` under the same per-field containment deno's permission descriptors
     /// use (`PACKAGE-ISOLATES-ENFORCEMENT.md`): a consented bare `net` host covers any
-    /// `host:port` on it (an exact `host:port` covers only that port); a consented `read`/`write`
+    /// `host:port` on it (an exact `host:port` covers only that port), while `*` covers every
+    /// host/port and `*:port` covers that port on every host; a consented `read`/`write`
     /// path covers its whole subtree; `env` is an exact (trimmed) name match. The permission-aware
     /// resolver uses this to pick the highest package version whose **closure** union fits the
     /// user's consented grant (`script/PACKAGE-ISOLATES-CONSENT-TRUST.md`): a version is loadable
@@ -1124,7 +1127,8 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
 /// [`added_since`](PackagePermissions::added_since) agree with what the restricted container grants.
 #[derive(Clone, Copy)]
 enum PermField {
-    /// `net`: a bare `host` grant covers any port; an exact `host:port` covers only that port.
+    /// `net`: a bare `host` grant covers any port; an exact `host:port` covers only that port;
+    /// `*` covers every host/port; `*:port` covers that port on every host.
     Net,
     /// `read`/`write`/`ffi`: a path grant covers its whole subtree (prefix at a component
     /// boundary).
@@ -1197,12 +1201,21 @@ fn dedup_key(field: PermField, entry: &str) -> String {
 /// Whether the consented `net` grant `ceiling` covers the `requested` host entry, mirroring deno's
 /// `NetDescriptor` (`PACKAGE-ISOLATES-ENFORCEMENT.md`): hosts compare case-insensitively, and a
 /// bare-host grant (no port) covers every port while a `host:port` grant covers only that exact
-/// port. (Manifest `net` entries are `host` or `host:port`; a colon suffix that isn't a `u16` port
-/// is taken as part of the host.)
+/// port. The special host `*` covers every requested host, with its optional port restriction
+/// applied normally. (A colon suffix that isn't a `u16` port is taken as part of the host.)
 fn host_covers(ceiling: &str, requested: &str) -> bool {
     let (ceiling_host, ceiling_port) = split_host_port(ceiling);
     let (requested_host, requested_port) = split_host_port(requested);
-    ceiling_host == requested_host && (ceiling_port.is_none() || ceiling_port == requested_port)
+    (ceiling_host == "*" || ceiling_host == requested_host)
+        && (ceiling_port.is_none() || ceiling_port == requested_port)
+}
+
+/// Whether one manifest `net` entry is the special any-host grant (`*` or `*:port`). Invalid
+/// wildcard spellings (for example `*:not-a-port`) return false and are rejected later by the
+/// deno permission descriptor parser.
+#[must_use]
+pub fn is_any_host_net_entry(entry: &str) -> bool {
+    split_host_port(entry).0 == "*"
 }
 
 /// Split a `net` entry into its lowercased host and optional `u16` port. A trailing `:<digits>`
@@ -3545,6 +3558,43 @@ mod tests {
             vec!["comms.coreclan.org:6380"],
             "a different port is a genuinely-new ask"
         );
+    }
+
+    #[test]
+    fn is_within_net_supports_any_host_with_optional_port() {
+        let any = PackagePermissions {
+            net: vec!["*".into()],
+            ..Default::default()
+        };
+        let any_443 = PackagePermissions {
+            net: vec!["*:443".into()],
+            ..Default::default()
+        };
+        let example_443 = PackagePermissions {
+            net: vec!["example.com:443".into()],
+            ..Default::default()
+        };
+        let example_80 = PackagePermissions {
+            net: vec!["example.com:80".into()],
+            ..Default::default()
+        };
+
+        assert!(example_443.is_within(&any), "* covers every host and port");
+        assert!(example_80.is_within(&any));
+        assert!(any_443.is_within(&any), "a port-scoped wildcard is narrower than *");
+        assert!(example_443.is_within(&any_443), "*:443 covers every host on port 443");
+        assert!(!example_80.is_within(&any_443), "*:443 does not cover another port");
+        assert!(!any.is_within(&any_443), "*:443 does not cover the all-port wildcard");
+        assert!(
+            !any_443.is_within(&example_443),
+            "one named host never covers an any-host request"
+        );
+        assert_eq!(example_443.added_since(&any_443).net, Vec::<String>::new());
+        assert_eq!(example_80.added_since(&any_443).net, vec!["example.com:80"]);
+        assert!(is_any_host_net_entry("*"));
+        assert!(is_any_host_net_entry(" *:443 "));
+        assert!(!is_any_host_net_entry("*.example.com"));
+        assert!(!is_any_host_net_entry("*:not-a-port"));
     }
 
     #[test]

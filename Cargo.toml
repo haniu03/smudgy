@@ -125,12 +125,17 @@ unic-langid = "0.9.6"
 #   whenever the named primary resolves to a monospace face, so missing
 #   glyphs fall back to coverage-ranked monospace candidates instead of the
 #   proportional script/common lists.
+# - `deno_permissions` (patches/deno_permissions+0.101.0.patch): adds an
+#   any-host network descriptor so package manifests can express `*` (any
+#   host/port) and `*:port` (any host on one port) consistently across fetch,
+#   sockets, listeners, TLS, WebSockets, and the other deno network ops.
 [workspace.metadata.patch]
-crates = ["iced_graphics", "cosmic-text"]
+crates = ["iced_graphics", "cosmic-text", "deno_permissions"]
 
 [patch.crates-io]
 iced_graphics = { path = "./target/patch/iced_graphics-0.14.0" }
 cosmic-text = { path = "./target/patch/cosmic-text-0.15.0" }
+deno_permissions = { path = "./target/patch/deno_permissions-0.101.0" }
 
 # Define workspace-wide lints
 [workspace.lints.clippy]

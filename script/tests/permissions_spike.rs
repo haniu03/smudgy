@@ -341,6 +341,83 @@ fn allow_net_grant_is_scoped_to_host_and_port() -> Result<()> {
     Ok(())
 }
 
+/// The smudgy manifest extensions to deno's net descriptors: `*` covers any host/port, while
+/// `*:port` covers that port on every host. Exercise both outgoing (`fetch`) and incoming
+/// (`Deno.listen`) paths so every deno network op that shares `PermissionsContainer` observes the
+/// same wildcard semantics.
+#[test]
+fn allow_net_any_host_wildcards_cover_outgoing_and_incoming_connections() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (fetch_port, _server) = spawn_http_200_server()?;
+    let listen_port = unused_port()?;
+    let denied_port = (1..=u16::MAX)
+        .find(|port| *port != fetch_port && *port != listen_port)
+        .expect("there is always a third port");
+
+    let opts = PermissionsOptions {
+        allow_net: Some(vec![format!("*:{fetch_port}"), format!("*:{listen_port}")]),
+        prompt: false,
+        ..Default::default()
+    };
+    let (tokio, mut rt) = restricted_runtime(temp.path(), &opts)?;
+    let source = format!(
+        r#"
+        (async () => {{
+          const out = {{}};
+          try {{
+            const res = await fetch("http://localhost:{fetch_port}/");
+            out.fetch = res.status + ":" + (await res.text());
+          }} catch (e) {{
+            out.fetch = (e?.name ?? "") + ": " + (e?.message ?? String(e));
+          }}
+          try {{
+            const listener = Deno.listen({{ hostname: "127.0.0.1", port: {listen_port} }});
+            listener.close();
+            out.listen = "OK";
+          }} catch (e) {{
+            out.listen = (e?.name ?? "") + ": " + (e?.message ?? String(e));
+          }}
+          try {{
+            const listener = Deno.listen({{ hostname: "127.0.0.1", port: {denied_port} }});
+            listener.close();
+            out.deniedListen = "NO_ERROR";
+          }} catch (e) {{
+            out.deniedListen = (e?.name ?? "") + ": " + (e?.message ?? String(e));
+          }}
+          return out;
+        }})()
+        "#
+    );
+    let out = eval_async_json(&tokio, &mut rt, &source)?;
+    assert_eq!(name(&out, "fetch"), "200:ok", "*:port must allow any hostname on that port");
+    assert_eq!(name(&out, "listen"), "OK", "*:port must allow an incoming listener on that port");
+    assert!(
+        name(&out, "deniedListen").starts_with("NotCapable: "),
+        "*:port must deny listeners on other ports: {out}"
+    );
+
+    let opts = PermissionsOptions {
+        allow_net: Some(vec!["*".to_string()]),
+        prompt: false,
+        ..Default::default()
+    };
+    let (tokio, mut rt) = restricted_runtime(temp.path(), &opts)?;
+    let any_listen_port = unused_port()?;
+    let source = format!(
+        r#"
+        (() => {{
+          const listener = Deno.listen({{ hostname: "127.0.0.1", port: {any_listen_port} }});
+          listener.close();
+          return {{ listen: "OK" }};
+        }})()
+        "#
+    );
+    let out = eval_async_json(&tokio, &mut rt, &source)?;
+    assert_eq!(name(&out, "listen"), "OK", "* must allow every host and port");
+
+    Ok(())
+}
+
 /// A directory grant authorizes its whole **subtree**, not a single path. Grant
 /// `<temp>/granted`; a file nested under it reads successfully, while a sibling outside
 /// it is denied.
