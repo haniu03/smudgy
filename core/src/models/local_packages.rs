@@ -14,8 +14,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Utc};
 use smudgy_cloud::{
-    highest_satisfying_version, PackageApiClient, PublishDependency, PublishModule,
+    highest_satisfying_version, PackageApiClient, PublishDependency, PublishModule, Uuid,
 };
 use smudgy_script::PackageManifest;
 
@@ -54,8 +55,14 @@ const SMUDGY_PARAMS_DTS: &str = include_str!("script_typings/smudgy-params.d.ts"
 /// and never fatal** — a package always publishes even if typings can't be produced.
 #[derive(Debug, Clone)]
 pub struct PublishSummary {
+    /// The package namespace that owns the newly published version.
+    pub package_id: Uuid,
+    /// The namespace's current visibility, returned by create-or-get before publishing.
+    pub is_public: bool,
     /// The published version (the manifest's `version`).
     pub version: String,
+    /// The server commit time for the published version.
+    pub published_at: DateTime<Utc>,
     /// How many `.d.ts` modules shipped with the version (0 if none were generated).
     pub typings_generated: usize,
     /// Non-fatal warnings from declaration generation (tsc diagnostics, a failed/empty run),
@@ -416,7 +423,10 @@ pub async fn publish_local_package(
         .map_err(|e| anyhow!("publish version {}: {e}", package.manifest.version))?;
 
     Ok(PublishSummary {
+        package_id: published.package_id,
+        is_public: view.is_public,
         version: published.version,
+        published_at: published.published_at,
         typings_generated,
         typings_warnings,
         locked_dependencies,
