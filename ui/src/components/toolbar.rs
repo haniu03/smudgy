@@ -1,5 +1,9 @@
 use iced::alignment::Vertical;
-use iced::widget::{Row, Space, button, mouse_area, row, svg, text};
+use iced::widget::{Row, Space, button, mouse_area, svg, text};
+// The `row!` macro only builds the custom window controls, which macOS
+// (native traffic lights) never renders.
+#[cfg(not(target_os = "macos"))]
+use iced::widget::row;
 use iced::{Color, Length};
 use smudgy_theme::builtins;
 
@@ -42,12 +46,22 @@ const TITLE_COLOR_HOVER: Color = Color::from_rgb8(128, 128, 128);
 /// explicit height the row would become fluid and grab half the window.
 const TOOLBAR_HEIGHT: f32 = 42.0;
 
+/// Width reserved at the toolbar's left edge for the native traffic lights.
+/// The main window keeps its macOS frame with a transparent titlebar and a
+/// full-size content view, so the buttons float above the toolbar and
+/// nothing else keeps them clear.
+#[cfg(target_os = "macos")]
+const TRAFFIC_LIGHT_INSET: f32 = 72.0;
+
 fn svg_style(_: &crate::Theme, _: iced::widget::svg::Status) -> iced::widget::svg::Style {
     iced::widget::svg::Style {
         color: Some(TITLE_COLOR),
     }
 }
 
+// On macOS the window keeps its native frame, so the traffic lights replace
+// these custom controls.
+#[cfg(not(target_os = "macos"))]
 fn window_control_button(
     handle: iced::widget::svg::Handle,
     message: Message,
@@ -92,6 +106,7 @@ fn menu_button() -> Element<'static, Message> {
     .into()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn window_controls(maximized: bool) -> Element<'static, Message> {
     let maximize_icon = if maximized {
         assets::hero_icons::SQUARE_2_STACK.clone()
@@ -109,14 +124,36 @@ fn window_controls(maximized: bool) -> Element<'static, Message> {
     .into()
 }
 
+/// The space the native traffic lights occupy, as a toolbar row item. The
+/// buttons themselves hit-test above the content view, so this surface only
+/// sees clicks on the empty area around them — give those the same drag/zoom
+/// behavior as the rest of the titlebar.
+#[cfg(target_os = "macos")]
+fn traffic_light_inset() -> Element<'static, Message> {
+    mouse_area(
+        Space::new()
+            .width(TRAFFIC_LIGHT_INSET)
+            .height(Length::Fill),
+    )
+    .on_press(Message::DragWindow)
+    .on_double_click(Message::ToggleMaximizePressed)
+    .into()
+}
+
 pub fn view(
     expanded: bool,
     maximized: bool,
     session_context: &SessionContext,
 ) -> Element<'static, Message> {
+    // The maximize state only styles the custom window controls, which macOS
+    // doesn't render.
+    #[cfg(target_os = "macos")]
+    let _ = maximized;
     if expanded {
         // Expanded view: quiet menu-bar items
         let mut buttons = vec![
+            #[cfg(target_os = "macos")]
+            traffic_light_inset(),
             menu_button(),
             toolbar_button(crate::i18n::t!("toolbar-connect"), Message::ConnectPressed),
         ];
@@ -143,6 +180,7 @@ pub fn view(
         ));
 
         buttons.push(drag_area());
+        #[cfg(not(target_os = "macos"))]
         buttons.push(window_controls(maximized));
 
         Row::with_children(buttons)
@@ -158,19 +196,24 @@ pub fn view(
         // title bar, so it mirrors the OS title (incl. the dev-build marker).
         let title = text(crate::main_window_title()).size(14).color(TITLE_COLOR);
 
-        row![
+        let items = vec![
+            #[cfg(target_os = "macos")]
+            traffic_light_inset(),
             menu_button(),
-            title,
+            title.into(),
             drag_area(),
-            window_controls(maximized)
-        ]
-        .padding(5)
-        .spacing(10)
-        // The collapsed toolbar still spans the window so the drag area
-        // and window controls stay reachable
-        .width(Length::Fill)
-        .height(TOOLBAR_HEIGHT)
-        .align_y(Vertical::Center)
-        .into()
+            #[cfg(not(target_os = "macos"))]
+            window_controls(maximized),
+        ];
+
+        Row::with_children(items)
+            .padding(5)
+            .spacing(10)
+            // The collapsed toolbar still spans the window so the drag area
+            // and window controls stay reachable
+            .width(Length::Fill)
+            .height(TOOLBAR_HEIGHT)
+            .align_y(Vertical::Center)
+            .into()
     }
 }

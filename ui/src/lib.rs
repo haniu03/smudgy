@@ -280,13 +280,60 @@ enum Message {
 #[cfg(target_os = "linux")]
 pub(crate) const LINUX_APP_ID: &str = "org.smudgy.Smudgy";
 
-/// Settings for main smudgy windows: borderless, with the toolbar acting as
-/// the titlebar (drag area + window controls) and resize grips at the edges.
+/// Whether main windows paint their own rounded window frame (Linux only).
+///
+/// True on Wayland sessions, where client-side decoration is the platform
+/// convention (GTK apps round their own corners) and an alpha surface is
+/// composited correctly. X11 stays sharp: without a compositor the pixels
+/// outside the corner arcs would render black, and sharp rectangles are what
+/// tiling setups expect anyway. `SMUDGY_SQUARE_CORNERS=1` opts out (e.g. on
+/// tiled Wayland compositors, where rounding fights the layout).
+#[cfg(target_os = "linux")]
+pub(crate) fn client_rounded_frame() -> bool {
+    static ACTIVE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        // Mirror winit's backend choice exactly: it goes Wayland when either
+        // variable is set non-empty (an empty `WAYLAND_DISPLAY=` still lands
+        // on X11, which must keep the opaque sharp look).
+        let non_empty =
+            |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+        // wgpu's GL backend advertises only Opaque composite alpha, so the
+        // transparent corners would render black there. The automatic
+        // GL fallback isn't visible from here, but an explicit override is.
+        let forced_gl = std::env::var("WGPU_BACKEND").is_ok_and(|v| {
+            matches!(v.to_ascii_lowercase().as_str(), "gl" | "gles" | "opengl")
+        });
+        (non_empty("WAYLAND_DISPLAY") || non_empty("WAYLAND_SOCKET"))
+            && !forced_gl
+            && !std::env::var_os("SMUDGY_SQUARE_CORNERS")
+                .is_some_and(|v| v == "1" || v == "true")
+    });
+    *ACTIVE
+}
+
+/// Windows gets its frame from DWM and macOS keeps its native frame, so only
+/// Linux ever draws one client-side.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn client_rounded_frame() -> bool {
+    false
+}
+
+/// Settings for main smudgy windows. On Windows and Linux the window is
+/// borderless, with the toolbar acting as the titlebar (drag area + window
+/// controls) and resize grips at the edges; Windows keeps DWM's rounded
+/// corners and hairline border, Linux Wayland paints its own (see
+/// [`client_rounded_frame`]). On macOS the window keeps its native frame —
+/// title hidden, titlebar transparent, full-size content view — so the system
+/// supplies the rounded corners, hairline border, edge resizing, and traffic
+/// lights, and the toolbar draws in the titlebar region.
 fn smudgy_window_settings() -> window::Settings {
     window::Settings {
-        decorations: false,
+        decorations: cfg!(target_os = "macos"),
         min_size: Some(Size::new(640.0, 400.0)),
         exit_on_close_request: true,
+        // Alpha surface so the pixels outside the self-drawn frame's corner
+        // arcs stay empty (Wayland only; the X11 surface stays opaque).
+        #[cfg(target_os = "linux")]
+        transparent: client_rounded_frame(),
         // Keep the OS drop shadow (and the window-frame feel it provides)
         // even without native decorations.
         #[cfg(target_os = "windows")]
@@ -300,6 +347,12 @@ fn smudgy_window_settings() -> window::Settings {
         platform_specific: PlatformSpecific {
             application_id: LINUX_APP_ID.to_string(),
             ..Default::default()
+        },
+        #[cfg(target_os = "macos")]
+        platform_specific: PlatformSpecific {
+            title_hidden: true,
+            titlebar_transparent: true,
+            fullsize_content_view: true,
         },
         ..Default::default()
     }
@@ -493,6 +546,18 @@ pub fn run() -> anyhow::Result<()> {
             } else {
                 smudgy_theme::secondary()
             }
+        })
+        .style(|_smudgy, theme| {
+            let mut style = iced::theme::Base::base(theme);
+            // The self-drawn rounded frame needs an alpha surface: the
+            // runtime's clear color goes fully transparent and every window
+            // paints its own background instead (main windows via the frame
+            // container, secondary windows via an opaque wrapper — see
+            // `view`), leaving the pixels outside the corner arcs empty.
+            if client_rounded_frame() {
+                style.background_color = iced::Color::TRANSPARENT;
+            }
+            style
         })
         .subscription(subscription)
         .font(assets::fonts::GEIST_VF_BYTES)
@@ -1309,6 +1374,12 @@ fn execute_layout_apply(smudgy: &mut Smudgy, plan: &workspace::apply::ApplyPlan)
                     }
                     if *maximized {
                         tasks.push(window::maximize(*window_id, true));
+                        // Seed the mirror alongside the request; the resize
+                        // event's authoritative answer lands a few frames
+                        // later.
+                        if let Some(win) = smudgy.smudgy_windows.get_mut(window_id) {
+                            win.seed_maximized(true);
+                        }
                     }
                 }
             }
@@ -1325,11 +1396,17 @@ fn execute_layout_apply(smudgy: &mut Smudgy, plan: &workspace::apply::ApplyPlan)
                     workspace::restore::clamp_geometry(geometry, bounds, Size::new(640.0, 400.0));
                 let mut settings = smudgy_window_settings();
                 settings.size = size;
+                // Open maximized directly (no floating-size flash), and seed
+                // the window's maximize mirror below so the first frames don't
+                // draw the floating frame chrome while the async
+                // `window::is_maximized` round trip is still in flight.
+                settings.maximized = *maximized;
                 if let Some(point) = position {
                     settings.position = window::Position::Specific(point);
                 }
                 let (id, open) = window::open(settings);
                 let mut fresh = SmudgyWindow::new(id, smudgy.account.handles());
+                fresh.seed_maximized(*maximized);
                 fresh.install_applied_layout(
                     pane_groups::GroupLayout::from_blueprint(realized.clusters),
                     realized.pending,
@@ -1339,9 +1416,6 @@ fn execute_layout_apply(smudgy: &mut Smudgy, plan: &workspace::apply::ApplyPlan)
                 );
                 smudgy.smudgy_windows.insert(id, fresh);
                 smudgy.workspace.register_window(id);
-                if *maximized {
-                    tasks.push(window::maximize(id, true));
-                }
                 tasks.push(open.map(Message::NewSmudgyWindow));
             }
         }
@@ -4456,13 +4530,33 @@ fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
                 .filter(|hover| hover.window == id)
                 .and_then(|hover| hover.target.as_ref()),
         };
-        center(
+        let content = center(
             window
                 .view(&smudgy.sessions, drag)
                 .map(move |message| Message::SmudgyWindowMessage(id, message)),
-        )
-        .into()
-    } else if let Some(window) = smudgy.automations_windows.get(&id) {
+        );
+        return if client_rounded_frame() {
+            // The window surface is transparent and this container paints the
+            // actual window frame: rounded top corners + hairline border
+            // while floating, a plain opaque fill while maximized (the frame
+            // chrome disappears, exactly like GTK squares off a maximized
+            // headerbar). The 1px padding keeps content off the border line.
+            let maximized = window.is_maximized();
+            iced::widget::container(content)
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fill)
+                .padding(if maximized { 0.0 } else { 1.0 })
+                .style(if maximized {
+                    theme::builtins::container::opaque
+                } else {
+                    theme::builtins::container::window_frame
+                })
+                .into()
+        } else {
+            content.into()
+        };
+    }
+    let content: Element<'_, Message> = if let Some(window) = smudgy.automations_windows.get(&id) {
         center(
             window
                 .view()
@@ -4485,6 +4579,18 @@ fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
         .into()
     } else {
         text(i18n::t!("window-none-open")).into()
+    };
+    if client_rounded_frame() {
+        // With the surface clear color transparent (see the daemon `style`),
+        // secondary windows — natively decorated, never rounded client-side —
+        // just need their background painted back.
+        iced::widget::container(content)
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .style(theme::builtins::container::opaque)
+            .into()
+    } else {
+        content
     }
 }
 

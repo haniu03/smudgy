@@ -697,6 +697,25 @@ impl SmudgyWindow {
         self.maximized
     }
 
+    /// Seed the maximize mirror at open/restore time, ahead of the async
+    /// `window::is_maximized` round trip, so a restored maximized window's
+    /// first frames don't draw the floating frame chrome.
+    pub(crate) fn seed_maximized(&mut self, maximized: bool) {
+        self.maximized = maximized;
+    }
+
+    /// Style for the full-window dim layer behind modals. When the window
+    /// draws its own rounded frame (Linux Wayland, floating), the layer's top
+    /// corners follow the frame radius so the dim fill doesn't paint square
+    /// pixels into the transparent region outside the corner arcs.
+    fn backdrop_style(&self) -> fn(&crate::Theme) -> iced::widget::container::Style {
+        if crate::client_rounded_frame() && !self.maximized {
+            theme::builtins::container::overlay_rounded_top
+        } else {
+            theme::builtins::container::overlay
+        }
+    }
+
     // ------------------------------------------------------------------
     // Workspace restoration and vacancy maintenance
     // ------------------------------------------------------------------
@@ -3485,7 +3504,7 @@ impl SmudgyWindow {
                 main_layout,
                 opaque(
                     mouse_area(
-                        center(opaque(modal_view)).style(theme::builtins::container::overlay),
+                        center(opaque(modal_view)).style(self.backdrop_style()),
                     )
                     .on_press(Message::CloseModal),
                 ),
@@ -3530,7 +3549,7 @@ impl SmudgyWindow {
             stack(vec![
                 main_layout,
                 opaque(
-                    mouse_area(center(opaque(popup)).style(theme::builtins::container::overlay))
+                    mouse_area(center(opaque(popup)).style(self.backdrop_style()))
                         // Click the backdrop to dismiss — the gentle, session-only
                         // dismissal (not the permanent "skip this version").
                         .on_press(Message::DismissUpgrade),
@@ -3541,9 +3560,12 @@ impl SmudgyWindow {
             main_layout
         };
 
-        if self.maximized {
+        if cfg!(target_os = "macos") || self.maximized {
             // No resize grips while maximized; the OS rejects resizing anyway
-            // and the strips would steal clicks at the screen edges.
+            // and the strips would steal clicks at the screen edges. macOS
+            // never gets grips: the window keeps its native frame there, so
+            // edge resizing is the system's (and winit's `drag_resize` is
+            // unsupported on macOS regardless).
             main_layout
         } else {
             stack(vec![

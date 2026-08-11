@@ -30,6 +30,35 @@ pub fn opaque(theme: &Theme) -> container::Style {
     }
 }
 
+/// Corner radius of the main window's self-drawn frame (Linux Wayland),
+/// matching the neighborhood of GNOME's headerbar rounding.
+pub const WINDOW_CORNER_RADIUS: f32 = 12.0;
+
+/// The main window's self-drawn frame on Linux Wayland: the window surface is
+/// transparent and this container paints the actual window. Top corners are
+/// rounded (the GNOME client-side-decoration convention); the bottom corners
+/// stay square because pane content reaches the bottom edge and iced cannot
+/// clip children to a rounded rect — the same shape GTK3 headerbar apps and
+/// GNOME Terminal present. The 1px hairline stands in for a window border
+/// where the compositor draws no frame of its own.
+#[must_use]
+pub fn window_frame(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(theme.styles.general.background.into()),
+        border: Border {
+            color: theme.styles.text.normal.scale_alpha(0.2),
+            width: 1.0,
+            radius: Radius {
+                top_left: WINDOW_CORNER_RADIUS,
+                top_right: WINDOW_CORNER_RADIUS,
+                bottom_right: 0.0,
+                bottom_left: 0.0,
+            },
+        },
+        ..Default::default()
+    }
+}
+
 #[must_use]
 pub fn overlay(theme: &Theme) -> container::Style {
     container::Style {
@@ -37,6 +66,26 @@ pub fn overlay(theme: &Theme) -> container::Style {
             theme.styles.general.overlay_background,
         )),
         ..Default::default()
+    }
+}
+
+/// [`overlay`] with the main-window frame's top rounding: the modal dim layer
+/// of a window that draws its own rounded corners, so the dim fill doesn't
+/// paint square pixels into the transparent region outside the corner arcs.
+#[must_use]
+pub fn overlay_rounded_top(theme: &Theme) -> container::Style {
+    container::Style {
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius {
+                top_left: WINDOW_CORNER_RADIUS,
+                top_right: WINDOW_CORNER_RADIUS,
+                bottom_right: 0.0,
+                bottom_left: 0.0,
+            },
+        },
+        ..overlay(theme)
     }
 }
 
