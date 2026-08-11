@@ -55,7 +55,7 @@ use manifest::{ManifestDraft, ManifestEdit, ManifestTab};
 use model::{LiveAutomations, PackageGraph, PatternKind, Script, ScriptKey};
 use packages::{
     ConsentPrompt, DetailSeq, FilePreview, ForkActivation, InstallResolution, InstallSeq,
-    InstalledFileTab, ParamConfig, ParamPrompt, StaleInstallCheck, UpdateDelta,
+    InstalledFileTab, ParamConfig, ParamPrompt, PublishOutput, StaleInstallCheck, UpdateDelta,
 };
 
 /// Returns the traversal direction for an unconsumed, unmodified Tab press.
@@ -322,7 +322,10 @@ pub enum Message {
     SaveManifest,
     RevertManifest,
     PublishOwned,
-    PublishFinished(Result<PublishSummary, String>),
+    PublishFinished {
+        name: String,
+        result: Result<PublishSummary, String>,
+    },
     RequestDeleteOwned,
     CancelDeleteOwned,
     DeleteOwned,
@@ -340,8 +343,9 @@ pub enum Message {
     ShareWithFriend(Uuid),
     GrantsUpdated(Result<Vec<PackageGrantView>, CloudError>),
     #[allow(clippy::type_complexity)]
-    OwnedShareLoaded(
-        Result<
+    OwnedShareLoaded {
+        name: String,
+        result: Result<
             (
                 Uuid,
                 bool,
@@ -351,7 +355,7 @@ pub enum Message {
             ),
             CloudError,
         >,
-    ),
+    },
 
     // ---- installed package -------------------------------------------------
     /// The [`DetailSeq`] is the manage-pane detail generation captured when the load started; a
@@ -599,6 +603,9 @@ pub struct AutomationsWindow {
     pub(super) manifest_tab: ManifestTab,
     pub(super) authoring_busy: bool,
     pub(super) authoring_feedback: Option<String>,
+    /// The latest publish command/output, scoped to the package that produced it. Kept separate
+    /// from general authoring feedback so it can render beside Publish in a bounded console.
+    publish_output: Option<PublishOutput>,
     pub(super) confirm_delete_local: bool,
     pub(super) share_package_id: Option<Uuid>,
     pub(super) share_is_public: bool,
@@ -811,6 +818,7 @@ impl AutomationsWindow {
             manifest_tab: ManifestTab::default(),
             authoring_busy: false,
             authoring_feedback: None,
+            publish_output: None,
             confirm_delete_local: false,
             share_package_id: None,
             share_is_public: false,
@@ -1293,27 +1301,56 @@ impl AutomationsWindow {
             Message::SaveManifest => self.save_manifest(),
             Message::RevertManifest => self.revert_manifest(),
             Message::PublishOwned => self.publish_owned(),
-            Message::PublishFinished(result) => {
+            Message::PublishFinished { name, result } => {
                 self.authoring_busy = false;
                 match result {
                     Ok(summary) => {
-                        let mut feedback = crate::i18n::t!(
-                            "automation-published",
-                            "version" => &summary.version
+                        let is_open_package = matches!(
+                            &self.selection,
+                            Selection::OwnedPackage(open) if open == &name
+                        );
+                        if is_open_package {
+                            self.share_package_id = Some(summary.package_id);
+                            self.share_is_public = summary.is_public;
+                            if !self
+                                .share_versions
+                                .iter()
+                                .any(|version| version.version == summary.version)
+                            {
+                                self.share_versions.insert(
+                                    0,
+                                    VersionListItem {
+                                        version: summary.version.clone(),
+                                        yanked: false,
+                                        deleted: false,
+                                        published_at: summary.published_at,
+                                    },
+                                );
+                            }
+                        }
+                        let mut feedback = format!(
+                            "smudgy> publish {name}\n{}",
+                            crate::i18n::t!(
+                                "automation-published",
+                                "version" => &summary.version
+                            )
                         );
                         if summary.typings_generated > 0 {
-                            feedback.push_str(&format!(
-                                " \u{b7} {} typings",
-                                summary.typings_generated
+                            let typings_generated =
+                                i64::try_from(summary.typings_generated).unwrap_or(i64::MAX);
+                            feedback.push('\n');
+                            feedback.push_str(&crate::i18n::t!(
+                                "automation-published-typings",
+                                "count" => typings_generated
                             ));
                         }
                         // Surface tsc warnings to the author — typings are best-effort, so a
                         // warning here never means the publish failed.
                         if !summary.typings_warnings.is_empty() {
-                            feedback.push_str(" \u{b7} ");
+                            feedback.push('\n');
                             feedback.push_str(&crate::i18n::t!(
                                 "automation-typings-warning",
-                                "warnings" => summary.typings_warnings.join("; ")
+                                "warnings" => summary.typings_warnings.join("\n")
                             ));
                         }
                         // Show exactly what each dependency froze to — a publish pins the whole tree,
@@ -1326,7 +1363,7 @@ impl AutomationsWindow {
                                     format!("{}@{ver}", spec.trim_start_matches("smudgy://"))
                                 })
                                 .collect();
-                            feedback.push_str(" \u{b7} ");
+                            feedback.push('\n');
                             feedback.push_str(&crate::i18n::t!(
                                 "automation-locked-dependencies",
                                 "dependencies" => locked.join(", ")
@@ -1336,8 +1373,8 @@ impl AutomationsWindow {
                         // non-fatal, but the author almost certainly wanted the newer one.
                         if !summary.dependency_warnings.is_empty() {
                             feedback.push_str(&format!(
-                                " \u{b7} \u{26a0} {}",
-                                summary.dependency_warnings.join("; ")
+                                "\n\u{26a0} {}",
+                                summary.dependency_warnings.join("\n\u{26a0} ")
                             ));
                         }
                         // Interop-declaration warnings (duplicate/aliased handle exports, a
@@ -1345,22 +1382,37 @@ impl AutomationsWindow {
                         // name is the identity consumers import, so these deserve eyes even
                         // though the publish succeeded.
                         if !summary.interop_warnings.is_empty() {
-                            feedback.push_str(" \u{b7} ");
+                            feedback.push('\n');
                             feedback.push_str(&crate::i18n::t!(
                                 "automation-interop-warning",
-                                "warnings" => summary.interop_warnings.join("; ")
+                                "warnings" => summary.interop_warnings.join("\n")
                             ));
                         }
-                        self.authoring_feedback = Some(feedback);
-                        Update::with_task(
+                        self.publish_output = Some(PublishOutput {
+                            package: name.clone(),
+                            text: feedback,
+                        });
+                        let refresh = if is_open_package {
+                            self.load_owned_share(name)
+                        } else {
+                            Task::none()
+                        };
+                        Update::with_task(Task::batch([
+                            refresh,
                             self.show_toast(format!("Published v{}", summary.version)),
-                        )
+                        ]))
                     }
                     Err(e) => {
-                        self.authoring_feedback = Some(crate::i18n::t!(
-                            "automation-publish-failed",
-                            "error" => e.to_string()
-                        ));
+                        self.publish_output = Some(PublishOutput {
+                            package: name.clone(),
+                            text: format!(
+                                "smudgy> publish {name}\n{}",
+                                crate::i18n::t!(
+                                    "automation-publish-failed",
+                                    "error" => e.to_string()
+                                )
+                            ),
+                        });
                         Update::none()
                     }
                 }
@@ -1388,7 +1440,7 @@ impl AutomationsWindow {
             Message::VersionsUpdated(result) => self.versions_updated(result),
             Message::ShareWithFriend(grantee) => self.share_with_friend(grantee),
             Message::GrantsUpdated(result) => self.grants_updated(result),
-            Message::OwnedShareLoaded(result) => self.owned_share_loaded(result),
+            Message::OwnedShareLoaded { name, result } => self.owned_share_loaded(&name, result),
 
             // -------- installed package ------------------------------------
             Message::InstalledDetailLoaded(seq, result) => {
@@ -1802,6 +1854,45 @@ impl AutomationsWindow {
 #[cfg(test)]
 mod tab_traversal_tests {
     use super::*;
+
+    #[test]
+    fn publish_completion_updates_the_open_pane_immediately() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "publish-completion-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.selection = Selection::OwnedPackage("demo".to_string());
+        window.authoring_busy = true;
+        let package_id = Uuid::new_v4();
+        let published_at = "2026-08-10T00:00:00Z".parse().unwrap();
+
+        let _ = window.update(Message::PublishFinished {
+            name: "demo".to_string(),
+            result: Ok(PublishSummary {
+                package_id,
+                is_public: true,
+                version: "1.2.3".to_string(),
+                published_at,
+                typings_generated: 1,
+                typings_warnings: Vec::new(),
+                locked_dependencies: Vec::new(),
+                dependency_warnings: Vec::new(),
+                interop_warnings: Vec::new(),
+            }),
+        });
+
+        assert!(!window.authoring_busy);
+        assert_eq!(window.share_package_id, Some(package_id));
+        assert!(window.share_is_public);
+        assert_eq!(window.share_versions.len(), 1);
+        assert_eq!(window.share_versions[0].version, "1.2.3");
+        assert_eq!(window.share_versions[0].published_at, published_at);
+        let output = window.publish_output.as_ref().unwrap();
+        assert_eq!(output.package, "demo");
+        assert!(output.text.starts_with("smudgy> publish demo\n"));
+    }
 
     #[test]
     fn plain_and_shift_tab_choose_forward_and_backward_traversal() {

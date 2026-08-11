@@ -1219,6 +1219,7 @@ package-enabled = Enabled
 package-metric-latest = Latest
 package-metric-versions = Versions
 package-publish = Publish
+package-publish-output = Publish output
 package-save-before-publish = Save your manifest changes before publishing.
 package-version-already-used = v{ $version } is already published. Version numbers can't be reused.
 package-published-versions = Published versions

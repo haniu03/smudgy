@@ -1250,6 +1250,7 @@ package-enabled = Увімкнений
 package-metric-latest = Найновіша
 package-metric-versions = Версії
 package-publish = Опублікувати
+package-publish-output = Результат публікації
 package-save-before-publish = Збережіть зміни в маніфесті перед публікацією.
 package-version-already-used = Версію v{ $version } вже опубліковано. Номери версій не можна використовувати повторно.
 package-published-versions = Опубліковані версії

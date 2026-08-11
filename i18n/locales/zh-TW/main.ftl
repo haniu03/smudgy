@@ -1218,6 +1218,7 @@ package-enabled = 已啟用
 package-metric-latest = 最新版
 package-metric-versions = 版本數
 package-publish = 發佈
+package-publish-output = 發佈輸出
 package-save-before-publish = 發佈前請先儲存套件資訊清單的變更。
 package-version-already-used = v{ $version } 已發佈過；版本號不可重複使用。
 package-published-versions = 已發佈版本
