@@ -49,9 +49,11 @@ const TOOLBAR_HEIGHT: f32 = 42.0;
 /// Width reserved at the toolbar's left edge for the native traffic lights.
 /// The main window keeps its macOS frame with a transparent titlebar and a
 /// full-size content view, so the buttons float above the toolbar and
-/// nothing else keeps them clear.
+/// nothing else keeps them clear. The buttons end ~60pt from the window
+/// edge; with the row's 5px padding this puts the first control at ~71px,
+/// in line with other custom-titlebar apps.
 #[cfg(target_os = "macos")]
-const TRAFFIC_LIGHT_INSET: f32 = 72.0;
+const TRAFFIC_LIGHT_INSET: f32 = 62.0;
 
 fn svg_style(_: &crate::Theme, _: iced::widget::svg::Status) -> iced::widget::svg::Style {
     iced::widget::svg::Style {
@@ -143,20 +145,30 @@ fn traffic_light_inset() -> Element<'static, Message> {
 pub fn view(
     expanded: bool,
     maximized: bool,
+    fullscreen: bool,
     session_context: &SessionContext,
 ) -> Element<'static, Message> {
     // The maximize state only styles the custom window controls, which macOS
-    // doesn't render.
+    // doesn't render; the fullscreen state only drops the traffic-light
+    // inset, which exists nowhere else.
     #[cfg(target_os = "macos")]
     let _ = maximized;
+    #[cfg(not(target_os = "macos"))]
+    let _ = fullscreen;
     if expanded {
         // Expanded view: quiet menu-bar items
-        let mut buttons = vec![
-            #[cfg(target_os = "macos")]
-            traffic_light_inset(),
-            menu_button(),
-            toolbar_button(crate::i18n::t!("toolbar-connect"), Message::ConnectPressed),
-        ];
+        let mut buttons = Vec::new();
+        // Native fullscreen auto-hides the traffic lights, so their reserved
+        // corner goes too.
+        #[cfg(target_os = "macos")]
+        if !fullscreen {
+            buttons.push(traffic_light_inset());
+        }
+        buttons.push(menu_button());
+        buttons.push(toolbar_button(
+            crate::i18n::t!("toolbar-connect"),
+            Message::ConnectPressed,
+        ));
 
         // Only show automations button if there's an active session
         if session_context.has_active_session {
@@ -196,15 +208,18 @@ pub fn view(
         // title bar, so it mirrors the OS title (incl. the dev-build marker).
         let title = text(crate::main_window_title()).size(14).color(TITLE_COLOR);
 
-        let items = vec![
-            #[cfg(target_os = "macos")]
-            traffic_light_inset(),
-            menu_button(),
-            title.into(),
-            drag_area(),
-            #[cfg(not(target_os = "macos"))]
-            window_controls(maximized),
-        ];
+        let mut items: Vec<Element<'static, Message>> = Vec::new();
+        // Native fullscreen auto-hides the traffic lights, so their reserved
+        // corner goes too.
+        #[cfg(target_os = "macos")]
+        if !fullscreen {
+            items.push(traffic_light_inset());
+        }
+        items.push(menu_button());
+        items.push(title.into());
+        items.push(drag_area());
+        #[cfg(not(target_os = "macos"))]
+        items.push(window_controls(maximized));
 
         Row::with_children(items)
             .padding(5)

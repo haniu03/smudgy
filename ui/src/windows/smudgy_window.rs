@@ -80,6 +80,7 @@ pub enum Message {
     ResizeGripPressed(window::Direction),
     WindowResized(window::Id),
     SetMaximized(bool),
+    SetFullscreen(bool),
     /// Activate a session in this window (the daemon sends this after
     /// transplanting a pane here, so the drop also moves the user's focus).
     SetActiveSession(SessionId),
@@ -354,6 +355,11 @@ pub struct SmudgyWindow {
     cloud: CloudHandles,
     toolbar_expanded: bool,
     maximized: bool,
+    /// Whether the window is in native fullscreen (as mirrored from resize
+    /// events, like `maximized`). On macOS fullscreen auto-hides the traffic
+    /// lights, so the toolbar drops their reserved inset; on Linux it squares
+    /// the self-drawn frame the same way maximized does.
+    fullscreen: bool,
     modal: Option<modal::Modal>,
     /// A keep-or-close prompt that arrived while the modal surface was
     /// otherwise occupied (a Connect form mid-use, or the Layouts menu deep
@@ -619,6 +625,7 @@ impl SmudgyWindow {
             cloud,
             toolbar_expanded: true,
             maximized: false,
+            fullscreen: false,
             modal: None,
             pending_layout_prompt: None,
             grid_area: std::cell::Cell::new(Size::ZERO),
@@ -704,12 +711,19 @@ impl SmudgyWindow {
         self.maximized = maximized;
     }
 
+    /// Whether the window is in native fullscreen (as mirrored from resize
+    /// events).
+    #[must_use]
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen
+    }
+
     /// Style for the full-window dim layer behind modals. When the window
     /// draws its own rounded frame (Linux Wayland, floating), the layer's top
     /// corners follow the frame radius so the dim fill doesn't paint square
     /// pixels into the transparent region outside the corner arcs.
     fn backdrop_style(&self) -> fn(&crate::Theme) -> iced::widget::container::Style {
-        if crate::client_rounded_frame() && !self.maximized {
+        if crate::client_rounded_frame() && !self.maximized && !self.fullscreen {
             theme::builtins::container::overlay_rounded_top
         } else {
             theme::builtins::container::overlay
@@ -2754,15 +2768,23 @@ impl SmudgyWindow {
             }
             Message::WindowResized(window_id) => {
                 if window_id == self.window_id {
-                    Update::with_task(
+                    Update::with_task(Task::batch([
                         window::is_maximized(self.window_id).map(Message::SetMaximized),
-                    )
+                        // Fullscreen transitions always resize, so the mode
+                        // mirror rides the same event.
+                        window::mode(self.window_id)
+                            .map(|mode| Message::SetFullscreen(mode == window::Mode::Fullscreen)),
+                    ]))
                 } else {
                     Update::none()
                 }
             }
             Message::SetMaximized(maximized) => {
                 self.maximized = maximized;
+                Update::none()
+            }
+            Message::SetFullscreen(fullscreen) => {
+                self.fullscreen = fullscreen;
                 Update::none()
             }
             Message::SetActiveSession(session_id) => {
@@ -3089,7 +3111,12 @@ impl SmudgyWindow {
     ) -> ThemedElement<'a, Message> {
         let session_context = self.create_session_context(sessions);
         let toolbar_element =
-            toolbar::view(self.toolbar_expanded, self.maximized, &session_context);
+            toolbar::view(
+                self.toolbar_expanded,
+                self.maximized,
+                self.fullscreen,
+                &session_context,
+            );
 
         // Header-visibility rule (§2.11): a pane's title bar is attached only
         // when its policy pins it, the toolbar is expanded, or the global
@@ -3560,7 +3587,7 @@ impl SmudgyWindow {
             main_layout
         };
 
-        if cfg!(target_os = "macos") || self.maximized {
+        if cfg!(target_os = "macos") || self.maximized || self.fullscreen {
             // No resize grips while maximized; the OS rejects resizing anyway
             // and the strips would steal clicks at the screen edges. macOS
             // never gets grips: the window keeps its native frame there, so
