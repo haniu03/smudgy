@@ -4538,15 +4538,16 @@ fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
         return if client_rounded_frame() {
             // The window surface is transparent and this container paints the
             // actual window frame: rounded top corners + hairline border
-            // while floating, a plain opaque fill while maximized (the frame
-            // chrome disappears, exactly like GTK squares off a maximized
-            // headerbar). The 1px padding keeps content off the border line.
-            let maximized = window.is_maximized();
+            // while floating, a plain opaque fill while maximized or
+            // fullscreen (the frame chrome disappears, exactly like GTK
+            // squares off a maximized headerbar). The 1px padding keeps
+            // content off the border line.
+            let squared = window.is_maximized() || window.is_fullscreen();
             iced::widget::container(content)
                 .width(iced::Length::Fill)
                 .height(iced::Length::Fill)
-                .padding(if maximized { 0.0 } else { 1.0 })
-                .style(if maximized {
+                .padding(if squared { 0.0 } else { 1.0 })
+                .style(if squared {
                     theme::builtins::container::opaque
                 } else {
                     theme::builtins::container::window_frame
