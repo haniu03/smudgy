@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use crate::session::styled_line::LinkAction;
-use crate::session::styled_line::{Color, LinkSpan, Style, StyledLine, StyledLink};
+use crate::session::styled_line::{Color, LinkSpan, Style, StyledLine, StyledLink, TextAttributes};
 
-/// One run of a styled splice: its text, the colors it SET (an unset channel
+/// One run of a styled splice: its text, the style channels it SET (an unset channel
 /// inherits the style at the splice point when the operation applies — which is
 /// only knowable then, at the line, not at the op boundary), and an optional link.
 #[derive(Debug, Clone)]
@@ -12,6 +12,7 @@ pub struct SpliceRun {
     pub text: String,
     pub fg: Option<Color>,
     pub bg: Option<Color>,
+    pub attributes: Option<TextAttributes>,
     pub link: Option<StyledLink>,
 }
 
@@ -117,7 +118,7 @@ impl LineOperation {
                     let style = Style {
                         fg: run.fg.unwrap_or(base_style.fg),
                         bg: run.bg.unwrap_or(base_style.bg),
-                        attributes: base_style.attributes,
+                        attributes: run.attributes.unwrap_or(base_style.attributes),
                     };
                     if style != base_style {
                         result = result.highlight(cursor, run_end, style);
@@ -228,12 +229,14 @@ mod tests {
                     text: "N".to_string(),
                     fg: None,
                     bg: None,
+                    attributes: None,
                     link: Some(styled_link(link.clone())),
                 },
                 SpliceRun {
                     text: "ORTH".to_string(),
                     fg: Some(bright(AnsiColor::Red)),
                     bg: None,
+                    attributes: None,
                     link: Some(styled_link(link.clone())),
                 },
             ]),
@@ -266,6 +269,51 @@ mod tests {
                 style: None,
             }]
         );
+    }
+
+    #[test]
+    fn splice_inherits_or_explicitly_resets_text_attributes() {
+        let inherited = TextAttributes {
+            bold: true,
+            italic: true,
+            ..TextAttributes::DEFAULT
+        };
+        let base = Style {
+            attributes: inherited,
+            ..base_style()
+        };
+        let line = Arc::new(StyledLine::new(
+            "xy",
+            vec![VtSpan {
+                style: base,
+                begin_pos: 0,
+                end_pos: 2,
+            }],
+        ));
+        let op = LineOperation::Splice {
+            runs: Arc::new(vec![
+                SpliceRun {
+                    text: "I".to_string(),
+                    fg: None,
+                    bg: None,
+                    attributes: None,
+                    link: None,
+                },
+                SpliceRun {
+                    text: "R".to_string(),
+                    fg: None,
+                    bg: None,
+                    attributes: Some(TextAttributes::DEFAULT),
+                    link: None,
+                },
+            ]),
+            begin: 0,
+            end: 2,
+        };
+        let result = op.apply(&line);
+        assert_eq!(style_at(&result, 0).attributes, inherited);
+        assert_eq!(style_at(&result, 1).attributes, TextAttributes::DEFAULT);
+        assert_tiles(&result);
     }
 
     #[test]
@@ -303,6 +351,7 @@ mod tests {
                 text: "X".to_string(),
                 fg: None,
                 bg: None,
+                attributes: None,
                 link: None,
             }]),
             begin: 5,
@@ -395,6 +444,7 @@ mod tests {
                 text: "!".to_string(),
                 fg: None,
                 bg: None,
+                attributes: None,
                 link: Some(styled_link(action.clone())),
             }]),
             begin: 8,
@@ -449,6 +499,7 @@ mod tests {
                 text: "south".to_string(),
                 fg: None,
                 bg: None,
+                attributes: None,
                 link: None,
             }]),
             begin: 3,

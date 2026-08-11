@@ -12,7 +12,7 @@ use crate::cloud_account::CloudHandles;
 use crate::components::session_input;
 use crate::images::image_store;
 use crate::terminal_buffer::selection::Selection;
-use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer};
+use crate::terminal_buffer::{LinkClickEvent, LinkProtocolState, TerminalBuffer};
 use crate::theme::Element;
 use crate::widgets::split_terminal_pane;
 use iced::widget::{
@@ -37,7 +37,9 @@ use smudgy_core::session::runtime::pane::{
     MAIN_PANE_KEY, MAIN_PANE_NAME_ID, PaneDef, PaneKey, PaneKind, TitleBarPolicy,
 };
 use smudgy_core::session::runtime::{IsolateId, RuntimeAction};
-use smudgy_core::session::styled_line::{LinkAction, LinkTooltipCallback};
+use smudgy_core::session::styled_line::{
+    InvisiblePolicy, LinkAction, LinkTooltipCallback, escape_invisible_text,
+};
 use smudgy_core::session::{self, SessionEvent, SessionId};
 use smudgy_core::session::{BufferUpdate, TaggedSessionEvent};
 use smudgy_map_widget::map_view;
@@ -168,6 +170,7 @@ pub struct ManagedSession {
     pub mapper: Option<Mapper>,
 
     terminal_buffer: Rc<RefCell<TerminalBuffer>>,
+    link_protocol_state: Rc<RefCell<LinkProtocolState>>,
     terminal_pane_selection: Rc<RefCell<Selection>>,
 
     /// Display state for this session's non-main panes, keyed by the
@@ -252,13 +255,24 @@ pub struct ManagedSession {
 struct PendingLinkConfirm {
     /// The gated action, performed verbatim on Proceed.
     action: LinkAction,
-    /// What the user is shown: the full URL, or the exact command a `send:`
-    /// link would transmit. Never server-relabelable.
+    /// Safe, middle-elided display copy of the full URL or `send:` target.
+    /// Deceptive invisible characters are escaped and the value is never
+    /// server-relabelable; elision preserves the genuine target suffix.
     display: String,
     /// The URL's host (the per-host grant key); `None` for a `send:` link.
     host: Option<String>,
     grant_host: bool,
     grant_server: bool,
+}
+
+const LINK_CONFIRM_DISPLAY_CHARS: usize = 180;
+
+fn safe_link_confirmation_display(action: &LinkAction) -> String {
+    let Some(target) = action.disclosure_target_text() else {
+        return String::new();
+    };
+    let elided = elide_middle(target.as_ref(), LINK_CONFIRM_DISPLAY_CHARS);
+    escape_invisible_text(&elided, InvisiblePolicy::ActionTarget).into_owned()
 }
 
 #[derive(Debug, Clone)]
@@ -633,7 +647,43 @@ fn link_activation_handler(
         .then(|| Rc::new(Message::LinkActivated) as Rc<dyn Fn(LinkClickEvent) -> Message>)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum VisibilityFanout {
+    Input,
+    Prompt,
+}
+
+fn fan_visibility_event<'a>(
+    main: &'a Rc<RefCell<TerminalBuffer>>,
+    panes: impl Iterator<Item = &'a Rc<RefCell<TerminalBuffer>>>,
+    event: VisibilityFanout,
+) {
+    for buffer in std::iter::once(main).chain(panes) {
+        let buffer = buffer.borrow();
+        match event {
+            VisibilityFanout::Input => buffer.note_visibility_input(),
+            VisibilityFanout::Prompt => buffer.note_visibility_prompt(),
+        }
+    }
+}
+
 impl ManagedSession {
+    fn note_visibility_input(&self) {
+        fan_visibility_event(
+            &self.terminal_buffer,
+            self.panes.values().filter_map(|pane| pane.buffer.as_ref()),
+            VisibilityFanout::Input,
+        );
+    }
+
+    fn note_visibility_prompt(&self) {
+        fan_visibility_event(
+            &self.terminal_buffer,
+            self.panes.values().filter_map(|pane| pane.buffer.as_ref()),
+            VisibilityFanout::Prompt,
+        );
+    }
+
     /// Creates the session state for `server_name`/`profile_name`. With
     /// `auto_connect` the connection is established as soon as the runtime is
     /// ready; without it the session opens **offline** — the runtime, mapper,
@@ -655,9 +705,10 @@ impl ManagedSession {
 
         info!("Settings: {settings:?}");
 
-        // Create a single shared terminal buffer, sized from settings
-        let terminal_buffer = Rc::new(RefCell::new(TerminalBuffer::new_with_max_lines(
+        let link_protocol_state = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let terminal_buffer = Rc::new(RefCell::new(TerminalBuffer::new_with_protocol_state(
             scrollback_limit(&settings),
+            link_protocol_state.clone(),
         )));
 
         // Load profile to get the subtext (caption) once
@@ -792,6 +843,7 @@ impl ManagedSession {
             profile_name,
             input,
             terminal_buffer: terminal_buffer.clone(),
+            link_protocol_state,
             terminal_pane_selection: Rc::new(RefCell::new(Selection::default())),
             panes: HashMap::new(),
             main_title_bar: TitleBarPolicy::Normal,
@@ -836,13 +888,17 @@ impl ManagedSession {
         let key = def.key;
         let main_input = &self.input;
         let mirror_interest = self.input_mirror_feed.interest;
+        let link_protocol_state = self.link_protocol_state.clone();
         self.panes.entry(def.key).or_insert_with(|| {
             let buffer = match def.kind {
                 PaneKind::Terminal => {
                     let settings = load_settings();
-                    Some(Rc::new(RefCell::new(TerminalBuffer::new_with_max_lines(
-                        scrollback_limit(&settings),
-                    ))))
+                    Some(Rc::new(RefCell::new(
+                        TerminalBuffer::new_with_protocol_state(
+                            scrollback_limit(&settings),
+                            link_protocol_state.clone(),
+                        ),
+                    )))
                 }
                 // Widgets-only: no scrollback (the widget stack is the
                 // pane's whole body).
@@ -1081,7 +1137,7 @@ impl ManagedSession {
     fn handle_link_activation(&mut self, event: LinkClickEvent) {
         let action = match event.action {
             LinkAction::Send(command) => {
-                self.terminal_buffer.borrow_mut().note_visibility_input();
+                self.note_visibility_input();
                 RuntimeAction::Send(Arc::new(command.to_string()))
             }
             LinkAction::Callback {
@@ -1109,9 +1165,10 @@ impl ManagedSession {
                 {
                     open_url_in_browser(&url);
                 } else {
+                    let action = LinkAction::OpenUrl(url);
                     *self.pending_link_confirm.borrow_mut() = Some(PendingLinkConfirm {
-                        display: url.to_string(),
-                        action: LinkAction::OpenUrl(url),
+                        display: safe_link_confirmation_display(&action),
+                        action,
                         host,
                         grant_host: false,
                         grant_server: false,
@@ -1121,12 +1178,13 @@ impl ManagedSession {
             }
             LinkAction::ServerSend(command) => {
                 if self.server_config.borrow().allows_server_link(None) {
-                    self.terminal_buffer.borrow_mut().note_visibility_input();
+                    self.note_visibility_input();
                     RuntimeAction::Send(Arc::new(command.to_string()))
                 } else {
+                    let action = LinkAction::ServerSend(command);
                     *self.pending_link_confirm.borrow_mut() = Some(PendingLinkConfirm {
-                        display: command.to_string(),
-                        action: LinkAction::ServerSend(command),
+                        display: safe_link_confirmation_display(&action),
+                        action,
                         host: None,
                         grant_host: false,
                         grant_server: false,
@@ -1183,7 +1241,7 @@ impl ManagedSession {
         match action {
             LinkAction::OpenUrl(url) => open_url_in_browser(url),
             LinkAction::ServerSend(command) => {
-                self.terminal_buffer.borrow_mut().note_visibility_input();
+                self.note_visibility_input();
                 self.send_runtime_action(RuntimeAction::Send(Arc::new(command.to_string())));
             }
             // Prompt and script links never pass through the trust gate.
@@ -1261,7 +1319,7 @@ impl ManagedSession {
     fn handle_input_event(&mut self, event: session_input::Event) {
         match event {
             session_input::Event::Submit { text, masked } => {
-                self.terminal_buffer.borrow_mut().note_visibility_input();
+                self.note_visibility_input();
                 self.send_runtime_action(submit_runtime_action(text, masked));
             }
             session_input::Event::HotkeyTriggered(id) => {
@@ -1589,7 +1647,7 @@ impl ManagedSession {
                                     self.terminal_buffer.borrow_mut().commit_current_line();
                                 }
                                 BufferUpdate::PromptBoundary => {
-                                    self.terminal_buffer.borrow_mut().note_visibility_prompt();
+                                    self.note_visibility_prompt();
                                 }
                                 BufferUpdate::Append(line) => {
                                     let mut buffer = self.terminal_buffer.borrow_mut();
@@ -1615,6 +1673,17 @@ impl ManagedSession {
                                             "Dropping AppendTo for unknown or bufferless {key}"
                                         ),
                                     }
+                                }
+                                BufferUpdate::BeginOpenLineReplacement => self
+                                    .terminal_buffer
+                                    .borrow_mut()
+                                    .begin_open_line_replacement(),
+                                BufferUpdate::FinishOpenLineReplacement(line) => {
+                                    let mut buffer = self.terminal_buffer.borrow_mut();
+                                    if line.is_some() {
+                                        buffer.note_visibility_output();
+                                    }
+                                    buffer.finish_open_line_replacement(line.clone());
                                 }
                                 BufferUpdate::RetractOpenLine => {
                                     self.terminal_buffer.borrow_mut().retract_open_line();
@@ -1935,12 +2004,8 @@ impl ManagedSession {
                         }
                         if pending.grant_host
                             && let Some(host) = &pending.host
-                            && !config
-                                .trusted_link_hosts
-                                .iter()
-                                .any(|t| t.eq_ignore_ascii_case(host))
                         {
-                            config.trusted_link_hosts.push(host.clone());
+                            config.grant_link_host(host);
                         }
                         if let Err(e) = update_server(&self.server_name, config.clone()) {
                             log::error!(
@@ -2016,8 +2081,8 @@ impl ManagedSession {
             .into()
     }
 
-    /// The trust-gate dialog for a server-sent link: the verbatim destination
-    /// (never server-relabelable), a perform/cancel pair, and the two opt-in
+    /// The trust-gate dialog for a server-sent link: a safely escaped,
+    /// never-server-relabelable destination, a perform/cancel pair, and two opt-in
     /// grants — per-host (URL links only) and trust-everything-from-this-
     /// server. Clicking the dimmed backdrop cancels.
     fn link_confirm_dialog(&self, pending: &PendingLinkConfirm) -> Element<'static, Message> {
@@ -2032,11 +2097,10 @@ impl ManagedSession {
             ),
         };
 
-        // A server can make the URL/command up to the OSC 8 URI cap (8 KiB);
-        // middle-elide so a long unbroken token can't overflow the card and
-        // push the buttons off-screen. The user still sees both ends — enough
-        // to judge the destination.
-        let display = elide_middle(&pending.display, 180);
+        // `safe_link_confirmation_display` has already middle-elided the full
+        // raw target before escaping it, so this bounded string preserves the
+        // genuine destination suffix and cannot split a `\u{...}` escape.
+        let display = pending.display.clone();
 
         let mut body = column![
             text(title).size(15),
@@ -2299,6 +2363,29 @@ fn migrate_global_local_maps(legacy: &Path, server_local_dirs: &[PathBuf]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn link_confirmation_escapes_deceptive_action_target_text() {
+        let action = LinkAction::ServerSend(Arc::from("pay\u{202e}gold\u{200b}"));
+        assert_eq!(
+            safe_link_confirmation_display(&action),
+            "send:pay\\u{202E}gold\\u{200B}"
+        );
+    }
+
+    #[test]
+    fn link_confirmation_preserves_the_actual_action_tail() {
+        let command = format!("{}\u{202e}delete-everything", "safe-prefix-".repeat(50));
+        let action = LinkAction::ServerSend(Arc::from(command));
+        let display = safe_link_confirmation_display(&action);
+
+        assert!(display.starts_with("send:safe-prefix-"));
+        assert!(display.contains('\u{2026}'));
+        assert!(display.ends_with("\\u{202E}delete-everything"));
+        assert!(!display.contains('\u{202e}'));
+        assert!(!display.contains("\\\\u{202E}delete-everything"));
+    }
 
     fn atlas_target(n: u128) -> BindTarget {
         BindTarget::Atlas(AtlasId(smudgy_cloud::Uuid::from_u128(n)))
@@ -2338,6 +2425,115 @@ mod tests {
             link_activation_handler(false).is_none(),
             "links remain inert until the session runtime is available"
         );
+    }
+
+    fn visibility_line(
+        prompt: bool,
+        input: bool,
+    ) -> Arc<smudgy_core::session::styled_line::StyledLine> {
+        use smudgy_core::session::styled_line::{
+            LinkProtocol, LinkSpan, LinkVisibility, LinkVisibilityAction, LinkVisibilityExpire,
+            StyledLine,
+        };
+
+        let action = LinkAction::Configured {
+            primary: Some(Box::new(LinkAction::ServerSend(Arc::from("look")))),
+            disabled: false,
+            primary_enabled: true,
+            menu: None,
+            menu_on_left_click: false,
+            protocol: Some(LinkProtocol {
+                visibility: Some(LinkVisibility {
+                    action: LinkVisibilityAction::Conceal,
+                    delay_ms: None,
+                    expire: LinkVisibilityExpire {
+                        input,
+                        prompt,
+                        output: false,
+                        output_delay_ms: 0,
+                    },
+                    whole_line: false,
+                }),
+                ..LinkProtocol::default()
+            }),
+        };
+        let mut line = StyledLine::new("link", Vec::new());
+        line.links.push(LinkSpan {
+            begin_pos: 0,
+            end_pos: 4,
+            action,
+            tooltip: None,
+            style: None,
+        });
+        Arc::new(line)
+    }
+
+    #[test]
+    fn visibility_input_and_prompt_events_fan_out_to_routed_buffers() {
+        use crate::terminal_buffer::LinkProtocolState;
+
+        let shared = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let main = Rc::new(RefCell::new(TerminalBuffer::new_with_protocol_state(
+            NonZeroUsize::new(10).unwrap(),
+            shared.clone(),
+        )));
+        let routed = Rc::new(RefCell::new(TerminalBuffer::new_with_protocol_state(
+            NonZeroUsize::new(10).unwrap(),
+            shared,
+        )));
+        main.borrow_mut().push_line(visibility_line(false, true));
+        routed.borrow_mut().push_line(visibility_line(true, false));
+        let main_key = main.borrow().link_keys().next().expect("main link key");
+        let routed_key = routed.borrow().link_keys().next().expect("routed link key");
+
+        // Expiry fanout is inert until each link has been activated.
+        fan_visibility_event(&main, std::iter::once(&routed), VisibilityFanout::Input);
+        fan_visibility_event(&main, std::iter::once(&routed), VisibilityFanout::Prompt);
+        assert!(!main.borrow().link_state().borrow().concealed(main_key));
+        assert!(!routed.borrow().link_state().borrow().concealed(routed_key));
+
+        let now = Instant::now();
+        main.borrow()
+            .link_state()
+            .borrow_mut()
+            .activate_visibility(main_key, now);
+        routed
+            .borrow()
+            .link_state()
+            .borrow_mut()
+            .activate_visibility(routed_key, now);
+
+        fan_visibility_event(&main, std::iter::once(&routed), VisibilityFanout::Input);
+        assert!(main.borrow().link_state().borrow().concealed(main_key));
+        assert!(!routed.borrow().link_state().borrow().concealed(routed_key));
+
+        // The first prompt after activation belongs to the click response.
+        fan_visibility_event(&main, std::iter::once(&routed), VisibilityFanout::Prompt);
+        assert!(!routed.borrow().link_state().borrow().concealed(routed_key));
+        fan_visibility_event(&main, std::iter::once(&routed), VisibilityFanout::Prompt);
+        assert!(routed.borrow().link_state().borrow().concealed(routed_key));
+    }
+
+    #[test]
+    fn protocol_mutation_does_not_reborrow_the_rendered_scrollback() {
+        use crate::terminal_buffer::LinkProtocolState;
+
+        let shared = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let buffer = RefCell::new(TerminalBuffer::new_with_protocol_state(
+            NonZeroUsize::new(10).unwrap(),
+            shared.clone(),
+        ));
+        let buffer_link_state = buffer.borrow().link_state();
+        let render_borrow = buffer.borrow();
+
+        shared
+            .borrow_mut()
+            .mark_visited(&LinkAction::Send(Arc::from("look")));
+        assert_eq!(buffer_link_state.borrow().visual_generation(), 0);
+        assert!(buffer.try_borrow_mut().is_err());
+
+        drop(render_borrow);
+        assert!(buffer.try_borrow_mut().is_ok());
     }
 
     /// The input mirror feed's interest gate and coalescing: without interest

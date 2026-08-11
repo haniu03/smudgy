@@ -144,8 +144,8 @@ pub const DEFAULT_API_BASE_URL: &str = if is_dev_build() {
 pub const MAX_LINK_TOOLTIP_DELAY_MS: u64 = 60_000;
 
 /// How an SGR bold attribute is presented in terminal output.
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", from = "TerminalBoldModeCompat")]
 pub enum TerminalBoldMode {
     /// Increase the selected terminal font's weight without changing color.
     Bold,
@@ -175,58 +175,32 @@ impl Default for TerminalBoldMode {
     }
 }
 
-impl std::fmt::Display for TerminalBoldMode {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Bold => "Show bold as bold",
-            Self::Bright => "Show bold as bright",
-            Self::BoldAndBright => "Show bold as bold and bright",
-        })
-    }
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalBoldModeName {
+    Bold,
+    Bright,
+    BoldAndBright,
 }
 
-impl<'de> Deserialize<'de> for TerminalBoldMode {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct BoldModeVisitor;
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TerminalBoldModeCompat {
+    Name(TerminalBoldModeName),
+    LegacyBool(bool),
+}
 
-        impl<'de> serde::de::Visitor<'de> for BoldModeVisitor {
-            type Value = TerminalBoldMode;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a terminal bold mode or legacy boolean")
+impl From<TerminalBoldModeCompat> for TerminalBoldMode {
+    fn from(value: TerminalBoldModeCompat) -> Self {
+        match value {
+            TerminalBoldModeCompat::Name(TerminalBoldModeName::Bold) => Self::Bold,
+            TerminalBoldModeCompat::Name(TerminalBoldModeName::Bright) => Self::Bright,
+            TerminalBoldModeCompat::Name(TerminalBoldModeName::BoldAndBright) => {
+                Self::BoldAndBright
             }
-
-            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(if value {
-                    TerminalBoldMode::BoldAndBright
-                } else {
-                    TerminalBoldMode::Bold
-                })
-            }
-
-            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                match value {
-                    "bold" => Ok(TerminalBoldMode::Bold),
-                    "bright" => Ok(TerminalBoldMode::Bright),
-                    "bold_and_bright" | "bold-and-bright" => Ok(TerminalBoldMode::BoldAndBright),
-                    _ => Err(E::unknown_variant(
-                        value,
-                        &["bold", "bright", "bold_and_bright"],
-                    )),
-                }
-            }
+            TerminalBoldModeCompat::LegacyBool(true) => Self::BoldAndBright,
+            TerminalBoldModeCompat::LegacyBool(false) => Self::Bold,
         }
-
-        deserializer.deserialize_any(BoldModeVisitor)
     }
 }
 
@@ -991,6 +965,11 @@ mod tests {
         let disabled: Settings =
             serde_json::from_str(r#"{"terminal_bold_is_bright":false}"#).unwrap();
         assert_eq!(disabled.terminal_bold_mode, TerminalBoldMode::Bold);
+    }
+
+    #[test]
+    fn terminal_bold_mode_rejects_unreleased_kebab_case_alias() {
+        assert!(serde_json::from_str::<TerminalBoldMode>(r#""bold-and-bright""#).is_err());
     }
 
     #[test]

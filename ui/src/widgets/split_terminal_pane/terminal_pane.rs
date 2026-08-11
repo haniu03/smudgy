@@ -1,12 +1,13 @@
 use std::{
     cell::{Ref, RefCell},
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     rc::Rc,
     sync::Arc,
 };
 
 use crate::terminal_buffer::{
-    LinkClickEvent, LinkRenderStyle, RenderedOffsets, SpanMetadata, TerminalBuffer, make_span,
+    BufferLinkState, LinkClickEvent, LinkKey, LinkProtocolState, LinkRenderStyle, RenderedOffsets,
+    SpanMetadata, TerminalBuffer, authored_color, make_span,
 };
 use iced::{
     Background, Border, Event, Pixels, Point, Rectangle, Size,
@@ -25,9 +26,8 @@ use iced::{
     window,
 };
 use smudgy_core::session::styled_line::{
-    LinkAction, LinkColor, LinkDecoration, LinkMenu, LinkMenuItem, LinkSelection, LinkSpan,
-    LinkStyleState, LinkTooltip, LinkTooltipCallback, LinkTooltipText, LinkVisibility,
-    LinkVisibilityAction, StyledLine,
+    LinkAction, LinkDecoration, LinkMenu, LinkMenuItem, LinkSpan, LinkStyleState, LinkTooltip,
+    LinkTooltipCallback, LinkTooltipText, StyledLine,
 };
 
 mod spans;
@@ -110,9 +110,7 @@ struct ParagraphCache<P: text::Paragraph> {
     spans: Spans<Link>,
     offsets: RenderedOffsets,
     paragraph: P,
-    slow_blink_hidden: Option<P>,
-    fast_blink_hidden: Option<P>,
-    all_blink_hidden: Option<P>,
+    hidden_blink_paragraphs: Rc<RefCell<HiddenBlinkParagraphs<P>>>,
     blink_modes: u8,
     max_valid_width: f32,
     selection: LineSelection,
@@ -123,7 +121,14 @@ struct ParagraphCache<P: text::Paragraph> {
     /// override composes with the generation (an override change re-shapes
     /// without a prefs bump).
     font_size: f32,
-    visual_generation: u64,
+    visual_generation: (u64, u64, u64),
+}
+
+#[derive(Debug, Clone, Default)]
+struct HiddenBlinkParagraphs<P> {
+    slow: Option<P>,
+    fast: Option<P>,
+    all: Option<P>,
 }
 
 const SLOW_BLINK: u8 = 1;
@@ -132,23 +137,6 @@ const SLOW_BLINK_HALF_PERIOD_MS: u128 = 500;
 const FAST_BLINK_HALF_PERIOD_MS: u128 = 250;
 const TOOLTIP_SPINNER_FRAME_MS: u64 = 100;
 const TOOLTIP_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct LinkKey {
-    line: usize,
-    begin: usize,
-    end: usize,
-}
-
-impl LinkKey {
-    fn new(line: usize, link: &LinkSpan) -> Self {
-        Self {
-            line,
-            begin: link.begin_pos,
-            end: link.end_pos,
-        }
-    }
-}
 
 fn link_navigation_index(
     link_count: usize,
@@ -167,96 +155,74 @@ fn link_navigation_index(
     })
 }
 
-fn append_query_flag(value: &str, name: &str, enabled: bool) -> Arc<str> {
-    let (head, fragment) = value
-        .split_once('#')
-        .map_or((value, None), |(head, fragment)| (head, Some(fragment)));
-    let separator = if head.contains('?') { '&' } else { '?' };
-    let mut result = format!("{head}{separator}{name}={enabled}");
-    if let Some(fragment) = fragment {
-        result.push('#');
-        result.push_str(fragment);
-    }
-    Arc::from(result)
+fn append_selected_flag(command: &str, selected: bool) -> Arc<str> {
+    let (command, query) = command
+        .split_once('?')
+        .map_or((command, None), |(command, query)| (command, Some(query)));
+    let mut parameters: Vec<_> = query
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter(|parameter| {
+            !parameter.is_empty()
+                && parameter.split_once('=').map_or(*parameter, |(key, _)| key) != "selected"
+        })
+        .collect();
+    let selected = if selected {
+        "selected=true"
+    } else {
+        "selected=false"
+    };
+    parameters.push(selected);
+    Arc::from(format!("{command}?{}", parameters.join("&")))
 }
 
 fn with_selected_callback(action: LinkAction, selected: bool) -> LinkAction {
     match action {
         LinkAction::ServerSend(command) => {
-            LinkAction::ServerSend(append_query_flag(&command, "selected", selected))
+            LinkAction::ServerSend(append_selected_flag(&command, selected))
         }
-        LinkAction::Prompt(command) => {
-            LinkAction::Prompt(append_query_flag(&command, "selected", selected))
-        }
-        LinkAction::OpenUrl(url) => {
-            LinkAction::OpenUrl(append_query_flag(&url, "selected", selected))
-        }
+        LinkAction::Prompt(command) => LinkAction::Prompt(append_selected_flag(&command, selected)),
         other => other,
     }
 }
 
-#[derive(Debug, Clone)]
-struct VisibilityState {
-    concealed: bool,
-    created: Instant,
-    activated: Option<Instant>,
-    revealed_phase: bool,
+fn link_action_disabled(action: &LinkAction) -> bool {
+    action.is_disabled()
+        || action
+            .protocol()
+            .and_then(|protocol| protocol.selection.as_ref())
+            .is_some_and(|selection| selection.disabled)
 }
 
-impl VisibilityState {
-    fn new(config: &LinkVisibility) -> Self {
-        let (concealed, revealed_phase) = match config.action {
-            LinkVisibilityAction::Conceal => (false, false),
-            LinkVisibilityAction::Reveal | LinkVisibilityAction::RevealThenConceal => (true, false),
-        };
-        Self {
-            concealed,
-            created: Instant::now(),
-            activated: None,
-            revealed_phase,
-        }
-    }
-
-    fn apply_expiry(&mut self, action: LinkVisibilityAction) -> bool {
-        let was_concealed = self.concealed;
-        let was_revealed_phase = self.revealed_phase;
-        match action {
-            LinkVisibilityAction::Conceal => self.concealed = true,
-            LinkVisibilityAction::Reveal => self.concealed = false,
-            LinkVisibilityAction::RevealThenConceal if !self.revealed_phase => {
-                self.concealed = false;
-                self.revealed_phase = true;
-            }
-            LinkVisibilityAction::RevealThenConceal => {}
-        }
-        self.activated = None;
-        self.concealed != was_concealed || self.revealed_phase != was_revealed_phase
-    }
+fn concealed_whole_lines(
+    terminal_buffer: &TerminalBuffer,
+    buffer_link_state: &BufferLinkState,
+) -> HashSet<usize> {
+    terminal_buffer
+        .iter_rev_with_line_number(None)
+        .map(|(line_number, _)| line_number)
+        .filter(|line_number| buffer_link_state.line_concealed(*line_number))
+        .collect()
 }
 
-impl<P: text::Paragraph> ParagraphCache<P> {
-    fn displayed_paragraph(&self, slow_visible: bool, fast_visible: bool) -> &P {
-        match (slow_visible, fast_visible) {
-            (true, true) => &self.paragraph,
-            (false, true) => self.slow_blink_hidden.as_ref().unwrap_or(&self.paragraph),
-            (true, false) => self.fast_blink_hidden.as_ref().unwrap_or(&self.paragraph),
-            (false, false) => self
-                .all_blink_hidden
-                .as_ref()
-                .or(self.slow_blink_hidden.as_ref())
-                .or(self.fast_blink_hidden.as_ref())
-                .unwrap_or(&self.paragraph),
-        }
-    }
+fn link_key_available(
+    key: LinkKey,
+    buffer_link_state: &BufferLinkState,
+    hidden_lines: &HashSet<usize>,
+) -> bool {
+    buffer_link_state.contains(key)
+        && !buffer_link_state.concealed(key)
+        && buffer_link_state
+            .line(key)
+            .is_none_or(|line| !hidden_lines.contains(&line))
 }
 
 fn hidden_blink_spans(
     spans: &[iced::widget::text::Span<'static, Link>],
     hide_slow: bool,
     hide_fast: bool,
-) -> Option<Vec<iced::widget::text::Span<'static, Link>>> {
-    let mut changed = false;
-    let hidden = spans
+) -> Vec<iced::widget::text::Span<'static, Link>> {
+    spans
         .iter()
         .cloned()
         .map(|mut span| {
@@ -266,13 +232,22 @@ fn hidden_blink_spans(
                 smudgy_core::session::styled_line::Blink::Fast => hide_fast,
             });
             if hide {
-                changed = true;
                 span.color = Some(iced::Color::TRANSPARENT);
             }
             span
         })
-        .collect();
-    changed.then_some(hidden)
+        .collect()
+}
+
+fn span_blink_modes(spans: &[iced::widget::text::Span<'static, Link>]) -> u8 {
+    spans.iter().fold(0, |modes, span| {
+        modes
+            | span.link.map_or(0, |metadata| match metadata.blink {
+                smudgy_core::session::styled_line::Blink::None => 0,
+                smudgy_core::session::styled_line::Blink::Slow => SLOW_BLINK,
+                smudgy_core::session::styled_line::Blink::Fast => FAST_BLINK,
+            })
+    })
 }
 
 /// The effective text metrics for a pane: its font override (line height by
@@ -285,44 +260,6 @@ pub(super) fn effective_metrics(
     match font_override {
         Some(px) => (px, (px * 1.25).round()),
         None => (prefs.font_size, prefs.line_height),
-    }
-}
-
-/// Render an actionable destination without letting control, zero-width, or
-/// bidi-reordering characters conceal what will actually be opened or sent.
-fn safe_link_target(target: &str) -> String {
-    const MAX_CHARS: usize = 512;
-    let mut rendered = String::with_capacity(target.len().min(MAX_CHARS));
-    for (index, c) in target.chars().enumerate() {
-        if index == MAX_CHARS {
-            rendered.push('\u{2026}');
-            break;
-        }
-        let suspicious = c.is_control()
-            || matches!(
-                c,
-                '\u{061c}'
-                    | '\u{200b}'..='\u{200f}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2060}'..='\u{206f}'
-                    | '\u{feff}'
-            );
-        if suspicious {
-            use std::fmt::Write;
-            write!(rendered, "\\u{{{:04X}}}", u32::from(c)).ok();
-        } else {
-            rendered.push(c);
-        }
-    }
-    rendered
-}
-
-fn action_target(action: &LinkAction) -> Option<String> {
-    match action.disclosed_target()? {
-        LinkAction::Send(command) | LinkAction::OpenUrl(command) => Some(command.to_string()),
-        LinkAction::ServerSend(command) => Some(format!("send:{command}")),
-        LinkAction::Prompt(command) => Some(format!("prompt:{command}")),
-        LinkAction::Callback { .. } | LinkAction::Configured { .. } => None,
     }
 }
 
@@ -374,6 +311,9 @@ struct LinkTooltipParagraphCache<P: text::Paragraph> {
     text: LinkTooltipText,
     spans: Rc<Vec<iced::widget::text::Span<'static, Link>>>,
     paragraph: P,
+    secondary_source: Option<Arc<str>>,
+    secondary_text: Option<String>,
+    secondary_paragraph: Option<P>,
     generation: u64,
     content_width: f32,
 }
@@ -382,7 +322,7 @@ fn draw_link_tooltip<Renderer>(
     renderer: &mut Renderer,
     prefs: &crate::prefs::TerminalPrefs,
     viewport: Rectangle,
-    cursor: mouse::Cursor,
+    anchor: Point,
     link: &HoveredLinkTooltip,
     spinner_frame: usize,
     paragraph_cache: &RefCell<Option<LinkTooltipParagraphCache<Renderer::Paragraph>>>,
@@ -390,9 +330,6 @@ fn draw_link_tooltip<Renderer>(
     Renderer: text::Renderer<Font = iced::Font>,
     Renderer::Paragraph: iced::advanced::text::Paragraph<Font = iced::Font>,
 {
-    let Some(cursor) = cursor.position() else {
-        return;
-    };
     let tooltip = &link.tooltip;
     let display = if tooltip.is_loading() {
         Some(loading_tooltip_display(
@@ -405,16 +342,19 @@ fn draw_link_tooltip<Renderer>(
     let Some((primary, secondary)) = display else {
         return;
     };
-    let target = action_target(&link.action);
+    let target = link.action.tooltip_target();
     let primary = if secondary.is_none() && target.as_deref() == Some(primary.text.as_ref()) {
-        LinkTooltipText::plain(Arc::from(safe_link_target(primary.text.as_ref())))
+        LinkTooltipText::plain(target.clone().expect("matched target must exist"))
     } else {
         clipped_tooltip_text(&primary)
     };
-    let secondary = secondary.map(|target| safe_link_target(&target));
+    // The tooltip's secondary value is only a signal that custom copy needs a
+    // disclosure line. Always render the action's authoritative, escaped
+    // target instead of trusting a copy stored alongside authored content.
+    let secondary_source = secondary.and(target);
 
     let padding = 8.0;
-    let gap = if secondary.is_some() { 3.0 } else { 0.0 };
+    let gap = if secondary_source.is_some() { 3.0 } else { 0.0 };
     let max_width = (viewport.width - 2.0).min(520.0);
     if max_width < 2.0 * padding + 1.0 {
         return;
@@ -433,13 +373,7 @@ fn draw_link_tooltip<Renderer>(
             wrapping: text::Wrapping::WordOrGlyph,
         })
     };
-    let mut paragraph_cache = paragraph_cache.borrow_mut();
-    let rebuild = paragraph_cache.as_ref().is_none_or(|cache| {
-        cache.text != primary
-            || cache.generation != prefs.generation
-            || cache.content_width != content_bounds.width
-    });
-    if rebuild {
+    let make_primary_paragraph = || {
         let spans: Rc<Vec<iced::widget::text::Span<'static, Link>>> = Rc::new(
             primary
                 .spans
@@ -466,21 +400,52 @@ fn draw_link_tooltip<Renderer>(
             shaping: text::Shaping::Advanced,
             wrapping: text::Wrapping::WordOrGlyph,
         });
+        (spans, paragraph)
+    };
+    let make_secondary = || {
+        let text = secondary_source.as_deref().map(str::to_owned);
+        let paragraph = text.as_deref().map(|text| make_plain_paragraph(text, 11.0));
+        (text, paragraph)
+    };
+    let mut paragraph_cache = paragraph_cache.borrow_mut();
+    let reset = paragraph_cache.as_ref().is_none_or(|cache| {
+        cache.generation != prefs.generation || cache.content_width != content_bounds.width
+    });
+    if reset {
+        let (spans, paragraph) = make_primary_paragraph();
+        let (secondary_text, secondary_paragraph) = make_secondary();
         *paragraph_cache = Some(LinkTooltipParagraphCache {
             text: primary.clone(),
             spans,
             paragraph,
+            secondary_source: secondary_source.clone(),
+            secondary_text,
+            secondary_paragraph,
             generation: prefs.generation,
             content_width: content_bounds.width,
         });
+    } else if let Some(cache) = paragraph_cache.as_mut() {
+        // The loading spinner changes the primary text ten times a second. Keep
+        // the disclosed target's sanitized copy and paragraph when only that
+        // primary changes.
+        if cache.text != primary {
+            let (spans, paragraph) = make_primary_paragraph();
+            cache.text = primary.clone();
+            cache.spans = spans;
+            cache.paragraph = paragraph;
+        }
+        if cache.secondary_source != secondary_source {
+            let (secondary_text, secondary_paragraph) = make_secondary();
+            cache.secondary_source = secondary_source.clone();
+            cache.secondary_text = secondary_text;
+            cache.secondary_paragraph = secondary_paragraph;
+        }
     }
     let primary_cache = paragraph_cache
         .as_ref()
         .expect("tooltip paragraph cache was just populated");
     let primary_paragraph = &primary_cache.paragraph;
-    let secondary_paragraph = secondary
-        .as_deref()
-        .map(|text| make_plain_paragraph(text, 11.0));
+    let secondary_paragraph = primary_cache.secondary_paragraph.as_ref();
     let content_width = secondary_paragraph
         .as_ref()
         .map_or(primary_paragraph.min_width(), |secondary| {
@@ -491,35 +456,21 @@ fn draw_link_tooltip<Renderer>(
         + secondary_paragraph.as_ref().map_or(0.0, |p| p.min_height())
         + gap
         + 2.0 * padding;
-    let text_primitive = |content: String, size: f32, height: f32| iced::advanced::text::Text {
-        content,
-        bounds: Size::new(width - 2.0 * padding, height),
-        size: Pixels(size),
-        font: prefs.font,
-        line_height: LineHeight::Absolute(Pixels((size * 1.25).round())),
-        align_x: text::Alignment::Left,
-        align_y: alignment::Vertical::Top,
-        shaping: text::Shaping::Advanced,
-        wrapping: text::Wrapping::WordOrGlyph,
-    };
-
     let right = viewport.x + viewport.width;
     let bottom = viewport.y + viewport.height;
-    let x = (cursor.x + 12.0).min(right - width).max(viewport.x);
-    let below = cursor.y + 18.0;
+    let x = (anchor.x + 12.0).min(right - width).max(viewport.x);
+    let below = anchor.y + 18.0;
     let y = if below + height <= bottom {
         below
     } else {
-        (cursor.y - height - 8.0).max(viewport.y)
+        (anchor.y - height - 8.0).max(viewport.y)
     };
     let bounds = Rectangle::new(Point::new(x, y), Size::new(width, height));
     let foreground = prefs.palette.foreground;
 
     // iced batches quads and glyphs into primitive sublayers. Without a fresh
     // renderer layer, every terminal paragraph is composited after this card's
-    // fill, which makes the scrollback show through it. Use owned text primitives
-    // here too: fill_paragraph records only a weak reference, and these transient
-    // measurement paragraphs do not live until the GPU preparation pass.
+    // fill, which makes the scrollback show through it.
     renderer.start_layer(viewport);
     renderer.fill_quad(
         Quad {
@@ -563,10 +514,12 @@ fn draw_link_tooltip<Renderer>(
         }
     }
     renderer.fill_paragraph(primary_paragraph, primary_at, foreground, viewport);
-    if let (Some(secondary), Some(secondary_paragraph)) = (secondary, secondary_paragraph) {
+    if let (Some(_secondary), Some(secondary_paragraph)) =
+        (&primary_cache.secondary_text, secondary_paragraph)
+    {
         let secondary_at = Point::new(x + padding, y + padding + primary_height + gap);
-        renderer.fill_text(
-            text_primitive(secondary, 11.0, secondary_paragraph.min_height()),
+        renderer.fill_paragraph(
+            secondary_paragraph,
             secondary_at,
             iced::Color {
                 a: foreground.a * 0.58,
@@ -585,6 +538,62 @@ struct LinkMenuPopup {
     source: Option<(LinkKey, LinkAction)>,
 }
 
+fn menu_source_is_available(
+    popup: &LinkMenuPopup,
+    live: &BufferLinkState,
+    hidden_lines: &HashSet<usize>,
+) -> bool {
+    popup.source.as_ref().is_none_or(|(key, action)| {
+        link_key_available(*key, live, hidden_lines) && !link_action_disabled(action)
+    })
+}
+
+#[derive(Debug)]
+enum LinkMenuInvocation {
+    None,
+    RevealSpoiler,
+    Open(Box<LinkMenuPopup>),
+}
+
+fn resolve_link_menu_invocation<P: text::Paragraph>(
+    state: &mut State<P>,
+    buffer_link_state: &mut BufferLinkState,
+    key: LinkKey,
+    link: &LinkSpan,
+    anchor: Point,
+) -> LinkMenuInvocation {
+    if !link_key_available(key, buffer_link_state, &state.hidden_lines)
+        || link_action_disabled(&link.action)
+    {
+        return LinkMenuInvocation::None;
+    }
+    let Some(menu) = link.action.menu().cloned() else {
+        return LinkMenuInvocation::None;
+    };
+    if buffer_link_state.reveal_spoiler(key) {
+        state.link_tooltip_hover = None;
+        state.invalidate_link_styles();
+        return LinkMenuInvocation::RevealSpoiler;
+    }
+    LinkMenuInvocation::Open(Box::new(LinkMenuPopup {
+        menu,
+        anchor,
+        source: Some((key, link.action.clone())),
+    }))
+}
+
+fn apply_menu_choice_protocol(
+    protocol_state: &mut LinkProtocolState,
+    buffer_link_state: &mut BufferLinkState,
+    source: Option<&(LinkKey, LinkAction)>,
+    now: Instant,
+) -> Option<Instant> {
+    let (key, action) = source?;
+    let redraw_at = buffer_link_state.activate_visibility(*key, now);
+    protocol_state.record_menu_choice(action);
+    redraw_at
+}
+
 struct LinkMenuGeometry {
     bounds: Rectangle,
     title: Option<Rectangle>,
@@ -597,40 +606,196 @@ struct HoveredLinkTooltip {
     tooltip: LinkTooltip,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkTooltipOrigin {
+    Mouse,
+    Keyboard(LinkKey),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LinkTooltipHover {
     Waiting {
         link: HoveredLinkTooltip,
         at: Instant,
+        origin: LinkTooltipOrigin,
     },
-    Open(HoveredLinkTooltip),
+    Open {
+        link: HoveredLinkTooltip,
+        origin: LinkTooltipOrigin,
+    },
 }
 
 impl LinkTooltipHover {
     fn link(&self) -> &HoveredLinkTooltip {
         match self {
-            Self::Waiting { link, .. } | Self::Open(link) => link,
+            Self::Waiting { link, .. } | Self::Open { link, .. } => link,
+        }
+    }
+
+    fn origin(&self) -> LinkTooltipOrigin {
+        match self {
+            Self::Waiting { origin, .. } | Self::Open { origin, .. } => *origin,
         }
     }
 
     fn is_open(&self) -> bool {
-        matches!(self, Self::Open(_))
+        matches!(self, Self::Open { .. })
+    }
+
+    fn is_keyboard(&self) -> bool {
+        matches!(self.origin(), LinkTooltipOrigin::Keyboard(_))
     }
 }
 
-fn begin_link_tooltip_hover<Message>(
+fn keyboard_tooltip_scrolled_out(
+    hover: Option<&LinkTooltipHover>,
+    live: &BufferLinkState,
+    is_visible: impl Fn(usize) -> bool,
+) -> bool {
+    hover
+        .and_then(|hover| match hover.origin() {
+            LinkTooltipOrigin::Keyboard(key) => live.line(key),
+            LinkTooltipOrigin::Mouse => None,
+        })
+        .is_some_and(|line| !is_visible(line))
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TooltipRedraw {
+    now: bool,
+    at: Option<Instant>,
+}
+
+impl TooltipRedraw {
+    fn merge(&mut self, other: Self) {
+        self.now |= other.now;
+        self.at = self.at.into_iter().chain(other.at).min();
+    }
+}
+
+fn begin_mouse_link_tooltip(
     link: HoveredLinkTooltip,
     delay: Duration,
     now: Instant,
-    shell: &mut advanced::Shell<'_, Message>,
-) -> LinkTooltipHover {
+) -> (LinkTooltipHover, TooltipRedraw) {
     if delay == Duration::ZERO {
-        shell.request_redraw();
-        LinkTooltipHover::Open(link)
+        (
+            LinkTooltipHover::Open {
+                link,
+                origin: LinkTooltipOrigin::Mouse,
+            },
+            TooltipRedraw {
+                now: true,
+                at: None,
+            },
+        )
     } else {
-        shell.request_redraw_at(now + delay);
-        LinkTooltipHover::Waiting { link, at: now }
+        (
+            LinkTooltipHover::Waiting {
+                link,
+                at: now,
+                origin: LinkTooltipOrigin::Mouse,
+            },
+            TooltipRedraw {
+                now: false,
+                at: Some(now + delay),
+            },
+        )
     }
+}
+
+fn update_mouse_link_tooltip(
+    previous: Option<LinkTooltipHover>,
+    hovered: Option<HoveredLinkTooltip>,
+    delay: Duration,
+    now: Instant,
+    cursor_moved: bool,
+) -> (Option<LinkTooltipHover>, TooltipRedraw) {
+    if previous.as_ref().is_some_and(LinkTooltipHover::is_keyboard) {
+        return (previous, TooltipRedraw::default());
+    }
+
+    match (previous, hovered) {
+        (None, None) => (None, TooltipRedraw::default()),
+        (Some(previous), None) => (
+            None,
+            TooltipRedraw {
+                now: previous.is_open(),
+                at: None,
+            },
+        ),
+        (None, Some(link)) => {
+            let (hover, redraw) = begin_mouse_link_tooltip(link, delay, now);
+            (Some(hover), redraw)
+        }
+        (Some(previous), Some(link)) if previous.link() != &link => {
+            let mut redraw = TooltipRedraw {
+                now: previous.is_open(),
+                at: None,
+            };
+            let (hover, begin_redraw) = begin_mouse_link_tooltip(link, delay, now);
+            redraw.merge(begin_redraw);
+            (Some(hover), redraw)
+        }
+        (
+            Some(LinkTooltipHover::Waiting {
+                link, at, origin, ..
+            }),
+            Some(_),
+        ) => {
+            let elapsed = now.saturating_duration_since(at);
+            if elapsed >= delay {
+                (
+                    Some(LinkTooltipHover::Open { link, origin }),
+                    TooltipRedraw {
+                        now: true,
+                        at: None,
+                    },
+                )
+            } else {
+                (
+                    Some(LinkTooltipHover::Waiting { link, at, origin }),
+                    TooltipRedraw {
+                        now: false,
+                        at: Some(now + delay - elapsed),
+                    },
+                )
+            }
+        }
+        (Some(LinkTooltipHover::Open { link, origin }), Some(_)) => (
+            Some(LinkTooltipHover::Open { link, origin }),
+            TooltipRedraw {
+                now: cursor_moved,
+                at: None,
+            },
+        ),
+    }
+}
+
+fn request_tooltip_redraw<Message>(
+    redraw: TooltipRedraw,
+    shell: &mut advanced::Shell<'_, Message>,
+) {
+    if redraw.now {
+        shell.request_redraw();
+    }
+    if let Some(at) = redraw.at {
+        shell.request_redraw_at(at);
+    }
+}
+
+/// Claim the tooltip's one-shot callback only when there is somewhere to send
+/// it. Claiming first would leave the shared state permanently loading when a
+/// runtime (and therefore its handler) is unavailable.
+fn claim_tooltip_request(
+    tooltip: &LinkTooltip,
+    handler_available: bool,
+) -> Option<LinkTooltipCallback> {
+    handler_available.then(|| tooltip.request()).flatten()
+}
+
+fn byte_ranges_overlap(begin: usize, end: usize, range_begin: usize, range_end: usize) -> bool {
+    end > range_begin && begin < range_end
 }
 
 fn link_menu_geometry<Renderer>(
@@ -781,14 +946,6 @@ fn draw_link_menu<Renderer>(
             x: title_bounds.x + 10.0,
             width: title_bounds.width - 20.0,
             ..title_bounds
-        };
-        let authored_color = |color: LinkColor| {
-            iced::Color::from_rgba8(
-                color.red,
-                color.green,
-                color.blue,
-                f32::from(color.alpha) / 255.0,
-            )
         };
         let mut title_font = prefs.font;
         if title.style.as_ref().and_then(|style| style.bold) == Some(true) {
@@ -947,16 +1104,12 @@ pub(super) struct State<P: text::Paragraph> {
     active_link: Option<LinkKey>,
     focused_link: Option<LinkKey>,
     focus_visible: bool,
-    visited_actions: Vec<LinkAction>,
-    selected_values: HashMap<(Arc<str>, Arc<str>), bool>,
-    revealed_spoilers: HashSet<LinkKey>,
-    visibility: HashMap<LinkKey, VisibilityState>,
+    /// Logical lines concealed with OSC 8 `wholeline`. They are omitted from
+    /// layout and every interaction path, including links that merely share
+    /// the line with the visibility-controlling link.
+    hidden_lines: HashSet<usize>,
     visual_generation: u64,
     seen_link_navigation_reset_epoch: u64,
-    seen_input_epoch: u64,
-    seen_prompt_epoch: u64,
-    seen_output_epoch: u64,
-    previous_output_at: Option<Instant>,
 }
 
 impl<P: text::Paragraph> Default for State<P> {
@@ -978,16 +1131,9 @@ impl<P: text::Paragraph> Default for State<P> {
             active_link: None,
             focused_link: None,
             focus_visible: false,
-            visited_actions: Vec::new(),
-            selected_values: HashMap::new(),
-            revealed_spoilers: HashSet::new(),
-            visibility: HashMap::new(),
+            hidden_lines: HashSet::new(),
             visual_generation: 0,
             seen_link_navigation_reset_epoch: 0,
-            seen_input_epoch: 0,
-            seen_prompt_epoch: 0,
-            seen_output_epoch: 0,
-            previous_output_at: None,
         }
     }
 }
@@ -997,84 +1143,76 @@ impl<P: text::Paragraph> State<P> {
         self.visual_generation = self.visual_generation.wrapping_add(1);
     }
 
-    fn selected(&self, selection: &LinkSelection) -> bool {
-        self.selected_values
-            .get(&(selection.group.clone(), selection.value.clone()))
-            .copied()
-            .unwrap_or(selection.selected)
+    fn install_menu_popup(&mut self, popup: LinkMenuPopup) {
+        self.menu_popup = Some(popup);
+        self.pressed_cell = None;
+        self.link_tooltip_hover = None;
     }
 
-    fn visited(&self, action: &LinkAction) -> bool {
-        let target = action.disclosed_target();
-        self.visited_actions
-            .iter()
-            .any(|visited| visited.disclosed_target() == target)
-    }
-
-    fn mark_visited(&mut self, action: &LinkAction) {
-        if !self.visited(action)
-            && let Some(target) = action.disclosed_target()
+    fn clear_keyboard_tooltip(&mut self) -> bool {
+        if self
+            .link_tooltip_hover
+            .as_ref()
+            .is_some_and(LinkTooltipHover::is_keyboard)
         {
-            self.visited_actions.push(target.clone());
+            self.link_tooltip_hover = None;
+            true
+        } else {
+            false
         }
     }
 
-    fn toggle_link_selection(&mut self, action: &LinkAction) -> Option<bool> {
-        let selection = action.protocol()?.selection.as_ref()?;
-        let current = self.selected(selection);
-        if selection.disabled {
-            return Some(current);
-        }
-        let next = if current { !selection.toggle } else { true };
-        if next && selection.exclusive {
-            for ((group, _), selected) in &mut self.selected_values {
-                if group == &selection.group {
-                    *selected = false;
-                }
-            }
-        }
-        self.selected_values
-            .insert((selection.group.clone(), selection.value.clone()), next);
-        Some(next)
+    fn dismiss_link_overlay(&mut self) -> bool {
+        let menu = self.menu_popup.take().is_some();
+        let tooltip = self.clear_keyboard_tooltip();
+        menu || tooltip
     }
 
-    fn ensure_protocol_state(&mut self, line: usize, link: &LinkSpan) {
-        let key = LinkKey::new(line, link);
-        let Some(protocol) = link.action.protocol() else {
-            return;
-        };
-        if let Some(selection) = &protocol.selection {
-            let key = (selection.group.clone(), selection.value.clone());
-            if !self.selected_values.contains_key(&key) {
-                if selection.selected && selection.exclusive {
-                    for ((group, _), selected) in &mut self.selected_values {
-                        if group == &selection.group {
-                            *selected = false;
-                        }
-                    }
-                }
-                self.selected_values.insert(key, selection.selected);
-            }
-        }
-        if let Some(visibility) = &protocol.visibility {
-            self.visibility
-                .entry(key)
-                .or_insert_with(|| VisibilityState::new(visibility));
-        }
-    }
-
-    fn prune_link_instances(&mut self, live: &HashSet<LinkKey>) {
-        self.visibility.retain(|key, _| live.contains(key));
-        self.revealed_spoilers.retain(|key| live.contains(key));
-        if self.hovered_link.is_some_and(|key| !live.contains(&key)) {
+    fn prune_widget_links(&mut self, live: &BufferLinkState) {
+        if self
+            .hovered_link
+            .is_some_and(|key| !link_key_available(key, live, &self.hidden_lines))
+        {
             self.hovered_link = None;
+            if self
+                .link_tooltip_hover
+                .as_ref()
+                .is_some_and(|hover| hover.origin() == LinkTooltipOrigin::Mouse)
+            {
+                self.link_tooltip_hover = None;
+            }
         }
-        if self.active_link.is_some_and(|key| !live.contains(&key)) {
+        if self
+            .active_link
+            .is_some_and(|key| !link_key_available(key, live, &self.hidden_lines))
+        {
             self.active_link = None;
         }
-        if self.focused_link.is_some_and(|key| !live.contains(&key)) {
+        if self
+            .focused_link
+            .is_some_and(|key| !link_key_available(key, live, &self.hidden_lines))
+        {
             self.focused_link = None;
             self.focus_visible = false;
+        }
+        if self
+            .menu_popup
+            .as_ref()
+            .is_some_and(|popup| !menu_source_is_available(popup, live, &self.hidden_lines))
+        {
+            self.menu_popup = None;
+        }
+        if self
+            .link_tooltip_hover
+            .as_ref()
+            .is_some_and(|hover| match hover.origin() {
+                LinkTooltipOrigin::Keyboard(key) => {
+                    !link_key_available(key, live, &self.hidden_lines)
+                }
+                LinkTooltipOrigin::Mouse => false,
+            })
+        {
+            self.link_tooltip_hover = None;
         }
     }
 
@@ -1088,143 +1226,12 @@ impl<P: text::Paragraph> State<P> {
         }
         self.seen_link_navigation_reset_epoch = epoch;
 
-        let changed = self.is_focused || self.focused_link.is_some() || self.focus_visible;
+        let cleared_tooltip = self.clear_keyboard_tooltip();
+        let changed =
+            self.is_focused || self.focused_link.is_some() || self.focus_visible || cleared_tooltip;
         self.is_focused = false;
         self.focused_link = None;
         self.focus_visible = false;
-        if changed {
-            self.invalidate_link_styles();
-        }
-    }
-
-    fn update_visibility_timers(&mut self, now: Instant) -> Option<Instant> {
-        let mut changed = false;
-        let mut next = None;
-        for cache in &self.cache {
-            for link in &cache.source.links {
-                let Some(config) = link
-                    .action
-                    .protocol()
-                    .and_then(|protocol| protocol.visibility.as_ref())
-                else {
-                    continue;
-                };
-                let key = LinkKey::new(cache.line_number, link);
-                let Some(state) = self.visibility.get_mut(&key) else {
-                    continue;
-                };
-                let deadline = match config.action {
-                    LinkVisibilityAction::Conceal => state
-                        .activated
-                        .zip(config.delay_ms)
-                        .map(|(at, delay_ms)| at + Duration::from_millis(delay_ms)),
-                    LinkVisibilityAction::Reveal | LinkVisibilityAction::RevealThenConceal
-                        if state.concealed =>
-                    {
-                        config
-                            .delay_ms
-                            .map(|delay_ms| state.created + Duration::from_millis(delay_ms))
-                    }
-                    _ => None,
-                };
-                if let Some(deadline) = deadline {
-                    if now >= deadline {
-                        state.concealed = matches!(config.action, LinkVisibilityAction::Conceal);
-                        state.revealed_phase = !state.concealed;
-                        state.activated = None;
-                        changed = true;
-                    } else {
-                        next =
-                            Some(next.map_or(deadline, |current: Instant| current.min(deadline)));
-                    }
-                }
-            }
-        }
-        if changed {
-            self.invalidate_link_styles();
-        }
-        next
-    }
-
-    fn activate_visibility(
-        &mut self,
-        key: LinkKey,
-        config: &LinkVisibility,
-        now: Instant,
-    ) -> Option<Instant> {
-        let state = self.visibility.get_mut(&key)?;
-        match config.action {
-            LinkVisibilityAction::Conceal if !state.concealed => match config.delay_ms {
-                Some(delay_ms) if delay_ms > 0 => {
-                    state.activated = Some(now);
-                    Some(now + Duration::from_millis(delay_ms))
-                }
-                _ => {
-                    state.concealed = true;
-                    state.activated = None;
-                    None
-                }
-            },
-            LinkVisibilityAction::RevealThenConceal if state.revealed_phase => {
-                state.concealed = true;
-                state.revealed_phase = false;
-                state.activated = None;
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn process_visibility_epochs(
-        &mut self,
-        (input_epoch, prompt_epoch, output_epoch, output_at): (u64, u64, u64, Option<Instant>),
-    ) {
-        let input = input_epoch != self.seen_input_epoch;
-        let prompt = prompt_epoch != self.seen_prompt_epoch;
-        let output = output_epoch != self.seen_output_epoch;
-        let previous_output_at = self.previous_output_at;
-        let output_after_gap = output
-            && previous_output_at
-                .zip(output_at)
-                .is_some_and(|(previous, current)| current > previous);
-        self.seen_input_epoch = input_epoch;
-        self.seen_prompt_epoch = prompt_epoch;
-        self.seen_output_epoch = output_epoch;
-        if output {
-            self.previous_output_at = output_at;
-        }
-        if !input && !prompt && !output {
-            return;
-        }
-
-        let mut changed = false;
-        for cache in &self.cache {
-            for link in &cache.source.links {
-                let Some(config) = link
-                    .action
-                    .protocol()
-                    .and_then(|protocol| protocol.visibility.as_ref())
-                else {
-                    continue;
-                };
-                let key = LinkKey::new(cache.line_number, link);
-                let Some(state) = self.visibility.get_mut(&key) else {
-                    continue;
-                };
-                let prompt_trigger = prompt && config.expire.prompt;
-                let output_trigger = output_after_gap
-                    && config.expire.output
-                    && previous_output_at
-                        .zip(output_at)
-                        .is_some_and(|(previous, current)| {
-                            current.saturating_duration_since(previous)
-                                >= Duration::from_millis(config.expire.output_delay_ms)
-                        });
-                if (input && config.expire.input) || prompt_trigger || output_trigger {
-                    changed |= state.apply_expiry(config.action);
-                }
-            }
-        }
         if changed {
             self.invalidate_link_styles();
         }
@@ -1289,10 +1296,146 @@ impl<P: text::Paragraph> State<P> {
         }
         None
     }
+
+    fn link_tooltip_anchor(
+        &self,
+        bounds: Rectangle,
+        line: usize,
+        begin: usize,
+        end: usize,
+    ) -> Option<Point> {
+        let mut y = bounds.y + bounds.height;
+        for cache in &self.cache {
+            y -= cache.paragraph.min_height();
+            if cache.line_number != line {
+                continue;
+            }
+
+            let range_begin = cache.offsets.source_to_rendered(begin);
+            let range_end = cache.offsets.source_to_rendered(end);
+            let mut span_begin = 0;
+            for (index, span) in cache.spans.spans().iter().enumerate() {
+                let span_end = span_begin + span.text.len();
+                if byte_ranges_overlap(span_begin, span_end, range_begin, range_end) {
+                    for region in cache.paragraph.span_bounds(index) {
+                        let absolute = Rectangle {
+                            x: bounds.x + region.x,
+                            y: y + region.y,
+                            width: region.width,
+                            height: region.height,
+                        };
+                        if let Some(visible) = absolute.intersection(&bounds) {
+                            return Some(visible.center());
+                        }
+                    }
+                }
+                span_begin = span_end;
+            }
+            return None;
+        }
+        None
+    }
+}
+
+#[derive(Debug)]
+enum LinkActivationOutcome {
+    None,
+    Publish(LinkClickEvent),
+    OpenMenu(LinkMenuPopup),
+}
+
+#[derive(Debug)]
+struct LinkActivation {
+    outcome: LinkActivationOutcome,
+    redraw_at: Option<Instant>,
+}
+
+struct LinkActivationRequest<'a> {
+    key: LinkKey,
+    link: &'a LinkSpan,
+    menu_anchor: Option<Point>,
+    modifiers: keyboard::Modifiers,
+    now: Instant,
+    can_publish: bool,
+}
+
+fn resolve_link_activation<P: text::Paragraph>(
+    state: &mut State<P>,
+    protocol_state: &mut LinkProtocolState,
+    buffer_link_state: &mut BufferLinkState,
+    request: LinkActivationRequest<'_>,
+) -> LinkActivation {
+    state.clear_keyboard_tooltip();
+    if !link_key_available(request.key, buffer_link_state, &state.hidden_lines)
+        || link_action_disabled(&request.link.action)
+    {
+        return LinkActivation {
+            outcome: LinkActivationOutcome::None,
+            redraw_at: None,
+        };
+    }
+    let reveal_only = buffer_link_state.reveal_spoiler(request.key);
+    if reveal_only {
+        state.link_tooltip_hover = None;
+    }
+
+    // Opening a left-click menu is only navigation. Visibility, selection, and
+    // visited bookkeeping belong to the chosen row so protocol state changes
+    // exactly once when an action is actually selected.
+    if !reveal_only
+        && request.link.action.opens_menu_on_left_click()
+        && let Some(menu) = request.link.action.menu().cloned()
+        && let Some(anchor) = request.menu_anchor
+    {
+        return LinkActivation {
+            outcome: LinkActivationOutcome::OpenMenu(LinkMenuPopup {
+                menu,
+                anchor,
+                source: Some((request.key, request.link.action.clone())),
+            }),
+            redraw_at: None,
+        };
+    }
+
+    let redraw_at = buffer_link_state.activate_visibility(request.key, request.now);
+    let selected = protocol_state.toggle_link_selection(&request.link.action);
+    let outcome = if !reveal_only
+        && request.can_publish
+        && let Some(mut primary) = request.link.action.primary().cloned()
+    {
+        if let Some(selected) = selected
+            && request.link.action.menu().is_none()
+        {
+            primary = with_selected_callback(primary, selected);
+        }
+        protocol_state.mark_visited(&request.link.action);
+        LinkActivationOutcome::Publish(LinkClickEvent {
+            action: primary,
+            shift: request.modifiers.shift(),
+            ctrl: request.modifiers.control(),
+            alt: request.modifiers.alt(),
+        })
+    } else {
+        LinkActivationOutcome::None
+    };
+
+    LinkActivation { outcome, redraw_at }
+}
+
+fn open_menu_popup<Message, P: text::Paragraph>(
+    state: &mut State<P>,
+    popup: LinkMenuPopup,
+    shell: &mut advanced::Shell<'_, Message>,
+) {
+    state.install_menu_popup(popup);
+    shell.invalidate_layout();
+    shell.request_redraw();
 }
 
 pub struct TerminalPane<'a, Message> {
     terminal_buffer: Ref<'a, TerminalBuffer>,
+    link_protocol_state: Rc<RefCell<LinkProtocolState>>,
+    buffer_link_state: Rc<RefCell<BufferLinkState>>,
     selection: Rc<RefCell<Selection>>,
     last_line_number: Option<usize>,
     /// Maps a clicked link span into the hosting session's message. Publishing
@@ -1309,8 +1452,12 @@ pub struct TerminalPane<'a, Message> {
 impl<'a, Message> TerminalPane<'a, Message> {
     pub fn new(buffer: Ref<'a, TerminalBuffer>, selection: Rc<RefCell<Selection>>) -> Self {
         log::debug!("TerminalPane::new() called");
+        let buffer_link_state = buffer.link_state();
+        let link_protocol_state = buffer.link_protocol_state();
         Self {
             terminal_buffer: buffer,
+            link_protocol_state,
+            buffer_link_state,
             selection,
             last_line_number: None,
             on_link: None,
@@ -1340,6 +1487,70 @@ impl<'a, Message> TerminalPane<'a, Message> {
     pub fn font_size(mut self, font_size: Option<f32>) -> Self {
         self.font_size = font_size;
         self
+    }
+
+    fn available_link_at<'b, P: text::Paragraph>(
+        &'b self,
+        state: &State<P>,
+        line: usize,
+        column: usize,
+    ) -> Option<(LinkKey, &'b LinkSpan)> {
+        let link = self.terminal_buffer.link_span_at(line, column)?;
+        let key = self.terminal_buffer.link_key(line, link)?;
+        link_key_available(key, &self.buffer_link_state.borrow(), &state.hidden_lines)
+            .then_some((key, link))
+    }
+
+    fn activate_link<P: text::Paragraph>(
+        &self,
+        state: &mut State<P>,
+        key: LinkKey,
+        link: &LinkSpan,
+        menu_anchor: Option<Point>,
+        modifiers: keyboard::Modifiers,
+        now: Instant,
+        shell: &mut advanced::Shell<'_, Message>,
+    ) {
+        let activation = {
+            let mut protocol_state = self.link_protocol_state.borrow_mut();
+            let mut buffer_link_state = self.buffer_link_state.borrow_mut();
+            resolve_link_activation(
+                state,
+                &mut protocol_state,
+                &mut buffer_link_state,
+                LinkActivationRequest {
+                    key,
+                    link,
+                    menu_anchor,
+                    modifiers,
+                    now,
+                    can_publish: self.on_link.is_some(),
+                },
+            )
+        };
+        if let Some(deadline) = activation.redraw_at {
+            shell.request_redraw_at(deadline);
+        }
+
+        match activation.outcome {
+            LinkActivationOutcome::None => {
+                state.invalidate_link_styles();
+                shell.invalidate_layout();
+                shell.request_redraw();
+            }
+            LinkActivationOutcome::Publish(event) => {
+                if let Some(on_link) = self.on_link.as_ref() {
+                    shell.publish(on_link(event));
+                }
+                state.invalidate_link_styles();
+                shell.invalidate_layout();
+                shell.request_redraw();
+            }
+            LinkActivationOutcome::OpenMenu(popup) => {
+                state.invalidate_link_styles();
+                open_menu_popup(state, popup, shell);
+            }
+        }
     }
 }
 
@@ -1373,16 +1584,19 @@ where
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
-        let live_links: HashSet<_> = self
-            .terminal_buffer
-            .all_link_spans()
-            .iter()
-            .map(|(line, link)| LinkKey::new(*line, link))
-            .collect();
-        state.prune_link_instances(&live_links);
+        state.hidden_lines = {
+            let live_links = self.buffer_link_state.borrow();
+            concealed_whole_lines(&self.terminal_buffer, &live_links)
+        };
+        {
+            let mut live_links = self.buffer_link_state.borrow_mut();
+            live_links.retire_deleted_line_registrations();
+            state.prune_widget_links(&live_links);
+        }
         state.process_link_navigation_reset(self.terminal_buffer.link_navigation_reset_epoch());
-        state.process_visibility_epochs(self.terminal_buffer.visibility_epochs());
         let selection = self.selection.borrow();
+        let protocol_state = self.link_protocol_state.borrow();
+        let buffer_link_state = self.buffer_link_state.borrow();
         let prefs = crate::prefs::current();
         let (font_size, line_height) = effective_metrics(&prefs, self.font_size);
 
@@ -1442,17 +1656,25 @@ where
                 break;
             }
 
-            for link in &line.styled_line.links {
-                state.ensure_protocol_state(line_number, link);
+            // A whole-line visibility action has deletion semantics. Omitting
+            // the paragraph collapses its layout slot, removes it from hit
+            // testing, and prevents selections from being initiated on it.
+            if state.hidden_lines.contains(&line_number) {
+                continue;
             }
+
             let dynamic_links = line.styled_line.links.iter().any(|link| {
                 link.style.as_ref().is_some_and(|style| style.has_states())
                     || link.action.protocol().is_some()
             });
             let visual_generation = if dynamic_links {
-                state.visual_generation
+                (
+                    state.visual_generation,
+                    protocol_state.visual_generation(),
+                    buffer_link_state.visual_generation(),
+                )
             } else {
-                0
+                (0, 0, 0)
             };
 
             // look for a matching cached Paragraph in state.paragraphs[i] or state.paragraphs[i + 1],
@@ -1489,6 +1711,8 @@ where
                         || text_bounds.width < cache.paragraph.min_bounds().width
                     {
                         cache.paragraph.resize(text_bounds);
+                        *cache.hidden_blink_paragraphs.borrow_mut() =
+                            HiddenBlinkParagraphs::default();
                         cache.max_valid_width = text_bounds.width;
                     }
 
@@ -1500,26 +1724,15 @@ where
             }
 
             let line_selection = selection.for_line(line_number);
-            let line_hidden = line.styled_line.links.iter().any(|link| {
-                let key = LinkKey::new(line_number, link);
-                link.action
-                    .protocol()
-                    .and_then(|protocol| protocol.visibility.as_ref())
-                    .is_some_and(|visibility| {
-                        visibility.whole_line
-                            && state
-                                .visibility
-                                .get(&key)
-                                .is_some_and(|visibility| visibility.concealed)
-                    })
-            });
             let rendered = if dynamic_links {
-                line.spans_with_link_state(&prefs, line_hidden, |link| {
-                    let key = LinkKey::new(line_number, link);
+                line.spans_with_link_state(&prefs, false, |link| {
+                    let key = buffer_link_state
+                        .key_at(line_number, link)
+                        .expect("every rendered link is registered");
                     let protocol = link.action.protocol();
                     let selected = protocol
                         .and_then(|protocol| protocol.selection.as_ref())
-                        .is_some_and(|selection| state.selected(selection));
+                        .is_some_and(|selection| protocol_state.selected(selection));
                     let disabled = link.action.is_disabled()
                         || protocol
                             .and_then(|protocol| protocol.selection.as_ref())
@@ -1529,7 +1742,7 @@ where
                         hover: state.hovered_link == Some(key),
                         focus_visible: state.focus_visible && state.focused_link == Some(key),
                         focus: state.focused_link == Some(key),
-                        visited: state.visited(&link.action),
+                        visited: protocol_state.visited(&link.action),
                         selected,
                         disabled,
                     };
@@ -1540,11 +1753,8 @@ where
                             .as_ref()
                             .map_or_else(Default::default, |style| style.resolve(style_state)),
                         spoiler_concealed: protocol.is_some_and(|protocol| protocol.spoiler)
-                            && !state.revealed_spoilers.contains(&key),
-                        hidden: state
-                            .visibility
-                            .get(&key)
-                            .is_some_and(|visibility| visibility.concealed),
+                            && !buffer_link_state.spoiler_revealed(key),
+                        hidden: buffer_link_state.concealed(key),
                     }
                 })
             } else {
@@ -1554,32 +1764,18 @@ where
             let spans = Spans::with_selection(rendered.spans, rendered_selection);
 
             let spans_vec = spans.spans();
-            let make_paragraph = |content: &[iced::widget::text::Span<'static, Link>]| {
-                Renderer::Paragraph::with_spans(iced::advanced::text::Text {
-                    content,
-                    bounds: text_bounds,
-                    size: Pixels(font_size),
-                    font: prefs.font,
-                    line_height: LineHeight::Absolute(Pixels(line_height)),
-                    align_x: text::Alignment::Left,
-                    align_y: alignment::Vertical::Top,
-                    shaping: text::Shaping::Advanced,
-                    wrapping: text::Wrapping::WordOrGlyph,
-                })
-            };
-            let slow_hidden_spans = hidden_blink_spans(&spans_vec, true, false);
-            let fast_hidden_spans = hidden_blink_spans(&spans_vec, false, true);
-            let all_hidden_spans = if slow_hidden_spans.is_some() && fast_hidden_spans.is_some() {
-                hidden_blink_spans(&spans_vec, true, true)
-            } else {
-                None
-            };
-            let blink_modes = (u8::from(slow_hidden_spans.is_some()) * SLOW_BLINK)
-                | (u8::from(fast_hidden_spans.is_some()) * FAST_BLINK);
-            let slow_blink_hidden = slow_hidden_spans.as_deref().map(&make_paragraph);
-            let fast_blink_hidden = fast_hidden_spans.as_deref().map(&make_paragraph);
-            let all_blink_hidden = all_hidden_spans.as_deref().map(&make_paragraph);
-            let paragraph = make_paragraph(&spans_vec);
+            let blink_modes = span_blink_modes(&spans_vec);
+            let paragraph = Renderer::Paragraph::with_spans(iced::advanced::text::Text {
+                content: spans_vec.as_slice(),
+                bounds: text_bounds,
+                size: Pixels(font_size),
+                font: prefs.font,
+                line_height: LineHeight::Absolute(Pixels(line_height)),
+                align_x: text::Alignment::Left,
+                align_y: alignment::Vertical::Top,
+                shaping: text::Shaping::Advanced,
+                wrapping: text::Wrapping::WordOrGlyph,
+            });
 
             available_y -= paragraph.min_height();
 
@@ -1589,9 +1785,7 @@ where
                 spans,
                 offsets: rendered.offsets,
                 paragraph,
-                slow_blink_hidden,
-                fast_blink_hidden,
-                all_blink_hidden,
+                hidden_blink_paragraphs: Rc::new(RefCell::new(HiddenBlinkParagraphs::default())),
                 blink_modes,
                 max_valid_width: text_bounds.width,
                 selection: line_selection,
@@ -1602,6 +1796,17 @@ where
         }
 
         state.cache = new_cache;
+
+        // A keyboard tooltip must not keep owning tooltip state after its link
+        // scrolls outside this terminal half. Otherwise it draws nowhere yet
+        // suppresses every mouse tooltip until some unrelated focus change.
+        if keyboard_tooltip_scrolled_out(
+            state.link_tooltip_hover.as_ref(),
+            &buffer_link_state,
+            |line| state.cache.iter().any(|cache| cache.line_number == line),
+        ) {
+            state.link_tooltip_hover = None;
+        }
 
         layout::atomic(limits, iced::Length::Fill, iced::Length::Fill)
     }
@@ -1735,41 +1940,88 @@ where
                     }
                 }
 
-                renderer.fill_paragraph(
-                    cache.displayed_paragraph(state.slow_blink_visible, state.fast_blink_visible),
-                    iced::Point::new(layout.bounds().x, y),
-                    iced::Color::WHITE,
-                    clipped_viewport,
-                );
+                let hide_slow = cache.blink_modes & SLOW_BLINK != 0 && !state.slow_blink_visible;
+                let hide_fast = cache.blink_modes & FAST_BLINK != 0 && !state.fast_blink_visible;
+                let at = iced::Point::new(layout.bounds().x, y);
+                if hide_slow || hide_fast {
+                    let mut hidden = cache.hidden_blink_paragraphs.borrow_mut();
+                    let paragraph = match (hide_slow, hide_fast) {
+                        (true, true) => &mut hidden.all,
+                        (true, false) => &mut hidden.slow,
+                        (false, true) => &mut hidden.fast,
+                        (false, false) => unreachable!("a hidden blink rate was required"),
+                    }
+                    .get_or_insert_with(|| {
+                        let spans = hidden_blink_spans(
+                            cache.spans.spans().as_slice(),
+                            hide_slow,
+                            hide_fast,
+                        );
+                        Renderer::Paragraph::with_spans(iced::advanced::text::Text {
+                            content: spans.as_slice(),
+                            bounds: cache.paragraph.bounds(),
+                            size: cache.paragraph.size(),
+                            font: cache.paragraph.font(),
+                            line_height: cache.paragraph.line_height(),
+                            align_x: cache.paragraph.align_x(),
+                            align_y: cache.paragraph.align_y(),
+                            shaping: cache.paragraph.shaping(),
+                            wrapping: cache.paragraph.wrapping(),
+                        })
+                    });
+                    renderer.fill_paragraph(paragraph, at, iced::Color::WHITE, clipped_viewport);
+                } else {
+                    renderer.fill_paragraph(
+                        &cache.paragraph,
+                        at,
+                        iced::Color::WHITE,
+                        clipped_viewport,
+                    );
+                }
             }
 
             if let Some(popup) = &state.menu_popup {
                 draw_link_menu(renderer, &prefs, clipped_viewport, cursor, popup);
-            } else if let Some(position) = cursor.position_in(layout.bounds())
-                && let Some(buffer_position) = state.hit_test(layout.bounds(), position)
-                && let Some(action) = self
-                    .terminal_buffer
-                    .link_at(buffer_position.line, buffer_position.column)
-                && let Some(tooltip) = self
-                    .terminal_buffer
-                    .link_tooltip_at(buffer_position.line, buffer_position.column)
-                && let Some(LinkTooltipHover::Open(link)) = state.link_tooltip_hover.as_ref()
-                && link.action == action
-                && link.tooltip == tooltip
+            } else if let Some(LinkTooltipHover::Open { link, origin }) =
+                state.link_tooltip_hover.as_ref()
             {
-                draw_link_tooltip(
-                    renderer,
-                    &prefs,
-                    clipped_viewport,
-                    cursor,
-                    link,
-                    usize::try_from(
-                        state.blink_epoch.elapsed().as_millis()
-                            / u128::from(TOOLTIP_SPINNER_FRAME_MS),
-                    )
-                    .unwrap_or(0),
-                    &state.link_tooltip_paragraph,
-                );
+                let anchor = match *origin {
+                    LinkTooltipOrigin::Mouse => cursor.position().filter(|_| {
+                        cursor
+                            .position_in(layout.bounds())
+                            .and_then(|position| state.hit_test(layout.bounds(), position))
+                            .and_then(|position| {
+                                self.terminal_buffer
+                                    .link_span_at(position.line, position.column)
+                            })
+                            .is_some_and(|span| {
+                                link.action == span.action
+                                    && span.tooltip.as_ref() == Some(&link.tooltip)
+                            })
+                    }),
+                    LinkTooltipOrigin::Keyboard(key) => {
+                        self.buffer_link_state.borrow().position(key).and_then(
+                            |(line, begin, end)| {
+                                state.link_tooltip_anchor(layout.bounds(), line, begin, end)
+                            },
+                        )
+                    }
+                };
+                if let Some(anchor) = anchor {
+                    draw_link_tooltip(
+                        renderer,
+                        &prefs,
+                        clipped_viewport,
+                        anchor,
+                        link,
+                        usize::try_from(
+                            state.blink_epoch.elapsed().as_millis()
+                                / u128::from(TOOLTIP_SPINNER_FRAME_MS),
+                        )
+                        .unwrap_or(0),
+                        &state.link_tooltip_paragraph,
+                    );
+                }
             }
         }
     }
@@ -1803,9 +2055,10 @@ where
                     .position_in(layout.bounds())
                     .and_then(|position| state.hit_test(layout.bounds(), position))
                     && self
-                        .terminal_buffer
-                        .link_at(position.line, position.column)
-                        .is_some_and(|action| action.is_interactive())
+                        .available_link_at(state, position.line, position.column)
+                        .is_some_and(|(_, link)| {
+                            link.action.is_interactive() && !link_action_disabled(&link.action)
+                        })
                 {
                     return mouse::Interaction::Pointer;
                 }
@@ -1828,10 +2081,18 @@ where
         viewport: &Rectangle,
     ) {
         let cursor_moved = matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }));
+        let mut mouse_tooltip_request = None;
         if let Event::Window(window::Event::RedrawRequested(now)) = event {
             let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
-            if let Some(next) = state.update_visibility_timers(*now) {
+            let (next, visibility_changed) = self
+                .buffer_link_state
+                .borrow_mut()
+                .update_visibility_timers(*now);
+            if let Some(next) = next {
                 shell.request_redraw_at(next);
+            }
+            if visibility_changed {
+                shell.invalidate_layout();
             }
             if state
                 .link_tooltip_hover
@@ -1869,82 +2130,44 @@ where
             Event::Mouse(_) | Event::Window(window::Event::RedrawRequested(_))
         ) {
             let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
-            let hovered_key = state
-                .menu_popup
-                .is_none()
+            let mouse_link = (state.menu_popup.is_none() && self.terminal_buffer.has_links())
                 .then(|| cursor.position_in(layout.bounds()))
                 .flatten()
                 .and_then(|position| state.hit_test(layout.bounds(), position))
-                .and_then(|position| {
-                    self.terminal_buffer
-                        .link_span_at(position.line, position.column)
-                        .map(|link| LinkKey::new(position.line, &link))
-                });
+                .and_then(|position| self.available_link_at(state, position.line, position.column));
+            let hovered_key = mouse_link.map(|(key, _)| key);
             if state.hovered_link != hovered_key {
                 state.hovered_link = hovered_key;
                 state.invalidate_link_styles();
                 shell.invalidate_layout();
                 shell.request_redraw();
             }
-            let hovered = state
-                .menu_popup
-                .is_none()
-                .then(|| cursor.position_in(layout.bounds()))
-                .flatten()
-                .and_then(|position| state.hit_test(layout.bounds(), position))
-                .and_then(|position| {
-                    let link = self
-                        .terminal_buffer
-                        .link_span_at(position.line, position.column)?;
-                    let key = LinkKey::new(position.line, &link);
-                    if link
-                        .action
-                        .protocol()
-                        .is_some_and(|protocol| protocol.spoiler)
-                        && state.revealed_spoilers.contains(&key)
-                    {
-                        return None;
-                    }
-                    Some(HoveredLinkTooltip {
-                        action: link.action,
-                        tooltip: link.tooltip?,
-                    })
+            let hovered = mouse_link.and_then(|(key, link)| {
+                if link
+                    .action
+                    .protocol()
+                    .is_some_and(|protocol| protocol.spoiler)
+                    && self.buffer_link_state.borrow().spoiler_revealed(key)
+                {
+                    return None;
+                }
+                Some(HoveredLinkTooltip {
+                    action: link.action.clone(),
+                    tooltip: link.tooltip.clone()?,
+                })
+            });
+            if cursor_moved {
+                mouse_tooltip_request = hovered.as_ref().and_then(|hovered| {
+                    claim_tooltip_request(&hovered.tooltip, self.on_link_tooltip.is_some())
                 });
+            }
             let now = Instant::now();
             let delay = Duration::from_millis(crate::prefs::current().link_tooltip_delay_ms);
             let previous = state.link_tooltip_hover.take();
-            state.link_tooltip_hover = match (previous, hovered) {
-                (None, None) => None,
-                (Some(previous), None) => {
-                    if previous.is_open() {
-                        shell.request_redraw();
-                    }
-                    None
-                }
-                (None, Some(link)) => Some(begin_link_tooltip_hover(link, delay, now, shell)),
-                (Some(previous), Some(link)) if previous.link() != &link => {
-                    if previous.is_open() {
-                        shell.request_redraw();
-                    }
-                    Some(begin_link_tooltip_hover(link, delay, now, shell))
-                }
-                (Some(LinkTooltipHover::Waiting { at, .. }), Some(link)) => {
-                    let elapsed = at.elapsed();
-                    if elapsed >= delay {
-                        shell.request_redraw();
-                        Some(LinkTooltipHover::Open(link))
-                    } else {
-                        shell.request_redraw_at(now + delay - elapsed);
-                        Some(LinkTooltipHover::Waiting { link, at })
-                    }
-                }
-                (Some(LinkTooltipHover::Open(_)), Some(link)) => {
-                    if cursor_moved {
-                        shell.request_redraw();
-                    }
-                    Some(LinkTooltipHover::Open(link))
-                }
-            };
+            let (next, redraw) =
+                update_mouse_link_tooltip(previous, hovered, delay, now, cursor_moved);
+            state.link_tooltip_hover = next;
+            request_tooltip_redraw(redraw, shell);
         }
 
         if matches!(
@@ -1971,15 +2194,29 @@ where
                     )
                 });
                 let inside = cursor.is_over(geometry.bounds);
+                let source_is_available = menu_source_is_available(
+                    &popup,
+                    &self.buffer_link_state.borrow(),
+                    &state.hidden_lines,
+                );
                 state.menu_popup = None;
                 shell.invalidate_layout();
                 shell.request_redraw();
-                if let Some(action) = chosen {
-                    if let Some((_, source)) = &popup.source {
-                        state.toggle_link_selection(source);
-                        state.mark_visited(source);
-                        state.invalidate_link_styles();
+                if let Some(action) = chosen.filter(|_| source_is_available) {
+                    let redraw_at = {
+                        let mut protocol_state = self.link_protocol_state.borrow_mut();
+                        let mut buffer_link_state = self.buffer_link_state.borrow_mut();
+                        apply_menu_choice_protocol(
+                            &mut protocol_state,
+                            &mut buffer_link_state,
+                            popup.source.as_ref(),
+                            Instant::now(),
+                        )
+                    };
+                    if let Some(deadline) = redraw_at {
+                        shell.request_redraw_at(deadline);
                     }
+                    state.invalidate_link_styles();
                     if let Some(on_link) = self.on_link.as_ref() {
                         shell.publish(on_link(LinkClickEvent {
                             action,
@@ -2002,39 +2239,49 @@ where
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
                 let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
                 let had_popup = state.menu_popup.is_some();
-                let menu = self
-                    .on_link
-                    .as_ref()
-                    .and_then(|_| cursor.position_in(layout.bounds()))
-                    .and_then(|position| state.hit_test(layout.bounds(), position))
-                    .and_then(|position| {
-                        let link = self
-                            .terminal_buffer
-                            .link_span_at(position.line, position.column)?;
-                        let menu = link.action.menu()?.clone();
-                        Some((menu, (LinkKey::new(position.line, &link), link.action)))
-                    });
-                state.menu_popup =
-                    menu.zip(cursor.position())
-                        .map(|((menu, source), anchor)| LinkMenuPopup {
-                            menu,
-                            anchor: Point::new(anchor.x + 2.0, anchor.y + 2.0),
-                            source: Some(source),
-                        });
-                if state.menu_popup.is_some() {
-                    state.pressed_cell = None;
-                    state.link_tooltip_hover = None;
-                    shell.invalidate_layout();
-                    shell.request_redraw();
-                    shell.capture_event();
-                } else if had_popup {
-                    shell.invalidate_layout();
-                    shell.request_redraw();
+                let invocation = if self.on_link.is_some()
+                    && let Some(anchor) = cursor.position()
+                    && let Some(position) = cursor
+                        .position_in(layout.bounds())
+                        .and_then(|position| state.hit_test(layout.bounds(), position))
+                    && let Some((key, link)) =
+                        self.available_link_at(state, position.line, position.column)
+                {
+                    resolve_link_menu_invocation(
+                        state,
+                        &mut self.buffer_link_state.borrow_mut(),
+                        key,
+                        link,
+                        Point::new(anchor.x + 2.0, anchor.y + 2.0),
+                    )
+                } else {
+                    LinkMenuInvocation::None
+                };
+                match invocation {
+                    LinkMenuInvocation::Open(popup) => {
+                        open_menu_popup(state, *popup, shell);
+                        shell.capture_event();
+                    }
+                    LinkMenuInvocation::RevealSpoiler => {
+                        state.menu_popup = None;
+                        shell.invalidate_layout();
+                        shell.request_redraw();
+                        shell.capture_event();
+                    }
+                    LinkMenuInvocation::None if had_popup => {
+                        state.menu_popup = None;
+                        shell.invalidate_layout();
+                        shell.request_redraw();
+                    }
+                    LinkMenuInvocation::None => {}
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerPressed { .. }) => {
                 let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+                if state.clear_keyboard_tooltip() {
+                    shell.request_redraw();
+                }
 
                 // Null-primary script menus are ordinary left-click menus. Open
                 // them on mouse-down so the next frame can paint the popup without
@@ -2047,36 +2294,44 @@ where
                     && let Some(position) = cursor
                         .position_in(layout.bounds())
                         .and_then(|position| state.hit_test(layout.bounds(), position))
-                    && let Some(link) = self
-                        .terminal_buffer
-                        .link_span_at(position.line, position.column)
+                    && let Some((key, link)) =
+                        self.available_link_at(state, position.line, position.column)
                     && link.action.opens_menu_on_left_click()
-                    && let Some(menu) = link.action.menu().cloned()
                 {
-                    state.menu_popup = Some(LinkMenuPopup {
-                        menu,
-                        anchor: Point::new(anchor.x + 2.0, anchor.y + 2.0),
-                        source: Some((LinkKey::new(position.line, &link), link.action)),
-                    });
-                    state.pressed_cell = None;
-                    state.link_tooltip_hover = None;
-                    state.is_focused = true;
-                    shell.invalidate_layout();
-                    shell.request_redraw();
-                    // Keep the press uncaptured, like ordinary terminal clicks,
-                    // so the parent can still focus this session's command input.
-                    return;
+                    let invocation = resolve_link_menu_invocation(
+                        state,
+                        &mut self.buffer_link_state.borrow_mut(),
+                        key,
+                        link,
+                        Point::new(anchor.x + 2.0, anchor.y + 2.0),
+                    );
+                    match invocation {
+                        LinkMenuInvocation::Open(popup) => {
+                            state.is_focused = true;
+                            open_menu_popup(state, *popup, shell);
+                            // Keep the press uncaptured, like ordinary terminal clicks,
+                            // so the parent can still focus this session's command input.
+                            return;
+                        }
+                        LinkMenuInvocation::RevealSpoiler => {
+                            state.is_focused = true;
+                            state.menu_popup = None;
+                            shell.invalidate_layout();
+                            shell.request_redraw();
+                            return;
+                        }
+                        LinkMenuInvocation::None => {}
+                    }
                 }
 
                 let mut selection = self.selection.borrow_mut();
 
                 if let Some(click_position) = cursor.position_in(layout.bounds()) {
                     if let Some(position) = state.hit_test(layout.bounds(), click_position) {
-                        if let Some(link) = self
-                            .terminal_buffer
-                            .link_span_at(position.line, position.column)
+                        if let Some((key, link)) =
+                            self.available_link_at(state, position.line, position.column)
+                            && !link_action_disabled(&link.action)
                         {
-                            let key = LinkKey::new(position.line, &link);
                             state.focused_link = Some(key);
                             state.focus_visible = false;
                             if matches!(event, Event::Mouse(_)) {
@@ -2111,66 +2366,27 @@ where
                 // ends elsewhere, and content scrolling under a stationary cursor
                 // moves the release onto a different absolute line — neither fires.
                 if let Some(pressed) = state.pressed_cell.take()
-                    && let Some(on_link) = self.on_link.as_ref()
+                    && self.on_link.is_some()
                     && self.terminal_buffer.has_links()
                     && let Some(position) = cursor
                         .position_in(layout.bounds())
                         .and_then(|position| state.hit_test(layout.bounds(), position))
                     && position == pressed
-                    && let Some(link) = self
-                        .terminal_buffer
-                        .link_span_at(position.line, position.column)
+                    && let Some((key, link)) =
+                        self.available_link_at(state, position.line, position.column)
                 {
-                    let key = LinkKey::new(position.line, &link);
-                    let protocol = link.action.protocol().cloned();
-                    let mut reveal_only = false;
-                    if protocol.as_ref().is_some_and(|protocol| protocol.spoiler)
-                        && state.revealed_spoilers.insert(key)
-                    {
-                        reveal_only = true;
-                        state.link_tooltip_hover = None;
-                    }
-
-                    if let Some(visibility) = protocol
-                        .as_ref()
-                        .and_then(|protocol| protocol.visibility.as_ref())
-                    {
-                        let now = Instant::now();
-                        if let Some(deadline) = state.activate_visibility(key, visibility, now) {
-                            shell.request_redraw_at(deadline);
-                        }
-                    }
-
-                    let selected = state.toggle_link_selection(&link.action);
-                    state.invalidate_link_styles();
-
-                    if !reveal_only && let Some(mut primary) = link.action.primary().cloned() {
-                        if let Some(selected) = selected
-                            && link.action.menu().is_none()
-                        {
-                            primary = with_selected_callback(primary, selected);
-                        }
-                        state.mark_visited(&link.action);
-                        shell.publish(on_link(LinkClickEvent {
-                            action: primary,
-                            shift: state.modifiers.shift(),
-                            ctrl: state.modifiers.control(),
-                            alt: state.modifiers.alt(),
-                        }));
-                    } else if !reveal_only
-                        && link.action.opens_menu_on_left_click()
-                        && let Some(menu) = link.action.menu().cloned()
-                        && let Some(anchor) = cursor.position()
-                    {
-                        state.menu_popup = Some(LinkMenuPopup {
-                            menu,
-                            anchor: Point::new(anchor.x + 2.0, anchor.y + 2.0),
-                            source: Some((key, link.action.clone())),
-                        });
-                        state.link_tooltip_hover = None;
-                        shell.invalidate_layout();
-                        shell.request_redraw();
-                    }
+                    let modifiers = state.modifiers;
+                    self.activate_link(
+                        state,
+                        key,
+                        link,
+                        cursor
+                            .position()
+                            .map(|anchor| Point::new(anchor.x + 2.0, anchor.y + 2.0)),
+                        modifiers,
+                        Instant::now(),
+                        shell,
+                    );
                 }
 
                 let mut selection = self.selection.borrow_mut();
@@ -2197,15 +2413,7 @@ where
                 }
 
                 if let Some(on_tooltip) = self.on_link_tooltip.as_ref()
-                    && state.menu_popup.is_none()
-                    && self.terminal_buffer.has_links()
-                    && let Some(position) = cursor
-                        .position_in(layout.bounds())
-                        .and_then(|position| state.hit_test(layout.bounds(), position))
-                    && let Some(tooltip) = self
-                        .terminal_buffer
-                        .link_tooltip_at(position.line, position.column)
-                    && let Some(request) = tooltip.request()
+                    && let Some(request) = mouse_tooltip_request
                 {
                     on_tooltip(request);
                     shell.request_redraw();
@@ -2265,9 +2473,10 @@ where
                 if matches!(
                     key.as_ref(),
                     keyboard::Key::Named(keyboard::key::Named::Escape)
-                ) && state.menu_popup.take().is_some()
+                ) && state.dismiss_link_overlay()
                 {
                     shell.invalidate_layout();
+                    shell.request_redraw();
                     shell.capture_event();
                     return;
                 }
@@ -2277,28 +2486,33 @@ where
                         keyboard::Key::Named(keyboard::key::Named::Tab)
                             if self.terminal_buffer.has_links() =>
                         {
+                            let buffer_link_state = self.buffer_link_state.borrow();
                             let links: Vec<_> = self
                                 .terminal_buffer
-                                .all_link_spans()
-                                .into_iter()
-                                .filter(|(line, link)| {
-                                    !state
-                                        .visibility
-                                        .get(&LinkKey::new(*line, link))
-                                        .is_some_and(|visibility| visibility.concealed)
+                                .link_keys()
+                                .filter(|key| {
+                                    link_key_available(
+                                        *key,
+                                        &buffer_link_state,
+                                        &state.hidden_lines,
+                                    ) && self
+                                        .terminal_buffer
+                                        .link_span(*key)
+                                        .is_some_and(|link| !link_action_disabled(&link.action))
                                 })
                                 .collect();
                             if !links.is_empty() {
                                 let current = state.focused_link.and_then(|focused| {
-                                    links.iter().position(|(line, link)| {
-                                        LinkKey::new(*line, link) == focused
-                                    })
+                                    links.iter().position(|key| *key == focused)
                                 });
                                 let index =
                                     link_navigation_index(links.len(), current, modifiers.shift())
                                         .expect("the link list was checked as non-empty");
-                                let (line, link) = &links[index];
-                                let focused = LinkKey::new(*line, link);
+                                let focused = links[index];
+                                let link = self
+                                    .terminal_buffer
+                                    .link_span(focused)
+                                    .expect("a key from the buffer resolves to its link");
                                 state.focused_link = Some(focused);
                                 state.focus_visible = true;
                                 state.link_tooltip_hover =
@@ -2307,18 +2521,22 @@ where
                                             .action
                                             .protocol()
                                             .is_some_and(|protocol| protocol.spoiler)
-                                            && state.revealed_spoilers.contains(&focused);
-                                        (!revealed).then_some(LinkTooltipHover::Open(
-                                            HoveredLinkTooltip {
+                                            && buffer_link_state.spoiler_revealed(focused);
+                                        (!revealed).then_some(LinkTooltipHover::Open {
+                                            link: HoveredLinkTooltip {
                                                 action: link.action.clone(),
                                                 tooltip,
                                             },
-                                        ))
+                                            origin: LinkTooltipOrigin::Keyboard(focused),
+                                        })
                                     });
+                                drop(buffer_link_state);
                                 if state.link_tooltip_hover.is_some()
-                                    && let Some(request) =
-                                        link.tooltip.as_ref().and_then(LinkTooltip::request)
                                     && let Some(on_tooltip) = self.on_link_tooltip.as_ref()
+                                    && let Some(request) = link
+                                        .tooltip
+                                        .as_ref()
+                                        .and_then(|tooltip| claim_tooltip_request(tooltip, true))
                                 {
                                     on_tooltip(request);
                                 }
@@ -2331,51 +2549,17 @@ where
                         keyboard::Key::Named(
                             keyboard::key::Named::Enter | keyboard::key::Named::Space,
                         ) if let Some(focused) = state.keyboard_focused_link()
-                            && let Some((_, link)) = self
-                                .terminal_buffer
-                                .all_link_spans()
-                                .into_iter()
-                                .find(|(line, link)| LinkKey::new(*line, link) == focused) =>
+                            && let Some(link) = self.terminal_buffer.link_span(focused) =>
                         {
-                            let protocol = link.action.protocol().cloned();
-                            let reveal_only =
-                                protocol.as_ref().is_some_and(|protocol| protocol.spoiler)
-                                    && state.revealed_spoilers.insert(focused);
-                            if reveal_only {
-                                state.link_tooltip_hover = None;
-                            }
-                            if let Some(visibility) = protocol
-                                .as_ref()
-                                .and_then(|protocol| protocol.visibility.as_ref())
-                            {
-                                let now = Instant::now();
-                                if let Some(deadline) =
-                                    state.activate_visibility(focused, visibility, now)
-                                {
-                                    shell.request_redraw_at(deadline);
-                                }
-                            }
-                            let selected = state.toggle_link_selection(&link.action);
-                            if !reveal_only
-                                && let Some(on_link) = self.on_link.as_ref()
-                                && let Some(mut primary) = link.action.primary().cloned()
-                            {
-                                if let Some(selected) = selected
-                                    && link.action.menu().is_none()
-                                {
-                                    primary = with_selected_callback(primary, selected);
-                                }
-                                state.mark_visited(&link.action);
-                                shell.publish(on_link(LinkClickEvent {
-                                    action: primary,
-                                    shift: modifiers.shift(),
-                                    ctrl: modifiers.control(),
-                                    alt: modifiers.alt(),
-                                }));
-                            }
-                            state.invalidate_link_styles();
-                            shell.invalidate_layout();
-                            shell.request_redraw();
+                            self.activate_link(
+                                state,
+                                focused,
+                                link,
+                                Some(layout.bounds().center()),
+                                *modifiers,
+                                Instant::now(),
+                                shell,
+                            );
                             shell.capture_event();
                         }
                         keyboard::Key::Named(keyboard::key::Named::ContextMenu)
@@ -2385,20 +2569,28 @@ where
                                 keyboard::Key::Named(keyboard::key::Named::ContextMenu)
                             ) || modifiers.shift())
                                 && let Some(focused) = state.keyboard_focused_link()
-                                && let Some((_, link)) =
-                                    self.terminal_buffer.all_link_spans().into_iter().find(
-                                        |(line, link)| LinkKey::new(*line, link) == focused,
-                                    )
-                                && let Some(menu) = link.action.menu().cloned() =>
+                                && let Some(link) = self.terminal_buffer.link_span(focused)
+                                && !link_action_disabled(&link.action)
+                                && link.action.menu().is_some() =>
                         {
-                            state.menu_popup = Some(LinkMenuPopup {
-                                menu,
-                                anchor: layout.bounds().center(),
-                                source: Some((focused, link.action)),
-                            });
-                            state.link_tooltip_hover = None;
-                            shell.invalidate_layout();
-                            shell.request_redraw();
+                            let invocation = resolve_link_menu_invocation(
+                                state,
+                                &mut self.buffer_link_state.borrow_mut(),
+                                focused,
+                                link,
+                                layout.bounds().center(),
+                            );
+                            match invocation {
+                                LinkMenuInvocation::Open(popup) => {
+                                    open_menu_popup(state, *popup, shell);
+                                }
+                                LinkMenuInvocation::RevealSpoiler => {
+                                    state.menu_popup = None;
+                                    shell.invalidate_layout();
+                                    shell.request_redraw();
+                                }
+                                LinkMenuInvocation::None => {}
+                            }
                             shell.capture_event();
                         }
                         keyboard::Key::Character("c") if modifiers.command() => {
@@ -2430,7 +2622,10 @@ pub fn terminal_pane<'a, Message>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smudgy_core::session::styled_line::Blink;
+    use smudgy_core::session::{
+        SessionId,
+        styled_line::{Blink, LinkTooltipState},
+    };
 
     fn blinking_span(blink: Blink) -> iced::widget::text::Span<'static, Link> {
         iced::widget::text::Span::new("blink")
@@ -2444,15 +2639,17 @@ mod tests {
     #[test]
     fn blink_variants_hide_only_the_requested_rates() {
         let spans = [blinking_span(Blink::Slow), blinking_span(Blink::Fast)];
-        let slow = hidden_blink_spans(&spans, true, false).expect("slow variant");
+        assert_eq!(span_blink_modes(&spans), SLOW_BLINK | FAST_BLINK);
+
+        let slow = hidden_blink_spans(&spans, true, false);
         assert_eq!(slow[0].color, Some(iced::Color::TRANSPARENT));
         assert_eq!(slow[1].color, Some(iced::Color::WHITE));
 
-        let fast = hidden_blink_spans(&spans, false, true).expect("fast variant");
+        let fast = hidden_blink_spans(&spans, false, true);
         assert_eq!(fast[0].color, Some(iced::Color::WHITE));
         assert_eq!(fast[1].color, Some(iced::Color::TRANSPARENT));
 
-        let all = hidden_blink_spans(&spans, true, true).expect("combined variant");
+        let all = hidden_blink_spans(&spans, true, true);
         assert!(
             all.iter()
                 .all(|span| span.color == Some(iced::Color::TRANSPARENT))
@@ -2460,15 +2657,37 @@ mod tests {
     }
 
     #[test]
-    fn selected_callback_preserves_existing_query_and_fragment() {
+    fn blink_probe_skips_ordinary_spans() {
+        let spans = [iced::widget::text::Span::new("ordinary")];
+        assert_eq!(span_blink_modes(&spans), 0);
+    }
+
+    #[test]
+    fn selected_callback_treats_hash_as_command_data() {
         let action = with_selected_callback(
             LinkAction::ServerSend(Arc::from("vote?choice=yes#receipt")),
             true,
         );
         assert_eq!(
             action,
-            LinkAction::ServerSend(Arc::from("vote?choice=yes&selected=true#receipt"))
+            LinkAction::ServerSend(Arc::from("vote?choice=yes#receipt&selected=true"))
         );
+    }
+
+    #[test]
+    fn selected_callback_replaces_duplicates_and_does_not_mutate_urls() {
+        assert_eq!(
+            with_selected_callback(
+                LinkAction::Prompt(Arc::from(
+                    "say #staff?selected=true&channel=staff&selected=stale",
+                )),
+                false,
+            ),
+            LinkAction::Prompt(Arc::from("say #staff?channel=staff&selected=false"))
+        );
+
+        let url = LinkAction::OpenUrl(Arc::from("https://example.test/path?selected=false"));
+        assert_eq!(with_selected_callback(url.clone(), true), url);
     }
 
     #[test]
@@ -2484,15 +2703,206 @@ mod tests {
         assert_eq!(second_target.as_deref(), Some(target.as_ref()));
     }
 
+    fn hovered_tooltip(label: &str) -> HoveredLinkTooltip {
+        HoveredLinkTooltip {
+            action: LinkAction::Send(Arc::from("look")),
+            tooltip: LinkTooltip::text(Arc::from(label.to_owned()), None),
+        }
+    }
+
+    #[test]
+    fn keyboard_tooltip_survives_mouse_and_redraw_recomputation() {
+        let now = Instant::now();
+        let key = LinkKey::test(7);
+        let keyboard = LinkTooltipHover::Open {
+            link: hovered_tooltip("keyboard"),
+            origin: LinkTooltipOrigin::Keyboard(key),
+        };
+
+        for hovered in [None, Some(hovered_tooltip("mouse"))] {
+            let (next, redraw) = update_mouse_link_tooltip(
+                Some(keyboard.clone()),
+                hovered,
+                Duration::from_millis(200),
+                now,
+                true,
+            );
+            assert_eq!(next, Some(keyboard.clone()));
+            assert_eq!(redraw, TooltipRedraw::default());
+        }
+    }
+
+    #[test]
+    fn mouse_tooltip_waits_opens_redraws_and_clears_as_before() {
+        let now = Instant::now();
+        let delay = Duration::from_millis(200);
+        let link = hovered_tooltip("mouse");
+
+        let (waiting, redraw) =
+            update_mouse_link_tooltip(None, Some(link.clone()), delay, now, false);
+        assert!(matches!(
+            waiting,
+            Some(LinkTooltipHover::Waiting {
+                origin: LinkTooltipOrigin::Mouse,
+                at,
+                ..
+            }) if at == now
+        ));
+        assert_eq!(
+            redraw,
+            TooltipRedraw {
+                now: false,
+                at: Some(now + delay),
+            }
+        );
+
+        let (open, redraw) =
+            update_mouse_link_tooltip(waiting, Some(link), delay, now + delay, false);
+        assert!(matches!(
+            open,
+            Some(LinkTooltipHover::Open {
+                origin: LinkTooltipOrigin::Mouse,
+                ..
+            })
+        ));
+        assert_eq!(
+            redraw,
+            TooltipRedraw {
+                now: true,
+                at: None,
+            }
+        );
+
+        let (moved, redraw) = update_mouse_link_tooltip(
+            open,
+            Some(hovered_tooltip("mouse")),
+            delay,
+            now + delay,
+            true,
+        );
+        assert!(moved.is_some());
+        assert!(redraw.now);
+
+        let (cleared, redraw) = update_mouse_link_tooltip(moved, None, delay, now + delay, false);
+        assert!(cleared.is_none());
+        assert!(redraw.now);
+    }
+
+    #[test]
+    fn keyboard_tooltip_clears_without_disturbing_mouse_tooltip() {
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+
+        let key = LinkKey::test(7);
+        let mut state = State::<Paragraph> {
+            link_tooltip_hover: Some(LinkTooltipHover::Open {
+                link: hovered_tooltip("keyboard"),
+                origin: LinkTooltipOrigin::Keyboard(key),
+            }),
+            ..State::default()
+        };
+        assert!(state.clear_keyboard_tooltip());
+        assert!(state.link_tooltip_hover.is_none());
+
+        let mouse = LinkTooltipHover::Open {
+            link: hovered_tooltip("mouse"),
+            origin: LinkTooltipOrigin::Mouse,
+        };
+        state.link_tooltip_hover = Some(mouse.clone());
+        assert!(!state.clear_keyboard_tooltip());
+        assert_eq!(state.link_tooltip_hover, Some(mouse));
+    }
+
+    #[test]
+    fn escape_dismisses_menu_and_keyboard_tooltip_together() {
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+
+        let key = LinkKey::test(7);
+        let mut state = State::<Paragraph> {
+            menu_popup: Some(LinkMenuPopup {
+                menu: one_row_menu(),
+                anchor: Point::ORIGIN,
+                source: None,
+            }),
+            link_tooltip_hover: Some(LinkTooltipHover::Open {
+                link: hovered_tooltip("keyboard"),
+                origin: LinkTooltipOrigin::Keyboard(key),
+            }),
+            ..State::default()
+        };
+
+        assert!(state.dismiss_link_overlay());
+        assert!(state.menu_popup.is_none());
+        assert!(state.link_tooltip_hover.is_none());
+    }
+
+    #[test]
+    fn rendered_span_overlap_uses_half_open_byte_ranges() {
+        assert!(byte_ranges_overlap(0, 4, 0, 4));
+        assert!(byte_ranges_overlap(0, 4, 2, 6));
+        assert!(byte_ranges_overlap(4, 8, 2, 6));
+        assert!(!byte_ranges_overlap(0, 4, 4, 8));
+        assert!(!byte_ranges_overlap(8, 12, 4, 8));
+    }
+
+    #[test]
+    fn keyboard_callback_tooltip_enters_loading_spinner_state() {
+        let shared = Arc::new(LinkTooltipState::default());
+        let tooltip = LinkTooltip::callback(
+            LinkTooltipCallback {
+                session: SessionId::from(1_u32),
+                isolate_token: Arc::from("main"),
+                id: 7,
+                state: Arc::clone(&shared),
+            },
+            Some(Arc::from("send:look")),
+        );
+        assert!(tooltip.request().is_some());
+        assert!(tooltip.is_loading());
+        assert!(tooltip.request().is_none());
+
+        let key = LinkKey::test(7);
+        let hover = LinkTooltipHover::Open {
+            link: HoveredLinkTooltip {
+                action: LinkAction::Send(Arc::from("look")),
+                tooltip,
+            },
+            origin: LinkTooltipOrigin::Keyboard(key),
+        };
+        assert!(hover.is_open());
+        assert!(hover.is_keyboard());
+        assert!(hover.link().tooltip.is_loading());
+        let (display, target) = loading_tooltip_display(0, hover.link().tooltip.target.clone());
+        assert!(display.text.starts_with("| "));
+        assert_eq!(target.as_deref(), Some("send:look"));
+    }
+
+    #[test]
+    fn callback_tooltip_is_not_claimed_without_a_runtime_handler() {
+        let shared = Arc::new(LinkTooltipState::default());
+        let tooltip = LinkTooltip::callback(
+            LinkTooltipCallback {
+                session: SessionId::from(1_u32),
+                isolate_token: Arc::from("main"),
+                id: 9,
+                state: shared,
+            },
+            Some(Arc::from("send:look")),
+        );
+
+        assert!(claim_tooltip_request(&tooltip, false).is_none());
+        assert!(!tooltip.is_loading());
+        assert!(
+            claim_tooltip_request(&tooltip, true).is_some(),
+            "the available handler must still be able to claim the first request"
+        );
+        assert!(tooltip.is_loading());
+    }
+
     #[test]
     fn keyboard_activation_requires_visible_link_focus_and_editor_focus_clears_it() {
         type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
 
-        let key = LinkKey {
-            line: 7,
-            begin: 3,
-            end: 9,
-        };
+        let key = LinkKey::test(7);
         let mut state = State::<Paragraph> {
             is_focused: true,
             focused_link: Some(key),
@@ -2503,12 +2913,17 @@ mod tests {
         assert_eq!(state.keyboard_focused_link(), None);
         state.focus_visible = true;
         assert_eq!(state.keyboard_focused_link(), Some(key));
+        state.link_tooltip_hover = Some(LinkTooltipHover::Open {
+            link: hovered_tooltip("keyboard"),
+            origin: LinkTooltipOrigin::Keyboard(key),
+        });
 
         let generation = state.visual_generation;
         state.process_link_navigation_reset(1);
         assert!(!state.is_focused);
         assert_eq!(state.focused_link, None);
         assert!(!state.focus_visible);
+        assert!(state.link_tooltip_hover.is_none());
         assert_ne!(state.visual_generation, generation);
     }
 
@@ -2524,11 +2939,414 @@ mod tests {
         assert_eq!(link_navigation_index(2, Some(0), true), Some(1));
     }
 
+    fn link_span(action: LinkAction) -> LinkSpan {
+        LinkSpan {
+            begin_pos: 2,
+            end_pos: 8,
+            action,
+            tooltip: None,
+            style: None,
+        }
+    }
+
+    fn protocol_states(
+        line_number: usize,
+        link: &LinkSpan,
+    ) -> (Rc<RefCell<LinkProtocolState>>, BufferLinkState, LinkKey) {
+        let shared = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let mut buffer = BufferLinkState::new(shared.clone());
+        let mut line = StyledLine::new("0123456789", Vec::new());
+        line.links.push(link.clone());
+        buffer.replace_line(line_number, Some(&line));
+        let key = buffer
+            .key_at(line_number, link)
+            .expect("registered test link");
+        (shared, buffer, key)
+    }
+
+    fn one_row_menu() -> LinkMenu {
+        LinkMenu {
+            title: None,
+            items: Arc::from(vec![LinkMenuItem::Action {
+                label: Arc::from("Choose"),
+                action: LinkAction::Send(Arc::from("choose")),
+            }]),
+        }
+    }
+
+    #[test]
+    fn activation_resolver_applies_selection_to_the_published_primary_once() {
+        use smudgy_core::session::styled_line::{LinkProtocol, LinkSelection};
+
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        let selection = LinkSelection {
+            group: Arc::from("difficulty"),
+            value: Arc::from("hard"),
+            toggle: true,
+            selected: false,
+            exclusive: true,
+            disabled: false,
+        };
+        let link = link_span(LinkAction::Configured {
+            primary: Some(Box::new(LinkAction::ServerSend(Arc::from("hard")))),
+            disabled: false,
+            primary_enabled: true,
+            menu: None,
+            menu_on_left_click: false,
+            protocol: Some(LinkProtocol {
+                selection: Some(selection.clone()),
+                ..LinkProtocol::default()
+            }),
+        });
+        let mut state = State::<Paragraph>::default();
+        let (protocol_state, mut buffer_link_state, key) = protocol_states(7, &link);
+
+        let activation = {
+            let mut protocol_state = protocol_state.borrow_mut();
+            resolve_link_activation(
+                &mut state,
+                &mut protocol_state,
+                &mut buffer_link_state,
+                LinkActivationRequest {
+                    key,
+                    link: &link,
+                    menu_anchor: Some(Point::new(12.0, 24.0)),
+                    modifiers: keyboard::Modifiers::default(),
+                    now: Instant::now(),
+                    can_publish: true,
+                },
+            )
+        };
+
+        let LinkActivationOutcome::Publish(event) = activation.outcome else {
+            panic!("an enabled primary must publish");
+        };
+        assert_eq!(
+            event.action,
+            LinkAction::ServerSend(Arc::from("hard?selected=true"))
+        );
+        assert!(protocol_state.borrow().selected(&selection));
+        assert!(protocol_state.borrow().visited(&link.action));
+    }
+
+    #[test]
+    fn activation_resolver_blocks_disabled_selection_links() {
+        use smudgy_core::session::styled_line::{LinkProtocol, LinkSelection};
+
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        let selection = LinkSelection {
+            group: Arc::from("difficulty"),
+            value: Arc::from("hard"),
+            toggle: true,
+            selected: false,
+            exclusive: true,
+            disabled: true,
+        };
+        let link = link_span(LinkAction::Configured {
+            primary: Some(Box::new(LinkAction::ServerSend(Arc::from("hard")))),
+            disabled: false,
+            primary_enabled: true,
+            menu: Some(one_row_menu()),
+            menu_on_left_click: true,
+            protocol: Some(LinkProtocol {
+                selection: Some(selection.clone()),
+                ..LinkProtocol::default()
+            }),
+        });
+        let mut state = State::<Paragraph>::default();
+        let (protocol_state, mut buffer_link_state, key) = protocol_states(7, &link);
+
+        let activation = {
+            let mut protocol_state = protocol_state.borrow_mut();
+            resolve_link_activation(
+                &mut state,
+                &mut protocol_state,
+                &mut buffer_link_state,
+                LinkActivationRequest {
+                    key,
+                    link: &link,
+                    menu_anchor: Some(Point::new(12.0, 24.0)),
+                    modifiers: keyboard::Modifiers::default(),
+                    now: Instant::now(),
+                    can_publish: true,
+                },
+            )
+        };
+
+        assert!(matches!(activation.outcome, LinkActivationOutcome::None));
+        assert!(!protocol_state.borrow().selected(&selection));
+        assert!(!protocol_state.borrow().visited(&link.action));
+    }
+
+    #[test]
+    fn activation_resolver_blocks_concealed_links_and_hidden_lines() {
+        use smudgy_core::session::styled_line::{
+            LinkProtocol, LinkVisibility, LinkVisibilityAction, LinkVisibilityExpire,
+        };
+
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        let link = link_span(LinkAction::Configured {
+            primary: Some(Box::new(LinkAction::ServerSend(Arc::from("secret")))),
+            disabled: false,
+            primary_enabled: true,
+            menu: None,
+            menu_on_left_click: false,
+            protocol: Some(LinkProtocol {
+                visibility: Some(LinkVisibility {
+                    action: LinkVisibilityAction::Reveal,
+                    delay_ms: None,
+                    expire: LinkVisibilityExpire {
+                        input: false,
+                        prompt: false,
+                        output: false,
+                        output_delay_ms: 0,
+                    },
+                    whole_line: false,
+                }),
+                ..LinkProtocol::default()
+            }),
+        });
+        let mut state = State::<Paragraph>::default();
+        let (protocol_state, mut buffer_link_state, key) = protocol_states(7, &link);
+        assert!(buffer_link_state.concealed(key));
+
+        let activate = |state: &mut State<Paragraph>, buffer_link_state: &mut BufferLinkState| {
+            let mut protocol_state = protocol_state.borrow_mut();
+            resolve_link_activation(
+                state,
+                &mut protocol_state,
+                buffer_link_state,
+                LinkActivationRequest {
+                    key,
+                    link: &link,
+                    menu_anchor: None,
+                    modifiers: keyboard::Modifiers::default(),
+                    now: Instant::now(),
+                    can_publish: true,
+                },
+            )
+        };
+        assert!(matches!(
+            activate(&mut state, &mut buffer_link_state).outcome,
+            LinkActivationOutcome::None
+        ));
+
+        let ordinary = link_span(LinkAction::ServerSend(Arc::from("co-located")));
+        let (ordinary_protocol, mut ordinary_buffer, ordinary_key) = protocol_states(9, &ordinary);
+        state.hidden_lines.insert(9);
+        let hidden_line_activation = {
+            let mut ordinary_protocol = ordinary_protocol.borrow_mut();
+            resolve_link_activation(
+                &mut state,
+                &mut ordinary_protocol,
+                &mut ordinary_buffer,
+                LinkActivationRequest {
+                    key: ordinary_key,
+                    link: &ordinary,
+                    menu_anchor: None,
+                    modifiers: keyboard::Modifiers::default(),
+                    now: Instant::now(),
+                    can_publish: true,
+                },
+            )
+        };
+        assert!(matches!(
+            hidden_line_activation.outcome,
+            LinkActivationOutcome::None
+        ));
+        assert!(!protocol_state.borrow().visited(&link.action));
+        assert!(!ordinary_protocol.borrow().visited(&ordinary.action));
+    }
+
+    #[test]
+    fn menu_open_defers_protocol_state_until_the_row_is_selected() {
+        use smudgy_core::session::styled_line::{
+            LinkProtocol, LinkSelection, LinkVisibility, LinkVisibilityAction, LinkVisibilityExpire,
+        };
+
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        let selection = LinkSelection {
+            group: Arc::from("answer"),
+            value: Arc::from("yes"),
+            toggle: true,
+            selected: false,
+            exclusive: true,
+            disabled: false,
+        };
+        let link = link_span(LinkAction::Configured {
+            primary: None,
+            disabled: false,
+            primary_enabled: true,
+            menu: Some(one_row_menu()),
+            menu_on_left_click: true,
+            protocol: Some(LinkProtocol {
+                selection: Some(selection.clone()),
+                visibility: Some(LinkVisibility {
+                    action: LinkVisibilityAction::Conceal,
+                    delay_ms: Some(25),
+                    expire: LinkVisibilityExpire {
+                        input: false,
+                        prompt: false,
+                        output: false,
+                        output_delay_ms: 0,
+                    },
+                    whole_line: false,
+                }),
+                ..LinkProtocol::default()
+            }),
+        });
+        let anchor = Point::new(320.0, 180.0);
+        let now = Instant::now();
+        let mut state = State::<Paragraph>::default();
+        let (protocol_state, mut buffer_link_state, key) = protocol_states(11, &link);
+
+        let activation = {
+            let mut protocol_state = protocol_state.borrow_mut();
+            resolve_link_activation(
+                &mut state,
+                &mut protocol_state,
+                &mut buffer_link_state,
+                LinkActivationRequest {
+                    key,
+                    link: &link,
+                    menu_anchor: Some(anchor),
+                    modifiers: keyboard::Modifiers::default(),
+                    now,
+                    can_publish: true,
+                },
+            )
+        };
+
+        let LinkActivationOutcome::OpenMenu(popup) = activation.outcome else {
+            panic!("Enter/Space must open a configured left-click menu");
+        };
+        assert_eq!(popup.anchor, anchor);
+        assert_eq!(popup.source.as_ref().map(|(key, _)| *key), Some(key));
+        assert!(!protocol_state.borrow().selected(&selection));
+        assert!(!protocol_state.borrow().visited(&link.action));
+        assert!(!buffer_link_state.concealed(key));
+        assert_eq!(activation.redraw_at, None);
+
+        let redraw_at = apply_menu_choice_protocol(
+            &mut protocol_state.borrow_mut(),
+            &mut buffer_link_state,
+            popup.source.as_ref(),
+            now,
+        );
+        let deadline = now + Duration::from_millis(25);
+        assert_eq!(redraw_at, Some(deadline));
+        assert!(protocol_state.borrow().selected(&selection));
+        assert!(protocol_state.borrow().visited(&link.action));
+        assert!(!buffer_link_state.concealed(key));
+
+        assert_eq!(
+            buffer_link_state.update_visibility_timers(deadline),
+            (None, true)
+        );
+        assert!(buffer_link_state.concealed(key));
+    }
+
+    #[test]
+    fn menu_invocation_reveals_a_spoiler_before_opening_its_popup() {
+        use smudgy_core::session::styled_line::LinkProtocol;
+
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        let link = link_span(LinkAction::Configured {
+            primary: None,
+            disabled: false,
+            primary_enabled: true,
+            menu: Some(one_row_menu()),
+            menu_on_left_click: true,
+            protocol: Some(LinkProtocol {
+                spoiler: true,
+                ..LinkProtocol::default()
+            }),
+        });
+        let anchor = Point::new(320.0, 180.0);
+        let mut state = State::<Paragraph>::default();
+        let (_, mut buffer_link_state, key) = protocol_states(11, &link);
+
+        assert!(matches!(
+            resolve_link_menu_invocation(&mut state, &mut buffer_link_state, key, &link, anchor,),
+            LinkMenuInvocation::RevealSpoiler
+        ));
+        assert!(buffer_link_state.spoiler_revealed(key));
+
+        let LinkMenuInvocation::Open(popup) =
+            resolve_link_menu_invocation(&mut state, &mut buffer_link_state, key, &link, anchor)
+        else {
+            panic!("the second menu invocation should open the revealed spoiler");
+        };
+        assert_eq!(popup.anchor, anchor);
+        assert_eq!(popup.source.as_ref().map(|(key, _)| *key), Some(key));
+    }
+
+    #[test]
+    fn popup_installation_clears_pressed_cell_through_the_common_path() {
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+
+        let mut state = State::<Paragraph> {
+            pressed_cell: Some(BufferPosition { line: 4, column: 9 }),
+            ..State::default()
+        };
+        state.install_menu_popup(LinkMenuPopup {
+            menu: one_row_menu(),
+            anchor: Point::new(10.0, 20.0),
+            source: None,
+        });
+
+        assert!(state.menu_popup.is_some());
+        assert_eq!(state.pressed_cell, None);
+        assert!(state.link_tooltip_hover.is_none());
+    }
+
+    #[test]
+    fn evicted_source_prunes_its_open_menu_and_blocks_choice_bookkeeping() {
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+
+        let link = link_span(LinkAction::Send(Arc::from("look")));
+        let (protocol_state, mut live, key) = protocol_states(7, &link);
+        let popup = LinkMenuPopup {
+            menu: one_row_menu(),
+            anchor: Point::new(10.0, 20.0),
+            source: Some((key, link.action.clone())),
+        };
+        let mut state = State::<Paragraph> {
+            menu_popup: Some(popup.clone()),
+            ..State::default()
+        };
+        assert!(menu_source_is_available(&popup, &live, &HashSet::new()));
+
+        live.replace_line(7, None);
+        assert!(!menu_source_is_available(&popup, &live, &HashSet::new()));
+        state.prune_widget_links(&live);
+        assert!(state.menu_popup.is_none());
+        assert!(!protocol_state.borrow().visited(&link.action));
+    }
+
+    #[test]
+    fn keyboard_tooltip_detects_when_its_link_scrolls_out() {
+        let link = link_span(LinkAction::Send(Arc::from("look")));
+        let (_, live, key) = protocol_states(7, &link);
+        let hover = LinkTooltipHover::Open {
+            link: hovered_tooltip("keyboard"),
+            origin: LinkTooltipOrigin::Keyboard(key),
+        };
+
+        assert!(!keyboard_tooltip_scrolled_out(
+            Some(&hover),
+            &live,
+            |line| line == 7
+        ));
+        assert!(keyboard_tooltip_scrolled_out(Some(&hover), &live, |_| {
+            false
+        }));
+    }
+
     #[test]
     fn visited_and_selection_state_are_semantic_and_stable() {
         use smudgy_core::session::styled_line::{LinkProtocol, LinkSelection};
 
-        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
         let selection = LinkSelection {
             group: Arc::from("difficulty"),
             value: Arc::from("hard"),
@@ -2548,84 +3366,26 @@ mod tests {
                 ..LinkProtocol::default()
             }),
         };
-        let mut state = State::<Paragraph>::default();
+        let link = link_span(action.clone());
+        let (protocol_state, _, _) = protocol_states(3, &link);
 
-        assert!(!state.visited(&action));
-        state.mark_visited(&action);
-        state.mark_visited(&action);
-        assert!(state.visited(&action));
-        assert_eq!(state.visited_actions.len(), 1);
+        assert!(!protocol_state.borrow().visited(&action));
+        protocol_state.borrow_mut().mark_visited(&action);
+        let generation = protocol_state.borrow().visual_generation();
+        protocol_state.borrow_mut().mark_visited(&action);
+        assert!(protocol_state.borrow().visited(&action));
+        assert_eq!(protocol_state.borrow().visual_generation(), generation);
 
-        assert!(!state.selected(&selection));
-        assert_eq!(state.toggle_link_selection(&action), Some(true));
-        assert!(state.selected(&selection));
-        assert_eq!(state.toggle_link_selection(&action), Some(false));
-        assert!(!state.selected(&selection));
-    }
-
-    #[test]
-    fn visibility_initial_state_matches_each_action() {
-        use smudgy_core::session::styled_line::LinkVisibilityExpire;
-
-        let expire = LinkVisibilityExpire {
-            input: false,
-            prompt: false,
-            output: false,
-            output_delay_ms: 500,
-        };
-        let conceal = VisibilityState::new(&LinkVisibility {
-            action: LinkVisibilityAction::Conceal,
-            delay_ms: Some(0),
-            expire: expire.clone(),
-            whole_line: false,
-        });
-        assert!(!conceal.concealed);
-        let reveal = VisibilityState::new(&LinkVisibility {
-            action: LinkVisibilityAction::Reveal,
-            delay_ms: Some(50),
-            expire: expire.clone(),
-            whole_line: false,
-        });
-        assert!(reveal.concealed);
-        let cycle = VisibilityState::new(&LinkVisibility {
-            action: LinkVisibilityAction::RevealThenConceal,
-            delay_ms: Some(0),
-            expire,
-            whole_line: false,
-        });
-        assert!(cycle.concealed);
-        assert!(!cycle.revealed_phase);
-    }
-
-    #[test]
-    fn visibility_expiry_applies_without_a_prior_click() {
-        use smudgy_core::session::styled_line::LinkVisibilityExpire;
-
-        let expire = LinkVisibilityExpire {
-            input: true,
-            prompt: false,
-            output: false,
-            output_delay_ms: 500,
-        };
-        let conceal_config = LinkVisibility {
-            action: LinkVisibilityAction::Conceal,
-            delay_ms: None,
-            expire: expire.clone(),
-            whole_line: false,
-        };
-        let mut conceal = VisibilityState::new(&conceal_config);
-        assert!(conceal.apply_expiry(conceal_config.action));
-        assert!(conceal.concealed);
-
-        let reveal_config = LinkVisibility {
-            action: LinkVisibilityAction::Reveal,
-            delay_ms: None,
-            expire,
-            whole_line: false,
-        };
-        let mut reveal = VisibilityState::new(&reveal_config);
-        assert!(reveal.concealed);
-        assert!(reveal.apply_expiry(reveal_config.action));
-        assert!(!reveal.concealed);
+        assert!(!protocol_state.borrow().selected(&selection));
+        assert_eq!(
+            protocol_state.borrow_mut().toggle_link_selection(&action),
+            Some(true)
+        );
+        assert!(protocol_state.borrow().selected(&selection));
+        assert_eq!(
+            protocol_state.borrow_mut().toggle_link_selection(&action),
+            Some(false)
+        );
+        assert!(!protocol_state.borrow().selected(&selection));
     }
 }

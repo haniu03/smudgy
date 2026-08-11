@@ -10563,6 +10563,7 @@ dependencies = [
  "thiserror 2.0.12",
  "tokio",
  "tokio-rustls",
+ "url",
  "validator",
  "vtparse",
  "winapi",
@@ -12637,8 +12638,6 @@ dependencies = [
 [[package]]
 name = "vtparse"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1726b5dabcf18909219a11c1ae3b85fff931b6e5ccf7321d998fc7665f52661b"
 dependencies = [
  "utf8parse",
 ]

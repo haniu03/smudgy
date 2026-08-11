@@ -205,9 +205,25 @@ fn redact(text: &str, redactions: &[String]) -> String {
     out
 }
 
+/// Stop accepting external work and terminally fail any tooltip resolutions
+/// already queued behind shutdown. Once the receiver is closed, concurrent
+/// forwards take the send-failure path instead.
+fn close_runtime_action_queue(receiver: &mut UnboundedReceiver<RuntimeAction>) {
+    receiver.close();
+    while let Ok(action) = receiver.try_recv() {
+        if let RuntimeAction::ResolveLinkTooltip { state, .. } = action {
+            state.resolve(None);
+        }
+    }
+}
+
 #[cfg(test)]
-mod redact_tests {
-    use super::redact;
+mod runtime_helper_tests {
+    use std::sync::Arc;
+
+    use super::{IsolateId, RuntimeAction, close_runtime_action_queue, redact};
+    use crate::session::SessionId;
+    use crate::session::styled_line::LinkTooltipState;
 
     #[test]
     fn masks_each_secret_but_leaves_other_text() {
@@ -221,6 +237,27 @@ mod redact_tests {
         // An empty redaction string must never panic or mask everything.
         assert_eq!(redact("hello", &[String::new()]), "hello");
         assert_eq!(redact("hello", &[]), "hello");
+    }
+
+    #[test]
+    fn shutdown_fails_tooltips_already_queued_behind_it() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = Arc::new(LinkTooltipState::default());
+        assert!(state.begin_request());
+        tx.send(RuntimeAction::ResolveLinkTooltip {
+            session: SessionId::from(7),
+            isolate: IsolateId::Main,
+            instance: 1,
+            id: 2,
+            state: Arc::clone(&state),
+        })
+        .expect("open runtime queue");
+
+        close_runtime_action_queue(&mut rx);
+
+        assert!(!state.is_loading());
+        assert!(state.text().is_none());
+        assert!(tx.send(RuntimeAction::Noop).is_err());
     }
 }
 
@@ -584,6 +621,7 @@ impl Runtime {
                 // EnsureNewLine) already committed it, which the notice's
                 // count bump records.
                 main_open_line: emitted_line_count.get() == 0,
+                replacing_main_open_line: false,
                 open_line: None,
                 log_open_line: Vec::new(),
                 log_committed_len: 0,
@@ -616,8 +654,11 @@ impl Runtime {
                 // Extract the receiver and connection from the old inner before dropping it,
                 // plus the line-pipeline state that must survive the rebuild: whether main's
                 // tail line is open and the in-flight logical line's accumulated fragments
-                // (a reload can land mid-server-line).
+                // (a reload can land mid-server-line). An active carriage-return replacement
+                // does not survive: `run` aborts it before returning `Reload`, because the
+                // completion action belonged to the discarded action stack.
                 let old_main_open_line = inner.main_open_line;
+                debug_assert!(!inner.replacing_main_open_line);
                 let old_open_line = inner.open_line.take();
                 let old_connection = inner.connection.take();
                 // The window-size cell is session-lifetime like the connection: the
@@ -860,6 +901,7 @@ impl Runtime {
                     msdp: old_msdp, // Same: server facts, no engine facts
                     main_open_line: old_main_open_line
                         && emitted_line_count.get() == count_before_rebuild,
+                    replacing_main_open_line: false,
                     open_line: old_open_line,
                     log_open_line: Vec::new(), // The reload flushed the old log; the new file starts a fresh line
                     log_committed_len: 0, // A new log file is opened on reconnect
@@ -1061,6 +1103,11 @@ struct Inner<'a> {
     /// and, unlike the peek, survives a flush. Drives the echo commit-first rule and
     /// `RetractOpenLine` emission; never touched by pane deliveries.
     main_open_line: bool,
+    /// A carriage-return replacement retired the prior main open line and is
+    /// moving through triggers. Kept independently of pending UI batches so
+    /// the exact transformed replacement can finish the transaction after a
+    /// flush or intervening trigger output.
+    replacing_main_open_line: bool,
     /// The in-flight server line's transformed fragments, accumulated so a non-main sink can
     /// receive one WHOLE line at routing time (complete-line events only carry the remainder
     /// since the last partial flush). Cleared when the line completes; consumed early when a
@@ -1265,6 +1312,7 @@ impl Inner<'_> {
     /// main appends only — a redirected line is "gagged from main" (not counted, not in
     /// `recent_lines`), and `RetractOpenLine` affects only the uncommitted line.
     fn route_complete_line(&mut self, processed: Arc<StyledLine>, routing: &LineRouting) {
+        let replacing_open_line = std::mem::take(&mut self.replacing_main_open_line);
         let (main_included, sinks) = if routing.is_default() {
             (true, Vec::new())
         } else {
@@ -1289,10 +1337,16 @@ impl Inner<'_> {
             self.emitted_line_count
                 .set(self.emitted_line_count.get() + 1);
             self.record_emitted_line(&processed);
-            self.pending_buffer_updates
-                .push(BufferUpdate::Append(processed));
+            self.pending_buffer_updates.push(if replacing_open_line {
+                BufferUpdate::FinishOpenLineReplacement(Some(processed))
+            } else {
+                BufferUpdate::Append(processed)
+            });
             self.pending_buffer_updates
                 .push(BufferUpdate::EnsureNewLine);
+        } else if replacing_open_line {
+            self.pending_buffer_updates
+                .push(BufferUpdate::FinishOpenLineReplacement(None));
         } else if self.main_open_line {
             self.pending_buffer_updates
                 .push(BufferUpdate::RetractOpenLine);
@@ -1307,6 +1361,7 @@ impl Inner<'_> {
     /// accumulator, so a later routing on the same line's completion delivers only the
     /// remainder (never duplicated text).
     fn route_partial_line(&mut self, processed: Arc<StyledLine>, routing: &LineRouting) {
+        let replacing_open_line = std::mem::take(&mut self.replacing_main_open_line);
         if routing.is_default() {
             // Fast path: no routing on this fragment. The whole-line
             // accumulator exists only to feed pane sinks, so with no non-main
@@ -1321,8 +1376,11 @@ impl Inner<'_> {
             } else {
                 self.open_line = None;
             }
-            self.pending_buffer_updates
-                .push(BufferUpdate::Append(processed));
+            self.pending_buffer_updates.push(if replacing_open_line {
+                BufferUpdate::FinishOpenLineReplacement(Some(processed))
+            } else {
+                BufferUpdate::Append(processed)
+            });
             self.main_open_line = true;
             return;
         }
@@ -1348,9 +1406,15 @@ impl Inner<'_> {
         }
 
         if main_included {
-            self.pending_buffer_updates
-                .push(BufferUpdate::Append(processed));
+            self.pending_buffer_updates.push(if replacing_open_line {
+                BufferUpdate::FinishOpenLineReplacement(Some(processed))
+            } else {
+                BufferUpdate::Append(processed)
+            });
             self.main_open_line = true;
+        } else if replacing_open_line {
+            self.pending_buffer_updates
+                .push(BufferUpdate::FinishOpenLineReplacement(None));
         } else if self.main_open_line {
             self.pending_buffer_updates
                 .push(BufferUpdate::RetractOpenLine);
@@ -1367,10 +1431,31 @@ impl Inner<'_> {
     pub(crate) fn retract_incoming_open_line_sync(&mut self) {
         if self.main_open_line {
             self.pending_buffer_updates
-                .push(BufferUpdate::RetractOpenLine);
+                .push(BufferUpdate::BeginOpenLineReplacement);
             self.main_open_line = false;
+            self.replacing_main_open_line = true;
         }
         self.open_line = None;
+    }
+
+    /// Abandon an incoming-line pipeline that will never reach its normal
+    /// `*LineTriggersProcessed` completion action.
+    ///
+    /// In particular, a delivered [`BufferUpdate::BeginOpenLineReplacement`]
+    /// owns a UI-side detached-line transaction. Every abandoned pipeline must
+    /// pair it with an empty finish before any unrelated line can be routed.
+    /// Trigger state is per-line too, so discard transforms/routing alongside
+    /// the replacement and pane accumulator instead of leaking them into the
+    /// next server line.
+    fn abort_incoming_line_sync(&mut self) {
+        self.script_engine.set_current_line(None);
+        self.pending_line_operations.borrow_mut().clear();
+        self.line_routing.borrow_mut().take();
+        self.open_line = None;
+        if std::mem::take(&mut self.replacing_main_open_line) {
+            self.pending_buffer_updates
+                .push(BufferUpdate::FinishOpenLineReplacement(None));
+        }
     }
 
     /// If the main buffer's tail line is open (an uncommitted partial), commit it: the
@@ -1637,7 +1722,8 @@ impl Inner<'_> {
             // completion/retraction rewrites cleanly.
             for update in &self.pending_buffer_updates {
                 match update {
-                    BufferUpdate::Append(line) => {
+                    BufferUpdate::Append(line)
+                    | BufferUpdate::FinishOpenLineReplacement(Some(line)) => {
                         self.log_open_line.extend_from_slice(line.as_bytes());
                     }
                     BufferUpdate::EnsureNewLine => {
@@ -1667,13 +1753,14 @@ impl Inner<'_> {
                     // The retracted prefix re-appears inside the routed whole
                     // line, so dropping the accumulator here is what keeps
                     // the transcript free of duplicated text.
-                    BufferUpdate::RetractOpenLine => {
+                    BufferUpdate::RetractOpenLine | BufferUpdate::BeginOpenLineReplacement => {
                         if self.log_open_on_disk {
                             rewind_provisional_open_line(log_file, self.log_committed_len)?;
                             self.log_open_on_disk = false;
                         }
                         self.log_open_line.clear();
                     }
+                    BufferUpdate::FinishOpenLineReplacement(None) => {}
                     // Display-only; the transcript keeps everything.
                     BufferUpdate::Clear(_) => {}
                 }
@@ -2024,9 +2111,17 @@ impl Inner<'_> {
                             "Session [{}, {} - {}] Closing",
                             self.session_id, self.server_name, self.profile_name
                         );
+                        close_runtime_action_queue(&mut self.session_runtime_rx);
                         break;
                     }
                     Ok(ActionResult::Reload) => {
+                        // The local action stack is discarded by this return. If a
+                        // trigger queued Reload ahead of its line-completion action,
+                        // close the replacement transaction now rather than letting
+                        // the rebuilt runtime finish the next unrelated server line.
+                        if self.replacing_main_open_line {
+                            self.abort_incoming_line_sync();
+                        }
                         return RunAction::Reload;
                     }
                     Ok(ActionResult::Run(actions)) => {

@@ -376,7 +376,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   you-are-here resolution on MUDs that announce room ids. A session map
   worth keeping can be exported with `mapper.exportArea`.
 - **Clickable server links (OSC 8 hyperlinks).** MUDs that send OSC 8
-  hyperlinks now render as clickable links in the terminal. `http`/`https`
+  hyperlinks now render as clickable links in the terminal. `http`/`https`/`ftp`
   links open in your browser; a MUD-specific `send:` link sends a command as
   you. Because these come from the server, the first click to a given site
   (or the first command link) opens a confirmation showing the exact
@@ -391,15 +391,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disabled links, spoilers, timed/input/prompt/output visibility, radio and
   checkbox selection groups, compact keys, and session presets are supported;
   styled tooltip text is announced through Smudgy's
-  `OSC_HYPERLINKS_TOOLTIP_SGR` capability extension;
-  links can be traversed and activated from the keyboard. Incoming OSC 8 URIs
-  are capped at 4096 bytes in the scanner, deceptive invisible controls are
-  rendered visibly, and unapproved URI schemes are ignored. Script-authored
-  links retain their existing unrestricted payload size.
+  `OSC_HYPERLINKS_TOOLTIP_SGR` capability extension; links can be traversed and
+  activated from the keyboard. Selection and visited state agree across split
+  views and routed panes. Incoming OSC 8 URIs are capped at 4096 bytes, while
+  the parser bounds every OSC and APC string at 8192 bytes; deceptive invisible
+  controls are rendered visibly, and unapproved URI schemes are ignored.
+  Script-authored links retain their existing unrestricted payload size.
 - **Configurable SGR bold presentation.** Terminal preferences now offer
   weight-only, bright-color-only, and combined bold modes. Weight-only bold
   preserves the selected regular font family and changes only its weight;
-  existing boolean settings migrate without changing their appearance.
+  existing boolean settings migrate without changing their appearance. The
+  three choices use the selected interface language.
+- **Scripts can round-trip terminal styling.** `line.styles` now reports every
+  text attribute plus the exact ANSI palette-bright bit, and styled echo and
+  line edits accept those attributes without losing double underline, fast
+  blink, reverse video, or the distinction between bold weight and bright
+  color. The legacy color `bold` readback remains available for compatibility.
 
 ### Fixed
 
@@ -410,6 +417,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Async link tooltips show progress.** A script tooltip whose callback is
   still resolving now opens with an animated loading indicator (and the honest
   target disclosure, when available) instead of appearing empty or finished.
+  Tooltips also stay open when a link is reached from the keyboard.
 - **Link clicks no longer hijack later command submissions.** Enter and Space
   activate a terminal link only while its keyboard focus ring is visible, and
   returning focus to a command editor clears the terminal's link-navigation
@@ -417,7 +425,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OSC 8 raw JSON and reserved query fields parse without URI ambiguity.**
   Literal JSON may contain `#` colors and `&` text, encoded `config%3D` and
   `preset%3D` fields are stripped like their literal forms, and real URL
-  fragments and ordinary query parameters remain intact.
+  fragments and ordinary query parameters remain intact. Presets are capped at
+  1024 names per connection; existing names remain replaceable at the cap.
+- **OSC control strings cannot desynchronize terminal output.** Bare ESC bytes
+  and UTF-8 continuation bytes no longer confuse a shadow OSC scanner and
+  swallow all later output. Unterminated OSC and APC strings are also bounded,
+  including non-hyperlink selectors.
+- **OSC link state follows the session and the rendered buffer.** Selection and
+  visited styles stay synchronized across scrollback splits and routed panes;
+  spoilers survive widget rebuilds; input and prompt expiry reach links in
+  routed panes; evicted selection values are retired.
+- **Empty OSC actions are handled safely.** Empty `send:` and hostless web URLs
+  are ignored, while empty `prompt:` remains a valid way to clear the command
+  editor.
 - **JSR packages can load slash-normalized dependencies.** Smudgy now accepts
   both `jsr:@scope/package` and the `jsr:/@scope/package` form emitted by Deno
   and found in published JSR packages, instead of rejecting the latter as an

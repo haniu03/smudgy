@@ -75,6 +75,34 @@ pub enum TweakSlider {
     Saturation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalBoldModeChoice {
+    mode: TerminalBoldMode,
+    label: String,
+}
+
+impl TerminalBoldModeChoice {
+    fn all() -> Vec<Self> {
+        TerminalBoldMode::ALL
+            .into_iter()
+            .map(|mode| Self {
+                mode,
+                label: match mode {
+                    TerminalBoldMode::Bold => t!("preferences-bold-mode-bold"),
+                    TerminalBoldMode::Bright => t!("preferences-bold-mode-bright"),
+                    TerminalBoldMode::BoldAndBright => t!("preferences-bold-mode-both"),
+                },
+            })
+            .collect()
+    }
+}
+
+impl std::fmt::Display for TerminalBoldModeChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     TabSelected(Tab),
@@ -1304,13 +1332,18 @@ impl SettingsWindow {
                 .label(t!("preferences-font-ligatures"))
                 .on_toggle(Message::PrefFontLigaturesToggled),
         );
+        let bold_mode_choices = TerminalBoldModeChoice::all();
+        let selected_bold_mode = bold_mode_choices
+            .iter()
+            .find(|choice| choice.mode == self.settings.terminal_bold_mode)
+            .cloned();
         col = col.push(
             column![
                 dim_text_owned(t!("preferences-bold-is-bright")),
                 pick_list(
-                    TerminalBoldMode::ALL,
-                    Some(self.settings.terminal_bold_mode),
-                    Message::PrefBoldModeSelected,
+                    bold_mode_choices,
+                    selected_bold_mode,
+                    |choice| Message::PrefBoldModeSelected(choice.mode),
                 )
                 .text_size(13)
                 .width(280),

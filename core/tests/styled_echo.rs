@@ -12,7 +12,8 @@ use futures::StreamExt;
 use smudgy_core::session::connection::vt_processor::{AnsiColor, Color};
 use smudgy_core::session::runtime::{IsolateId, RuntimeAction};
 use smudgy_core::session::styled_line::{
-    LinkAction, LinkMenuItem, LinkSpan, LinkTooltip, Style, StyledLine,
+    Blink, LinkAction, LinkMenuItem, LinkSpan, LinkTooltip, Style, StyledLine, TextAttributes,
+    Underline,
 };
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
 
@@ -38,6 +39,24 @@ try {
 echo(style.bg("default")`bgdef`);
 // 7: an illegal escape in a tagged template falls back to the raw text.
 echo(style.red`C:\utils`);
+// 8: every text attribute crosses the packed wire without changing the dim palette slot.
+const allAttributes = {
+    bold: true,
+    faint: true,
+    italic: true,
+    underline: "double" as const,
+    blink: "fast" as const,
+    crossedOut: true,
+    reverse: true,
+};
+echo(style({
+    fg: { color: "red", bold: true, paletteBright: false },
+    attributes: allAttributes,
+})`attrs`);
+// 9: legacy color bold remains palette-only; it does not gain font weight.
+echo(style({ fg: { color: "red", bold: true } })`palette-only`);
+// 10: default foreground accepts the lossless palette override too.
+echo(style({ fg: { color: "default", bold: true, paletteBright: false } })`default-dim`);
 echo("SE_DONE");
 "#;
 
@@ -255,6 +274,45 @@ async fn styled_echo_spans_reach_the_buffer() {
             .any(|l| l.text == "ERR_MISSED" || l.text == "bad"),
         "the failed echo must not deliver.\nTranscript:\n{transcript}"
     );
+
+    let attributes = find("attrs");
+    assert_eq!(
+        attributes.spans[0].style,
+        Style {
+            fg: Color::Ansi {
+                color: AnsiColor::Red,
+                bold: false,
+            },
+            bg: Color::DefaultBackground,
+            attributes: TextAttributes {
+                bold: true,
+                faint: true,
+                italic: true,
+                underline: Underline::Double,
+                blink: Blink::Fast,
+                crossed_out: true,
+                reverse: true,
+            },
+        }
+    );
+    let palette_only = find("palette-only");
+    assert_eq!(
+        palette_only.spans[0].style,
+        Style {
+            fg: bright(AnsiColor::Red),
+            bg: Color::DefaultBackground,
+            attributes: TextAttributes::DEFAULT,
+        }
+    );
+    let default_dim = find("default-dim");
+    assert_eq!(
+        default_dim.spans[0].style,
+        Style {
+            fg: Color::DefaultForeground { bold: false },
+            bg: Color::DefaultBackground,
+            attributes: TextAttributes::DEFAULT,
+        }
+    );
 }
 
 const STYLED_SPLICE_TS: &str = r#"
@@ -290,6 +348,21 @@ createTrigger("^BADSPLICE$", () => {
     } catch (e) {
         echo((e instanceof TypeError) ? "NL_OK" : "NL_WRONG");
     }
+});
+
+createTrigger("^ATTRSPLICE$", () => {
+    line.replace("ATTRSPLICE", style({
+        fg: { color: "red", bold: true, paletteBright: false },
+        attributes: {
+            bold: true,
+            faint: false,
+            italic: true,
+            underline: "single",
+            blink: "slow",
+            crossedOut: true,
+            reverse: false,
+        },
+    })`styled`);
 });
 
 echo("SP_READY");
@@ -373,15 +446,14 @@ async fn styled_splice_edits_incoming_lines() {
                             "ITEM thing",
                             "TOOLTIP foo bar",
                             "BADSPLICE",
+                            "ATTRSPLICE",
                         ] {
                             tx.send(RuntimeAction::HandleIncomingLine(incoming(text)))
                                 .unwrap();
                             tx.send(RuntimeAction::RequestRepaint).unwrap();
                         }
                     }
-                    // A trigger's echo emits depth-first AHEAD of the incoming line it
-                    // fired on, so the BADSPLICE line itself is the last append.
-                    if line.text == "BADSPLICE" {
+                    if line.text == "styled" {
                         break 'done;
                     }
                 }
@@ -496,6 +568,26 @@ async fn styled_splice_edits_incoming_lines() {
     );
     let bad = find("BADSPLICE");
     assert_eq!(bad.text, "BADSPLICE");
+    let attr_splice = find("styled");
+    assert_eq!(
+        attr_splice.spans[0].style,
+        Style {
+            fg: Color::Ansi {
+                color: AnsiColor::Red,
+                bold: false,
+            },
+            bg: rgb.bg,
+            attributes: TextAttributes {
+                bold: true,
+                faint: false,
+                italic: true,
+                underline: Underline::Single,
+                blink: Blink::Slow,
+                crossed_out: true,
+                reverse: false,
+            },
+        }
+    );
     tx.send(RuntimeAction::Shutdown).ok();
 }
 

@@ -564,7 +564,6 @@ pub fn run() -> anyhow::Result<()> {
         .font(assets::fonts::GEIST_ITALIC_VF_BYTES)
         .font(assets::fonts::GEIST_MONO_VF_BYTES)
         .font(assets::fonts::GEIST_MONO_ITALIC_VF_BYTES)
-        .font(assets::fonts::GEIST_PIXEL_VF_BYTES)
         .font(assets::fonts::BOOTSTRAP_ICONS_BYTES)
         .font(assets::fonts::MONASPACE_ARGON_BYTES)
         .font(assets::fonts::MONASPACE_KRYPTON_BYTES)

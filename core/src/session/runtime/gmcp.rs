@@ -508,9 +508,9 @@ impl GmcpProducer {
             &IsolateId::Main,
         );
         match base {
-            Some(Value::Object(mut base)) => {
-                deep_merge(&mut base, delta);
-                Value::Object(base)
+            Some(mut base @ Value::Object(_)) => {
+                crate::json::deep_merge(&mut base, Value::Object(delta));
+                base
             }
             _ => Value::Object(delta),
         }
@@ -542,23 +542,6 @@ fn player_name(player: &Value) -> Option<String> {
             _ => None,
         },
         _ => None,
-    }
-}
-
-/// Recursive object merge: object-into-object merges per key, anything else replaces.
-/// Keys match exactly here; the store's uniform write-time fold resolves any
-/// case-collision at the write, exactly as it would for a producer publishing both
-/// spellings.
-fn deep_merge(base: &mut serde_json::Map<String, Value>, delta: serde_json::Map<String, Value>) {
-    for (key, incoming) in delta {
-        match (base.get_mut(&key), incoming) {
-            (Some(Value::Object(existing)), Value::Object(delta_child)) => {
-                deep_merge(existing, delta_child);
-            }
-            (_, incoming) => {
-                base.insert(key, incoming);
-            }
-        }
     }
 }
 

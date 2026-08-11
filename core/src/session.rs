@@ -272,6 +272,15 @@ pub enum BufferUpdate {
     /// arrive as several appends glued by the UI, terminated by
     /// [`BufferUpdate::EnsureNewLine`].
     Append(Arc<StyledLine>),
+    /// Begin a carriage-return replacement of the main buffer's open line.
+    /// The matching [`BufferUpdate::FinishOpenLineReplacement`] may arrive in
+    /// a later UI batch and may have unrelated trigger output before it.
+    BeginOpenLineReplacement,
+    /// Finish the carriage-return replacement started by
+    /// [`BufferUpdate::BeginOpenLineReplacement`]. `Some` supplies the exact
+    /// replacement frame after triggers/transforms; `None` means routing
+    /// gagged or redirected it away from main.
+    FinishOpenLineReplacement(Option<Arc<StyledLine>>),
     /// Commit the main buffer's open line.
     EnsureNewLine,
     /// A telnet GA/EOR prompt boundary. Carries no text; terminal panes use it
@@ -282,10 +291,10 @@ pub enum BufferUpdate {
     /// line, so pane buffers never receive fragments — core assembles the
     /// full line before queuing this.
     AppendTo(PaneKey, Arc<StyledLine>),
-    /// Drop the main buffer's unterminated tail line. Emitted when routing
-    /// excludes main (gag/redirect) after a prefix of the line already
-    /// flushed as a partial; affects only the uncommitted line, so line
-    /// numbering parity holds.
+    /// Drop the main buffer's unterminated tail line. Emitted only when routing
+    /// excludes main (gag/redirect) after a prefix of the line already flushed
+    /// as a partial; affects only the uncommitted line, so line numbering
+    /// parity holds.
     RetractOpenLine,
     /// Clear a terminal pane's scrollback (`pane.clear()`); the main pane is
     /// addressed by [`runtime::pane::MAIN_PANE_KEY`]. Line numbering
