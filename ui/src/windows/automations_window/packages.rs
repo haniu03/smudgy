@@ -31,6 +31,7 @@ use crate::theme::builtins::button as button_style;
 use crate::update::Update;
 
 use smudgy_core::session::runtime::{AutomationBody, AutomationKind};
+use smudgy_core::session::styled_line::{InvisiblePolicy, deceptive_invisible};
 
 use super::common;
 use super::editors::pane_scroll;
@@ -462,15 +463,8 @@ pub enum FilePreview {
 /// audit pane is the safe default. We *warn*, not strip: legitimate right-to-left source exists, so
 /// the auditor is told to look closely rather than having their text silently rewritten.
 fn has_deceptive_unicode(s: &str) -> bool {
-    s.chars().any(|c| {
-        matches!(c,
-            '\u{202A}'..='\u{202E}'   // LRE RLE PDF LRO RLO (embeddings + overrides)
-            | '\u{2066}'..='\u{2069}' // LRI RLI FSI PDI (isolates)
-            | '\u{200E}' | '\u{200F}' | '\u{061C}' // LRM RLM ALM (bidi marks)
-            | '\u{200B}'..='\u{200D}' // ZWSP ZWNJ ZWJ
-            | '\u{2060}' | '\u{FEFF}' | '\u{00AD}' // word joiner, ZWNBSP/BOM, soft hyphen
-        )
-    })
+    s.chars()
+        .any(|c| deceptive_invisible(c, InvisiblePolicy::ActionTarget))
 }
 
 /// Classify fetched module bytes for the source browser. The declared media type is
@@ -7123,6 +7117,7 @@ mod tests {
         ));
         // Zero-width space hidden in an identifier.
         assert!(has_deceptive_unicode("ad\u{200B}min"));
+        assert!(has_deceptive_unicode("admin\u{3164}"));
         // Plain Arabic (RTL letters, no control chars) is legitimate source/text — no warning.
         assert!(!has_deceptive_unicode(
             "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} = 1"

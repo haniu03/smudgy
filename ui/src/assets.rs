@@ -15,9 +15,6 @@ pub mod fonts {
     pub const GEIST_MONO_ITALIC_VF_BYTES: &[u8] =
         include_bytes!("../../assets/fonts/GeistMono-Italic[wght].ttf");
     pub const GEIST_MONO_VF: Font = Font::with_name("Geist Mono");
-    pub const GEIST_PIXEL_VF_BYTES: &[u8] =
-        include_bytes!("../../assets/fonts/GeistPixel[ELSH].ttf");
-    pub const GEIST_PIXEL_VF: Font = Font::with_name("Geist Pixel");
     pub const BOOTSTRAP_ICONS_BYTES: &[u8] =
         include_bytes!("../../assets/fonts/bootstrap-icons.ttf");
     pub const BOOTSTRAP_ICONS: Font = Font::with_name("bootstrap-icons");
@@ -89,7 +86,6 @@ pub mod fonts {
                 (super::GEIST_ITALIC_VF_BYTES, "Geist"),
                 (super::GEIST_MONO_VF_BYTES, "Geist Mono"),
                 (super::GEIST_MONO_ITALIC_VF_BYTES, "Geist Mono"),
-                (super::GEIST_PIXEL_VF_BYTES, "Geist Pixel"),
                 (super::BOOTSTRAP_ICONS_BYTES, "bootstrap-icons"),
                 (super::MONASPACE_ARGON_BYTES, "Monaspace Argon Var"),
                 (super::MONASPACE_KRYPTON_BYTES, "Monaspace Krypton Var"),
@@ -129,7 +125,6 @@ pub mod fonts {
                     fontdb::Style::Italic,
                     true,
                 ),
-                (super::GEIST_PIXEL_VF_BYTES, fontdb::Style::Normal, false),
             ];
 
             for (bytes, expected_style, expected_monospaced) in cases {
@@ -142,11 +137,10 @@ pub mod fonts {
             }
         }
 
-        /// cosmic-text 0.15 used to reject a variable face whenever the
-        /// requested weight differed from the single default weight fontdb
-        /// records for that file. In the terminal that made bold Geist Mono
-        /// fall through to another family even though its `wght` axis covers
-        /// the requested weight.
+        /// Unpatched cosmic-text 0.15 rejects a variable face when the
+        /// requested weight differs from the face's default; guards the
+        /// `variable_weight_match` backport in
+        /// `patches/cosmic-text+0.15.0.patch`.
         #[test]
         fn geist_mono_variable_weights_keep_the_requested_family() {
             use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Weight};

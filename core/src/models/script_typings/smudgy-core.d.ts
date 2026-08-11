@@ -402,6 +402,7 @@ declare module "smudgy:core" {
     readonly __smudgyProcedure?: (args: A) => R;
   }
 
+  /** A terminal procedure consumer directed at one session. */
   export interface BoundProcedureConsumer<A = unknown, R = void> {
     post(args: A): void;
     readonly __smudgyProcedure?: (args: A) => R;
@@ -774,15 +775,15 @@ declare module "smudgy:core" {
    * available through the Layouts toolbar menu.
    *
    * Layouts exist so users' saved arrangements win. `split()` sizes and
-   * placements are creation *defaults*, while an explicit `pane.resize()`
+   * placements are creation defaults, while an explicit `pane.resize()`
    * is imperative intent that overrides the user's saved geometry -- exactly
    * as a user divider drag would. So resizing panes at load time is an
    * anti-pattern: it permanently defeats the sizes users saved. Use split
    * defaults at creation and reserve `resize` for genuine runtime
    * reactions; switch whole arrangements with `layout.apply`.
    *
-   * Every `layout` method requires both the `panes` and `session:
-   * ["reach-others"]` capabilities: rearranging the workspace reaches
+   * Every `layout` method requires both the `panes` and
+   * `session: ["reach-others"]` capabilities: rearranging the workspace reaches
    * every window showing this server, not just the panes this script made.
    */
   export const layout: {
@@ -1492,7 +1493,7 @@ declare module "smudgy:core" {
    * echo color when echoed, the surrounding style when spliced into a line.
    */
   export interface StyleBuilder extends StyleTag {
-    /** Both colors at once, in the same shape `highlight` takes. */
+    /** Colors and/or complete text attributes, in the same shape `highlight` takes. */
     (options: LineColorOptions): StyleBuilder;
     fg(color: Color): StyleBuilder;
     bg(color: Color): StyleBuilder;
@@ -1569,7 +1570,7 @@ declare module "smudgy:core" {
    * keeps up:
    *
    * ```ts
-   * import { line, link, style } from "smudgy:core";
+   * import { echo, line, link, send, style } from "smudgy:core";
    *
    * line.replace("north", link("north")`${style.cyan`north`}`);
    * line.replace("foo bar", link("https://www.google.com", {
@@ -2053,13 +2054,37 @@ declare module "smudgy:core" {
    *   `"magenta"`, `"cyan"`, `"white"`, meaning the bright variant), or a
    *   theme role: `"default"`, `"echo"`, `"output"`, `"warn"`
    * - `{ r, g, b }` with each component 0-255, for an exact color
-   * - `{ color, bold }`: an ANSI color name plus an explicit bright/bold flag
-   *   (`bold: false` selects the normal, dimmer variant)
+   * - `{ color, bold, paletteBright? }`: an ANSI color name or `"default"`
+   *   plus its palette slot (`bold: false` selects the normal, dimmer variant).
+   *   `paletteBright` is normally only needed when re-emitting style readback.
    */
   export type Color =
     | string
     | { r: number; g: number; b: number }
-    | { color: string; bold: boolean };
+    | {
+        color: string;
+        /** On input, selects the palette's bright slot unless `paletteBright`
+         *  is supplied. On ANSI style readback this is the deprecated legacy
+         *  palette-bright-or-font-bold value; use `attributes.bold` for weight. */
+        bold: boolean;
+        /** An explicit palette-slot override. Style readback supplies this for
+         *  ANSI colors so a span round-trips even when legacy `bold` is conflated.
+         *  Default foreground readback remains the string `"default"` for
+         *  compatibility and carries its raw slot in
+         *  `StyleSpan.foregroundPaletteBright`. */
+        paletteBright?: boolean;
+      };
+
+  /** The lossless non-color attributes carried by a terminal text run. */
+  export interface TextAttributes {
+    bold: boolean;
+    faint: boolean;
+    italic: boolean;
+    underline: "none" | "single" | "double";
+    blink: "none" | "slow" | "fast";
+    crossedOut: boolean;
+    reverse: boolean;
+  }
 
   /** One styled run read back from a line. `begin`/`end` are byte offsets into
    *  the line's text (not character counts; multi-byte characters span
@@ -2069,12 +2094,21 @@ declare module "smudgy:core" {
     end: number;
     fg: Color;
     bg: Color;
+    attributes: TextAttributes;
+    /** Present when `fg` is the compatibility string `"default"` but its
+     * terminal palette slot is the bright default. Passing this span back to a
+     * line styling method preserves that raw palette bit. */
+    foregroundPaletteBright?: boolean;
   }
 
-  /** Foreground and/or background color for a line write. */
+  /** Foreground, background, and/or complete text attributes for a line write.
+   *  A {@link StyleSpan} is accepted directly, making readback lossless. */
   export interface LineColorOptions {
     fg?: Color;
     bg?: Color;
+    attributes?: TextAttributes;
+    /** Lossless raw palette bit for a read-back `fg: "default"` span. */
+    foregroundPaletteBright?: boolean;
   }
 
   /**

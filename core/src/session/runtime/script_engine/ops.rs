@@ -14,8 +14,9 @@ use crate::session::runtime::{
     SingletonRegistry,
 };
 use crate::session::styled_line::{
-    Color, LinkAction, LinkMenu, LinkMenuItem, LinkMenuTitle, LinkTooltip, LinkTooltipCallback,
-    LinkTooltipState, LinkTooltipText, Style, StyledLine, StyledLink, sanitize_display_text,
+    Blink, Color, LinkAction, LinkMenu, LinkMenuItem, LinkMenuTitle, LinkTooltip,
+    LinkTooltipCallback, LinkTooltipState, LinkTooltipText, Style, StyledLine, StyledLink,
+    TextAttributes, Underline, sanitize_display_text,
 };
 use crate::session::{SessionId, registry};
 
@@ -2964,17 +2965,15 @@ fn single_line_text(text: &str) -> Option<Arc<str>> {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let cleaned = cleaned.trim();
-    (!cleaned.is_empty()).then(|| Arc::from(cleaned))
-}
-
-fn tooltip_target(action: &LinkAction) -> Option<Arc<str>> {
-    match action.disclosed_target()? {
-        LinkAction::Send(command) => Some(command.clone()),
-        LinkAction::OpenUrl(url) => Some(url.clone()),
-        LinkAction::ServerSend(command) => Some(Arc::from(format!("send:{command}"))),
-        LinkAction::Prompt(command) => Some(Arc::from(format!("prompt:{command}"))),
-        LinkAction::Callback { .. } | LinkAction::Configured { .. } => None,
-    }
+    (!cleaned.is_empty()).then(|| {
+        Arc::from(
+            crate::session::styled_line::escape_invisible_text(
+                cleaned,
+                crate::session::styled_line::InvisiblePolicy::Prose,
+            )
+            .as_ref(),
+        )
+    })
 }
 
 impl LinkContext {
@@ -2983,7 +2982,7 @@ impl LinkContext {
         tooltip: Option<ResolvedTooltip>,
         action: &LinkAction,
     ) -> Result<Option<LinkTooltip>, StyledTextOpError> {
-        let target = tooltip_target(action);
+        let target = action.tooltip_target();
         match tooltip {
             Some(ResolvedTooltip::Text(text)) => Ok(Some(LinkTooltip::styled_text(text, target))),
             Some(ResolvedTooltip::Callback(index)) => {
@@ -3042,8 +3041,17 @@ fn op_smudgy_resolve_link_tooltip(
 #[serde(untagged)]
 enum ColorWire {
     Name(String),
-    Rgb { r: u8, g: u8, b: u8 },
-    AnsiBold { color: String, bold: bool },
+    Rgb {
+        r: u8,
+        g: u8,
+        b: u8,
+    },
+    Palette {
+        color: String,
+        bold: bool,
+        #[serde(default, rename = "paletteBright")]
+        palette_bright: Option<bool>,
+    },
 }
 
 impl ColorWire {
@@ -3057,23 +3065,88 @@ impl ColorWire {
                 g: *g,
                 b: *b,
             }),
-            Self::AnsiBold { color, bold } => ansi_color_by_name(color)
-                .map(|color| Color::Ansi { color, bold: *bold })
-                .ok_or_else(|| {
-                    StyledTextOpError::Invalid(format!("unknown ANSI color \"{color}\""))
-                }),
+            Self::Palette {
+                color,
+                bold,
+                palette_bright,
+            } => {
+                let bright = palette_bright.unwrap_or(*bold);
+                if color == "default" {
+                    Ok(Color::DefaultForeground { bold: bright })
+                } else {
+                    ansi_color_by_name(color)
+                        .map(|color| Color::Ansi {
+                            color,
+                            bold: bright,
+                        })
+                        .ok_or_else(|| {
+                            StyledTextOpError::Invalid(format!("unknown ANSI color \"{color}\""))
+                        })
+                }
+            }
         }
     }
 }
 
-/// One run of a styled line: its text plus the colors it set. `None` means the run
-/// left that channel unset, so it takes the delivery default (the echo role for
-/// echoes). `link` makes the run's text clickable.
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TextAttributesWire {
+    bold: bool,
+    faint: bool,
+    italic: bool,
+    underline: UnderlineWire,
+    blink: BlinkWire,
+    crossed_out: bool,
+    reverse: bool,
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum UnderlineWire {
+    None,
+    Single,
+    Double,
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BlinkWire {
+    None,
+    Slow,
+    Fast,
+}
+
+impl From<TextAttributesWire> for TextAttributes {
+    fn from(value: TextAttributesWire) -> Self {
+        Self {
+            bold: value.bold,
+            faint: value.faint,
+            italic: value.italic,
+            underline: match value.underline {
+                UnderlineWire::None => Underline::None,
+                UnderlineWire::Single => Underline::Single,
+                UnderlineWire::Double => Underline::Double,
+            },
+            blink: match value.blink {
+                BlinkWire::None => Blink::None,
+                BlinkWire::Slow => Blink::Slow,
+                BlinkWire::Fast => Blink::Fast,
+            },
+            crossed_out: value.crossed_out,
+            reverse: value.reverse,
+        }
+    }
+}
+
+/// One run of a styled line: its text plus the style channels it set. `None`
+/// means that channel inherits the delivery/splice default. `link` makes the
+/// run's text clickable.
 #[derive(serde::Deserialize)]
 struct StyledRunWire {
     text: String,
     fg: Option<ColorWire>,
     bg: Option<ColorWire>,
+    attributes: Option<TextAttributesWire>,
     #[serde(default)]
     link: Option<LinkWire>,
 }
@@ -3090,7 +3163,8 @@ struct StyledRunWire {
 //   [0] line count L
 //   [1] send-link count S
 //   [2] static-tooltip count T
-//   L × { run count R, R × 5: [text length (UTF-16 units), fg, bg, link, tooltip] }
+//   L × { run count R,
+//         R × 6: [text length (UTF-16 units), fg, bg, attributes, link, tooltip] }
 //   S × 1: send text length (UTF-16 code units)  -- at the TAIL because the
 //          encoder discovers sends while walking runs, in one pass
 //   T × 1: tooltip text length (UTF-16 code units), also at the tail
@@ -3101,6 +3175,10 @@ struct StyledRunWire {
 //   1 = RGB   (low 24 bits: r<<16 | g<<8 | b)
 //   2 = ANSI  (bit 3: bold; bits 0-2: black..white index)
 //   3 = role  (0 default, 1 echo, 2 output, 3 warn)
+//
+// attributes u32: 0 = unset (delivery/splice default). Otherwise bit 31 is the
+// presence marker and bits 0..=8 carry bold, faint, italic, two-bit underline,
+// two-bit blink, crossed-out, and reverse. Presence-only is an explicit reset.
 //
 // link u32: 0 = none. Else the top 2 bits are a tag over a 30-bit index:
 //   1 = send (index into the send strings), 2 = callback (index into the
@@ -3173,10 +3251,45 @@ fn packed_color(value: u32) -> Result<Option<Color>, StyledTextOpError> {
             1 => Color::Echo,
             2 => Color::Output,
             3 => Color::Warn,
+            4 => Color::DefaultForeground { bold: true },
             _ => return Err(packed_invalid("unknown role color")),
         })),
         _ => Err(packed_invalid("unknown color tag")),
     }
+}
+
+/// Decode one packed text-attribute set. Zero is inherited/unset; bit 31
+/// distinguishes an explicit all-default reset from that unset value.
+fn packed_attributes(value: u32) -> Result<Option<TextAttributes>, StyledTextOpError> {
+    const PRESENT: u32 = 1 << 31;
+    const KNOWN: u32 = PRESENT | 0x01ff;
+    if value == 0 {
+        return Ok(None);
+    }
+    if value & PRESENT == 0 || value & !KNOWN != 0 {
+        return Err(packed_invalid("invalid styled text attributes"));
+    }
+    let underline = match (value >> 3) & 0x3 {
+        0 => Underline::None,
+        1 => Underline::Single,
+        2 => Underline::Double,
+        _ => return Err(packed_invalid("unknown underline style")),
+    };
+    let blink = match (value >> 5) & 0x3 {
+        0 => Blink::None,
+        1 => Blink::Slow,
+        2 => Blink::Fast,
+        _ => return Err(packed_invalid("unknown blink style")),
+    };
+    Ok(Some(TextAttributes {
+        bold: value & (1 << 0) != 0,
+        faint: value & (1 << 1) != 0,
+        italic: value & (1 << 2) != 0,
+        underline,
+        blink,
+        crossed_out: value & (1 << 7) != 0,
+        reverse: value & (1 << 8) != 0,
+    }))
 }
 
 /// One packed link, decoded but not yet resolved against the send/callback tables.
@@ -3284,6 +3397,7 @@ fn packed_validate(
             let units = reader.next()?;
             packed_color(reader.next()?)?;
             packed_color(reader.next()?)?;
+            packed_attributes(reader.next()?)?;
             let link = packed_link(reader.next()?)?;
             match link {
                 PackedLink::Send(index) if index >= send_count => {
@@ -3389,7 +3503,7 @@ fn packed_echo_lines(
             let style = Style {
                 fg: packed_color(reader.next()?)?.unwrap_or(default_style.fg),
                 bg: packed_color(reader.next()?)?.map_or(default_style.bg, normalize_bg),
-                attributes: default_style.attributes,
+                attributes: packed_attributes(reader.next()?)?.unwrap_or(default_style.attributes),
             };
             let packed_link = packed_link(reader.next()?)?;
             let action = match packed_link {
@@ -3671,7 +3785,7 @@ fn wire_link_to_styled(
                 } else {
                     "Right-click for menu"
                 };
-                LinkTooltip::text(Arc::from(hint), tooltip_target(&action))
+                LinkTooltip::text(Arc::from(hint), action.tooltip_target())
             })
         });
     Ok(Some(StyledLink {
@@ -3715,6 +3829,7 @@ impl StyledRunWire {
                 .as_ref()
                 .map(|bg| bg.to_color().map(normalize_bg))
                 .transpose()?,
+            attributes: self.attributes.map(Into::into),
             link: wire_link_to_styled(self.link.as_ref(), links)?,
             text: match sanitize_display_text(&self.text) {
                 std::borrow::Cow::Borrowed(_) => self.text,
@@ -4579,21 +4694,40 @@ fn parse_color_from_js(
             return Ok(Color::Rgb { r, g, b });
         }
 
-        // Check if it's an ANSI color with bold
+        // Check if it's a palette color with the legacy effective `bold` bit
+        // and, on line-style readback, the lossless raw palette bit.
         let color_key = v8::String::new(scope, "color").unwrap().into();
         let bold_key = v8::String::new(scope, "bold").unwrap().into();
+        let palette_bright_key = v8::String::new(scope, "paletteBright").unwrap().into();
 
         if let Some(color_val) = obj.get(scope, color_key) {
             let bold = obj
                 .get(scope, bold_key)
                 .is_some_and(|v| v.boolean_value(scope));
             let color_str = color_val.to_rust_string_lossy(scope);
+            let palette_bright = obj
+                .get(scope, palette_bright_key)
+                .filter(|value| !value.is_null_or_undefined())
+                .map(|value| {
+                    if value.is_boolean() {
+                        Ok(value.boolean_value(scope))
+                    } else {
+                        Err(anyhow::anyhow!("paletteBright must be a boolean"))
+                    }
+                })
+                .transpose()?
+                .unwrap_or(bold);
+            if color_str == "default" {
+                return Ok(Color::DefaultForeground {
+                    bold: palette_bright,
+                });
+            }
             let Some(ansi_color) = ansi_color_by_name(&color_str) else {
                 bail!("Unknown ANSI color: {}", color_str);
             };
             return Ok(Color::Ansi {
                 color: ansi_color,
-                bold,
+                bold: palette_bright,
             });
         }
 
@@ -4603,11 +4737,77 @@ fn parse_color_from_js(
     }
 }
 
+fn object_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+) -> Result<v8::Local<'s, v8::Value>, AnyError> {
+    let key = v8::String::new(scope, name).unwrap().into();
+    object
+        .get(scope, key)
+        .ok_or_else(|| anyhow::anyhow!("missing text attribute {name}"))
+}
+
+fn boolean_attribute<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+) -> Result<bool, AnyError> {
+    let value = object_property(scope, object, name)?;
+    if !value.is_boolean() {
+        bail!("text attribute {name} must be a boolean");
+    }
+    Ok(value.boolean_value(scope))
+}
+
+fn string_attribute<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+) -> Result<String, AnyError> {
+    let value = object_property(scope, object, name)?;
+    if !value.is_string() {
+        bail!("text attribute {name} must be a string");
+    }
+    Ok(value.to_rust_string_lossy(scope))
+}
+
+fn parse_attributes_from_js<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Result<TextAttributes, AnyError> {
+    let object = value
+        .to_object(scope)
+        .ok_or_else(|| anyhow::anyhow!("attributes must be an object"))?;
+    let underline = match string_attribute(scope, object, "underline")?.as_str() {
+        "none" => Underline::None,
+        "single" => Underline::Single,
+        "double" => Underline::Double,
+        other => bail!("unknown underline style: {other}"),
+    };
+    let blink = match string_attribute(scope, object, "blink")?.as_str() {
+        "none" => Blink::None,
+        "slow" => Blink::Slow,
+        "fast" => Blink::Fast,
+        other => bail!("unknown blink style: {other}"),
+    };
+    Ok(TextAttributes {
+        bold: boolean_attribute(scope, object, "bold")?,
+        faint: boolean_attribute(scope, object, "faint")?,
+        italic: boolean_attribute(scope, object, "italic")?,
+        underline,
+        blink,
+        crossed_out: boolean_attribute(scope, object, "crossedOut")?,
+        reverse: boolean_attribute(scope, object, "reverse")?,
+    })
+}
+
 /// Helper function to create a Style from JavaScript values
-fn parse_style_from_js(
-    scope: &mut v8::PinScope,
-    fg_val: Option<v8::Local<v8::Value>>,
-    bg_val: Option<v8::Local<v8::Value>>,
+fn parse_style_from_js<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    fg_val: Option<v8::Local<'s, v8::Value>>,
+    bg_val: Option<v8::Local<'s, v8::Value>>,
+    attributes_val: Option<v8::Local<'s, v8::Value>>,
 ) -> Result<Style, AnyError> {
     let fg = match fg_val {
         Some(val) => parse_color_from_js(scope, val)?,
@@ -4619,22 +4819,24 @@ fn parse_style_from_js(
         None => Color::DefaultBackground,
     };
 
-    Ok(Style {
-        fg,
-        bg,
-        ..Style::DEFAULT
-    })
+    let attributes = match attributes_val {
+        Some(value) => parse_attributes_from_js(scope, value)?,
+        None => TextAttributes::DEFAULT,
+    };
+
+    Ok(Style { fg, bg, attributes })
 }
 
 #[op2(fast)]
-fn op_smudgy_insert(
-    scope: &mut v8::PinScope,
+fn op_smudgy_insert<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     state: &mut OpState,
     #[string] text: String,
     begin: u32,
     end: u32,
-    fg_color: v8::Local<v8::Value>,
-    bg_color: v8::Local<v8::Value>,
+    fg_color: v8::Local<'s, v8::Value>,
+    bg_color: v8::Local<'s, v8::Value>,
+    attributes: v8::Local<'s, v8::Value>,
 ) -> Result<(), LineCallError> {
     // Inserting into the current line changes what the user sees (→ change-display).
     ensure(grants(state).change_display, "change-display")?;
@@ -4651,6 +4853,11 @@ fn op_smudgy_insert(
             None
         } else {
             Some(bg_color)
+        },
+        if attributes.is_null_or_undefined() {
+            None
+        } else {
+            Some(attributes)
         },
     ) {
         Ok(style) => style,
@@ -4694,13 +4901,14 @@ fn op_smudgy_replace(
 }
 
 #[op2(fast)]
-fn op_smudgy_highlight(
-    scope: &mut v8::PinScope,
+fn op_smudgy_highlight<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     state: &mut OpState,
     begin: u32,
     end: u32,
-    fg_color: v8::Local<v8::Value>,
-    bg_color: v8::Local<v8::Value>,
+    fg_color: v8::Local<'s, v8::Value>,
+    bg_color: v8::Local<'s, v8::Value>,
+    attributes: v8::Local<'s, v8::Value>,
 ) -> Result<(), LineCallError> {
     ensure(grants(state).change_display, "change-display")?;
     ensure_current_line(state)?;
@@ -4716,6 +4924,11 @@ fn op_smudgy_highlight(
             None
         } else {
             Some(bg_color)
+        },
+        if attributes.is_null_or_undefined() {
+            None
+        } else {
+            Some(attributes)
         },
     ) {
         Ok(style) => style,
@@ -6454,7 +6667,29 @@ fn ansi_color_token(color: AnsiColor) -> &'static str {
 /// `highlightAt`/`insert`. RGB -> `{ r, g, b }`; ANSI -> `{ color, bold }` (the object
 /// form, so `bold: false` survives — the bare `"red"` token implies bold); the special slots
 /// and the theme default -> their string tokens (`"echo"`/`"output"`/`"warn"`/`"default"`).
-fn color_to_js<'s>(scope: &mut v8::PinScope<'s, '_>, color: Color) -> v8::Local<'s, v8::Value> {
+fn palette_color_to_js<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    token: &str,
+    legacy_bold: bool,
+    palette_bright: bool,
+) -> v8::Local<'s, v8::Value> {
+    let obj = v8::Object::new(scope);
+    let color_key = v8::String::new(scope, "color").unwrap().into();
+    let color_value = v8::String::new(scope, token).unwrap().into();
+    obj.create_data_property(scope, color_key, color_value);
+    for (name, value) in [("bold", legacy_bold), ("paletteBright", palette_bright)] {
+        let key = v8::String::new(scope, name).unwrap().into();
+        let value = v8::Boolean::new(scope, value).into();
+        obj.create_data_property(scope, key, value);
+    }
+    obj.into()
+}
+
+fn color_to_js<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    color: Color,
+    attribute_bold: bool,
+) -> v8::Local<'s, v8::Value> {
     match color {
         Color::Rgb { r, g, b } => {
             let obj = v8::Object::new(scope);
@@ -6466,24 +6701,52 @@ fn color_to_js<'s>(scope: &mut v8::PinScope<'s, '_>, color: Color) -> v8::Local<
             obj.into()
         }
         Color::Ansi { color, bold } => {
-            let obj = v8::Object::new(scope);
-            let color_key = v8::String::new(scope, "color").unwrap().into();
-            let color_val = v8::String::new(scope, ansi_color_token(color))
-                .unwrap()
-                .into();
-            obj.create_data_property(scope, color_key, color_val);
-            let bold_key = v8::String::new(scope, "bold").unwrap().into();
-            let bold_val = v8::Boolean::new(scope, bold).into();
-            obj.create_data_property(scope, bold_key, bold_val);
-            obj.into()
+            palette_color_to_js(scope, ansi_color_token(color), bold || attribute_bold, bold)
         }
         Color::Echo => v8::String::new(scope, "echo").unwrap().into(),
         Color::Output => v8::String::new(scope, "output").unwrap().into(),
         Color::Warn => v8::String::new(scope, "warn").unwrap().into(),
+        // Keep the released readback contract: the theme default is always the
+        // string token. Font weight remains in `attributes`; `spans_to_js`
+        // carries the independent raw palette bit as sibling metadata.
         Color::DefaultForeground { .. } | Color::DefaultBackground => {
             v8::String::new(scope, "default").unwrap().into()
         }
     }
+}
+
+fn attributes_to_js<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    attributes: TextAttributes,
+) -> v8::Local<'s, v8::Object> {
+    let obj = v8::Object::new(scope);
+    for (name, value) in [
+        ("bold", attributes.bold),
+        ("faint", attributes.faint),
+        ("italic", attributes.italic),
+        ("crossedOut", attributes.crossed_out),
+        ("reverse", attributes.reverse),
+    ] {
+        let key = v8::String::new(scope, name).unwrap().into();
+        let value = v8::Boolean::new(scope, value).into();
+        obj.create_data_property(scope, key, value);
+    }
+    let underline = match attributes.underline {
+        Underline::None => "none",
+        Underline::Single => "single",
+        Underline::Double => "double",
+    };
+    let blink = match attributes.blink {
+        Blink::None => "none",
+        Blink::Slow => "slow",
+        Blink::Fast => "fast",
+    };
+    for (name, value) in [("underline", underline), ("blink", blink)] {
+        let key = v8::String::new(scope, name).unwrap().into();
+        let value = v8::String::new(scope, value).unwrap().into();
+        obj.create_data_property(scope, key, value);
+    }
+    obj
 }
 
 /// Serialize a line's spans to the styles array: `[{ begin, end, fg, bg }]`, each color in
@@ -6513,11 +6776,21 @@ fn spans_to_js<'s>(
             .into();
             obj.create_data_property(scope, end_key, end_val);
             let fg_key = v8::String::new(scope, "fg").unwrap().into();
-            let fg_val = color_to_js(scope, span.style.fg);
+            let fg_val = color_to_js(scope, span.style.fg, span.style.attributes.bold);
             obj.create_data_property(scope, fg_key, fg_val);
             let bg_key = v8::String::new(scope, "bg").unwrap().into();
-            let bg_val = color_to_js(scope, span.style.bg);
+            let bg_val = color_to_js(scope, span.style.bg, false);
             obj.create_data_property(scope, bg_key, bg_val);
+            let attributes_key = v8::String::new(scope, "attributes").unwrap().into();
+            let attributes_val = attributes_to_js(scope, span.style.attributes).into();
+            obj.create_data_property(scope, attributes_key, attributes_val);
+            if matches!(span.style.fg, Color::DefaultForeground { bold: true }) {
+                let key = v8::String::new(scope, "foregroundPaletteBright")
+                    .unwrap()
+                    .into();
+                let value = v8::Boolean::new(scope, true).into();
+                obj.create_data_property(scope, key, value);
+            }
             obj.into()
         })
         .collect();
@@ -6582,15 +6855,16 @@ fn op_smudgy_buffer_get_styles<'s>(
 }
 
 #[op2(fast)]
-fn op_smudgy_line_insert(
-    scope: &mut v8::PinScope,
+fn op_smudgy_line_insert<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     state: &mut OpState,
     line_number: u32,
     #[string] text: String,
     begin: u32,
     end: u32,
-    fg_color: v8::Local<v8::Value>,
-    bg_color: v8::Local<v8::Value>,
+    fg_color: v8::Local<'s, v8::Value>,
+    bg_color: v8::Local<'s, v8::Value>,
+    attributes: v8::Local<'s, v8::Value>,
 ) -> Result<(), NotCapable> {
     // Editing an already-emitted buffer line also changes what the user sees.
     ensure(grants(state).change_display, "change-display")?;
@@ -6605,6 +6879,11 @@ fn op_smudgy_line_insert(
             None
         } else {
             Some(bg_color)
+        },
+        if attributes.is_null_or_undefined() {
+            None
+        } else {
+            Some(attributes)
         },
     ) {
         Ok(style) => style,
@@ -6650,14 +6929,15 @@ fn op_smudgy_line_replace(
 }
 
 #[op2(fast)]
-fn op_smudgy_line_highlight(
-    scope: &mut v8::PinScope,
+fn op_smudgy_line_highlight<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     line_number: u32,
     state: &mut OpState,
     begin: u32,
     end: u32,
-    fg_color: v8::Local<v8::Value>,
-    bg_color: v8::Local<v8::Value>,
+    fg_color: v8::Local<'s, v8::Value>,
+    bg_color: v8::Local<'s, v8::Value>,
+    attributes: v8::Local<'s, v8::Value>,
 ) -> Result<(), NotCapable> {
     ensure(grants(state).change_display, "change-display")?;
     // Parse the style
@@ -6672,6 +6952,11 @@ fn op_smudgy_line_highlight(
             None
         } else {
             Some(bg_color)
+        },
+        if attributes.is_null_or_undefined() {
+            None
+        } else {
+            Some(attributes)
         },
     ) {
         Ok(style) => style,
@@ -6777,11 +7062,11 @@ fn op_smudgy_fallthrough(state: &mut OpState, value: bool) -> Result<(), Fallthr
 mod tests {
     use super::{
         AnsiColor, Color, ECHO_DEFAULT_STYLE, EventSourceFilter, IsolateId, LinkContext, SessionId,
-        canonical_procedure, fold_name, packed_echo_lines, packed_validate, param_read_allowed,
-        single_line_text,
+        canonical_procedure, fold_name, packed_attributes, packed_echo_lines, packed_validate,
+        param_read_allowed, single_line_text,
     };
     use crate::session::runtime::store::ProducerKey;
-    use crate::session::styled_line::LinkAction;
+    use crate::session::styled_line::{Blink, LinkAction, TextAttributes, Underline};
     use std::sync::Arc;
 
     // ---- Packed styled-echo payload ----------------------------------------------
@@ -6790,6 +7075,7 @@ mod tests {
     const RGB_123: u32 = 0x0101_0203; // rgb(1, 2, 3)
     const ANSI_RED_BRIGHT: u32 = 0x0200_0009;
     const ROLE_DEFAULT: u32 = 0x0300_0000;
+    const ATTR_PRESENT: u32 = 0x8000_0000;
     const LINK_SEND_0: u32 = 0x4000_0000;
     const LINK_CB_0: u32 = 0x8000_0000;
 
@@ -6810,6 +7096,14 @@ mod tests {
         assert_eq!(
             single_line_text("one\r\ntwo\tthree").as_deref(),
             Some("one  two three")
+        );
+        assert_eq!(
+            single_line_text("emoji \u{1f469}\u{200d}\u{1f4bb}").as_deref(),
+            Some("emoji \u{1f469}\u{200d}\u{1f4bb}")
+        );
+        assert_eq!(
+            single_line_text("bidi\u{202e}").as_deref(),
+            Some("bidi\\u{202E}")
         );
     }
 
@@ -6844,7 +7138,9 @@ mod tests {
             0,
             0,
             0,
+            0,
             1,
+            0,
             0,
             0,
             0, // line 1: 2 runs
@@ -6853,6 +7149,7 @@ mod tests {
             2,
             ANSI_RED_BRIGHT,
             ROLE_DEFAULT,
+            0,
             0,
             0, // line 2: 1 run
         ];
@@ -6903,9 +7200,11 @@ mod tests {
             4,
             0,
             0,
+            0,
             LINK_SEND_0,
             0,
             2,
+            0,
             0,
             0,
             LINK_CB_0,
@@ -6940,9 +7239,11 @@ mod tests {
             2,
             0,
             0,
+            0,
             LINK_SEND_0,
             0x4000_0000,
             2,
+            0,
             0,
             0,
             LINK_CB_0,
@@ -6984,7 +7285,7 @@ mod tests {
     fn packed_non_bmp_text_maps_utf16_units_to_byte_offsets() {
         // "\u{1F600}!" is 3 UTF-16 units and 5 UTF-8 bytes; the differently-colored
         // "?" pins the span boundary at the byte (not unit) offset.
-        let records = [1, 0, 0, 2, 3, 0, 0, 0, 0, 1, RGB_123, 0, 0, 0];
+        let records = [1, 0, 0, 2, 3, 0, 0, 0, 0, 0, 1, RGB_123, 0, 0, 0, 0];
         let lines = decode("\u{1F600}!?", &records, 0, Vec::new()).expect("valid payload");
         assert_eq!(lines[0].text, "\u{1F600}!?");
         assert_eq!(
@@ -7000,8 +7301,41 @@ mod tests {
     #[test]
     fn packed_control_characters_are_stripped_not_fatal() {
         // "a\rb" is dirty data: the \r is stripped, the run still lands.
-        let lines = decode("a\rb", &[1, 0, 0, 1, 3, 0, 0, 0, 0], 0, Vec::new()).expect("valid");
+        let lines = decode("a\rb", &[1, 0, 0, 1, 3, 0, 0, 0, 0, 0], 0, Vec::new()).expect("valid");
         assert_eq!(lines[0].text, "ab");
+    }
+
+    #[test]
+    fn packed_attributes_distinguish_inheritance_reset_and_all_variants() {
+        assert_eq!(packed_attributes(0).unwrap(), None);
+        assert_eq!(
+            packed_attributes(ATTR_PRESENT).unwrap(),
+            Some(TextAttributes::DEFAULT)
+        );
+        let all = ATTR_PRESENT
+            | (1 << 0)
+            | (1 << 1)
+            | (1 << 2)
+            | (2 << 3)
+            | (2 << 5)
+            | (1 << 7)
+            | (1 << 8);
+        assert_eq!(
+            packed_attributes(all).unwrap(),
+            Some(TextAttributes {
+                bold: true,
+                faint: true,
+                italic: true,
+                underline: Underline::Double,
+                blink: Blink::Fast,
+                crossed_out: true,
+                reverse: true,
+            })
+        );
+        assert!(packed_attributes(ATTR_PRESENT | (3 << 3)).is_err());
+        assert!(packed_attributes(ATTR_PRESENT | (3 << 5)).is_err());
+        assert!(packed_attributes(ATTR_PRESENT | (1 << 9)).is_err());
+        assert!(packed_attributes(1).is_err());
     }
 
     #[test]
@@ -7010,81 +7344,81 @@ mod tests {
             (
                 "newline in a run",
                 "a\nb",
-                vec![1, 0, 0, 1, 3, 0, 0, 0, 0],
+                vec![1, 0, 0, 1, 3, 0, 0, 0, 0, 0],
                 0,
             ),
             (
                 "unknown color tag",
                 "x",
-                vec![1, 0, 0, 1, 1, 0x0400_0000, 0, 0, 0],
+                vec![1, 0, 0, 1, 1, 0x0400_0000, 0, 0, 0, 0],
                 0,
             ),
             (
                 "unknown role color",
                 "x",
-                vec![1, 0, 0, 1, 1, 0x0300_0004, 0, 0, 0],
+                vec![1, 0, 0, 1, 1, 0x0300_0005, 0, 0, 0, 0],
                 0,
             ),
             (
                 "unknown ansi index",
                 "x",
-                vec![1, 0, 0, 1, 1, 0x0200_0010, 0, 0, 0],
+                vec![1, 0, 0, 1, 1, 0x0200_0010, 0, 0, 0, 0],
                 0,
             ),
             (
                 "unknown link tag",
                 "x",
-                vec![1, 0, 0, 1, 1, 0, 0, 0xC000_0000, 0],
+                vec![1, 0, 0, 1, 1, 0, 0, 0, 0xC000_0000, 0],
                 0,
             ),
             (
                 "nonzero link with tag 0",
                 "x",
-                vec![1, 0, 0, 1, 1, 0, 0, 1, 0],
+                vec![1, 0, 0, 1, 1, 0, 0, 0, 1, 0],
                 0,
             ),
             (
                 "callback index out of range",
                 "x",
-                vec![1, 0, 0, 1, 1, 0, 0, LINK_CB_0, 0],
+                vec![1, 0, 0, 1, 1, 0, 0, 0, LINK_CB_0, 0],
                 0,
             ),
             (
                 "send index out of range",
                 "x",
-                vec![1, 0, 0, 1, 1, 0, 0, LINK_SEND_0, 0],
+                vec![1, 0, 0, 1, 1, 0, 0, 0, LINK_SEND_0, 0],
                 0,
             ),
             (
                 "unknown tooltip tag",
                 "x",
-                vec![1, 0, 0, 1, 1, 0, 0, 0, 0xC000_0000],
+                vec![1, 0, 0, 1, 1, 0, 0, 0, 0, 0xC000_0000],
                 0,
             ),
             (
                 "tooltip callback index out of range",
                 "x",
-                vec![1, 0, 0, 1, 1, 0, 0, 0, LINK_CB_0],
+                vec![1, 0, 0, 1, 1, 0, 0, 0, 0, LINK_CB_0],
                 0,
             ),
             (
                 "tooltip text index out of range",
                 "x",
-                vec![1, 0, 0, 1, 1, 0, 0, 0, LINK_SEND_0],
+                vec![1, 0, 0, 1, 1, 0, 0, 0, 0, LINK_SEND_0],
                 0,
             ),
             ("truncated records", "x", vec![1, 0, 0, 1, 1, 0], 0),
             (
                 "text shorter than records",
                 "x",
-                vec![1, 0, 0, 1, 2, 0, 0, 0, 0],
+                vec![1, 0, 0, 1, 2, 0, 0, 0, 0, 0],
                 0,
             ),
-            ("trailing text", "xy", vec![1, 0, 0, 1, 1, 0, 0, 0, 0], 0),
+            ("trailing text", "xy", vec![1, 0, 0, 1, 1, 0, 0, 0, 0, 0], 0),
             (
                 "trailing records",
                 "x",
-                vec![1, 0, 0, 1, 1, 0, 0, 0, 0, 0],
+                vec![1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0],
                 0,
             ),
             ("send count past table", "x", vec![1, 9, 0, 0], 0),
@@ -7092,7 +7426,7 @@ mod tests {
             (
                 "surrogate split",
                 "\u{1F600}",
-                vec![1, 0, 0, 1, 1, 0, 0, 0, 0],
+                vec![1, 0, 0, 1, 1, 0, 0, 0, 0, 0],
                 0,
             ),
         ];

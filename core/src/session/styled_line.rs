@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -327,7 +328,7 @@ impl LinkAction {
     }
 
     /// The underlying primary target, even when activation is disabled. Used
-    /// only for honest tooltip disclosure.
+    /// only for honest target disclosure.
     #[must_use]
     pub fn disclosed_target(&self) -> Option<&Self> {
         match self {
@@ -337,6 +338,43 @@ impl LinkAction {
             } => primary.disclosed_target(),
             Self::Configured { primary: None, .. } => None,
             _ => Some(self),
+        }
+    }
+
+    /// Complete, unescaped text for the action this link would perform.
+    /// Configured wrappers are unwrapped; callbacks and actionless links
+    /// disclose nothing. Callers must escape this before rendering it.
+    #[must_use]
+    pub fn disclosure_target_text(&self) -> Option<Cow<'_, str>> {
+        let target = self.disclosed_target()?;
+        match target {
+            Self::Send(command) | Self::OpenUrl(command) => Some(Cow::Borrowed(command.as_ref())),
+            Self::ServerSend(command) => Some(Cow::Owned(format!("send:{command}"))),
+            Self::Prompt(command) => Some(Cow::Owned(format!("prompt:{command}"))),
+            Self::Callback { .. } | Self::Configured { .. } => None,
+        }
+    }
+
+    /// Safe, prefix-bounded tooltip copy for the action this link would
+    /// perform. Invisible target bytes are written explicitly so two actions
+    /// cannot look identical while sending or opening different data.
+    #[must_use]
+    pub fn tooltip_target(&self) -> Option<Arc<str>> {
+        let target = self.disclosed_target()?;
+        match target {
+            Self::Send(command) | Self::OpenUrl(command) => {
+                Some(match tooltip_action_target(command) {
+                    Cow::Borrowed(_) => Arc::clone(command),
+                    Cow::Owned(display) => Arc::from(display),
+                })
+            }
+            Self::ServerSend(command) => Some(Arc::from(
+                tooltip_action_target(&format!("send:{command}")).as_ref(),
+            )),
+            Self::Prompt(command) => Some(Arc::from(
+                tooltip_action_target(&format!("prompt:{command}")).as_ref(),
+            )),
+            Self::Callback { .. } | Self::Configured { .. } => None,
         }
     }
 
@@ -389,6 +427,20 @@ impl LinkAction {
             _ => None,
         }
     }
+}
+
+/// Bound tooltip shaping without limiting the underlying script-authored
+/// action. The ellipsis makes the disclosure truncation explicit.
+fn tooltip_action_target(target: &str) -> Cow<'_, str> {
+    const MAX_CHARS: usize = 512;
+
+    if let Some((cutoff, _)) = target.char_indices().nth(MAX_CHARS) {
+        let mut escaped =
+            escape_invisible_text(&target[..cutoff], InvisiblePolicy::ActionTarget).into_owned();
+        escaped.push('\u{2026}');
+        return Cow::Owned(escaped);
+    }
+    escape_invisible_text(target, InvisiblePolicy::ActionTarget)
 }
 
 /// A right-click menu attached to a link-styled range.
@@ -626,7 +678,7 @@ pub struct LinkSpan {
     /// `None` means no OSC-authored style and enables Smudgy's fallback link
     /// affordance. `Some`, including an empty style, follows authored OSC
     /// semantics exactly.
-    pub style: Option<LinkStyle>,
+    pub style: Option<Arc<LinkStyle>>,
 }
 
 /// Link metadata on one styled-text run before its byte range is known.
@@ -634,7 +686,7 @@ pub struct LinkSpan {
 pub struct StyledLink {
     pub action: LinkAction,
     pub tooltip: Option<LinkTooltip>,
-    pub style: Option<LinkStyle>,
+    pub style: Option<Arc<LinkStyle>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1107,6 +1159,92 @@ pub fn sanitize_display_text(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// How invisible Unicode is handled in user-visible copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvisiblePolicy {
+    /// Labels, menu titles, and tooltip prose. Joiners, variation selectors,
+    /// directional marks, and tag characters reach the shaper so authored
+    /// grapheme sequences and bidirectional labels remain intact.
+    Prose,
+    /// Commands and URLs. Every invisible byte is disclosed explicitly
+    /// because it changes the action even when the rendered text looks equal.
+    ActionTarget,
+}
+
+/// True for an invisible character that can make rendered text conceal its
+/// underlying bytes. Ordinary controls are handled separately by
+/// [`push_escaped_char`] so callers auditing source text do not flag every
+/// newline.
+#[must_use]
+pub fn deceptive_invisible(c: char, policy: InvisiblePolicy) -> bool {
+    let shaping_control = matches!(
+        c,
+        '\u{061c}'
+            | '\u{180b}'..='\u{180d}'
+            | '\u{200c}'..='\u{200f}'
+            | '\u{fe00}'..='\u{fe0f}'
+    ) || ('\u{e0000}'..='\u{e007f}').contains(&c)
+        || ('\u{e0100}'..='\u{e01ef}').contains(&c);
+    if policy == InvisiblePolicy::Prose && shaping_control {
+        return false;
+    }
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{061c}'
+            | '\u{115f}'
+            | '\u{1160}'
+            | '\u{17b4}'
+            | '\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}'
+            | '\u{e0100}'..='\u{e01ef}'
+    )
+}
+
+fn requires_explicit_escape(c: char, policy: InvisiblePolicy) -> bool {
+    c.is_control()
+        || deceptive_invisible(c, policy)
+        || (policy == InvisiblePolicy::ActionTarget && matches!(c, '\\' | '\u{2028}' | '\u{2029}'))
+}
+
+/// Append one display-safe character under `policy`. Action targets also
+/// escape literal backslashes so escaped Unicode notation cannot be forged by
+/// ordinary target text.
+pub fn push_escaped_char(out: &mut String, c: char, policy: InvisiblePolicy) {
+    if policy == InvisiblePolicy::ActionTarget && c == '\\' {
+        out.push_str("\\\\");
+    } else if requires_explicit_escape(c, policy) {
+        write!(out, "\\u{{{:X}}}", u32::from(c)).expect("writing to a String cannot fail");
+    } else {
+        out.push(c);
+    }
+}
+
+/// Escape control and deceptive invisible characters while borrowing already
+/// safe text. Action targets additionally escape literal backslashes and
+/// Unicode line/paragraph separators to keep disclosures injective and on one
+/// visual line.
+#[must_use]
+pub fn escape_invisible_text(text: &str, policy: InvisiblePolicy) -> Cow<'_, str> {
+    if !text.chars().any(|c| requires_explicit_escape(c, policy)) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        push_escaped_char(&mut out, c, policy);
+    }
+    Cow::Owned(out)
+}
+
 impl std::ops::Deref for StyledLine {
     type Target = str;
 
@@ -1565,6 +1703,34 @@ mod tests {
     }
 
     #[test]
+    fn authored_link_style_is_shared_across_clones_and_line_surgery() {
+        let text_style = create_test_style(AnsiColor::White, false);
+        let link_style = Arc::new(LinkStyle::default());
+        let styled_link = StyledLink {
+            action: send_link("look"),
+            tooltip: None,
+            style: Some(Arc::clone(&link_style)),
+        };
+        let line =
+            StyledLine::from_linked_runs(&[("link", text_style, Some(styled_link))], text_style);
+
+        assert!(std::mem::size_of::<Option<Arc<LinkStyle>>>() < std::mem::size_of::<LinkStyle>());
+        assert!(Arc::ptr_eq(
+            line.links[0].style.as_ref().expect("authored style"),
+            &link_style
+        ));
+
+        let split = line.insert("-", 1, 3, text_style);
+        assert_eq!(split.links.len(), 2);
+        assert!(
+            split
+                .links
+                .iter()
+                .all(|link| Arc::ptr_eq(link.style.as_ref().expect("authored style"), &link_style))
+        );
+    }
+
+    #[test]
     fn from_styled_runs_links_merge_across_style_boundaries() {
         let red = create_test_style(AnsiColor::Red, true);
         let green = create_test_style(AnsiColor::Green, true);
@@ -1762,7 +1928,10 @@ mod tests {
 
 #[cfg(test)]
 mod sanitize_tests {
-    use super::{Cow, StyledLine, sanitize_display_text};
+    use super::{
+        Cow, InvisiblePolicy, LinkAction, StyledLine, escape_invisible_text, sanitize_display_text,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn clean_text_borrows() {
@@ -1785,6 +1954,79 @@ mod sanitize_tests {
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].begin_pos, 0);
         assert_eq!(line.spans[0].end_pos, line.text.len());
+    }
+
+    #[test]
+    fn invisible_policies_preserve_prose_shaping_but_disclose_action_bytes() {
+        let emoji = "\u{1f469}\u{200d}\u{1f4bb}\u{fe0f}\u{e0067}\u{e0100}";
+        assert!(matches!(
+            escape_invisible_text(emoji, InvisiblePolicy::Prose),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            escape_invisible_text(emoji, InvisiblePolicy::ActionTarget),
+            "\u{1f469}\\u{200D}\u{1f4bb}\\u{FE0F}\\u{E0067}\\u{E0100}"
+        );
+        assert_eq!(
+            escape_invisible_text("a\u{202e}b\n", InvisiblePolicy::Prose),
+            "a\\u{202E}b\\u{A}"
+        );
+        let directional_marks = "\u{061c}\u{200e}\u{200f}";
+        assert!(matches!(
+            escape_invisible_text(directional_marks, InvisiblePolicy::Prose),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            escape_invisible_text(directional_marks, InvisiblePolicy::ActionTarget),
+            "\\u{61C}\\u{200E}\\u{200F}"
+        );
+    }
+
+    #[test]
+    fn action_target_escaping_is_injective_and_single_line() {
+        let directional_override =
+            escape_invisible_text("actual:\u{202e}", InvisiblePolicy::ActionTarget);
+        let forged_notation =
+            escape_invisible_text("actual:\\u{202E}", InvisiblePolicy::ActionTarget);
+        assert_eq!(directional_override, "actual:\\u{202E}");
+        assert_eq!(forged_notation, "actual:\\\\u{202E}");
+        assert_ne!(directional_override, forged_notation);
+
+        assert_eq!(
+            escape_invisible_text("a\u{2028}b\u{2029}c", InvisiblePolicy::ActionTarget),
+            "a\\u{2028}b\\u{2029}c"
+        );
+        assert!(matches!(
+            escape_invisible_text("literal\\slash\u{2028}", InvisiblePolicy::Prose),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn link_action_targets_unwrap_escape_and_bound_only_tooltips() {
+        let action = LinkAction::Configured {
+            primary: Some(Box::new(LinkAction::ServerSend(Arc::from("look\u{200d}")))),
+            disabled: true,
+            primary_enabled: false,
+            menu: None,
+            menu_on_left_click: false,
+            protocol: None,
+        };
+        assert_eq!(
+            action.tooltip_target().as_deref(),
+            Some("send:look\\u{200D}")
+        );
+
+        let command: Arc<str> = Arc::from("x".repeat(600));
+        let action = LinkAction::Send(command.clone());
+        let displayed = action.tooltip_target().expect("send target");
+        let disclosure = action
+            .disclosure_target_text()
+            .expect("send disclosure target");
+        assert_eq!(command.chars().count(), 600, "the action is not capped");
+        assert_eq!(disclosure.chars().count(), 600);
+        assert_eq!(displayed.chars().count(), 513);
+        assert!(displayed.ends_with('\u{2026}'));
     }
 }
 

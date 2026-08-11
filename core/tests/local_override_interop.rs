@@ -69,7 +69,8 @@ fn offline_package_client() -> PackageApiClient {
 }
 
 /// Spawn the session against the REAL cloud-backed provider (no in-memory override), collect
-/// every appended line (notices included) until quiet.
+/// every appended line (notices included) until quiet. Callers must use a session ID unique within
+/// this test binary because the runtime registry is process-global and these tests run in parallel.
 async fn run_session_real_provider(session_id: u32, server: &str) -> Vec<String> {
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(session_id),
@@ -494,7 +495,7 @@ async fn consuming_an_undeclared_producer_is_refused_at_load() {
     );
     install_untrusted(server, "smudgy://local/arctic-hud");
 
-    let lines = run_session_real_provider(9804, server).await;
+    let lines = run_session_real_provider(9810, server).await;
 
     assert!(
         !has_line(&lines, "HUD_RAN"),
@@ -561,7 +562,7 @@ async fn two_consumers_across_isolates_each_stay_stumble_free() {
     );
     install_untrusted(server, "smudgy://local/hud-sandbox");
 
-    let lines = run_session_real_provider(9805, server).await;
+    let lines = run_session_real_provider(9811, server).await;
 
     assert!(has_line(&lines, "A_RAN") && has_line(&lines, "B_RAN"), "both consumers must load; transcript:\n{lines:#?}");
     assert!(
@@ -606,7 +607,7 @@ async fn a_required_but_unconsumed_producer_does_not_stumble() {
     );
     install_trusted(server, "smudgy://local/arctic-hud");
 
-    let lines = run_session_real_provider(9806, server).await;
+    let lines = run_session_real_provider(9812, server).await;
 
     assert!(has_line(&lines, "HUD_RAN"), "the requirer must load; transcript:\n{lines:#?}");
     assert!(has_line(&lines, "PROMPT_RAN"), "the required producer must run in its own home; transcript:\n{lines:#?}");

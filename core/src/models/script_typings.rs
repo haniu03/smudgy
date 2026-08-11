@@ -1245,8 +1245,8 @@ export function make() { return createEvent('dynamic'); }
         );
         sources.insert(
             "consumer.ts".to_string(),
-            "import { events, session, mapper, getSessions, createHotkey, line, createDerived } from \"smudgy:core\";\n\
-             import type { ConsumerOf, Payload } from \"smudgy:core\";\n\
+            "import { events, session, mapper, getSessions, createHotkey, line, createDerived, style } from \"smudgy:core\";\n\
+             import type { ConsumerOf, Payload, TextAttributes } from \"smudgy:core\";\n\
              import { connect, send } from \"smudgy:events/sys\";\n\
              import { room } from \"smudgy:events/map\";\n\
              import type { PromptState, PromptEvent, RefreshRequest } from \"./producer.ts\";\n\
@@ -1303,6 +1303,10 @@ export function make() { return createEvent('dynamic'); }
                createHotkey({ key: \"Code(KeyT)\", modifiers: [\"alt\", \"shift\"] }, () => {}).delete();\n\
                createHotkey({ key: \"Character(é)\", modifiers: [\"super\"] }, () => {}).delete();\n\
                const t: string = line.text; void t;\n\
+               const attributes: TextAttributes = { bold: true, faint: false, italic: true, underline: \"double\", blink: \"fast\", crossedOut: true, reverse: false };\n\
+               void style({ fg: { color: \"red\", bold: true, paletteBright: false }, attributes })`styled`;\n\
+               const span = line.styles?.[0];\n\
+               if (span) { const raw: boolean | undefined = typeof span.fg === \"object\" && \"paletteBright\" in span.fg ? span.fg.paletteBright : span.foregroundPaletteBright; void raw; line.highlightAt(span.begin, span.end, span); }\n\
                const a = mapper.areas[0];\n\
                if (a) { const r = a.room(1); void r; const id: readonly [number, number] = a.id; void id; }\n\
              }\n"

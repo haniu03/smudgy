@@ -166,6 +166,11 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
                             seen.push(Seen::AppendTo(*key, line.text.clone()));
                         }
                         BufferUpdate::RetractOpenLine => seen.push(Seen::Retract),
+                        BufferUpdate::BeginOpenLineReplacement => seen.push(Seen::Retract),
+                        BufferUpdate::FinishOpenLineReplacement(Some(line)) => {
+                            seen.push(Seen::Append(line.text.clone()));
+                        }
+                        BufferUpdate::FinishOpenLineReplacement(None) => {}
                         BufferUpdate::Clear(_) | BufferUpdate::PromptBoundary => {}
                     }
                 }
@@ -643,6 +648,11 @@ async fn redirect_to_widgets_throws_and_echo_before_close_delivers() {
                             seen.push(Seen::AppendTo(*key, line.text.clone()));
                         }
                         BufferUpdate::RetractOpenLine => seen.push(Seen::Retract),
+                        BufferUpdate::BeginOpenLineReplacement => seen.push(Seen::Retract),
+                        BufferUpdate::FinishOpenLineReplacement(Some(line)) => {
+                            seen.push(Seen::Append(line.text.clone()));
+                        }
+                        BufferUpdate::FinishOpenLineReplacement(None) => {}
                         BufferUpdate::Clear(_) | BufferUpdate::PromptBoundary => {}
                     }
                 }

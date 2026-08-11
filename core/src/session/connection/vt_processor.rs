@@ -1,16 +1,18 @@
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 use vtparse::{CsiParam, VTActor, VTParser};
 
+use crate::json::deep_merge;
+use crate::models::server::link_url_host;
 use crate::session::{
     runtime::RuntimeAction,
     styled_line::{
-        LinkAction, LinkColor, LinkDecoration, LinkMenu, LinkMenuItem, LinkMenuTitle, LinkProtocol,
-        LinkSelection, LinkSpan, LinkStyle, LinkTextStyle, LinkTooltip, LinkTooltipText,
-        LinkVisibility, LinkVisibilityAction, LinkVisibilityExpire, Style, StyledLine, VtSpan,
+        InvisiblePolicy, LinkAction, LinkColor, LinkDecoration, LinkMenu, LinkMenuItem,
+        LinkMenuTitle, LinkProtocol, LinkSelection, LinkSpan, LinkStyle, LinkTextStyle,
+        LinkTooltip, LinkTooltipText, LinkVisibility, LinkVisibilityAction, LinkVisibilityExpire,
+        Style, StyledLine, VtSpan, deceptive_invisible, push_escaped_char,
     },
 };
 
@@ -24,70 +26,35 @@ pub use sgr::process as sgr_process;
 /// The most bytes an OSC 8 URI may carry; longer links are ignored (the text
 /// still displays, unlinked).
 const MAX_OSC8_URI_LEN: usize = 4096;
-
-fn dangerous_invisible(c: char, allow_shaping_controls: bool) -> bool {
-    // Joiners, variation selectors, and emoji tag characters are invisible on
-    // their own because they modify the glyph beside them. Preserve them in
-    // authored prose/link labels so sequences such as `🗝️` and ZWJ emoji shape
-    // normally. Destination disclosure keeps `allow_shaping_controls` false:
-    // an invisible character in a URL or command is still written explicitly.
-    if allow_shaping_controls
-        && (matches!(c, '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}')
-            || ('\u{e0000}'..='\u{e007f}').contains(&c))
-    {
-        return false;
-    }
-    matches!(
-        c,
-        '\u{00ad}'
-            | '\u{034f}'
-            | '\u{061c}'
-            | '\u{115f}'
-            | '\u{1160}'
-            | '\u{17b4}'
-            | '\u{17b5}'
-            | '\u{180b}'..='\u{180f}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{206f}'
-            | '\u{3164}'
-            | '\u{fe00}'..='\u{fe0f}'
-            | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}'
-            | '\u{e0000}'..='\u{e007f}'
-    )
-}
+/// The most named OSC 8 presets retained for one connection. Existing names
+/// remain replaceable at the cap so a server can still restyle its presets.
+const MAX_OSC8_PRESETS: usize = 1024;
 
 fn push_display_char(out: &mut String, c: char, prose: bool) {
-    if dangerous_invisible(c, prose) {
-        write!(out, "\\u{{{:X}}}", u32::from(c)).expect("writing to a String cannot fail");
-    } else {
-        out.push(c);
-    }
+    push_escaped_char(
+        out,
+        c,
+        if prose {
+            InvisiblePolicy::Prose
+        } else {
+            InvisiblePolicy::ActionTarget
+        },
+    );
 }
 
+#[cfg(test)]
 fn sanitize_display_text(text: &str, prose: bool) -> Arc<str> {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        push_display_char(&mut out, c, prose);
-    }
-    Arc::from(out)
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-enum Osc8Scan {
-    #[default]
-    Ground,
-    Escape,
-    Selector,
-    Payload {
-        uri_bytes: usize,
-        separators: u8,
-        escape: bool,
-    },
-    Discard {
-        escape: bool,
-    },
+    Arc::from(
+        crate::session::styled_line::escape_invisible_text(
+            text,
+            if prose {
+                InvisiblePolicy::Prose
+            } else {
+                InvisiblePolicy::ActionTarget
+            },
+        )
+        .as_ref(),
+    )
 }
 
 struct TooltipAnsiActor {
@@ -242,7 +209,7 @@ pub fn parse_link_tooltip_text(text: &str) -> Option<LinkTooltipText> {
 struct ParsedLink {
     action: LinkAction,
     tooltip: LinkTooltip,
-    style: Option<LinkStyle>,
+    style: Option<Arc<LinkStyle>>,
 }
 
 #[derive(Default)]
@@ -250,7 +217,7 @@ struct Osc8Config {
     tooltip: Option<LinkTooltipText>,
     disabled: bool,
     menu: Option<LinkMenu>,
-    style: Option<LinkStyle>,
+    style: Option<Arc<LinkStyle>>,
     protocol: Option<LinkProtocol>,
 }
 
@@ -316,10 +283,10 @@ fn parse_link_text_style(value: &serde_json::Value) -> Option<LinkTextStyle> {
     })
 }
 
-fn parse_link_style(value: &serde_json::Value) -> Option<LinkStyle> {
+fn parse_link_style(value: &serde_json::Value) -> Option<Arc<LinkStyle>> {
     let style = value.as_object()?;
     let state = |full, compact| style_field(style, full, compact).and_then(parse_link_text_style);
-    Some(LinkStyle {
+    Some(Arc::new(LinkStyle {
         base: parse_link_text_style(value)?,
         active: state("active", "a"),
         hover: state("hover", "h"),
@@ -330,7 +297,7 @@ fn parse_link_style(value: &serde_json::Value) -> Option<LinkStyle> {
         disabled: state("disabled", "d"),
         link: state("link", "l"),
         any_link: state("any-link", "al"),
-    })
+    }))
 }
 
 fn parse_visibility(value: &serde_json::Value) -> Option<LinkVisibility> {
@@ -397,21 +364,6 @@ fn parse_selection(value: &serde_json::Value) -> Option<LinkSelection> {
         exclusive: flag("exclusive", true),
         disabled: flag("disabled", false),
     })
-}
-
-fn deep_merge(base: &mut serde_json::Value, higher: serde_json::Value) {
-    match (base, higher) {
-        (serde_json::Value::Object(base), serde_json::Value::Object(higher)) => {
-            for (key, value) in higher {
-                if let Some(existing) = base.get_mut(&key) {
-                    deep_merge(existing, value);
-                } else {
-                    base.insert(key, value);
-                }
-            }
-        }
-        (base, higher) => *base = higher,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -706,33 +658,17 @@ fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
 }
 
 fn server_action_for_uri(uri: &str) -> Option<LinkAction> {
-    if starts_with_ascii_case_insensitive(uri, "http://")
-        || starts_with_ascii_case_insensitive(uri, "https://")
-        || starts_with_ascii_case_insensitive(uri, "ftp://")
-    {
+    if link_url_host(uri).is_some() {
         return Some(LinkAction::OpenUrl(Arc::from(uri)));
     }
     if starts_with_ascii_case_insensitive(uri, "send:") {
-        return Some(LinkAction::ServerSend(Arc::from(percent_decode(&uri[5..]))));
+        let command = percent_decode(&uri[5..]);
+        return (!command.is_empty()).then(|| LinkAction::ServerSend(Arc::from(command)));
     }
     if starts_with_ascii_case_insensitive(uri, "prompt:") {
         return Some(LinkAction::Prompt(Arc::from(percent_decode(&uri[7..]))));
     }
     None
-}
-
-fn action_display_target(action: &LinkAction) -> Option<Arc<str>> {
-    match action.disclosed_target()? {
-        LinkAction::OpenUrl(url) => Some(sanitize_display_text(url, false)),
-        LinkAction::ServerSend(command) => {
-            Some(sanitize_display_text(&format!("send:{command}"), false))
-        }
-        LinkAction::Prompt(command) => {
-            Some(sanitize_display_text(&format!("prompt:{command}"), false))
-        }
-        LinkAction::Send(command) => Some(sanitize_display_text(command, false)),
-        LinkAction::Callback { .. } | LinkAction::Configured { .. } => None,
-    }
 }
 
 fn link_action_for_uri(
@@ -748,7 +684,7 @@ fn link_action_for_uri(
         log::debug!("OSC 8 URI with unsupported scheme ignored");
         return None;
     };
-    let display_target = action_display_target(&primary);
+    let display_target = primary.tooltip_target();
     let tooltip = if config
         .protocol
         .as_ref()
@@ -844,8 +780,7 @@ pub struct VtProcessor {
     /// Mudlet-compatible OSC 8 presets live for exactly one connection/
     /// processor lifetime and are never shared across sessions.
     link_presets: HashMap<String, serde_json::Value>,
-    osc8_scan: Osc8Scan,
-    discard_current_osc8: bool,
+    link_preset_overflow_logged: bool,
 }
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
@@ -866,8 +801,7 @@ impl VtProcessor {
             raw_wanted: None,
             capture_raw: true,
             link_presets: HashMap::new(),
-            osc8_scan: Osc8Scan::default(),
-            discard_current_osc8: false,
+            link_preset_overflow_logged: false,
         }
     }
 
@@ -1070,95 +1004,6 @@ impl VtProcessor {
             self.buf_raw.push(byte);
         }
     }
-
-    /// Feed one byte through the VT parser while bounding OSC 8 buffering at
-    /// the scanner. Once an overlong sequence is recognized, the parser gets
-    /// a synthetic terminator and the remainder is swallowed through the real
-    /// BEL/ST. This prevents a hostile peer from making vtparse retain an
-    /// unbounded URI; script-authored links never pass through this path.
-    pub fn parse_byte(&mut self, parser: &mut VTParser, byte: u8) {
-        use Osc8Scan::{Discard, Escape, Ground, Payload, Selector};
-
-        match self.osc8_scan {
-            Ground => {
-                self.osc8_scan = if byte == 0x1b {
-                    Escape
-                } else if byte == 0x9d {
-                    Selector
-                } else {
-                    Ground
-                };
-                parser.parse_byte(byte, self);
-            }
-            Escape => {
-                self.osc8_scan = if byte == b']' {
-                    Selector
-                } else if byte == 0x1b {
-                    Escape
-                } else {
-                    Ground
-                };
-                parser.parse_byte(byte, self);
-            }
-            Selector => {
-                self.osc8_scan = if byte == b'8' {
-                    Payload {
-                        uri_bytes: 0,
-                        separators: 0,
-                        escape: false,
-                    }
-                } else if byte == 0x1b {
-                    Escape
-                } else {
-                    Ground
-                };
-                parser.parse_byte(byte, self);
-            }
-            Payload {
-                uri_bytes,
-                separators,
-                escape,
-            } => {
-                let terminated = byte == 0x07 || byte == 0x9c || (escape && byte == b'\\');
-                if terminated {
-                    self.osc8_scan = Ground;
-                    parser.parse_byte(byte, self);
-                    return;
-                }
-                let (uri_bytes, separators) = if byte == b';' && separators < 2 {
-                    (uri_bytes, separators + 1)
-                } else if separators >= 2 {
-                    let added = usize::from(escape) + usize::from(byte != 0x1b);
-                    (uri_bytes.saturating_add(added), separators)
-                } else {
-                    (uri_bytes, separators)
-                };
-                if uri_bytes > MAX_OSC8_URI_LEN {
-                    self.discard_current_osc8 = true;
-                    parser.parse_byte(0x07, self);
-                    self.osc8_scan = Discard {
-                        escape: byte == 0x1b,
-                    };
-                } else {
-                    self.osc8_scan = Payload {
-                        uri_bytes,
-                        separators,
-                        escape: byte == 0x1b,
-                    };
-                    parser.parse_byte(byte, self);
-                }
-            }
-            Discard { escape } => {
-                if byte == 0x07 || byte == 0x9c || (escape && byte == b'\\') {
-                    self.osc8_scan = Ground;
-                } else {
-                    self.osc8_scan = Discard {
-                        escape: byte == 0x1b,
-                    };
-                }
-            }
-        }
-    }
 }
 
 impl VTActor for VtProcessor {
@@ -1166,7 +1011,7 @@ impl VTActor for VtProcessor {
         if let Some(raw_mark) = self.pending_cr.take() {
             self.restart_open_line(raw_mark);
         }
-        if self.cursor_link.is_some() && dangerous_invisible(b, true) {
+        if self.cursor_link.is_some() && deceptive_invisible(b, InvisiblePolicy::Prose) {
             let mut escaped = String::new();
             push_display_char(&mut escaped, b, true);
             self.buf.push_str(&escaped);
@@ -1223,11 +1068,6 @@ impl VTActor for VtProcessor {
         if params.first() != Some(&&b"8"[..]) {
             return;
         }
-        if std::mem::take(&mut self.discard_current_osc8) {
-            self.close_link_range(false);
-            log::debug!("overlong OSC 8 sequence ignored at scanner");
-            return;
-        }
         // A well-formed OSC 8 is `8 ; params ; URI`; anything shorter (a
         // truncated `ESC]8;` or bare `ESC]8`) is treated as a close so a
         // degenerate sequence can't leave a link open over later lines.
@@ -1249,15 +1089,26 @@ impl VTActor for VtProcessor {
             let definition = &uri[7..];
             let (name, query) = definition.split_once('?').unwrap_or((definition, ""));
             let name = percent_decode(name);
-            let config = query.split('&').find_map(|field| {
-                let encoded = field.strip_prefix("config=")?;
-                serde_json::from_str::<serde_json::Value>(&percent_decode(encoded)).ok()
+            let (fields, _) = osc8_query_fields(query);
+            let config = fields.iter().find_map(|field| {
+                (field.kind == Osc8QueryFieldKind::Config).then_some(())?;
+                let decoded = percent_decode(field.value?);
+                serde_json::from_str::<serde_json::Value>(&decoded).ok()
             });
             if !name.is_empty()
                 && !name.chars().any(char::is_control)
                 && let Some(config @ serde_json::Value::Object(_)) = config
             {
-                self.link_presets.insert(name, config);
+                if self.link_presets.contains_key(&name)
+                    || self.link_presets.len() < MAX_OSC8_PRESETS
+                {
+                    self.link_presets.insert(name, config);
+                } else if !self.link_preset_overflow_logged {
+                    log::warn!(
+                        "OSC 8 preset limit of {MAX_OSC8_PRESETS} reached; new names ignored"
+                    );
+                    self.link_preset_overflow_logged = true;
+                }
             }
             return;
         }
@@ -1268,15 +1119,26 @@ impl VTActor for VtProcessor {
         }
     }
 
+    fn osc_dispatch_truncated(&mut self, params: &[&[u8]]) {
+        // A partial OSC 8 replacement/close is not actionable, and must not
+        // leave the preceding active hyperlink spanning later output. Other
+        // oversized OSC selectors remain ignored, exactly like their complete
+        // forms, so an unrelated title/clipboard command cannot sever a link.
+        if params.first() == Some(&&b"8"[..]) {
+            self.close_link_range(false);
+        }
+    }
+
     fn apc_dispatch(&mut self, _data: Vec<u8>) {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsiColor, Color, MAX_OSC8_URI_LEN, VtProcessor, menu_title, parse_link_tooltip_text,
-        sanitize_display_text,
+        AnsiColor, Color, MAX_OSC8_PRESETS, MAX_OSC8_URI_LEN, VtProcessor, menu_title,
+        parse_link_tooltip_text, sanitize_display_text,
     };
+    use crate::models::server::link_url_host;
     use crate::session::runtime::RuntimeAction;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use vtparse::VTParser;
@@ -1304,7 +1166,7 @@ mod tests {
                 if b != b'\n' && b != b'\r' {
                     self.processor.push_raw_incoming_byte(b);
                 }
-                self.processor.parse_byte(&mut self.parser, b);
+                self.parser.parse_byte(b, &mut self.processor);
             }
         }
 
@@ -1483,6 +1345,78 @@ mod tests {
                 .as_ref()
                 .and_then(LinkTooltip::display),
             Some((std::sync::Arc::from("https://example.com"), None))
+        );
+    }
+
+    #[test]
+    fn osc8_empty_send_and_hostless_urls_render_plain_text() {
+        for uri in [
+            "send:",
+            "send:?config={\"tooltip\":\"empty\"}",
+            "http://",
+            "https://",
+            "ftp://",
+            "http:///path",
+            "https://?query",
+            "ftp://#fragment",
+            "http://:80/path",
+            "https://user@/path",
+        ] {
+            let mut h = harness();
+            h.feed(format!("\x1b]8;;{uri}\x1b\\plain\x1b]8;;\x1b\\\n").as_bytes());
+            let lines = committed_lines(&h.actions());
+            assert_eq!(lines[0].text, "plain", "URI: {uri}");
+            assert!(lines[0].links.is_empty(), "URI: {uri}");
+        }
+    }
+
+    #[test]
+    fn osc8_empty_prompt_matches_mudlet_clear_input_action() {
+        let mut h = harness();
+        // Mudlet's current OSC 8 implementation accepts `prompt:` and calls
+        // sendCmdLine(""); this deliberately preserves that clear-input action.
+        h.feed(b"\x1b]8;;prompt:\x1b\\clear input\x1b]8;;\x1b\\\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].links.len(), 1);
+        assert_eq!(
+            lines[0].links[0].action,
+            LinkAction::Prompt(std::sync::Arc::from(""))
+        );
+    }
+
+    #[test]
+    fn osc8_minimal_host_check_keeps_unusual_valid_urls() {
+        for uri in [
+            "http://localhost",
+            "HtTpS://[::1]:8443/path",
+            "ftp://user:password@example.test/archive",
+            "https://\u{4f8b}\u{3048}.test/path",
+        ] {
+            let mut h = harness();
+            h.feed(format!("\x1b]8;;{uri}\x1b\\open\x1b]8;;\x1b\\\n").as_bytes());
+            let lines = committed_lines(&h.actions());
+            assert_eq!(lines[0].links.len(), 1, "URI: {uri}");
+            assert_eq!(
+                lines[0].links[0].action,
+                LinkAction::OpenUrl(std::sync::Arc::from(uri)),
+                "URI: {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc8_web_urls_use_browser_host_parsing() {
+        let mut h = harness();
+        h.feed(b"\x1b]8;;https://evil.example\\@trusted.example/\x1b\\open\x1b]8;;\x1b\\\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].links.len(), 1);
+        let LinkAction::OpenUrl(url) = &lines[0].links[0].action else {
+            panic!("expected web link")
+        };
+        assert_eq!(
+            link_url_host(url),
+            Some("evil.example".to_string()),
+            "validation and trust grants must identify the browser's destination host"
         );
     }
 
@@ -1683,6 +1617,38 @@ mod tests {
     }
 
     #[test]
+    fn esc_terminated_osc8_does_not_swallow_later_output() {
+        let mut h = harness();
+        // vtparse terminates an OSC string on a bare ESC; the stream stays live.
+        h.feed(b"\x1b]8;;send:hi\x1b[0mlinked\x1b]8;;\x1b[0m\n");
+        let mut filler = Vec::new();
+        for _ in 0..60 {
+            filler.extend_from_slice(&[b'a'; 99]);
+            filler.push(b'\n');
+        }
+        h.feed(&filler);
+        h.feed(b"hello\n");
+        let lines = committed_lines(&h.actions());
+        assert!(lines.iter().any(|line| line.text == "hello"));
+    }
+
+    #[test]
+    fn utf8_continuation_9d_does_not_swallow_later_output() {
+        let mut h = harness();
+        // U+1F49D ends in byte 0x9D, a UTF-8 continuation byte, followed by '8'.
+        h.feed("\u{1F49D}8;; plain text\n".as_bytes());
+        let mut filler = Vec::new();
+        for _ in 0..60 {
+            filler.extend_from_slice(&[b'b'; 99]);
+            filler.push(b'\n');
+        }
+        h.feed(&filler);
+        h.feed(b"world\n");
+        let lines = committed_lines(&h.actions());
+        assert!(lines.iter().any(|line| line.text == "world"));
+    }
+
+    #[test]
     fn osc8_basic_style_parses_full_and_compact_properties() {
         let mut h = harness();
         h.feed(
@@ -1826,6 +1792,57 @@ mod tests {
                 std::sync::Arc::from("Danger"),
                 Some(std::sync::Arc::from("send:attack"))
             ))
+        );
+    }
+
+    #[test]
+    fn osc8_preset_raw_json_keeps_ampersands_and_hash_colors() {
+        let mut h = harness();
+        h.feed(
+            b"\x1b]8;;preset:shop?config={\"t\":\"Fish & Chips\",\"s\":{\"c\":\"#0066ff\"}}\x1b\\",
+        );
+        h.feed(b"\x1b]8;;send:buy?preset=shop\x1b\\buy\x1b]8;;\x1b\\\n");
+        let lines = committed_lines(&h.actions());
+        let link = &lines[0].links[0];
+        assert_eq!(
+            link.tooltip.as_ref().and_then(LinkTooltip::display),
+            Some((
+                std::sync::Arc::from("Fish & Chips"),
+                Some(std::sync::Arc::from("send:buy"))
+            ))
+        );
+        assert_eq!(
+            link.style.as_ref().expect("preset style").base.foreground,
+            Some(LinkColor {
+                red: 0,
+                green: 102,
+                blue: 255,
+                alpha: 255,
+            })
+        );
+    }
+
+    #[test]
+    fn osc8_preset_registry_caps_new_names_but_allows_replacement() {
+        let mut h = harness();
+        for index in 0..MAX_OSC8_PRESETS {
+            h.feed(
+                format!("\x1b]8;;preset:p{index}?config={{\"t\":\"original\"}}\x1b\\").as_bytes(),
+            );
+        }
+        assert_eq!(h.processor.link_presets.len(), MAX_OSC8_PRESETS);
+
+        h.feed(b"\x1b]8;;preset:overflow?config={\"t\":\"ignored\"}\x1b\\");
+        h.feed(b"\x1b]8;;preset:overflow-again?config={\"t\":\"ignored\"}\x1b\\");
+        assert_eq!(h.processor.link_presets.len(), MAX_OSC8_PRESETS);
+        assert!(!h.processor.link_presets.contains_key("overflow"));
+        assert!(h.processor.link_preset_overflow_logged);
+
+        h.feed(b"\x1b]8;;preset:p0?config={\"t\":\"replacement\"}\x1b\\");
+        assert_eq!(h.processor.link_presets.len(), MAX_OSC8_PRESETS);
+        assert_eq!(
+            h.processor.link_presets["p0"]["t"].as_str(),
+            Some("replacement")
         );
     }
 
@@ -2121,7 +2138,7 @@ mod tests {
     }
 
     #[test]
-    fn osc8_scanner_discards_an_overlong_sequence_across_reads() {
+    fn osc8_dispatch_rejects_an_overlong_sequence_across_reads() {
         let mut h = harness();
         h.feed(b"\x1b]8;;https://example.com/");
         h.feed(&vec![b'x'; MAX_OSC8_URI_LEN]);
@@ -2132,6 +2149,115 @@ mod tests {
         assert_eq!(
             lines[0].links[0].action,
             LinkAction::ServerSend(std::sync::Arc::from("look"))
+        );
+    }
+
+    #[test]
+    fn overlong_osc_selector_88_does_not_drop_the_next_link() {
+        let mut payload = b"\x1b]88;;".to_vec();
+        payload.extend(std::iter::repeat_n(b'x', MAX_OSC8_URI_LEN + 1));
+        payload.extend_from_slice(b"\x1b\\plain ");
+        payload.extend_from_slice(b"\x1b]8;;send:look\x1b\\look\x1b]8;;\x1b\\\n");
+
+        let mut h = harness();
+        h.feed(&payload);
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "plain look");
+        assert_eq!(lines[0].links.len(), 1);
+        assert_eq!(
+            lines[0].links[0].action,
+            LinkAction::ServerSend(std::sync::Arc::from("look"))
+        );
+    }
+
+    #[test]
+    fn vtparse_osc_cap_rejects_truncated_uri_and_keeps_stream_live() {
+        let mut payload = b"\x1b]8;;https://example.com/".to_vec();
+        payload.extend(std::iter::repeat_n(b'x', 8192 + 1024));
+        payload.extend_from_slice(b"\x1b\\plain ");
+        payload.extend_from_slice(b"\x1b]8;;send:look\x1b\\look\x1b]8;;\x1b\\\n");
+
+        let mut h = harness();
+        h.feed(&payload);
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "plain look");
+        assert_eq!(lines[0].links.len(), 1);
+        assert_eq!(
+            lines[0].links[0].action,
+            LinkAction::ServerSend(std::sync::Arc::from("look"))
+        );
+    }
+
+    #[test]
+    fn vtparse_osc_cap_does_not_dispatch_a_wrong_target_prefix() {
+        const WRONG_PREFIX: &[u8] = b"send:quit";
+        let params_len = 8192 - b"8".len() - WRONG_PREFIX.len();
+        let mut payload = b"\x1b]8;".to_vec();
+        payload.extend(std::iter::repeat_n(b'p', params_len));
+        payload.extend_from_slice(b";send:quit-now\x1b\\text\x1b]8;;\x1b\\\n");
+
+        let mut h = harness();
+        h.feed(&payload);
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "text");
+        assert!(
+            lines[0].links.is_empty(),
+            "a truncated send:quit prefix must never become live"
+        );
+    }
+
+    #[test]
+    fn vtparse_truncated_osc_closes_an_existing_link() {
+        let mut payload = b"\x1b]8;;send:look\x1b\\linked".to_vec();
+        payload.extend_from_slice(b"\x1b]8;");
+        payload.extend(std::iter::repeat_n(b'p', 8192));
+        payload.extend_from_slice(b";send:quit-now\x1b\\ plain\n");
+
+        let mut h = harness();
+        h.feed(&payload);
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "linked plain");
+        assert_eq!(lines[0].links.len(), 1);
+        assert_eq!(
+            &lines[0].text[lines[0].links[0].begin_pos..lines[0].links[0].end_pos],
+            "linked"
+        );
+        assert_eq!(
+            lines[0].links[0].action,
+            LinkAction::ServerSend(std::sync::Arc::from("look"))
+        );
+    }
+
+    #[test]
+    fn oversized_non_osc8_command_does_not_sever_an_existing_link() {
+        let mut payload = b"\x1b]8;;send:look\x1b\\before".to_vec();
+        payload.extend_from_slice(b"\x1b]0;");
+        payload.extend(std::iter::repeat_n(b'x', 8192));
+        payload.extend_from_slice(b"\x1b\\after\x1b]8;;\x1b\\\n");
+
+        let mut h = harness();
+        h.feed(&payload);
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "beforeafter");
+        assert_eq!(lines[0].links.len(), 1);
+        assert_eq!(
+            &lines[0].text[lines[0].links[0].begin_pos..lines[0].links[0].end_pos],
+            "beforeafter"
+        );
+    }
+
+    #[test]
+    fn osc8_uri_keeps_semicolons_beyond_vtparse_parameter_capacity() {
+        let uri = format!("https://example.com/{}", ";segment".repeat(70));
+        let payload = format!("\x1b]8;;{uri}\x1b\\open\x1b]8;;\x1b\\\n");
+
+        let mut h = harness();
+        h.feed(payload.as_bytes());
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].links.len(), 1);
+        assert_eq!(
+            lines[0].links[0].action,
+            LinkAction::OpenUrl(std::sync::Arc::from(uri))
         );
     }
 

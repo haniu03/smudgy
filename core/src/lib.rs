@@ -183,6 +183,7 @@ pub fn init() {
     );
 }
 
+pub(crate) mod json;
 pub mod models;
 pub mod session;
 

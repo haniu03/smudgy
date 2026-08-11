@@ -16,6 +16,25 @@ use super::trigger::{self, PushTriggerParams};
 use super::{ActionResult, Inner, IsolateId, RuntimeAction, ScriptAction};
 use crate::session::styled_line::StyledLine;
 
+/// Forward a lazy tooltip request while preserving a terminal failure path.
+/// A runtime's receiver is dropped just before its registry entry is removed,
+/// so a successful lookup does not guarantee that the send will succeed.
+fn send_link_tooltip(
+    tx: &tokio::sync::mpsc::UnboundedSender<RuntimeAction>,
+    action: RuntimeAction,
+) -> bool {
+    match tx.send(action) {
+        Ok(()) => true,
+        Err(error) => {
+            let RuntimeAction::ResolveLinkTooltip { state, .. } = error.0 else {
+                unreachable!("send_link_tooltip accepts only tooltip actions");
+            };
+            state.resolve(None);
+            false
+        }
+    }
+}
+
 fn prepare_pane_open(
     registry: &super::SharedPaneRegistry,
     def: super::pane::PaneDef,
@@ -401,6 +420,7 @@ impl Inner<'_> {
                 self.script_engine
                     .set_current_line(Some(Arc::downgrade(&line)));
                 if let Err(err) = self.trigger_manager.process_incoming_line(&line) {
+                    self.abort_incoming_line_sync();
                     return Ok(ActionResult::Echo(format!("Error processing line {err:?}")));
                 }
 
@@ -426,9 +446,12 @@ impl Inner<'_> {
                     .set_current_line(Some(Arc::downgrade(&line)));
                 match self.trigger_manager.process_partial_line(line) {
                     Ok(()) => Ok(ActionResult::None),
-                    Err(err) => Ok(ActionResult::Echo(format!(
-                        "Error processing partial line {err:?}"
-                    ))),
+                    Err(err) => {
+                        self.abort_incoming_line_sync();
+                        Ok(ActionResult::Echo(format!(
+                            "Error processing partial line {err:?}"
+                        )))
+                    }
                 }
             }
             RuntimeAction::PromptBoundary => {
@@ -756,16 +779,20 @@ impl Inner<'_> {
                         .resolve_link_tooltip(&isolate, instance, id, state)
                 } else {
                     if let Some(runtime) = crate::session::registry::get_runtime(session) {
-                        runtime
-                            .tx
-                            .send(RuntimeAction::ResolveLinkTooltip {
+                        if !send_link_tooltip(
+                            &runtime.tx,
+                            RuntimeAction::ResolveLinkTooltip {
                                 session,
                                 isolate,
                                 instance,
                                 id,
                                 state,
-                            })
-                            .ok();
+                            },
+                        ) {
+                            warn!(
+                                "Dropping link tooltip for session {session}: runtime channel closed"
+                            );
+                        }
                     } else {
                         state.resolve(None);
                         warn!("Dropping link tooltip for session {session}: no live runtime");
@@ -1101,12 +1128,11 @@ impl Inner<'_> {
                 // The tail of the session log is what users read after a
                 // drop; don't leave it sitting in the BufWriter.
                 self.flush_log();
-                // Drop any unterminated whole-line accumulator: the next
-                // connection starts a fresh logical line, so a leftover prompt
-                // fragment must not glue onto the first pane-routed line after
-                // reconnect. The main open line is committed by the disconnect
-                // notice echo; this is the separate pane-delivery accumulator.
-                self.open_line = None;
+                // Drop any unterminated line pipeline: the next connection starts
+                // a fresh logical line, so neither pane-routing state nor a
+                // carriage-return replacement transaction may cross the boundary.
+                // The main open line is committed by the disconnect notice echo.
+                self.abort_incoming_line_sync();
                 self.ui_tx
                     .send(TaggedSessionEvent {
                         session_id: self.session_id,
@@ -1998,11 +2024,35 @@ impl Inner<'_> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use super::prepare_pane_open;
+    use super::{prepare_pane_open, send_link_tooltip};
+    use crate::session::SessionId;
     use crate::session::runtime::pane::{
         DefStateSpec, MAIN_PANE_KEY, PaneKind, PaneNamespace, PanePlacement, PaneRegistry,
         SplitDirection,
     };
+    use crate::session::runtime::{IsolateId, RuntimeAction};
+    use crate::session::styled_line::LinkTooltipState;
+
+    #[test]
+    fn failed_tooltip_forward_resolves_the_loading_state() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let state = Arc::new(LinkTooltipState::default());
+        assert!(state.begin_request());
+
+        assert!(!send_link_tooltip(
+            &tx,
+            RuntimeAction::ResolveLinkTooltip {
+                session: SessionId::from(7),
+                isolate: IsolateId::Main,
+                instance: 1,
+                id: 2,
+                state: Arc::clone(&state),
+            },
+        ));
+        assert!(!state.is_loading());
+        assert!(state.text().is_none());
+    }
 
     #[test]
     fn retired_own_open_is_preserved_but_retired_foreign_open_is_dropped() {

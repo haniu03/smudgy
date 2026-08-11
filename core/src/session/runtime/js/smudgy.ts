@@ -219,11 +219,24 @@ interface Settings {
 type Color =
     | string
     | { r: number; g: number; b: number }
-    | { color: string; bold: boolean };
+    | { color: string; bold: boolean; paletteBright?: boolean };
+
+interface TextAttributes {
+    bold: boolean;
+    faint: boolean;
+    italic: boolean;
+    underline: "none" | "single" | "double";
+    blink: "none" | "slow" | "fast";
+    crossedOut: boolean;
+    reverse: boolean;
+}
 
 interface ColorOptions {
     fg?: Color;
     bg?: Color;
+    attributes?: TextAttributes;
+    /** Lossless raw palette bit for a read-back `fg: "default"` span. */
+    foregroundPaletteBright?: boolean;
 }
 
 // ---- Styled text (the `style` tagged-template surface) ------------------------
@@ -279,6 +292,7 @@ interface StyledRun {
     text: string;
     fg: Color | null;
     bg: Color | null;
+    attributes: TextAttributes | null;
     link: LinkSpec | null;
 }
 
@@ -346,15 +360,49 @@ function __styled_check_color(value: Color): Color {
             return { r: __styled_u8(v.r), g: __styled_u8(v.g), b: __styled_u8(v.b) };
         }
         if (typeof v.color === "string") {
-            if (__STYLED_ANSI_NAMES.indexOf(v.color) === -1) {
-                throw new TypeError(`Unknown ANSI color "${v.color}" in { color, bold }`);
+            if (__STYLED_ANSI_NAMES.indexOf(v.color) === -1 && v.color !== "default") {
+                throw new TypeError(`Unknown palette color "${v.color}" in { color, bold }`);
             }
-            return { color: v.color, bold: Boolean(v.bold) };
+            if (v.paletteBright !== undefined && typeof v.paletteBright !== "boolean") {
+                throw new TypeError("paletteBright must be a boolean");
+            }
+            return {
+                color: v.color,
+                bold: Boolean(v.bold),
+                ...(v.paletteBright === undefined ? {} : { paletteBright: v.paletteBright }),
+            };
         }
     }
     throw new TypeError(
         "Expected a color: an ANSI/theme name, { r, g, b }, or { color, bold }",
     );
+}
+
+function __styled_check_attributes(value: TextAttributes): TextAttributes {
+    if (typeof value !== "object" || value === null) {
+        throw new TypeError("attributes must be an object");
+    }
+    const v = value as any;
+    for (const name of ["bold", "faint", "italic", "crossedOut", "reverse"]) {
+        if (typeof v[name] !== "boolean") {
+            throw new TypeError(`attributes.${name} must be a boolean`);
+        }
+    }
+    if (v.underline !== "none" && v.underline !== "single" && v.underline !== "double") {
+        throw new TypeError('attributes.underline must be "none", "single", or "double"');
+    }
+    if (v.blink !== "none" && v.blink !== "slow" && v.blink !== "fast") {
+        throw new TypeError('attributes.blink must be "none", "slow", or "fast"');
+    }
+    return {
+        bold: v.bold,
+        faint: v.faint,
+        italic: v.italic,
+        underline: v.underline,
+        blink: v.blink,
+        crossedOut: v.crossedOut,
+        reverse: v.reverse,
+    };
 }
 
 /** Build a fragment from one tagged-template invocation under the enclosing style
@@ -365,6 +413,7 @@ function __styled_check_color(value: Color): Color {
 function __styled_from_template(
     fg: Color | null,
     bg: Color | null,
+    attributes: TextAttributes | null,
     link: LinkSpec | null,
     strings: TemplateStringsArray,
     values: unknown[],
@@ -374,20 +423,28 @@ function __styled_from_template(
         text: string,
         runFg: Color | null,
         runBg: Color | null,
+        runAttributes: TextAttributes | null,
         runLink: LinkSpec | null,
     ): void => {
         if (text === "") return;
         const last = runs.length > 0 ? runs[runs.length - 1] : undefined;
-        if (last !== undefined && last.fg === runFg && last.bg === runBg && last.link === runLink) {
+        if (last !== undefined && last.fg === runFg && last.bg === runBg
+            && last.attributes === runAttributes && last.link === runLink) {
             last.text += text;
             return;
         }
-        runs.push({ text, fg: runFg, bg: runBg, link: runLink });
+        runs.push({ text, fg: runFg, bg: runBg, attributes: runAttributes, link: runLink });
     };
     for (let i = 0; i < strings.length; i++) {
         // An illegal escape in a tagged template yields an undefined cooked entry
         // (legal ES for tags); fall back to the raw text, like String.raw.
-        push(strings[i] !== undefined ? strings[i] : (strings.raw[i] ?? ""), fg, bg, link);
+        push(
+            strings[i] !== undefined ? strings[i] : (strings.raw[i] ?? ""),
+            fg,
+            bg,
+            attributes,
+            link,
+        );
         if (i < values.length) {
             const value = values[i];
             if (__is_styled_text(value)) {
@@ -396,12 +453,13 @@ function __styled_from_template(
                         run.text,
                         run.fg === null ? fg : run.fg,
                         run.bg === null ? bg : run.bg,
+                        run.attributes === null ? attributes : run.attributes,
                         run.link === null ? link : run.link,
                     );
                 }
             } else {
                 // Plain-template semantics: every other value stringifies.
-                push(String(value), fg, bg, link);
+                push(String(value), fg, bg, attributes, link);
             }
         }
     }
@@ -448,22 +506,29 @@ const __STYLED_BG_PROPS: [string, Color][] = __STYLED_ANSI_NAMES.map((name) => [
  *  a template tag and (called with options) a refinement. Shorthand properties are
  *  memoizing getters: the derived builder is built on first touch and cached as a data
  *  property, so a chain echoed per incoming line pays its allocations once. */
-function __styled_make_builder(fg: Color | null, bg: Color | null): StyleBuilder {
+function __styled_make_builder(
+    fg: Color | null,
+    bg: Color | null,
+    attributes: TextAttributes | null,
+): StyleBuilder {
     const builder = ((first: TemplateStringsArray | ColorOptions, ...values: unknown[]): any => {
         if (__is_template_strings(first)) {
-            return __styled_from_template(fg, bg, null, first, values);
+            return __styled_from_template(fg, bg, attributes, null, first, values);
         }
         if (typeof first !== "object" || first === null) {
             throw new TypeError("style(...) expects { fg?, bg? }, or use it as a template tag");
         }
         // `!= null` so an explicit null means unset, like the plain color options.
         return __styled_make_builder(
-            first.fg != null ? __styled_check_color(first.fg) : fg,
+            first.fg != null ? __styled_check_color(__line_fg(first)!) : fg,
             first.bg != null ? __styled_check_color(first.bg) : bg,
+            first.attributes != null ? __styled_check_attributes(first.attributes) : attributes,
         );
     }) as any;
-    builder.fg = (color: Color) => __styled_make_builder(__styled_check_color(color), bg);
-    builder.bg = (color: Color) => __styled_make_builder(fg, __styled_check_color(color));
+    builder.fg = (color: Color) =>
+        __styled_make_builder(__styled_check_color(color), bg, attributes);
+    builder.bg = (color: Color) =>
+        __styled_make_builder(fg, __styled_check_color(color), attributes);
     const memoize = (prop: string, derive: () => StyleBuilder): void => {
         Object.defineProperty(builder, prop, {
             configurable: true,
@@ -475,16 +540,16 @@ function __styled_make_builder(fg: Color | null, bg: Color | null): StyleBuilder
         });
     };
     for (const [prop, color] of __STYLED_FG_PROPS) {
-        memoize(prop, () => __styled_make_builder(color, bg));
+        memoize(prop, () => __styled_make_builder(color, bg, attributes));
     }
     for (const [prop, color] of __STYLED_BG_PROPS) {
-        memoize(prop, () => __styled_make_builder(fg, color));
+        memoize(prop, () => __styled_make_builder(fg, color, attributes));
     }
     return builder as StyleBuilder;
 }
 
 /** The root style builder (`style.red`, `style.bgBlue`, `style({ fg, bg })`, ...). */
-const style: StyleBuilder = __styled_make_builder(null, null);
+const style: StyleBuilder = __styled_make_builder(null, null, null);
 
 /** The impl-side twin of the contract's `StyleTag` (see smudgy-core.d.ts). */
 interface StyleTag {
@@ -582,7 +647,7 @@ function link(
         title: options?.title ?? null,
     };
     return ((strings: TemplateStringsArray, ...values: unknown[]) =>
-        __styled_from_template(null, null, spec, strings, values)) as StyleTag;
+        __styled_from_template(null, null, null, spec, strings, values)) as StyleTag;
 }
 
 /** A run's link in wire form: a command, or an index into the callbacks array the op
@@ -602,32 +667,58 @@ interface WireLinkValue {
 }
 type WireLink = WireLinkValue | null;
 
+function __styled_callback_index(callbacks: Function[], fn: Function): number {
+    let index = callbacks.indexOf(fn);
+    if (index === -1) {
+        index = callbacks.length;
+        callbacks.push(fn);
+    }
+    return index;
+}
+
+/** One exhaustive decision per LinkSpec field. Adding a link option therefore
+ *  fails type-checking until the packed fast path declares whether that field
+ *  requires the complete wire form. */
+const __STYLED_LINK_REQUIRES_WIRE: {
+    [K in keyof LinkSpec]: (value: LinkSpec[K], spec: LinkSpec) => boolean;
+} = {
+    action: (value) => value === null,
+    tooltip: () => false,
+    enabled: (value) => !value,
+    menu: (value) => value !== null,
+    // A title is serialized only as part of a menu; `menu` already selects
+    // the wire form. A title without a menu has no rendering effect.
+    title: () => false,
+};
+
+function __styled_link_requires_wire(spec: LinkSpec): boolean {
+    return (Object.keys(__STYLED_LINK_REQUIRES_WIRE) as (keyof LinkSpec)[])
+        .some((field) => __STYLED_LINK_REQUIRES_WIRE[field](spec[field] as never, spec));
+}
+
 /** The wire shape of one SPLICE run (see ops.rs `StyledRunWire`; the echo path
  *  crosses packed instead -- see `__styled_echo_packed`). */
 interface WireRun {
     text: string;
     fg: Color | null;
     bg: Color | null;
+    attributes: TextAttributes | null;
     link: WireLink;
 }
 
 /** Build the link converter one flatten pass uses: `{ fn }` specs are deduplicated
  *  into `callbacks` and become `{ cb }` indexes; command links pass through. */
 function __styled_make_wire_link(callbacks: Function[]): (spec: LinkSpec | null) => WireLink {
-    const callbackIndex = (fn: Function): number => {
-        let index = callbacks.indexOf(fn);
-        if (index === -1) {
-            index = callbacks.length;
-            callbacks.push(fn);
-        }
-        return index;
-    };
     const tooltipWire = (tooltip: TooltipSpec | null): WireTooltip | undefined => {
         if (tooltip === null) return undefined;
-        return "text" in tooltip ? tooltip : { cb: callbackIndex(tooltip.fn) };
+        return "text" in tooltip
+            ? tooltip
+            : { cb: __styled_callback_index(callbacks, tooltip.fn) };
     };
     const actionWire = (action: LinkActionSpec): WireAction =>
-        "send" in action ? { send: action.send } : { cb: callbackIndex(action.fn) };
+        "send" in action
+            ? { send: action.send }
+            : { cb: __styled_callback_index(callbacks, action.fn) };
     return (spec) => {
         if (spec === null) return null;
         const tooltip = tooltipWire(spec.tooltip);
@@ -682,7 +773,42 @@ function __styled_encode_color(value: Color | null): number {
     if (typeof v.r === "number") {
         return 0x01000000 | (v.r << 16) | (v.g << 8) | v.b;
     }
-    return 0x02000000 | (v.bold ? 8 : 0) | __STYLED_ANSI_NAMES.indexOf(v.color);
+    const bright = v.paletteBright ?? v.bold;
+    if (v.color === "default") return 0x03000000 | (bright ? 4 : 0);
+    return 0x02000000 | (bright ? 8 : 0) | __STYLED_ANSI_NAMES.indexOf(v.color);
+}
+
+/** Encode a complete attribute object. Zero stays reserved for unset/inherit;
+ *  bit 31 marks even an explicit all-default object as present. */
+function __styled_encode_attributes(value: TextAttributes | null): number {
+    if (value === null) return 0;
+    if (typeof value.bold !== "boolean" || typeof value.faint !== "boolean"
+        || typeof value.italic !== "boolean" || typeof value.crossedOut !== "boolean"
+        || typeof value.reverse !== "boolean") {
+        return 0x80000200; // reserved bit: Rust rejects the forged run
+    }
+    const underline = value.underline === "none"
+        ? 0
+        : value.underline === "single"
+        ? 1
+        : value.underline === "double"
+        ? 2
+        : 3;
+    const blink = value.blink === "none"
+        ? 0
+        : value.blink === "slow"
+        ? 1
+        : value.blink === "fast"
+        ? 2
+        : 3;
+    return 0x80000000
+        | (value.bold ? 1 << 0 : 0)
+        | (value.faint ? 1 << 1 : 0)
+        | (value.italic ? 1 << 2 : 0)
+        | (underline << 3)
+        | (blink << 5)
+        | (value.crossedOut ? 1 << 7 : 0)
+        | (value.reverse ? 1 << 8 : 0);
 }
 
 /** A flattened fragment ready for a styled echo op call. `records` is a view of
@@ -724,26 +850,20 @@ function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
         piece: string,
         fg: number,
         bg: number,
+        attributes: number,
         link: number,
         tooltip: number,
     ): void => {
         if (piece === "") return;
-        if (__packedScratch.length < w + 5) __packed_grow(w + 5);
+        if (__packedScratch.length < w + 6) __packed_grow(w + 6);
         __packedScratch[w++] = piece.length;
         __packedScratch[w++] = fg;
         __packedScratch[w++] = bg;
+        __packedScratch[w++] = attributes;
         __packedScratch[w++] = link;
         __packedScratch[w++] = tooltip;
         runText += piece;
         runCount++;
-    };
-    const callbackIndex = (fn: Function): number => {
-        let index = callbacks.indexOf(fn);
-        if (index === -1) {
-            index = callbacks.length;
-            callbacks.push(fn);
-        }
-        return index;
     };
     const encodeTooltip = (tooltip: TooltipSpec | null): number => {
         if (tooltip === null) return 0;
@@ -752,34 +872,39 @@ function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
             tooltipLengths.push(tooltip.text.length);
             return 0x40000000 | (tooltipLengths.length - 1);
         }
-        return 0x80000000 | callbackIndex(tooltip.fn);
+        return 0x80000000 | __styled_callback_index(callbacks, tooltip.fn);
     };
     const wireLink = __styled_make_wire_link(callbacks);
     const encodeLink = (spec: LinkSpec | null): [number, number] => {
         if (spec === null) return [0, 0];
-        if (spec.action === null || !spec.enabled || spec.menu !== null) {
+        const action = spec.action;
+        if (__styled_link_requires_wire(spec)) {
             const wire = wireLink(spec);
             if (wire === null) throw new TypeError("internal advanced link encoding failure");
             advancedLinks.push(wire);
             return [0xC0000000 | (advancedLinks.length - 1), 0];
         }
+        if (action === null) {
+            throw new TypeError("internal packed link classification failure");
+        }
         const tooltip = encodeTooltip(spec.tooltip);
-        if ("send" in spec.action) {
-            sendText += spec.action.send;
-            sendLengths.push(spec.action.send.length);
+        if ("send" in action) {
+            sendText += action.send;
+            sendLengths.push(action.send.length);
             return [0x40000000 | (sendLengths.length - 1), tooltip];
         }
-        return [0x80000000 | callbackIndex(spec.action.fn), tooltip];
+        return [0x80000000 | __styled_callback_index(callbacks, action.fn), tooltip];
     };
 
     beginLine();
     for (const run of frag._runs) {
         const fg = __styled_encode_color(run.fg);
         const bg = __styled_encode_color(run.bg);
+        const attributes = __styled_encode_attributes(run.attributes);
         const [link, tooltip] = encodeLink(run.link);
         // Common case: no newline in the run.
         if (run.text.indexOf("\n") === -1) {
-            pushRun(run.text, fg, bg, link, tooltip);
+            pushRun(run.text, fg, bg, attributes, link, tooltip);
             continue;
         }
         const parts = run.text.split("\n");
@@ -788,7 +913,7 @@ function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
                 endLine();
                 beginLine();
             }
-            pushRun(parts[i], fg, bg, link, tooltip);
+            pushRun(parts[i], fg, bg, attributes, link, tooltip);
         }
     }
     endLine();
@@ -820,8 +945,12 @@ function __styled_splice_args(
     const callbacks: Function[] = [];
     const wireLink = __styled_make_wire_link(callbacks);
     // Match the plain path's tolerance: a null color option means unset.
-    const baseFg = options.fg != null ? __styled_check_color(options.fg) : null;
+    const lineFg = __line_fg(options);
+    const baseFg = lineFg !== null ? __styled_check_color(lineFg) : null;
     const baseBg = options.bg != null ? __styled_check_color(options.bg) : null;
+    const baseAttributes = options.attributes != null
+        ? __styled_check_attributes(options.attributes)
+        : null;
     const runs: WireRun[] = [];
     for (const run of text._runs) {
         if (run.text.indexOf("\n") !== -1) {
@@ -832,6 +961,7 @@ function __styled_splice_args(
             text: run.text,
             fg: run.fg === null ? baseFg : run.fg,
             bg: run.bg === null ? baseBg : run.bg,
+            attributes: run.attributes === null ? baseAttributes : run.attributes,
             link: wireLink(run.link),
         });
     }
@@ -845,7 +975,7 @@ function __styled_echo_arg(
     values: unknown[],
 ): string | StyledTextImpl {
     if (__is_template_strings(first)) {
-        return __styled_from_template(null, null, null, first, values);
+        return __styled_from_template(null, null, null, null, first, values);
     }
     return first as string | StyledTextImpl;
 }
@@ -1050,6 +1180,22 @@ interface StyleSpan {
     end: number;
     fg: Color;
     bg: Color;
+    attributes: TextAttributes;
+    /** Present when `fg` is the compatibility string `"default"` but its
+     *  terminal palette slot is the bright default. */
+    foregroundPaletteBright?: boolean;
+}
+
+function __line_fg(options: ColorOptions): Color | null {
+    const fg = options.fg ?? null;
+    if (fg === "default" && options.foregroundPaletteBright !== undefined) {
+        return {
+            color: "default",
+            bold: options.attributes?.bold ?? false,
+            paletteBright: options.foregroundPaletteBright,
+        };
+    }
+    return fg;
 }
 
 // ---- Panes --------------------------------------------------------------
@@ -2807,9 +2953,24 @@ class Line {
             return;
         }
         if (this._isCurrent) {
-            op_smudgy_insert(text as string, begin, end, options.fg || null, options.bg || null);
+            op_smudgy_insert(
+                text as string,
+                begin,
+                end,
+                __line_fg(options),
+                options.bg || null,
+                options.attributes ?? null,
+            );
         } else {
-            op_smudgy_line_insert(this._lineNumber, text as string, begin, end, options.fg || null, options.bg || null);
+            op_smudgy_line_insert(
+                this._lineNumber,
+                text as string,
+                begin,
+                end,
+                __line_fg(options),
+                options.bg || null,
+                options.attributes ?? null,
+            );
         }
     }
 
@@ -2830,9 +2991,22 @@ class Line {
     /** Highlights text in the specified byte range with the given colors. */
     highlightAt(begin: number, end: number, options: ColorOptions = {}): void {
         if (this._isCurrent) {
-            op_smudgy_highlight(begin, end, options.fg || null, options.bg || null);
+            op_smudgy_highlight(
+                begin,
+                end,
+                __line_fg(options),
+                options.bg || null,
+                options.attributes ?? null,
+            );
         } else {
-            op_smudgy_line_highlight(this._lineNumber, begin, end, options.fg || null, options.bg || null);
+            op_smudgy_line_highlight(
+                this._lineNumber,
+                begin,
+                end,
+                __line_fg(options),
+                options.bg || null,
+                options.attributes ?? null,
+            );
         }
     }
 
