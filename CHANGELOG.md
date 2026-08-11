@@ -188,6 +188,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The window wears its platform's frame.** On macOS the main window
+  now keeps its native frame — the system's rounded corners, hairline
+  border, and traffic-light buttons — with smudgy's toolbar drawn up in
+  the titlebar area. On Linux under Wayland, the window draws the same
+  finish itself, the way GNOME apps do: rounded top corners and a
+  hairline border while floating, squared off while maximized. X11
+  sessions keep the sharp rectangle, and `SMUDGY_SQUARE_CORNERS=1`
+  turns the rounding off anywhere it fights a tiling layout. (Windows
+  already had this look from the OS.)
 - **Map links meet rooms the way the exit reads.** Compass exits keep
   their short wall stubs, and diagonal exits' stubs now leave the corner
   diagonally — but up/down, in/out, and portal links drop the stub
