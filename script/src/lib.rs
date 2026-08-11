@@ -41,8 +41,8 @@ use sys_traits::impls::RealSys;
 
 pub use module_loader::{ImportProvider, ScriptModuleLoader};
 pub use package_resolver::{
-    canonical_url, params_module_url, parse_canonical, parse_params_url, platform_event_catalog,
-    platform_state_producer,
+    canonical_url, is_any_host_net_entry, params_module_url, parse_canonical, parse_params_url,
+    platform_event_catalog, platform_state_producer,
     CanonicalCoords,
     ImportPolicy, InMemoryPackageProvider, PackageDependency, PackageError, PackageKey,
     PackageManifest, PackageModuleSource, PackageParameter, PackagePermissions, PackageProvider,

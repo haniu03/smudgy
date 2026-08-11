@@ -22,7 +22,7 @@ use smudgy_core::models::local_packages::{self, LocalModule, LocalPackage};
 use smudgy_core::models::naming;
 use smudgy_core::models::shared_packages::{
     self, ImportPolicy, LockedPackage, PackageManifest, PackageParameter, PackagePermissions,
-    ParamKind, SmudgyCapabilities, UpdateMode,
+    ParamKind, SmudgyCapabilities, UpdateMode, is_any_host_net_entry,
 };
 
 use crate::assets::fonts;
@@ -1016,8 +1016,9 @@ async fn closure_permission_union(
 enum PermissionRisk {
     /// A scoped grant that does what the line says and nothing more.
     Normal,
-    /// Elevated exposure (reading files outside the package's own data folder, downloading
-    /// arbitrary web code to run) — flagged amber, but still contained by the sandbox.
+    /// Elevated exposure (reading files outside the package's own data folder, connecting to any
+    /// host, downloading arbitrary web code to run) — flagged amber, but still contained by the
+    /// sandbox.
     Caution,
     /// Sandbox-escape-equivalent: subprocesses (`run`), native code (`ffi`), or writes outside
     /// `$DATA`. A subprocess or native library runs with the user's full privileges, and an
@@ -1060,7 +1061,13 @@ fn permission_can_lines(perms: &PackagePermissions) -> Vec<PermissionLine> {
             lines.push(PermissionLine {
                 head: crate::i18n::t!("permission-connect-to"),
                 detail: Some(host.clone()),
-                risk: PermissionRisk::Normal,
+                // `*` / `*:port` lets the package choose the peer rather than constraining it to
+                // a named host. Frame that at the same caution tier as arbitrary web-code imports.
+                risk: if is_any_host_net_entry(host) {
+                    PermissionRisk::Caution
+                } else {
+                    PermissionRisk::Normal
+                },
             });
         }
     }
@@ -7132,5 +7139,33 @@ mod tests {
         assert_eq!(human_size(1536), "1.5 KB");
         assert_eq!(human_size(1024 * 1024), "1.0 MB");
         assert_eq!(human_size(1024 * 1024 * 3 / 2), "1.5 MB");
+    }
+
+    #[test]
+    fn any_host_network_grants_share_the_arbitrary_import_risk_tier() {
+        let wildcard = PackagePermissions {
+            net: vec!["*".into(), "*:443".into()],
+            ..Default::default()
+        };
+        let wildcard_lines = permission_can_lines(&wildcard);
+        assert_eq!(wildcard_lines.len(), 2);
+        assert!(
+            wildcard_lines
+                .iter()
+                .all(|line| line.risk == PermissionRisk::Caution)
+        );
+        assert_eq!(union_risk(&wildcard), PermissionRisk::Caution);
+
+        let arbitrary_import = PackagePermissions {
+            import: ImportPolicy::Any,
+            ..Default::default()
+        };
+        assert_eq!(union_risk(&arbitrary_import), PermissionRisk::Caution);
+
+        let named_host = PackagePermissions {
+            net: vec!["api.example.com:443".into()],
+            ..Default::default()
+        };
+        assert_eq!(union_risk(&named_host), PermissionRisk::Normal);
     }
 }
