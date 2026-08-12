@@ -415,10 +415,14 @@ impl SessionInput {
     /// obscure, not the user abandoning the line. The next
     /// [`Message::FocusLost`] consumes the mark and skips the clear-on-blur
     /// behavior, so the in-progress text is waiting when the tab is
-    /// re-selected. Idempotent across repeated switches while no blur has
-    /// landed.
+    /// re-selected. The inactive subtree cannot deliver that widget event
+    /// promptly, so update the component-side focus mirror here as well: a
+    /// script must never continue seeing an obscured input as focused.
+    /// Idempotent across repeated switches while no blur has landed.
     pub fn note_obscured(&mut self) {
         self.obscured_blur_pending = true;
+        self.caret.focused = false;
+        self.last_source = InputSource::Other;
     }
 
     /// Register a new hotkey with the given ID
@@ -1279,6 +1283,10 @@ mod tests {
         // What `select_tab` does before its focus operations reach the
         // obscured subtree through TabHost::operate.
         input.note_obscured();
+        assert!(
+            !input.mirror_snapshot().focused,
+            "an obscured input is unfocused immediately"
+        );
         // What the obscured input's next update publishes once its tab is
         // re-selected.
         let _ = input.update(Message::FocusLost);
