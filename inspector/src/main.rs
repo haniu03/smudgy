@@ -216,7 +216,7 @@ fn http_get_json(addr: &str, path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
     #[test]
@@ -288,8 +288,21 @@ mod tests {
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut s) = conn else { break };
-                let mut buf = [0u8; 1024];
-                let _ = s.read(&mut buf);
+                // Consume the complete request headers before closing the socket.
+                // A single TCP read may leave request bytes unread, which can make
+                // Linux report the subsequent close as ECONNRESET to the client.
+                {
+                    let mut reader = BufReader::new(&mut s);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) if line == "\r\n" => break,
+                            Ok(_) => {}
+                        }
+                    }
+                }
                 let body =
                     r#"[{"webSocketDebuggerUrl":"ws://127.0.0.1:9999/ws/uuid-1","type":"node"}]"#;
                 let resp = format!(
