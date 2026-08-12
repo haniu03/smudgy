@@ -318,8 +318,8 @@ async function areaCommand([subcommand, ...args]: string[]) {
                 echo("Usage: area create <name>");
                 return;
             }
-            await mapper.createArea(name);
-            echo(`Created area ${name}`);
+            await mapper.createArea(name, { storage: "local" });
+            echo(`Created local area ${name}`);
             break;
         }
         default:

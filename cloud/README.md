@@ -13,6 +13,7 @@ This crate embraces simplicity over complex synchronization. Both UI and JavaScr
 - **`MapperBackend`**: Core trait defining all map operations (CRUD for areas, rooms, exits, labels, shapes, properties)
 - **`CloudMapper`**: HTTP client implementation connecting to the REST API; `CachedCloudMapper`, `LocalBackend`, and `CompositeBackend` are the other `MapperBackend` implementations
 - **`Mapper`**: cheaply cloneable cache + background-sync front end providing lock-free access from any thread; backed by per-domain caches (`AreaCache`, `AtlasCache`, `ExitCache`, `RoomCache`)
+- **Storage + relocation**: `MapStorage::{Session, Local, Cloud}` and `MapDestination` make creation and placement explicit. `Mapper::relocate_areas` / `relocate_atlas` copy complete documents across tiers, remap links within a copied set, wait for acknowledgement, and only then delete sources for a move.
 - **`CloudApiClient` / `PackageApiClient`**: the cloud service clients — identity/social/sharing and `smudgy://` package sharing/discovery respectively — sharing the same `CredentialSource`
 - **Comprehensive data structures**: `Area`, `Room`, `Exit`, `Label`, `Shape` with Arc-based sharing
 
@@ -23,6 +24,9 @@ This crate embraces simplicity over complex synchronization. Both UI and JavaScr
 3. **Single Cache Implementation**: Both UI and JavaScript threads use identical interface
 4. **Arc-Based Sharing**: Zero-copy data sharing between threads
 5. **Eventual Consistency**: Simplicity over complex rollback mechanisms
+6. **Storage Is Explicit**: session lifetime, durable local files, and cloud sync are named destinations; atlas placement is a separate field, not an overloaded boolean
+7. **Cross-Tier Moves Are Recoverable**: copy-then-delete can leave a duplicate after a delete failure, but never a partial destination with the only source already gone
+8. **Compatibility Has a Deadline**: pre-storage-model creation helpers and the script-facing `ephemeral` / `isEphemeral` names are deprecated through 0.7.x and removed in 0.8.0; release assertions enforce the cutoff
 
 ## Current Status
 

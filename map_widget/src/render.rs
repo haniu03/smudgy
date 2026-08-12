@@ -13,8 +13,8 @@ use iced::{
     widget::canvas::{self, LineDash, Stroke, gradient, stroke},
 };
 use smudgy_cloud::{
-    ConnectionDash, ConnectionRouting, ExitDirection, HorizontalAlignment, Label, MapPoint,
-    Shape, ShapeType, VerticalAlignment,
+    ConnectionDash, ConnectionRouting, ExitDirection, HorizontalAlignment, Label, MapPoint, Shape,
+    ShapeType, VerticalAlignment,
     connection_geometry::{ConnectionGeometry, PathPrimitive},
     mapper::{
         AtlasCache,
@@ -24,6 +24,7 @@ use smudgy_cloud::{
 };
 
 use crate::viewport::Region;
+use crate::{MapViewStyle, RoomOverlay};
 
 /// The default exit gray — the rendered form of
 /// [`smudgy_cloud::DEFAULT_CONNECTION_COLOR`]; a drift test asserts the two
@@ -327,7 +328,6 @@ pub fn draw_level_triangle_outline(
     frame.stroke(&level_triangle_path(cx, cy, up), solid_stroke(color, width));
 }
 
-
 /// The center of a cross-level exit's level triangle when the exit carries a
 /// compass direction: placed on that side of the room rather than the fixed
 /// up/down corner. Non-planar directions (Up/Down/unset) keep the corner.
@@ -432,7 +432,10 @@ pub fn level_treatment(
         return None;
     };
     let up = *level > connection.from_level;
-    let (x, y) = (connection.room.get_x(), connection.room.get_y());
+    let (x, y) = (
+        connection.room.get_x() * connection.layout_spacing,
+        connection.room.get_y() * connection.layout_spacing,
+    );
     let corner = || {
         let center =
             smudgy_cloud::connection_geometry::level_marker_center(MapPoint::new(x, y), up);
@@ -480,15 +483,17 @@ fn draw_cross_level_stub(
     tip: Point,
     opacity: f32,
     is_secret: bool,
+    color: Color,
+    width: f32,
 ) {
-    let near = apply_opacity(connection.color, opacity);
-    let far = apply_opacity(connection.color, opacity * CROSS_LEVEL_FADE_FLOOR);
+    let near = apply_opacity(color, opacity);
+    let far = apply_opacity(color, opacity * CROSS_LEVEL_FADE_FLOOR);
     let fade = gradient::Linear::new(edge, tip)
         .add_stop(0.0, near)
         .add_stop(1.0, far);
     let stroke = Stroke {
         style: stroke::Style::Gradient(fade.into()),
-        width: connection.thickness,
+        width,
         line_cap: dash_line_cap(connection.dash),
         line_join: stroke::LineJoin::Round,
         line_dash: LineDash {
@@ -519,9 +524,38 @@ pub fn draw_connection(
     show_secrets: bool,
     suppress_level_stubs: bool,
 ) {
+    draw_connection_styled(
+        frame,
+        atlas,
+        connection,
+        opacity,
+        show_secrets,
+        suppress_level_stubs,
+        None,
+        None,
+        None,
+    );
+}
+
+/// Draw a connection with view-local color/width and door state. `door`
+/// overrides the persisted member aggregate without mutating the map.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_connection_styled(
+    frame: &mut canvas::Frame,
+    atlas: &AtlasCache,
+    connection: &RoomConnection,
+    opacity: f32,
+    show_secrets: bool,
+    suppress_level_stubs: bool,
+    color_override: Option<Color>,
+    width_override: Option<f32>,
+    door: Option<(bool, bool, Color)>,
+) {
     let is_secret = show_secrets && connection.is_secret;
-    let color = apply_opacity(connection.color, opacity);
-    let stroke = connection_stroke(color, connection.thickness, connection.dash, is_secret);
+    let base_color = color_override.unwrap_or(connection.color);
+    let width = width_override.unwrap_or(connection.thickness);
+    let color = apply_opacity(base_color, opacity);
+    let stroke = connection_stroke(color, width, connection.dash, is_secret);
     // Secret connections mute their fill-only pieces (level markers,
     // arrowheads, external dots) — the dash carries secrecy on the stroke.
     let fill_opacity = if is_secret {
@@ -529,7 +563,7 @@ pub fn draw_connection(
     } else {
         opacity
     };
-    let fill_color = apply_opacity(connection.color, fill_opacity);
+    let fill_color = apply_opacity(base_color, fill_opacity);
     let geometry = &connection.geometry;
 
     match &connection.to {
@@ -589,8 +623,8 @@ pub fn draw_connection(
             frame.stroke(
                 &path_from_primitives(&geometry.primitives),
                 connection_stroke(
-                    apply_opacity(connection.color, opacity * UNKNOWN_MAP_OPACITY),
-                    connection.thickness,
+                    apply_opacity(base_color, opacity * UNKNOWN_MAP_OPACITY),
+                    width,
                     connection.dash,
                     is_secret,
                 ),
@@ -603,7 +637,7 @@ pub fn draw_connection(
                 position: tip,
                 align_x: Alignment::Center,
                 align_y: Vertical::Center,
-                color: apply_opacity(connection.color, dim),
+                color: apply_opacity(base_color, dim),
                 size: 0.3.into(),
                 ..Default::default()
             });
@@ -633,7 +667,9 @@ pub fn draw_connection(
                     draw_level_triangle(frame, center.x, center.y, up, marker_color);
                 }
                 Some(LevelTreatment::FadingStub { edge, tip }) => {
-                    draw_cross_level_stub(frame, connection, edge, tip, opacity, is_secret);
+                    draw_cross_level_stub(
+                        frame, connection, edge, tip, opacity, is_secret, base_color, width,
+                    );
                 }
                 None => {}
             }
@@ -645,15 +681,79 @@ pub fn draw_connection(
     // leaves this way" against the filled triangle of a linked cross-level
     // Connection.
     for &(center, up) in &geometry.level_markers {
-        draw_level_triangle_outline(
+        draw_level_triangle_outline(frame, center.x, center.y, up, fill_color, width);
+    }
+
+    if let Some((closed, locked, door_color)) = door
+        && (closed || locked)
+    {
+        draw_door_state(
             frame,
-            center.x,
-            center.y,
-            up,
-            fill_color,
-            connection.thickness,
+            geometry,
+            closed,
+            locked,
+            apply_opacity(door_color, opacity),
         );
     }
+}
+
+fn draw_door_state(
+    frame: &mut canvas::Frame,
+    geometry: &ConnectionGeometry,
+    closed: bool,
+    locked: bool,
+    color: Color,
+) {
+    let Some((center, tangent)) = centerline_midpoint(&geometry.centerline) else {
+        return;
+    };
+    let normal = Vector::new(-tangent.y, tangent.x);
+    if closed {
+        let half = 0.13;
+        frame.stroke(
+            &canvas::Path::line(center - normal * half, center + normal * half),
+            solid_stroke(color, 3.0),
+        );
+    }
+    if locked {
+        let radius = 0.065;
+        frame.fill(
+            &canvas::Path::rounded_rectangle(
+                Point::new(center.x - radius, center.y - radius),
+                Size::new(radius * 2.0, radius * 2.0),
+                (radius * 0.25).into(),
+            ),
+            color,
+        );
+    }
+}
+
+fn centerline_midpoint(points: &[MapPoint]) -> Option<(Point, Vector)> {
+    let total: f32 = points
+        .windows(2)
+        .map(|pair| pair[0].distance(pair[1]))
+        .sum();
+    if !total.is_finite() || total <= f32::EPSILON {
+        return None;
+    }
+    let mut remaining = total / 2.0;
+    for pair in points.windows(2) {
+        let length = pair[0].distance(pair[1]);
+        if remaining <= length && length > f32::EPSILON {
+            let t = remaining / length;
+            let center = Point::new(
+                pair[0].x + (pair[1].x - pair[0].x) * t,
+                pair[0].y + (pair[1].y - pair[0].y) * t,
+            );
+            let tangent = Vector::new(
+                (pair[1].x - pair[0].x) / length,
+                (pair[1].y - pair[0].y) / length,
+            );
+            return Some((center, tangent));
+        }
+        remaining -= length;
+    }
+    None
 }
 
 /// The one-way arrowhead at a Connection's arrival port, oriented by the
@@ -713,23 +813,63 @@ fn marker_anchor(geometry: &ConnectionGeometry) -> (Point, Point, Alignment, Ver
 /// coordinates, plus a small corner diamond when the room is secret. The
 /// secret mark is suppressed entirely when `show_secrets` is false.
 pub fn draw_room(frame: &mut canvas::Frame, room: &RoomCache, opacity: f32, show_secrets: bool) {
+    draw_room_styled(
+        frame,
+        room,
+        room.get_x(),
+        room.get_y(),
+        opacity,
+        show_secrets,
+        &MapViewStyle::default(),
+        None,
+    );
+}
+
+/// Draw a room at a presentation-adjusted coordinate with view-local style.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_room_styled(
+    frame: &mut canvas::Frame,
+    room: &RoomCache,
+    x: f32,
+    y: f32,
+    opacity: f32,
+    show_secrets: bool,
+    style: &MapViewStyle,
+    overlay: Option<&RoomOverlay>,
+) {
     let room_shape = canvas::Path::rounded_rectangle(
         Point {
-            x: room.get_x() - MAP_ROOM_SIZE / 2.0,
-            y: room.get_y() - MAP_ROOM_SIZE / 2.0,
+            x: x - MAP_ROOM_SIZE / 2.0,
+            y: y - MAP_ROOM_SIZE / 2.0,
         },
         MAP_ROOM_SIZE_AS_SIZE,
-        MAP_ROOM_BORDER_RADIUS.into(),
+        style
+            .room_border_radius
+            .unwrap_or(MAP_ROOM_BORDER_RADIUS)
+            .into(),
     );
 
-    frame.fill(&room_shape, apply_opacity(room.get_iced_color(), opacity));
+    let fill = overlay
+        .and_then(|overlay| overlay.fill.as_deref())
+        .and_then(parse_color)
+        .unwrap_or_else(|| room.get_iced_color());
+    frame.fill(&room_shape, apply_opacity(fill, opacity));
+    let stroke_color = overlay
+        .and_then(|overlay| overlay.stroke.as_deref())
+        .or(style.room_stroke.as_deref())
+        .and_then(parse_color)
+        .unwrap_or_else(|| Color::from_rgba8(0, 0, 0, 0.1));
+    let stroke_width = overlay
+        .and_then(|overlay| overlay.stroke_width)
+        .or(style.room_stroke_width)
+        .unwrap_or(2.0);
     frame.stroke(
         &room_shape,
-        solid_stroke(apply_opacity(Color::from_rgba8(0, 0, 0, 0.1), opacity), 2.0),
+        solid_stroke(apply_opacity(stroke_color, opacity), stroke_width),
     );
 
     if show_secrets && room.is_secret() {
-        draw_secret_mark(frame, room.get_x(), room.get_y(), opacity);
+        draw_secret_mark(frame, x, y, opacity);
     }
 }
 
@@ -751,8 +891,24 @@ fn draw_secret_mark(frame: &mut canvas::Frame, x: f32, y: f32, opacity: f32) {
 
 /// Draws the player's position marker on a room center.
 pub fn draw_player_indicator(frame: &mut canvas::Frame, x: f32, y: f32, opacity: f32) {
+    draw_player_indicator_styled(frame, x, y, opacity, None);
+}
+
+pub fn draw_player_indicator_styled(
+    frame: &mut canvas::Frame,
+    x: f32,
+    y: f32,
+    opacity: f32,
+    color: Option<Color>,
+) {
     let circle = canvas::Path::circle(Point { x, y }, MAP_PLAYER_INDICATOR_RADIUS);
-    frame.fill(&circle, apply_opacity(Color::from_rgb8(0, 0, 255), opacity));
+    frame.fill(
+        &circle,
+        apply_opacity(
+            color.unwrap_or_else(|| Color::from_rgb8(0, 0, 255)),
+            opacity,
+        ),
+    );
 }
 
 /// Buckets a CSS-style numeric font weight into iced's weight scale.

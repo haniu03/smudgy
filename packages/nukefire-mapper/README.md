@@ -166,7 +166,7 @@ import {
 
 nukefireMapper.stop();
 const durableMapper = new NukeFireMapper({
-  ephemeral: false,
+  storage: "local",
   updateCoordinates: true,
 });
 durableMapper.start(); // creates and reuses durable areas

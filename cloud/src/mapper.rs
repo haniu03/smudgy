@@ -9,7 +9,8 @@ use crate::mutation::{
 use crate::{
     Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CreateAreaRequest, Exit, ExitArgs, ExitId, ExitUpdates, LabelArgs, LabelId,
-    LabelUpdates, RoomNumber, RoomUpdates, ShapeArgs, ShapeId, ShapeUpdates,
+    LabelUpdates, MapDestination, MapStorage, RoomNumber, RoomUpdates, ShapeArgs, ShapeId,
+    ShapeUpdates,
 };
 
 use arc_swap::ArcSwap;
@@ -565,7 +566,7 @@ impl<'de> serde::Deserialize<'de> for AreaImportDocument {
 /// `connection_id` resolves in the document's `connections`, and every
 /// Connection has one or two member exits. A violation rejects the whole
 /// import.
-fn validate_import_document(details: &AreaWithDetails) -> CloudResult<()> {
+pub(crate) fn validate_import_document(details: &AreaWithDetails) -> CloudResult<()> {
     let mut members: HashMap<crate::ConnectionId, u32> = details
         .connections
         .iter()
@@ -672,6 +673,7 @@ impl SyncStats {
 struct AcknowledgedWrite {
     area_id: AreaId,
     pending_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
+    metadata_writes_by_area: Option<Arc<Mutex<HashMap<AreaId, u64>>>>,
     stats: Arc<SyncStats>,
     settled: bool,
 }
@@ -687,8 +689,27 @@ impl AcknowledgedWrite {
         Self {
             area_id,
             pending_by_area,
+            metadata_writes_by_area: None,
             stats,
             settled: false,
+        }
+    }
+
+    fn new_metadata(
+        area_id: AreaId,
+        pending_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
+        metadata_writes_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
+        stats: Arc<SyncStats>,
+    ) -> Self {
+        let mut write = Self::new(area_id, pending_by_area, stats);
+        *metadata_writes_by_area.lock().entry(area_id).or_insert(0) += 1;
+        write.metadata_writes_by_area = Some(metadata_writes_by_area);
+        write
+    }
+
+    fn release_metadata_marker(&self) {
+        if let Some(writes) = &self.metadata_writes_by_area {
+            Inner::decrement_pending(writes, self.area_id);
         }
     }
 
@@ -700,6 +721,7 @@ impl AcknowledgedWrite {
         };
         counter.fetch_add(1, Ordering::Relaxed);
         Inner::decrement_pending(&self.pending_by_area, self.area_id);
+        self.release_metadata_marker();
         self.settled = true;
     }
 }
@@ -709,11 +731,12 @@ impl Drop for AcknowledgedWrite {
         if !self.settled {
             self.stats.operations_failed.fetch_add(1, Ordering::Relaxed);
             Inner::decrement_pending(&self.pending_by_area, self.area_id);
+            self.release_metadata_marker();
         }
     }
 }
 
-struct AreaDeleteFence {
+pub(crate) struct AreaDeleteFence {
     area_id: AreaId,
     pending: Arc<PendingQueue>,
     armed: bool,
@@ -777,6 +800,26 @@ impl Drop for AreaDeleteFence {
     }
 }
 
+/// In-memory pre-delete fence held while a move copies its destination.
+/// Dropping an uncommitted fence reopens the source and its queued WAL.
+pub(crate) struct AreaMoveFence {
+    area_id: AreaId,
+    delete_fence: Option<AreaDeleteFence>,
+}
+
+impl AreaMoveFence {
+    #[must_use]
+    pub(crate) fn area_id(&self) -> AreaId {
+        self.area_id
+    }
+
+    fn into_delete_fence(mut self) -> AreaDeleteFence {
+        self.delete_fence
+            .take()
+            .expect("a move fence is committed at most once")
+    }
+}
+
 #[derive(Clone)]
 pub struct Mapper {
     inner: Arc<Inner>,
@@ -801,6 +844,9 @@ pub struct Inner {
     /// In-flight local write operations per area; the sync engine defers
     /// refetching an area while its count is non-zero.
     pending_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
+    /// Acknowledged area metadata writes (rename/refile) that are not part of
+    /// the content WAL. Relocation must not snapshot while one is in flight.
+    metadata_writes_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
     /// Operations already represented in session diagnostics. Reactivating a
     /// dormant viewer journal must not count the same durable edit twice.
     accounted_operations: Mutex<HashSet<OperationId>>,
@@ -906,6 +952,7 @@ impl Mapper {
             auth_projection_revision: AtomicU64::new(0),
             sync_notify: Arc::new(Notify::new()),
             pending_by_area: Arc::new(Mutex::new(pending_by_area)),
+            metadata_writes_by_area: Arc::new(Mutex::new(HashMap::new())),
             accounted_operations: Mutex::new(accounted_operations),
             pending,
             ephemeral_cap_warned: AtomicBool::new(false),
@@ -1044,6 +1091,10 @@ impl Mapper {
             .rcu(|cache| Arc::new(cache.with_scope_exclusions(atlases.clone(), areas.clone())));
     }
 
+    #[deprecated(
+        since = "0.5.3",
+        note = "use create_area_at with an explicit MapDestination; supported through Smudgy 0.7.x and removed in 0.8.0"
+    )]
     pub fn create_area(&self, name: String) -> impl Future<Output = CloudResult<AreaId>> {
         self.inner.create_area(name)
     }
@@ -1057,21 +1108,74 @@ impl Mapper {
     /// Propagates the backend's create error (the ephemeral tier itself is
     /// infallible; a non-composite backend without the tier routes this to
     /// its default create path).
+    #[deprecated(
+        since = "0.5.3",
+        note = "use create_area_at with MapStorage::Session; supported through Smudgy 0.7.x and removed in 0.8.0"
+    )]
     pub fn create_area_ephemeral(&self, name: String) -> impl Future<Output = CloudResult<AreaId>> {
-        self.inner.create_area_ephemeral(name)
+        self.create_area_at(name, MapDestination::loose(MapStorage::Session))
+    }
+
+    /// Create an area at an explicit storage + folder destination.
+    ///
+    /// This is the canonical creation surface. The deprecated `create_area*`
+    /// compatibility helpers delegate here only through 0.7.x and are removed
+    /// in 0.8.0.
+    pub fn create_area_at(
+        &self,
+        name: String,
+        destination: MapDestination,
+    ) -> impl Future<Output = CloudResult<AreaId>> {
+        self.inner.create_area_at(name, destination)
     }
 
     /// Whether `area_id` lives in the ephemeral (session-lifetime) tier.
     #[must_use]
+    #[deprecated(
+        since = "0.5.3",
+        note = "use area_storage(area_id) == MapStorage::Session; supported through Smudgy 0.7.x and removed in 0.8.0"
+    )]
     pub fn is_ephemeral(&self, area_id: &AreaId) -> bool {
-        self.inner.backend.ephemeral_area_ids().contains(area_id)
+        self.area_storage(area_id) == MapStorage::Session
     }
 
-    /// Area ids of the ephemeral tier — the set the editor's atlas tree and
-    /// per-area preference writes exclude.
+    /// The authoritative storage tier for a loaded area.
     #[must_use]
-    pub fn ephemeral_area_ids(&self) -> HashSet<AreaId> {
+    pub fn area_storage(&self, area_id: &AreaId) -> MapStorage {
+        if self.inner.backend.ephemeral_area_ids().contains(area_id) {
+            MapStorage::Session
+        } else if self.inner.backend.local_area_ids().contains(area_id) {
+            MapStorage::Local
+        } else {
+            MapStorage::Cloud
+        }
+    }
+
+    /// The authoritative storage tier for an owned atlas.
+    #[must_use]
+    pub fn atlas_storage(&self, atlas_id: &AtlasId) -> MapStorage {
+        if self.inner.backend.local_atlas_ids().contains(atlas_id) {
+            MapStorage::Local
+        } else {
+            MapStorage::Cloud
+        }
+    }
+
+    /// Area ids in session storage — the set the editor's atlas tree and
+    /// per-area preference writes exclude from durable filing.
+    #[must_use]
+    pub fn session_area_ids(&self) -> HashSet<AreaId> {
         self.inner.backend.ephemeral_area_ids()
+    }
+
+    /// Compatibility name for [`Self::session_area_ids`].
+    #[must_use]
+    #[deprecated(
+        since = "0.5.3",
+        note = "use session_area_ids; supported through Smudgy 0.7.x and removed in 0.8.0"
+    )]
+    pub fn ephemeral_area_ids(&self) -> HashSet<AreaId> {
+        self.session_area_ids()
     }
 
     /// Like [`Self::create_area`] but files the new area into `atlas_id`
@@ -1079,6 +1183,10 @@ impl Mapper {
     ///
     /// # Errors
     /// Propagates the backend's create error (e.g. unauthorized, network).
+    #[deprecated(
+        since = "0.5.3",
+        note = "use create_area_at with an explicit MapDestination; supported through Smudgy 0.7.x and removed in 0.8.0"
+    )]
     pub fn create_area_in(
         &self,
         name: String,
@@ -1116,6 +1224,44 @@ impl Mapper {
     /// Propagates the backend's read error.
     pub async fn export_area(&self, area_id: AreaId) -> CloudResult<AreaWithDetails> {
         self.inner.export_area(area_id).await
+    }
+
+    /// Snapshot the displayed area, including durably-journaled optimistic
+    /// edits that have not reached their backend yet. Relocation uses this
+    /// rather than a backend export so moving a map can never omit edits the
+    /// user can already see.
+    pub(crate) fn snapshot_area(&self, area_id: AreaId) -> CloudResult<AreaWithDetails> {
+        self.inner
+            .atlas_cache
+            .load()
+            .get_area(&area_id)
+            .map(|area| area.to_details())
+            .ok_or(CloudError::AreaNotFound(area_id))
+    }
+
+    /// Freeze source content before a move snapshot. The fence is deliberately
+    /// not durable yet: a crash during destination copy must leave the source
+    /// and its WAL usable. Existing in-flight content writes are allowed to
+    /// finish; future content and metadata writes are rejected until these
+    /// guards are committed or dropped.
+    pub(crate) fn begin_area_move(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaMoveFence>> {
+        self.inner.begin_area_move(area_ids)
+    }
+
+    pub(crate) async fn wait_area_move_quiescent(&self, fences: &[AreaMoveFence]) {
+        for fence in fences {
+            self.inner
+                .pending
+                .wait_until_delete_quiescent(fence.area_id())
+                .await;
+        }
+    }
+
+    pub(crate) async fn commit_area_move(&self, fence: AreaMoveFence) -> CloudResult<()> {
+        let area_id = fence.area_id();
+        self.inner
+            .delete_area_with_fence(area_id, fence.into_delete_fence())
+            .await
     }
 
     /// The viewer's effective access for an area, or `None` if it isn't in the current atlas.
@@ -1180,6 +1326,10 @@ impl Mapper {
     ///
     /// # Errors
     /// Propagates the backend's create error (e.g. unauthorized, network).
+    #[deprecated(
+        since = "0.5.3",
+        note = "use create_atlas_at with an explicit MapStorage; supported through Smudgy 0.7.x and removed in 0.8.0"
+    )]
     pub fn create_atlas(&self, name: String) -> impl Future<Output = CloudResult<Atlas>> {
         let backend = self.inner.backend.clone();
         async move { backend.create_atlas(&name).await }
@@ -1191,6 +1341,10 @@ impl Mapper {
     ///
     /// # Errors
     /// Propagates the backend's create error (e.g. unauthorized, network).
+    #[deprecated(
+        since = "0.5.3",
+        note = "use create_atlas_at with an explicit MapStorage; supported through Smudgy 0.7.x and removed in 0.8.0"
+    )]
     pub fn create_atlas_in(
         &self,
         name: String,
@@ -1198,6 +1352,16 @@ impl Mapper {
     ) -> impl Future<Output = CloudResult<Atlas>> {
         let backend = self.inner.backend.clone();
         async move { backend.create_atlas_in(&name, prefer_local).await }
+    }
+
+    /// Create an atlas in an explicit durable storage tier.
+    pub fn create_atlas_at(
+        &self,
+        name: String,
+        storage: MapStorage,
+    ) -> impl Future<Output = CloudResult<Atlas>> {
+        let backend = self.inner.backend.clone();
+        async move { backend.create_atlas_at(&name, storage).await }
     }
 
     /// Rename an atlas.
@@ -1867,22 +2031,51 @@ impl Inner {
         self.create_area_from_request(request).await
     }
 
+    /// Create an area in an explicit storage tier and optional atlas.
+    pub async fn create_area_at(
+        &self,
+        name: String,
+        destination: MapDestination,
+    ) -> CloudResult<AreaId> {
+        if destination.storage == MapStorage::Session && destination.atlas_id.is_some() {
+            return Err(CloudError::InvalidInput(
+                "session maps cannot be filed into atlases".to_string(),
+            ));
+        }
+        let request = CreateAreaRequest {
+            name,
+            atlas_id: destination.atlas_id,
+            ephemeral: destination.storage == MapStorage::Session,
+        };
+        self.create_area_from_request_at(request, destination.storage)
+            .await
+    }
+
     /// Create an area in the ephemeral tier (see [`Mapper::create_area_ephemeral`]).
     ///
     /// # Errors
     /// Propagates the backend's create error.
     pub async fn create_area_ephemeral(&self, name: String) -> CloudResult<AreaId> {
-        let request = CreateAreaRequest {
-            name,
-            atlas_id: None,
-            ephemeral: true,
-        };
-        self.create_area_from_request(request).await
+        self.create_area_at(name, MapDestination::loose(MapStorage::Session))
+            .await
+    }
+
+    async fn create_area_from_request_at(
+        &self,
+        request: CreateAreaRequest,
+        storage: MapStorage,
+    ) -> CloudResult<AreaId> {
+        let backend_area = self.backend.create_area_at(request, storage).await?;
+        self.finish_created_area(backend_area)
     }
 
     async fn create_area_from_request(&self, request: CreateAreaRequest) -> CloudResult<AreaId> {
         // Create area on backend first to get the real ID
         let backend_area = self.backend.create_area(request).await?;
+        self.finish_created_area(backend_area)
+    }
+
+    fn finish_created_area(&self, backend_area: Area) -> CloudResult<AreaId> {
         let area_id = backend_area.id;
 
         // The created row is backend truth for the new area's revision.
@@ -2138,12 +2331,56 @@ impl Inner {
             .map(|area| area.effective_access())
     }
 
+    fn begin_area_move(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaMoveFence>> {
+        let _mutation_guard = self.mutation_gate.lock();
+        let metadata = self.metadata_writes_by_area.lock();
+        if let Some(area_id) = area_ids
+            .iter()
+            .find(|area_id| metadata.contains_key(area_id))
+        {
+            return Err(CloudError::PendingOperations(format!(
+                "map {area_id} is still being renamed or filed; retry the move when it finishes"
+            )));
+        }
+        drop(metadata);
+
+        let mut fences = Vec::with_capacity(area_ids.len());
+        for &area_id in area_ids {
+            fences.push(AreaMoveFence {
+                area_id,
+                delete_fence: Some(AreaDeleteFence::begin(area_id, self.pending.clone())?),
+            });
+        }
+        Ok(fences)
+    }
+
     async fn delete_area_and_wait(&self, area_id: AreaId) -> CloudResult<()> {
         let auth_generation = self.metadata_auth_generation(area_id);
-        let mut delete_fence = {
-            let _mutation_guard = self.mutation_gate.lock();
-            AreaDeleteFence::begin(area_id, self.pending.clone())?
-        };
+        let mut fences = self.begin_area_move(&[area_id])?;
+        let delete_fence = fences
+            .pop()
+            .expect("one requested delete produces one fence")
+            .into_delete_fence();
+        self.delete_area_with_fence_at_generation(area_id, delete_fence, auth_generation)
+            .await
+    }
+
+    async fn delete_area_with_fence(
+        &self,
+        area_id: AreaId,
+        delete_fence: AreaDeleteFence,
+    ) -> CloudResult<()> {
+        let auth_generation = self.metadata_auth_generation(area_id);
+        self.delete_area_with_fence_at_generation(area_id, delete_fence, auth_generation)
+            .await
+    }
+
+    async fn delete_area_with_fence_at_generation(
+        &self,
+        area_id: AreaId,
+        mut delete_fence: AreaDeleteFence,
+        auth_generation: Option<u64>,
+    ) -> CloudResult<()> {
         self.pending.wait_until_delete_quiescent(area_id).await;
         delete_fence.prepare()?;
         delete_fence.request_started();
@@ -2195,11 +2432,20 @@ impl Inner {
             name: Some(name.to_string()),
             atlas_id: None,
         };
-        let tracking = AcknowledgedWrite::new(
-            area_id,
-            self.pending_by_area.clone(),
-            self.sync_stats.clone(),
-        );
+        let tracking = {
+            let _mutation_guard = self.mutation_gate.lock();
+            if self.pending.is_delete_fenced(area_id) {
+                return Err(CloudError::PendingOperations(
+                    "this map is being moved or deleted".to_string(),
+                ));
+            }
+            AcknowledgedWrite::new_metadata(
+                area_id,
+                self.pending_by_area.clone(),
+                self.metadata_writes_by_area.clone(),
+                self.sync_stats.clone(),
+            )
+        };
         let result = if let Some(auth_generation) = auth_generation {
             self.backend
                 .update_area_at_generation(&area_id, updates, auth_generation)
@@ -2207,9 +2453,12 @@ impl Inner {
         } else {
             self.backend.update_area(&area_id, updates).await
         };
-        tracking.settle(result.is_ok());
-        result?;
+        if let Err(error) = result {
+            tracking.settle(false);
+            return Err(error);
+        }
         if auth_generation.is_some_and(|generation| self.backend.auth_generation() != generation) {
+            tracking.settle(true);
             return Ok(());
         }
         self.atlas_cache.rcu(|cache| {
@@ -2218,6 +2467,7 @@ impl Inner {
                 |area| Arc::new(cache.insert_area(area_id, Arc::new(area.rename(name)))),
             )
         });
+        tracking.settle(true);
         Ok(())
     }
 
@@ -2227,11 +2477,20 @@ impl Inner {
         atlas_id: Option<AtlasId>,
     ) -> CloudResult<()> {
         let auth_generation = self.metadata_auth_generation(area_id);
-        let tracking = AcknowledgedWrite::new(
-            area_id,
-            self.pending_by_area.clone(),
-            self.sync_stats.clone(),
-        );
+        let tracking = {
+            let _mutation_guard = self.mutation_gate.lock();
+            if self.pending.is_delete_fenced(area_id) {
+                return Err(CloudError::PendingOperations(
+                    "this map is being moved or deleted".to_string(),
+                ));
+            }
+            AcknowledgedWrite::new_metadata(
+                area_id,
+                self.pending_by_area.clone(),
+                self.metadata_writes_by_area.clone(),
+                self.sync_stats.clone(),
+            )
+        };
         let result = if let Some(auth_generation) = auth_generation {
             self.backend
                 .move_area_to_atlas_at_generation(&area_id, atlas_id, auth_generation)
@@ -2239,9 +2498,12 @@ impl Inner {
         } else {
             self.backend.move_area_to_atlas(&area_id, atlas_id).await
         };
-        tracking.settle(result.is_ok());
-        result?;
+        if let Err(error) = result {
+            tracking.settle(false);
+            return Err(error);
+        }
         if auth_generation.is_some_and(|generation| self.backend.auth_generation() != generation) {
+            tracking.settle(true);
             return Ok(());
         }
         self.atlas_cache.rcu(|cache| {
@@ -2250,6 +2512,7 @@ impl Inner {
                 |area| Arc::new(cache.insert_area(area_id, Arc::new(area.with_atlas(atlas_id)))),
             )
         });
+        tracking.settle(true);
         Ok(())
     }
 
@@ -4638,7 +4901,10 @@ mod tests {
 
         let mapper = Mapper::new(Arc::new(EphemeralBackend::new()), temp_cache_dir());
         let area_id = mapper
-            .create_area_ephemeral("Session".to_string())
+            .create_area_at(
+                "Session".to_string(),
+                MapDestination::loose(MapStorage::Session),
+            )
             .await
             .expect("create ephemeral");
         mapper

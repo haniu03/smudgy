@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::MapperBackend;
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CloudError, CloudResult, CreateAreaRequest, SyncRow,
+    CloudError, CloudResult, CreateAreaRequest, MapStorage, SyncRow,
 };
 
 /// A cloud API credential. The server dispatches on the token prefix:
@@ -435,6 +435,19 @@ impl MapperBackend for CloudMapper {
         self.post("/areas", &request).await
     }
 
+    async fn create_area_at(
+        &self,
+        request: CreateAreaRequest,
+        storage: MapStorage,
+    ) -> CloudResult<Area> {
+        if storage != MapStorage::Cloud {
+            return Err(CloudError::InvalidInput(format!(
+                "the cloud backend cannot create a {storage} map"
+            )));
+        }
+        self.create_area(request).await
+    }
+
     async fn list_areas(&self) -> CloudResult<Vec<Area>> {
         self.get("/areas").await
     }
@@ -572,6 +585,15 @@ impl MapperBackend for CloudMapper {
 
     async fn create_atlas(&self, name: &str) -> CloudResult<Atlas> {
         self.post("/atlases", &json!({ "name": name })).await
+    }
+
+    async fn create_atlas_at(&self, name: &str, storage: MapStorage) -> CloudResult<Atlas> {
+        if storage != MapStorage::Cloud {
+            return Err(CloudError::InvalidInput(format!(
+                "the cloud backend cannot create a {storage} atlas"
+            )));
+        }
+        self.create_atlas(name).await
     }
 
     async fn rename_atlas(&self, atlas_id: &AtlasId, name: &str) -> CloudResult<Atlas> {

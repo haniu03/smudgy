@@ -39,9 +39,9 @@ use smudgy_cloud::cloud_api::{
 };
 use smudgy_cloud::mapper::{AtlasCache, area_cache::AreaCache};
 use smudgy_cloud::{
-    Area, AreaAccess, AreaId, AtlasId, AtlasListItem, CloudError, ConnectionId, ConnectionRouting,
-    ConnectionUpdates, ExitId, LabelId, Mapper, PortMode, RoomNumber, RoomSide, SegmentShape,
-    ShapeId,
+    Area, AreaAccess, AreaId, AtlasId, AtlasListItem, AtlasRelocation, CloudError, ConnectionId,
+    ConnectionRouting, ConnectionUpdates, ExitId, LabelId, MapDestination, MapStorage, Mapper,
+    PortMode, RelocationMode, RoomNumber, RoomSide, SegmentShape, ShapeId,
     automatic_routing::{AutoRouteResult, RouteValidation},
     mapper::RoomKey,
     mutation::OperationId,
@@ -142,6 +142,7 @@ pub enum Message {
     SetCurrentLocation(AreaId, Option<i32>),
     NewAreaRequested,
     CreateAreaNameChanged(String),
+    CreateAreaStorageChanged(MapStorage),
     CreateAreaConfirmed,
     AreaCreated(Result<AreaId, String>),
     RenameAreaStarted(AreaId),
@@ -231,10 +232,14 @@ pub enum Message {
     /// Open the create-folder modal.
     NewAtlasRequested,
     CreateAtlasNameChanged(String),
-    /// Pick the new folder's tier: `true` = local, `false` = cloud.
-    CreateAtlasTierChanged(bool),
+    /// Pick the new folder's explicit storage tier.
+    CreateAtlasTierChanged(MapStorage),
     CreateAtlasConfirmed,
     AtlasCreated(Result<AtlasId, String>),
+    /// Move a whole owned atlas between local and cloud storage.
+    MoveAtlasStorageRequested(AtlasId),
+    MoveAtlasStorageConfirmed,
+    MoveAtlasStorageCompleted(Result<AtlasRelocation, String>),
     /// Begin an inline rename of a folder header.
     RenameAtlasStarted(AtlasId),
     RenameAtlasChanged(String),
@@ -248,12 +253,12 @@ pub enum Message {
     NewAreaInAtlas(AtlasId),
     /// Open the "move to folder" picker for an owned area.
     MoveAreaRequested(AreaId),
-    /// File an owned area into a folder (`Some`) or pull it loose (`None`).
-    MoveAreaToAtlas {
+    /// Move an owned area to an explicit storage/folder destination.
+    MoveAreaTo {
         area: AreaId,
-        atlas: Option<AtlasId>,
+        destination: MapDestination,
     },
-    MoveAreaCompleted(Result<(), String>),
+    MoveAreaCompleted(Result<AreaId, String>),
     /// Collapse/expand a folder in the area list (pure view state).
     ToggleFolderCollapsed(FolderKey),
     /// Open the atlas-scoped "Share folder…" dialog.
@@ -695,7 +700,7 @@ impl MapEditorWindow {
         map_scopes: MapScopes,
     ) -> Self {
         let first_area =
-            area_list::first_area_id(&mapper.get_current_atlas(), &mapper.ephemeral_area_ids());
+            area_list::first_area_id(&mapper.get_current_atlas(), &mapper.session_area_ids());
 
         let (mut panes, area_list_pane) = pane_grid::State::new(PaneKind::AreaList);
 
@@ -803,7 +808,7 @@ impl MapEditorWindow {
             .and_then(|area| area.meta().atlas_id)
             .is_some();
         if has_atlas
-            || self.mapper.is_ephemeral(&area_id)
+            || self.mapper.area_storage(&area_id) == MapStorage::Session
             || self.mapper.local_area_ids().contains(&area_id)
         {
             return None;
@@ -829,7 +834,9 @@ impl MapEditorWindow {
         if self.scope_all {
             return None;
         }
-        if self.mapper.is_ephemeral(&area_id) || self.mapper.local_area_ids().contains(&area_id) {
+        if self.mapper.area_storage(&area_id) == MapStorage::Session
+            || self.mapper.local_area_ids().contains(&area_id)
+        {
             return None;
         }
         let atlas_id = self
@@ -2448,10 +2455,18 @@ impl MapEditorWindow {
                 }
             }
             Message::NewAreaRequested => {
+                let signed_in = self.cloud.snapshot.get().signed_in;
                 self.modal = Some(modals::Modal::CreateArea {
                     name: String::new(),
                     error: None,
                     atlas_id: None,
+                    storage: if signed_in {
+                        MapStorage::Cloud
+                    } else {
+                        MapStorage::Local
+                    },
+                    storage_selectable: true,
+                    cloud_available: signed_in,
                 });
                 Update::none()
             }
@@ -2461,8 +2476,29 @@ impl MapEditorWindow {
                 }
                 Update::none()
             }
+            Message::CreateAreaStorageChanged(storage) => {
+                if let Some(modals::Modal::CreateArea {
+                    storage: slot,
+                    storage_selectable,
+                    cloud_available,
+                    ..
+                }) = &mut self.modal
+                    && *storage_selectable
+                    && storage != MapStorage::Session
+                    && (storage != MapStorage::Cloud || *cloud_available)
+                {
+                    *slot = storage;
+                }
+                Update::none()
+            }
             Message::CreateAreaConfirmed => {
-                let Some(modals::Modal::CreateArea { name, atlas_id, .. }) = &self.modal else {
+                let Some(modals::Modal::CreateArea {
+                    name,
+                    atlas_id,
+                    storage,
+                    ..
+                }) = &self.modal
+                else {
                     return Update::none();
                 };
                 let name = name.trim().to_string();
@@ -2470,9 +2506,14 @@ impl MapEditorWindow {
                     return Update::none();
                 }
                 let atlas_id = *atlas_id;
+                let storage = *storage;
                 let mapper = self.mapper.clone();
                 Update::with_task(Task::perform(
-                    async move { mapper.create_area_in(name, atlas_id).await },
+                    async move {
+                        mapper
+                            .create_area_at(name, MapDestination { storage, atlas_id })
+                            .await
+                    },
                     |result| Message::AreaCreated(result.map_err(|error| display_error(&error))),
                 ))
             }
@@ -2588,7 +2629,7 @@ impl MapEditorWindow {
                 if self.editor.area_id() == Some(area_id) {
                     let next_area = area_list::first_area_id(
                         &self.mapper.get_current_atlas(),
-                        &self.mapper.ephemeral_area_ids(),
+                        &self.mapper.session_area_ids(),
                     );
                     self.editor.set_area(next_area);
                     let editable = self.can_edit_active_area();
@@ -3246,7 +3287,11 @@ impl MapEditorWindow {
                 self.modal = Some(modals::Modal::CreateAtlas {
                     name: String::new(),
                     error: None,
-                    local: !signed_in,
+                    storage: if signed_in {
+                        MapStorage::Cloud
+                    } else {
+                        MapStorage::Local
+                    },
                     cloud_available: signed_in,
                 });
                 Update::none()
@@ -3257,30 +3302,34 @@ impl MapEditorWindow {
                 }
                 Update::none()
             }
-            Message::CreateAtlasTierChanged(local) => {
+            Message::CreateAtlasTierChanged(storage) => {
                 if let Some(modals::Modal::CreateAtlas {
-                    local: slot,
+                    storage: slot,
                     cloud_available,
                     ..
                 }) = &mut self.modal
                 {
                     // Cloud can't be chosen when it isn't available.
-                    *slot = local || !*cloud_available;
+                    *slot = if storage == MapStorage::Cloud && !*cloud_available {
+                        MapStorage::Local
+                    } else {
+                        storage
+                    };
                 }
                 Update::none()
             }
             Message::CreateAtlasConfirmed => {
-                let Some(modals::Modal::CreateAtlas { name, local, .. }) = &self.modal else {
+                let Some(modals::Modal::CreateAtlas { name, storage, .. }) = &self.modal else {
                     return Update::none();
                 };
                 let name = name.trim().to_string();
                 if name.is_empty() {
                     return Update::none();
                 }
-                let local = *local;
+                let storage = *storage;
                 let mapper = self.mapper.clone();
                 Update::with_task(Task::perform(
-                    async move { mapper.create_atlas_in(name, local).await },
+                    async move { mapper.create_atlas_at(name, storage).await },
                     |result| {
                         Message::AtlasCreated(
                             result.map(|atlas| atlas.id).map_err(|e| display_error(&e)),
@@ -3310,6 +3359,72 @@ impl MapEditorWindow {
                 }
                 Update::none()
             }
+            Message::MoveAtlasStorageRequested(atlas_id) => {
+                let storage = self.mapper.atlas_storage(&atlas_id);
+                let destination = match storage {
+                    MapStorage::Local if self.cloud.snapshot.get().signed_in => MapStorage::Cloud,
+                    MapStorage::Cloud => MapStorage::Local,
+                    MapStorage::Local | MapStorage::Session => return Update::none(),
+                };
+                let Some(atlas) = self.atlases.iter().find(|atlas| atlas.id == atlas_id) else {
+                    return Update::none();
+                };
+                self.modal = Some(modals::Modal::MoveAtlasStorage {
+                    atlas_id,
+                    name: atlas.name.clone(),
+                    area_count: atlas.area_count,
+                    source: storage,
+                    destination,
+                });
+                Update::none()
+            }
+            Message::MoveAtlasStorageConfirmed => {
+                let Some(modals::Modal::MoveAtlasStorage {
+                    atlas_id,
+                    destination,
+                    ..
+                }) = self.modal.take()
+                else {
+                    return Update::none();
+                };
+                let mapper = self.mapper.clone();
+                Update::with_task(Task::perform(
+                    async move {
+                        mapper
+                            .relocate_atlas(atlas_id, destination, RelocationMode::Move)
+                            .await
+                            .map_err(|error| display_error(&error))
+                    },
+                    Message::MoveAtlasStorageCompleted,
+                ))
+            }
+            Message::MoveAtlasStorageCompleted(result) => match result {
+                Ok(relocation) => {
+                    self.collapsed_folders
+                        .remove(&FolderKey::Atlas(relocation.source_atlas_id));
+                    self.collapsed_folders
+                        .remove(&FolderKey::Atlas(relocation.destination_atlas_id));
+                    let selected = self.editor.area_id().and_then(|selected| {
+                        relocation
+                            .areas
+                            .source_ids
+                            .iter()
+                            .position(|source| *source == selected)
+                            .map(|index| relocation.areas.destination_ids[index])
+                    });
+                    let assoc = self.associate_new_atlas(relocation.destination_atlas_id);
+                    let mut update = selected.map_or_else(Update::none, |area_id| {
+                        self.update(Message::AreaSelected(area_id))
+                    });
+                    update.task = Task::batch([update.task, self.fetch_atlases()]);
+                    update.event = assoc.or(update.event);
+                    update
+                }
+                Err(error) => {
+                    self.editor_notice = Some((Instant::now(), error));
+                    Update::none()
+                }
+            },
             Message::RenameAtlasStarted(atlas_id) => {
                 let name = self
                     .atlases
@@ -3392,6 +3507,9 @@ impl MapEditorWindow {
                     name: String::new(),
                     error: None,
                     atlas_id: Some(atlas_id),
+                    storage: self.mapper.atlas_storage(&atlas_id),
+                    storage_selectable: false,
+                    cloud_available: self.cloud.snapshot.get().signed_in,
                 });
                 Update::none()
             }
@@ -3409,18 +3527,48 @@ impl MapEditorWindow {
                 let current_atlas = atlas
                     .get_area(&area_id)
                     .and_then(|area| area.meta().atlas_id);
-                // Only same-tier folders are valid targets: moving a map
-                // between the local and cloud tiers is a migration, not a
-                // re-file (and the composite would reject it). Loose is always
-                // offered (handled by the modal).
-                let area_is_local = self.mapper.local_area_ids().contains(&area_id);
-                let mut folders: Vec<(AtlasId, String)> = self
+                let current = MapDestination {
+                    storage: self.mapper.area_storage(&area_id),
+                    atlas_id: current_atlas,
+                };
+                let mut targets: Vec<(MapDestination, String)> = self
                     .atlases
                     .iter()
-                    .filter(|atlas| self.local_atlas_ids.contains(&atlas.id) == area_is_local)
-                    .map(|atlas| (atlas.id, atlas.name.clone()))
+                    .map(|atlas| {
+                        let storage = self.mapper.atlas_storage(&atlas.id);
+                        (
+                            MapDestination::in_atlas(storage, atlas.id),
+                            format!(
+                                "{} — {}",
+                                atlas.name,
+                                match storage {
+                                    MapStorage::Local => crate::i18n::t!("mapper-save-local"),
+                                    MapStorage::Cloud => crate::i18n::t!("mapper-save-cloud"),
+                                    MapStorage::Session => unreachable!("atlases are durable"),
+                                }
+                            ),
+                        )
+                    })
                     .collect();
-                folders.sort_by(|a, b| {
+                targets.push((
+                    MapDestination::loose(MapStorage::Local),
+                    format!(
+                        "{} — {}",
+                        crate::i18n::t!("mapper-loose-maps"),
+                        crate::i18n::t!("mapper-save-local")
+                    ),
+                ));
+                if self.cloud.snapshot.get().signed_in {
+                    targets.push((
+                        MapDestination::loose(MapStorage::Cloud),
+                        format!(
+                            "{} — {}",
+                            crate::i18n::t!("mapper-loose-maps"),
+                            crate::i18n::t!("mapper-save-cloud")
+                        ),
+                    ));
+                }
+                targets.sort_by(|a, b| {
                     a.1.to_lowercase()
                         .cmp(&b.1.to_lowercase())
                         .then_with(|| a.1.cmp(&b.1))
@@ -3428,20 +3576,25 @@ impl MapEditorWindow {
                 self.modal = Some(modals::Modal::MoveArea {
                     area_id,
                     area_name,
-                    current_atlas,
-                    folders,
+                    current,
+                    targets,
                 });
                 Update::none()
             }
-            Message::MoveAreaToAtlas { area, atlas } => {
+            Message::MoveAreaTo { area, destination } => {
                 self.modal = None;
                 if self.area_owned(area) {
                     let mapper = self.mapper.clone();
                     return Update::with_task(Task::perform(
                         async move {
                             mapper
-                                .move_area_to_atlas(area, atlas)
+                                .relocate_areas(vec![area], destination, RelocationMode::Move)
                                 .await
+                                .and_then(|result| {
+                                    result.destination_ids.into_iter().next().ok_or_else(|| {
+                                        CloudError::InvalidInput("move returned no map".into())
+                                    })
+                                })
                                 .map_err(|error| display_error(&error))
                         },
                         Message::MoveAreaCompleted,
@@ -3450,8 +3603,14 @@ impl MapEditorWindow {
                 Update::none()
             }
             Message::MoveAreaCompleted(result) => {
-                if let Err(error) = result {
-                    self.editor_notice = Some((Instant::now(), error));
+                match result {
+                    Ok(area_id) => {
+                        let assoc = self.associate_new_area(area_id);
+                        let mut update = self.update(Message::AreaSelected(area_id));
+                        update.event = assoc.or(update.event);
+                        return update;
+                    }
+                    Err(error) => self.editor_notice = Some((Instant::now(), error)),
                 }
                 self.refresh_seen_rev();
                 self.inspector.resync(&self.mapper, &self.editor);
@@ -4001,7 +4160,10 @@ mod tests {
             std::env::temp_dir().join(format!("smudgy-pair-candidate-{}", Uuid::new_v4())),
         );
         let area_id = mapper
-            .create_area_ephemeral("Pair candidates".to_string())
+            .create_area_at(
+                "Pair candidates".to_string(),
+                MapDestination::loose(MapStorage::Session),
+            )
             .await
             .expect("create area");
         for room_number in [RoomNumber(1), RoomNumber(2)] {

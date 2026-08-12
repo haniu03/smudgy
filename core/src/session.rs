@@ -15,9 +15,7 @@ use crate::{
     models::hotkeys::HotkeyDefinition,
     session::runtime::input::InputOp,
     session::runtime::line_operation::LineOperation,
-    session::runtime::pane::{
-        PaneDef, PaneKey, PanePlacement, SplitDirection, TabPosition,
-    },
+    session::runtime::pane::{PaneDef, PaneKey, PanePlacement, SplitDirection, TabPosition},
 };
 
 pub mod config;
@@ -63,6 +61,9 @@ pub enum SessionEvent {
     /// A script created a non-ephemeral (cloud-tier) area; the daemon
     /// associates it with this session's server entry.
     MapAreaCreated(AreaId),
+    /// A script created or promoted a cloud atlas; the daemon associates it
+    /// with this session's server entry.
+    MapAtlasCreated(AtlasId),
     /// A pane was created in this session's registry. Travels the same
     /// ordered channel as buffer updates, so the UI always sees the open
     /// before the first `AppendTo` for the key. `placement` tells the hosting
@@ -115,7 +116,9 @@ pub enum SessionEvent {
         position: TabPosition,
         selected: bool,
     },
-    PaneSelect { key: PaneKey },
+    PaneSelect {
+        key: PaneKey,
+    },
     /// A script asked to move a pane into a fresh dedicated window
     /// (`pane.tearOut`): the drag tear-out flow minus the drag. `width`/
     /// `height` size the new window (floored by the window minimum); omitted

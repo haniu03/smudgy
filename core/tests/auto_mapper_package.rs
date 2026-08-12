@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use smudgy_cloud::{
-    CloudMapper, CompositeBackend, Credential, CredentialSource, LocalBackend, Mapper,
-    MapperBackend, PackageApiClient, RoomNumber, RoomUpdates, mapper::RoomKey,
+    CloudMapper, CompositeBackend, Credential, CredentialSource, LocalBackend, MapDestination,
+    MapStorage, Mapper, MapperBackend, PackageApiClient, RoomNumber, RoomUpdates, mapper::RoomKey,
 };
 use smudgy_core::models::local_packages::packages_dir;
 use smudgy_core::models::shared_packages::{self, UpdateMode};
@@ -182,7 +182,7 @@ async fn auto_mapper_maps_follows_and_promotes() {
     assert_eq!(key100.area_id, key101.area_id, "one area per zone");
     assert_eq!(key100.area_id, key103.area_id, "one area per zone");
     assert!(
-        mapper.is_ephemeral(&key100.area_id),
+        mapper.area_storage(&key100.area_id) == MapStorage::Session,
         "auto-mapped rooms land in the ephemeral tier"
     );
     let area = atlas.get_area(&key100.area_id).expect("zone area");
@@ -301,7 +301,7 @@ async fn auto_mapper_maps_follows_and_promotes() {
         "a fresh (imported) area"
     );
     assert!(
-        !mapper.is_ephemeral(&promoted_key.area_id),
+        mapper.area_storage(&promoted_key.area_id) != MapStorage::Session,
         "the promoted area is no longer ephemeral"
     );
     assert_eq!(promoted_room.get_title(), "Temple Square");
@@ -438,11 +438,11 @@ async fn auto_mapper_maps_follows_and_promotes() {
         "the new room joins the SAVED midgaard map (adopted by name).\n{transcript}"
     );
     assert!(
-        !mapper.is_ephemeral(&key105.area_id),
+        mapper.area_storage(&key105.area_id) != MapStorage::Session,
         "the adopted area is the saved local map, not a session copy.\n{transcript}"
     );
     assert_eq!(
-        mapper.ephemeral_area_ids().len(),
+        mapper.session_area_ids().len(),
         0,
         "no duplicate session area is minted for a saved zone.\n{transcript}"
     );
@@ -607,7 +607,7 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         "a new room discovered after returning joins the original zone area.\n{transcript}"
     );
     assert_eq!(
-        mapper.ephemeral_area_ids().len(),
+        mapper.session_area_ids().len(),
         2,
         "exactly two session areas: old-town and wildwood.\n{transcript}"
     );
@@ -680,7 +680,7 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         "the -1 sentinel must not be minted as a room.\n{transcript}"
     );
     assert_eq!(
-        mapper.ephemeral_area_ids().len(),
+        mapper.session_area_ids().len(),
         2,
         "an unmappable fix opens no area.\n{transcript}"
     );
@@ -776,7 +776,7 @@ async fn auto_mapper_maps_ire_dialect_with_server_coords() {
     let (key, room) = atlas
         .find_room_by_external_id("4711")
         .unwrap_or_else(|| panic!("IRE room was auto-created.\n{transcript}"));
-    assert!(mapper.is_ephemeral(&key.area_id));
+    assert_eq!(mapper.area_storage(&key.area_id), MapStorage::Session);
     assert_eq!(
         atlas.get_area(&key.area_id).expect("area").get_name(),
         "the village of Tasur'ke",
@@ -985,7 +985,7 @@ async fn auto_mapper_maps_msdp_composite_room() {
     let (key, room) = atlas
         .find_room_by_external_id("14100")
         .unwrap_or_else(|| panic!("MSDP room was auto-created.\n{transcript}"));
-    assert!(mapper.is_ephemeral(&key.area_id));
+    assert_eq!(mapper.area_storage(&key.area_id), MapStorage::Session);
     let area = atlas.get_area(&key.area_id).expect("zone area");
     assert_eq!(area.get_name(), "Training Halls");
     assert_eq!(room.get_title(), "A Small Island Beach");
@@ -1179,8 +1179,10 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
     // A refused north move produces no room report, then east reaches a new room. With
     // two unresolved commands and no destination ids, attribution is ambiguous: the
     // mapper may create/follow room 903, but must not invent 900 --north--> 903.
-    tx.send(RuntimeAction::Send(Arc::new("n".to_string()))).unwrap();
-    tx.send(RuntimeAction::Send(Arc::new("e".to_string()))).unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("n".to_string())))
+        .unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("e".to_string())))
+        .unwrap();
     tx.send(gmcp(
         "Room.Info",
         r#"{ "num": 903, "name": "Ambiguous Trail", "zone": "trailfields", "exits": {} }"#,
@@ -1300,7 +1302,10 @@ async fn auto_mapper_follows_continent_rooms_without_drawing() {
 
     // Stand in for an imported overland map: one continent room bound to its id.
     let mesolar = mapper
-        .create_area_ephemeral("Mesolar".to_string())
+        .create_area_at(
+            "Mesolar".to_string(),
+            MapDestination::loose(MapStorage::Session),
+        )
         .await
         .expect("create the overland area");
     mapper
@@ -1386,7 +1391,7 @@ async fn auto_mapper_follows_continent_rooms_without_drawing() {
         "the overland map gained no rooms.\n{transcript}"
     );
     assert_eq!(
-        mapper.ephemeral_area_ids().len(),
+        mapper.session_area_ids().len(),
         1,
         "no zone area was opened for continent fixes.\n{transcript}"
     );
@@ -1433,7 +1438,10 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
     // longer resolve "9500" (it is another entry's map), but the rescue index
     // still holds it.
     let elsewhere = mapper
-        .create_area_ephemeral("Other Server Map".to_string())
+        .create_area_at(
+            "Other Server Map".to_string(),
+            MapDestination::loose(MapStorage::Session),
+        )
         .await
         .expect("create the stand-in area");
     mapper
@@ -1454,7 +1462,7 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
             .is_none(),
         "the scope-excluded room is absent from normal identification"
     );
-    let ephemeral_before = mapper.ephemeral_area_ids().len();
+    let ephemeral_before = mapper.session_area_ids().len();
 
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(9335_u32),
@@ -1510,7 +1518,7 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
     // No duplicate was minted: no new ephemeral zone area appeared, and "9500"
     // still resolves nowhere in normal identification.
     assert_eq!(
-        mapper.ephemeral_area_ids().len(),
+        mapper.session_area_ids().len(),
         ephemeral_before,
         "the rescue path must not auto-create a duplicate zone area.\n{transcript}"
     );

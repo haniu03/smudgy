@@ -1368,6 +1368,15 @@ impl Inner<'_> {
                     .await?;
                 Ok(ActionResult::None)
             }
+            RuntimeAction::AssociateCreatedAtlas(atlas_id) => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::MapAtlasCreated(atlas_id),
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
             RuntimeAction::PaneOpened {
                 def,
                 placement,

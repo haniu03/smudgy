@@ -22,7 +22,8 @@ use smudgy_cloud::mutation::{
 use smudgy_cloud::{
     AreaId, AtlasId, CachedCloudMapper, CloudApiClient, CloudError, CloudMapper, ConnectionDash,
     ConnectionKind, ConnectionRouting, Credential, CredentialSource, ExitArgs, ExitDirection,
-    ExitUpdates, Mapper, MapperBackend, PortMode, RoomNumber, RoomSide, RoomUpdates,
+    ExitUpdates, MapDestination, MapStorage, Mapper, MapperBackend, PortMode, RoomNumber, RoomSide,
+    RoomUpdates,
 };
 use support::{GrantFlags, GrantScope, MockServer};
 use uuid::Uuid;
@@ -1111,7 +1112,10 @@ async fn legacy_api_key_path_unchanged() {
 
     // Create through the mapper (waits for the backend-assigned id).
     let area_id = mapper
-        .create_area("Homestead".to_string())
+        .create_area_at(
+            "Homestead".to_string(),
+            MapDestination::loose(MapStorage::Cloud),
+        )
         .await
         .expect("create_area over the legacy API-key credential");
 

@@ -12,6 +12,11 @@ import {
     op_smudgy_mapper_list_rooms_by_title_and_description,
     op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits,
     op_smudgy_mapper_create_area,
+    op_smudgy_mapper_get_area_storage,
+    op_smudgy_mapper_list_atlases,
+    op_smudgy_mapper_create_atlas,
+    op_smudgy_mapper_relocate_areas,
+    op_smudgy_mapper_relocate_atlas,
     op_smudgy_mapper_delete_area,
     op_smudgy_mapper_get_area_is_ephemeral,
     op_smudgy_mapper_rename_area,
@@ -87,6 +92,7 @@ import {
 // numbers (the ops serialize the `u64` pair to f64). It is an OPAQUE handle: pass it back to
 // mapper methods unchanged; each half exceeds 2^53, so the numbers are not exact.
 type AreaId = readonly [number, number];
+type AtlasId = readonly [number, number];
 type RoomNumber = number;
 type ExitId = readonly [number, number];
 type ConnectionId = readonly [number, number];
@@ -124,13 +130,105 @@ interface CreateRoomParams {
 type UpdateRoomParams = CreateRoomParams;
 
 interface CreateAreaOptions {
+    storage: MapStorage;
+    atlas?: Atlas | AtlasId;
+    ephemeral?: never;
+}
+
+interface LegacyCreateAreaOptions {
+    storage?: never;
+    atlas?: never;
+    /**
+     * @deprecated Supported through Smudgy 0.7.x; removed in 0.8.0.
+     * Use `storage: "session"` instead.
+     */
     ephemeral?: boolean;
 }
 
+type AnyCreateAreaOptions = CreateAreaOptions | LegacyCreateAreaOptions;
+
+type MapStorage = "session" | "local" | "cloud";
+
+interface MapDestination {
+    storage: MapStorage;
+    atlas?: Atlas | AtlasId;
+}
+
+interface CreateAtlasOptions {
+    storage: "local" | "cloud";
+}
+
+function atlasIdOf(atlas: Atlas | AtlasId | undefined): AtlasId | undefined {
+    return atlas instanceof Atlas ? atlas.id : atlas;
+}
+
+function areaIdOf(area: Area | AreaId): AreaId {
+    return area instanceof Area ? area.id : area;
+}
+
+function destinationForOp(destination: MapDestination) {
+    return {
+        storage: destination.storage,
+        atlas_id: atlasIdOf(destination.atlas),
+    };
+}
+
 const mapper = {
-    async createArea(name: string, options?: CreateAreaOptions) {
-        const id = await op_smudgy_mapper_create_area(name, options?.ephemeral === true);
+    async createArea(name: string, options?: AnyCreateAreaOptions) {
+        const id = await op_smudgy_mapper_create_area(name, {
+            storage: options?.storage,
+            atlas_id: atlasIdOf(options?.atlas),
+            ephemeral: options?.ephemeral === true,
+        });
         return new Area(id);
+    },
+
+    async listAtlases(): Promise<Atlas[]> {
+        const atlases = await op_smudgy_mapper_list_atlases();
+        return atlases.map((atlas: { id: AtlasId; name: string; storage: MapStorage }) =>
+            new Atlas(atlas.id, atlas.name, atlas.storage)
+        );
+    },
+
+    async createAtlas(name: string, options: CreateAtlasOptions): Promise<Atlas> {
+        const atlas = await op_smudgy_mapper_create_atlas(name, options.storage);
+        return new Atlas(atlas.id, atlas.name, atlas.storage);
+    },
+
+    async copyAreas(areas: (Area | AreaId)[], destination: MapDestination): Promise<Area[]> {
+        const ids = await op_smudgy_mapper_relocate_areas(
+            areas.map(areaIdOf),
+            destinationForOp(destination),
+            false,
+        );
+        return ids.map((id: AreaId) => this.getAreaById(id));
+    },
+
+    async moveAreas(areas: (Area | AreaId)[], destination: MapDestination): Promise<Area[]> {
+        const ids = await op_smudgy_mapper_relocate_areas(
+            areas.map(areaIdOf),
+            destinationForOp(destination),
+            true,
+        );
+        return ids.map((id: AreaId) => this.getAreaById(id));
+    },
+
+    async copyArea(area: Area | AreaId, destination: MapDestination): Promise<Area> {
+        return (await this.copyAreas([area], destination))[0];
+    },
+
+    async moveArea(area: Area | AreaId, destination: MapDestination): Promise<Area> {
+        return (await this.moveAreas([area], destination))[0];
+    },
+
+    async copyAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas> {
+        const copied = await op_smudgy_mapper_relocate_atlas(atlasIdOf(atlas), storage, false);
+        return new Atlas(copied.id, copied.name, copied.storage);
+    },
+
+    async moveAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas> {
+        const moved = await op_smudgy_mapper_relocate_atlas(atlasIdOf(atlas), storage, true);
+        return new Atlas(moved.id, moved.name, moved.storage);
     },
 
     setCurrentLocation(areaId: AreaId, roomNumber?: RoomNumber) {
@@ -661,6 +759,18 @@ interface ShapeUpdates {
 // A portable area JSON blob produced by `exportArea` and consumed by `importArea`/`importAreas`.
 // Treat it as opaque: round-trip it (export -> store -> import) without introspecting its shape.
 type AreaJson = Record<string, unknown>;
+class Atlas {
+    constructor(
+        readonly id: AtlasId,
+        readonly name: string,
+        readonly storage: MapStorage,
+    ) {}
+
+    toString() {
+        return this.name;
+    }
+}
+
 class Area {
     #obj: any;
 
@@ -680,8 +790,16 @@ class Area {
         return op_smudgy_mapper_list_area_room_numbers(this.#obj) || [];
     }
 
+    /**
+     * @deprecated Supported through Smudgy 0.7.x; removed in 0.8.0.
+     * Use `storage === "session"` instead.
+     */
     get isEphemeral(): boolean {
         return op_smudgy_mapper_get_area_is_ephemeral(this.#obj) === true;
+    }
+
+    get storage(): MapStorage {
+        return op_smudgy_mapper_get_area_storage(this.#obj);
     }
 
     get next_room_number(): RoomNumber {

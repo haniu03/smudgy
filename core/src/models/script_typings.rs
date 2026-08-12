@@ -1878,13 +1878,83 @@ export function make() { return createEvent('dynamic'); }
         );
     }
 
-    /// Rust↔TS enum drift guard: every serde variant name of the map enums must appear
-    /// (quoted) in BOTH the published contract and the runtime impl, whose string unions
-    /// mirror the Rust enums by hand. The impl↔contract guards above cannot catch this class
-    /// (they compare TS against TS); this pins both to the Rust source of truth — the
-    /// original regression was a Rust-side enum variant invisible to scripts. A tripwire on
-    /// quoted-name presence, not a union parser: adding a Rust variant fails here until the
-    /// unions name it.
+    /// The compatibility catalog is deliberately finite. These assertions do
+    /// three jobs together: old scripts still type-check during 0.5-0.7, every
+    /// compatibility member carries an editor-visible deprecation, and the
+    /// test itself blocks the first 0.8 build until the shims are removed.
+    #[test]
+    fn map_storage_compatibility_is_deprecated_and_expires_in_0_8() {
+        use std::collections::BTreeMap;
+
+        const DEPRECATION: &str = "@deprecated Supported through Smudgy 0.7.x; removed in 0.8.0.";
+
+        assert_eq!(
+            smudgy_cloud::MAP_STORAGE_COMPATIBILITY_LAST_RELEASE,
+            "0.7.x"
+        );
+        assert_eq!(
+            smudgy_cloud::MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION,
+            "0.8.0"
+        );
+        let running = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("Cargo package versions are valid semver");
+        assert!(
+            (running.major, running.minor) < (0, 8),
+            "remove the legacy mapper creation overload, `ephemeral`, and `isEphemeral` \
+             before building the 0.8 release line"
+        );
+
+        assert_eq!(
+            SMUDGY_MAPPER_DTS.matches(DEPRECATION).count(),
+            3,
+            "the compatibility catalog is exactly: omitted-storage createArea, \
+             LegacyCreateAreaOptions.ephemeral, and Area.isEphemeral"
+        );
+        assert_eq!(
+            SMUDGY_MAPPER_TS.matches(DEPRECATION).count(),
+            2,
+            "the runtime implementation must mark its ephemeral option and getter"
+        );
+        let nukefire_mapper = include_str!("../../../packages/nukefire-mapper/mapper.ts");
+        assert_eq!(
+            nukefire_mapper.matches(DEPRECATION).count(),
+            1,
+            "the first-party NukeFire mapper's ephemeral option is part of the same finite window"
+        );
+        let arctic_mapper = include_str!("../../../packages/arctic-mapper/mapper/alias.ts");
+        assert!(
+            arctic_mapper.contains("mapper.createArea(name, { storage: \"local\" })"),
+            "first-party mappers must exercise the explicit-storage API, not its compatibility overload"
+        );
+
+        let mut ambient = BTreeMap::new();
+        ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "compatibility-consumer.ts".to_string(),
+            "import { mapper } from \"smudgy:core\";\n\
+             declare const area: Area;\n\
+             export const oldDefault = mapper.createArea(\"old default\");\n\
+             export const oldSession = mapper.createArea(\"old session\", { ephemeral: true });\n\
+             export const oldPredicate: boolean = area.isEphemeral;\n\
+             export const canonical = mapper.createArea(\"canonical\", { storage: \"local\" });\n"
+                .to_string(),
+        );
+        let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+            .expect("compile legacy and canonical mapper creation forms");
+        assert!(
+            out.diagnostics.is_empty(),
+            "0.7 compatibility forms or their canonical replacements stopped type-checking:\n{:#?}",
+            out.diagnostics
+        );
+    }
+
+    /// Rust↔TS enum drift guard: every serde variant name of the map enums must
+    /// appear in both the published contract and runtime implementation.
     #[test]
     fn map_enum_unions_cover_rust_variants() {
         fn assert_covered<T: serde::Serialize>(variants: &[T], enum_name: &str) {

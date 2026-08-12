@@ -50,7 +50,12 @@ const SOURCE_NAME = "NukeFire.Map.Local";
 export interface NukeFireMapperOptions {
   /** Prefix used when Room.Info has not supplied the zone's display name. */
   areaPrefix?: string;
-  /** Create new areas as session-only maps. Defaults to false (durable maps). */
+  /** Explicit storage for newly managed areas. Defaults to local. */
+  storage?: MapStorage;
+  /**
+   * @deprecated Supported through Smudgy 0.7.x; removed in 0.8.0.
+   * Use `storage: "session"` instead.
+   */
   ephemeral?: boolean;
   /** Allow the integral-grid planner to reflow existing NukeFire rooms. Default true. */
   updateCoordinates?: boolean;
@@ -106,7 +111,7 @@ interface ConnectionMirror {
 interface AreaMirror {
   id: AreaId;
   name: string;
-  isEphemeral: boolean;
+  storage: MapStorage;
   zone?: string;
   source?: string;
   roomsByNumber: Map<RoomNumber, RoomMirror>;
@@ -307,7 +312,9 @@ function connectionMirrorKey(id: ConnectionId): string {
  * Calls are serialized because mapper mutations acknowledge asynchronously.
  */
 export class NukeFireMapper {
-  readonly #options: Required<NukeFireMapperOptions>;
+  readonly #options: Required<Omit<NukeFireMapperOptions, "ephemeral" | "storage">> & {
+    storage: MapStorage;
+  };
   readonly #decisionLogger: MappingDecisionLogger;
   readonly #subscriptions: EventSubscription[] = [];
   readonly #zoneAreas = new Map<number, AreaMirror>();
@@ -327,7 +334,7 @@ export class NukeFireMapper {
   constructor(options: NukeFireMapperOptions = {}) {
     this.#options = {
       areaPrefix: options.areaPrefix ?? "NukeFire Zone",
-      ephemeral: options.ephemeral ?? false,
+      storage: options.storage ?? (options.ephemeral ? "session" : "local"),
       updateCoordinates: options.updateCoordinates ?? true,
       decisionLogFile: options.decisionLogFile ?? DEFAULT_DECISION_LOG_FILE,
     };
@@ -370,7 +377,7 @@ export class NukeFireMapper {
     const area: AreaMirror = {
       id,
       name: source.name,
-      isEphemeral: source.isEphemeral,
+      storage: source.storage,
       zone: source.data(AREA_ZONE_PROPERTY),
       source: source.data(AREA_SOURCE_PROPERTY),
       roomsByNumber: new Map(),
@@ -536,7 +543,7 @@ export class NukeFireMapper {
     for (const source of sources) {
       const room = this.#roomsByVnum.get(source.vnum);
       const area = room && this.#areasById.get(areaIdKey(room.areaId));
-      if (room && area?.isEphemeral === this.#options.ephemeral) existing.set(source.vnum, room);
+      if (room && area?.storage === this.#options.storage) existing.set(source.vnum, room);
     }
 
     // Hydrate an existing matching area at most once. Subsequent snapshots use
@@ -546,14 +553,14 @@ export class NukeFireMapper {
         if (existing.has(source.vnum)) continue;
         const cached = this.#roomsByVnum.get(source.vnum);
         const cachedArea = cached && this.#areasById.get(areaIdKey(cached.areaId));
-        if (cached && cachedArea?.isEphemeral === this.#options.ephemeral) {
+        if (cached && cachedArea?.storage === this.#options.storage) {
           existing.set(source.vnum, cached);
           continue;
         }
         const hostRoom = mapper.findRoomByExternalId(externalRoomId(source.vnum));
         if (!hostRoom) continue;
         const hostArea = mapper.getAreaById(hostRoom.area_id);
-        if (hostArea.isEphemeral !== this.#options.ephemeral) continue;
+        if (hostArea.storage !== this.#options.storage) continue;
         this.#hydrateArea(hostArea);
         const room = this.#roomsByVnum.get(source.vnum);
         if (room) existing.set(source.vnum, room);
@@ -565,7 +572,7 @@ export class NukeFireMapper {
       const wanted = new Set(sources.map((source) => source.vnum));
       for (const hostArea of mapper.areas) {
         if (existing.size >= wanted.size) break;
-        if (hostArea.isEphemeral !== this.#options.ephemeral) continue;
+        if (hostArea.storage !== this.#options.storage) continue;
         const area = this.#hydrateArea(hostArea);
         for (const room of area.roomsByNumber.values()) {
           if (room.vnum !== undefined && wanted.has(room.vnum) && !existing.has(room.vnum)) {
@@ -630,19 +637,19 @@ export class NukeFireMapper {
     known: AreaMirror | undefined,
     preferredName: string,
   ): Promise<AreaMirror> {
-    let area = known?.isEphemeral === this.#options.ephemeral
+    let area = known?.storage === this.#options.storage
       ? known
       : this.#zoneAreas.get(zone);
     if (!area) {
       const source = mapper.areas.find((candidate) =>
-        candidate.isEphemeral === this.#options.ephemeral &&
+        candidate.storage === this.#options.storage &&
         candidate.data(AREA_ZONE_PROPERTY) === String(zone)
       );
       if (source) area = this.#hydrateArea(source);
     }
     if (!area && preferredName) {
       const source = mapper.areas.find((candidate) =>
-        candidate.isEphemeral === this.#options.ephemeral &&
+        candidate.storage === this.#options.storage &&
         candidate.name.localeCompare(preferredName, undefined, { sensitivity: "accent" }) === 0
       );
       if (source) area = this.#hydrateArea(source);
@@ -650,12 +657,12 @@ export class NukeFireMapper {
     if (!area) {
       const source = await mapper.createArea(
         preferredName || `${this.#options.areaPrefix} ${zone}`,
-        { ephemeral: this.#options.ephemeral },
+        { storage: this.#options.storage },
       );
       area = this.#registerArea({
         id: source.id,
         name: source.name,
-        isEphemeral: source.isEphemeral,
+        storage: source.storage,
         roomsByNumber: new Map(),
         connections: new Map(),
       });

@@ -2,7 +2,7 @@
 // (docs/gmcp-mapping.md section 5.3). Known rooms are followed; unknown rooms are
 // auto-created, one area per server-reported zone. A zone the player has never kept maps
 // into a session (ephemeral) area, so nothing a server sends can touch durable state
-// uninvited; `savemap` promotes those areas to local maps. A zone whose map was kept —
+// uninvited; `savemap` promotes those areas to explicit local or cloud storage. A zone whose map was kept —
 // this session or any earlier one (matched by name) — is adopted and mapped into
 // directly: opting in once keeps the zone durable.
 //
@@ -382,7 +382,7 @@ async function zoneArea(zone: string | null): Promise<AreaId> {
     for (const area of mapper.areas) {
         if (zoneKey(area.name) !== key) continue;
         if (rejectedAreas.some((rejected) => sameArea(rejected, area.id))) continue;
-        if (!area.isEphemeral) {
+        if (area.storage !== "session") {
             zoneAreas.set(key, area.id);
             return area.id;
         }
@@ -393,7 +393,7 @@ async function zoneArea(zone: string | null): Promise<AreaId> {
         return sessionArea;
     }
     const area = await mapper.createArea((zone ?? FALLBACK_ZONE).trim() || FALLBACK_ZONE, {
-        ephemeral: true,
+        storage: "session",
     });
     zoneAreas.set(key, area.id);
     return area.id;
@@ -1070,19 +1070,19 @@ function enqueue(task: () => Promise<void>) {
 // ---------------------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------------------
-// savemap: promote session areas to local maps and keep mapping into them.
+// savemap: promote session areas to local/cloud maps and keep mapping into them.
 // Runs THROUGH the fix queue: promoting an area out from under an in-flight room
 // creation would race it.
 // ---------------------------------------------------------------------------------------
 
-async function doSavemap(zone: string | undefined) {
+async function doSavemap(storage: "local" | "cloud", zone: string | undefined) {
     const filter = zone ? zoneKey(zone) : null;
     // Only session maps need promotion: a zone bound to an adopted saved map is already
     // durable, and "promoting" it would duplicate the map and delete the original.
     const chosen = [...zoneAreas.entries()].filter(([key, areaId]) => {
         if (filter !== null && key !== filter) return false;
         try {
-            return mapper.getAreaById(areaId).isEphemeral;
+            return mapper.getAreaById(areaId).storage === "session";
         } catch {
             return false;
         }
@@ -1093,33 +1093,31 @@ async function doSavemap(zone: string | undefined) {
             : `[auto-mapper] no session map for "${zone}".`);
         return;
     }
-    const exports = [];
-    for (const [, areaId] of chosen) {
-        exports.push(await mapper.exportArea(areaId));
+    const moved = await mapper.moveAreas(
+        chosen.map(([, areaId]) => areaId),
+        { storage },
+    );
+    const destinationIds = moved.map((area) => area.id);
+    // Rebind so mapping continues seamlessly into the acknowledged durable copies.
+    for (const [index, [key]] of chosen.entries()) {
+        const destinationId = destinationIds[index];
+        if (destinationId) zoneAreas.set(key, destinationId);
     }
-    const importedIds = await mapper.importAreas(exports);
-    // Rebind so mapping continues seamlessly into the saved copies, and drop the session
-    // originals so each room id resolves to exactly one room again.
-    for (const [index, [key, areaId]] of chosen.entries()) {
-        const importedId = importedIds[index];
-        if (importedId) zoneAreas.set(key, importedId);
-        await mapper.deleteArea(areaId);
-    }
-    // Re-key tracked exits into the imported copies: the deleted originals took their
-    // exit ids with them, but import preserves room numbers, so each waiter's exit is
+    // Re-key tracked exits into the relocated copies: the deleted originals took their
+    // exit ids with them, but relocation preserves room numbers, so each waiter's exit is
     // recoverable in the promoted area by (room, direction) — whether it links to an
-    // in-set placeholder (import remapped it) or went dangling. A waiter that cannot
+    // in-set placeholder (relocation remapped it) or went dangling. A waiter that cannot
     // be recovered is dropped rather than left pointing into a dead area.
     for (const [id, waiters] of [...pendingLinks]) {
         const remapped = waiters.flatMap((waiter) => {
             const index = chosen.findIndex(([, areaId]) => sameArea(areaId, waiter.areaId));
             if (index === -1) return [waiter];
-            const importedId = importedIds[index];
-            if (!importedId) return [];
-            const owner = mapper.getAreaById(importedId).room(waiter.room);
+            const destinationId = destinationIds[index];
+            if (!destinationId) return [];
+            const owner = mapper.getAreaById(destinationId).room(waiter.room);
             const exit = owner ? exitFor(owner, waiter.dir) : undefined;
             return exit
-                ? [{ areaId: importedId, room: waiter.room, exitId: exit.id, dir: waiter.dir }]
+                ? [{ areaId: destinationId, room: waiter.room, exitId: exit.id, dir: waiter.dir }]
                 : [];
         });
         if (remapped.length === 0) pendingLinks.delete(id);
@@ -1128,7 +1126,7 @@ async function doSavemap(zone: string | undefined) {
     if (lastRoom && chosen.some(([, areaId]) => sameArea(areaId, lastRoom!.areaId))) {
         lastRoom = null;
     }
-    echo(`[auto-mapper] saved ${importedIds.length} map(s).`);
+    echo(`[auto-mapper] saved ${destinationIds.length} map(s) to ${storage}.`);
 }
 
 function start() {
@@ -1176,8 +1174,12 @@ function start() {
 
     if (enableRoomModule) gmcpCtl.enableModule("Room");
 
-    createAlias(/^savemap(?:\s+(?<zone>.+))?$/, (matches: { zone?: string }) => {
-        enqueue(() => doSavemap(matches.zone));
+    createAlias(/^savemap(?:\s+(?<args>.+))?$/, (matches: { args?: string }) => {
+        const args = matches.args?.trim();
+        const tier = args?.match(/^(local|cloud)(?:\s+(.*))?$/i);
+        const storage = (tier?.[1]?.toLowerCase() ?? "local") as "local" | "cloud";
+        const zone = tier ? tier[2]?.trim() || undefined : args;
+        enqueue(() => doSavemap(storage, zone));
     });
     createAlias(/^mapprune(?:\s+(?<state>on|off))?$/, (matches: { state?: string }) => {
         if (matches.state) pruneStale = matches.state === "on";

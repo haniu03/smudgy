@@ -9,5 +9,5 @@ export * from "./routing.ts";
 export * from "./decision-log.ts";
 export * from "./mapper.ts";
 
-export const nukefireMapper = new NukeFireMapper({ ephemeral: true });
+export const nukefireMapper = new NukeFireMapper({ storage: "session" });
 nukefireMapper.start();
