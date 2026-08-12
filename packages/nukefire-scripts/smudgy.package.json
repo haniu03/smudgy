@@ -1,0 +1,161 @@
+{
+  "version": "0.3.0",
+  "description": "NukeFire command deck: vitals HUD, Navigator (MapView + live BIGMAP radar), GPS atlas, context deck, comms, affects, and Knowledge codex panes.",
+  "entry": "index.ts",
+  "min_smudgy_version": "0.5.3",
+  "dependencies": [
+    "smudgy://kapusniak/nukefire-gmcp"
+  ],
+  "requires": [
+    "smudgy://kapusniak/nukefire-gmcp",
+    "smudgy://kapusniak/nukefire-mapper"
+  ],
+  "hosts": [
+    "tdome.nukefire.org"
+  ],
+  "params": [
+    {
+      "key": "showHud",
+      "label": "Show vitals HUD / session summary",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "showAffects",
+      "label": "Show Affects pane",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "showComms",
+      "label": "Show Comms pane",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "showMap",
+      "label": "Show Map pane",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "showRadar",
+      "label": "Show BIGMAP radar pane",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "showAtlas",
+      "label": "Show GPS Atlas tab",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "showDeck",
+      "label": "Show context Deck pane",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "showCodex",
+      "label": "Show Codex pane",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "key": "chatRendering",
+      "label": "Chat rendering",
+      "type": "dropdown",
+      "default": "plain",
+      "options": [
+        {
+          "value": "full-ansi",
+          "label": "Full ANSI"
+        },
+        {
+          "value": "plain",
+          "label": "Plain"
+        }
+      ]
+    },
+    {
+      "key": "chatFontSize",
+      "label": "Chat font size (px)",
+      "type": "number",
+      "default": 12
+    },
+    {
+      "key": "widgetFontSize",
+      "label": "Widget font size (px)",
+      "type": "number",
+      "default": 12
+    },
+    {
+      "key": "sessionLayout",
+      "label": "Additional session layout",
+      "type": "dropdown",
+      "default": "stacked-right",
+      "options": [
+        {
+          "value": "stacked-right",
+          "label": "Stack sessions on the right"
+        },
+        {
+          "value": "tabbed",
+          "label": "All sessions in one set of tabs"
+        }
+      ]
+    },
+    {
+      "key": "sessionVitalsLayout",
+      "label": "Tabbed-session vitals style",
+      "type": "dropdown",
+      "default": "compact",
+      "options": [
+        {
+          "value": "compact",
+          "label": "Compact"
+        },
+        {
+          "value": "wide",
+          "label": "Wide"
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "write": [
+      "$DATA"
+    ],
+    "smudgy": {
+      "automations": [
+        "aliases",
+        "triggers"
+      ],
+      "session": [
+        "send",
+        "echo",
+        "reach-others"
+      ],
+      "display": [
+        "change"
+      ],
+      "widgets": [
+        "create"
+      ],
+      "interop": [
+        "read",
+        "write"
+      ],
+      "panes": [
+        "create"
+      ],
+      "gmcp": [
+        "send"
+      ],
+      "input": [
+        "access"
+      ]
+    }
+  }
+}
