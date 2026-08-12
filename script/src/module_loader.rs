@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use deno_core::error::ModuleLoaderError;
 use deno_core::{
@@ -16,8 +17,16 @@ use serde_json::Value;
 use crate::transpiler::transpile;
 use crate::{generic_loader_error, ModulePolicy};
 
-type SourceMapCache = RefCell<HashMap<String, Vec<u8>>>;
+type SourceMapCache = Rc<RefCell<HashMap<String, Vec<u8>>>>;
 
+const JSR_REGISTRY_URL: &str = "https://jsr.io";
+
+/// Synchronous override hook for local/custom module sources.
+///
+/// Implementations must not perform network requests or other unbounded blocking I/O here: both
+/// callbacks execute on the session's V8 thread and the trait cannot return an async response.
+/// Built-in remote schemes (`npm:`, `jsr:`, HTTP(S), and `smudgy://`) deliberately bypass this
+/// default hook and return [`ModuleLoadResponse::Async`] from [`ScriptModuleLoader::load`].
 pub trait ImportProvider {
     fn resolve(
         &mut self,
@@ -39,6 +48,11 @@ pub trait ImportProvider {
     }
 }
 
+#[derive(Default)]
+struct NoopImportProvider;
+
+impl ImportProvider for NoopImportProvider {}
+
 pub struct ScriptModuleLoader {
     cwd: PathBuf,
     policy: ModulePolicy,
@@ -48,6 +62,12 @@ pub struct ScriptModuleLoader {
     /// `load()` (deno's async/!Send npm stack can't run under the sync ImportProvider
     /// or a nested block_on), so npm lives here rather than as an ImportProvider.
     npm: Option<std::rc::Rc<crate::npm_resolver::SmudgyNpmServices>>,
+    /// JSR's synchronous `resolve()` step only preserves the `jsr:` marker. Metadata
+    /// resolution happens under this async state from `load()`, so registry latency never
+    /// blocks the session thread. Shared by every future produced by this loader.
+    jsr: Rc<tokio::sync::Mutex<JsrResolver>>,
+    /// Reused by async JSR metadata and HTTP(S) source fetches.
+    http: reqwest::Client,
     /// `smudgy://` shared-package resolution. Like npm, loaded via async `load()`
     /// (network fetch on the session runtime), so it lives here rather than as an
     /// ImportProvider. `None` disables `smudgy://` imports.
@@ -72,7 +92,7 @@ enum DepGate {
 
 impl ScriptModuleLoader {
     pub fn new(cwd: PathBuf, policy: ModulePolicy) -> Self {
-        Self::with_import_provider(cwd, policy, Box::new(JsrImportProvider::default()))
+        Self::with_import_provider(cwd, policy, Box::new(NoopImportProvider))
     }
 
     pub fn with_import_provider(
@@ -86,12 +106,13 @@ impl ScriptModuleLoader {
             source_maps: Default::default(),
             import_provider: RefCell::new(import_provider),
             npm: None,
+            jsr: Rc::new(tokio::sync::Mutex::new(JsrResolver::default())),
+            http: reqwest::Client::new(),
             package_provider: None,
         }
     }
 
-    /// Loader with jsr resolution (via the ImportProvider) plus native npm
-    /// resolution (async, handled in `load`).
+    /// Loader with async jsr resolution plus native npm resolution (both handled in `load`).
     pub fn with_npm(
         cwd: PathBuf,
         policy: ModulePolicy,
@@ -99,12 +120,12 @@ impl ScriptModuleLoader {
     ) -> Self {
         Self {
             npm: Some(npm),
-            ..Self::with_import_provider(cwd, policy, Box::new(JsrImportProvider::default()))
+            ..Self::with_import_provider(cwd, policy, Box::new(NoopImportProvider))
         }
     }
 
-    /// Loader with jsr + native npm + `smudgy://` shared-package resolution. The
-    /// package provider (if any) is consulted asynchronously in `load`.
+    /// Loader with async jsr + native npm + `smudgy://` shared-package resolution. The package
+    /// provider (if any) is consulted asynchronously in `load`.
     pub fn with_npm_and_packages(
         cwd: PathBuf,
         policy: ModulePolicy,
@@ -114,7 +135,7 @@ impl ScriptModuleLoader {
         Self {
             npm: Some(npm),
             package_provider,
-            ..Self::with_import_provider(cwd, policy, Box::new(JsrImportProvider::default()))
+            ..Self::with_import_provider(cwd, policy, Box::new(NoopImportProvider))
         }
     }
 
@@ -245,19 +266,9 @@ impl ScriptModuleLoader {
                     generic_loader_error(format!("failed to read module {}: {e}", path.display()))
                 })?
             }
-            "http" | "https" => {
-                if !self.policy.allow_https {
-                    return Err(generic_loader_error(format!(
-                        "https imports are disabled: {specifier}"
-                    )));
-                }
-                // Must run the blocking HTTP off the async event-loop thread:
-                // `load()` returns `Sync`, so it executes inside deno's async
-                // context, where creating+dropping reqwest::blocking's tokio
-                // runtime panics ("drop a runtime within an async context").
-                // fetch_text isolates it on a spawned thread (as fetch_json does).
-                fetch_text(specifier.as_str())?
-            }
+            "http" | "https" | "jsr" => unreachable!(
+                "remote modules are handled by an async ModuleLoadResponse before load_sync"
+            ),
             "node" => {
                 return Err(generic_loader_error(format!(
                     "node builtin {specifier} was not handled by deno_node"
@@ -275,23 +286,41 @@ impl ScriptModuleLoader {
             }
         };
 
-        let module_type = if specifier.path().ends_with(".json") {
-            ModuleType::Json
-        } else {
-            ModuleType::JavaScript
-        };
-        let (code, source_map) =
-            transpile(specifier, &source).map_err(JsErrorBox::from_err)?;
-        if let Some(source_map) = source_map {
-            self.source_maps
-                .borrow_mut()
-                .insert(specifier.to_string(), source_map.to_vec());
-        }
+        transpile_module(&self.source_maps, specifier, specifier, &source)
+    }
+}
 
+fn transpile_module(
+    source_maps: &SourceMapCache,
+    requested: &ModuleSpecifier,
+    found: &ModuleSpecifier,
+    source: &str,
+) -> Result<ModuleSource, ModuleLoaderError> {
+    let module_type = if found.path().ends_with(".json") {
+        ModuleType::Json
+    } else {
+        ModuleType::JavaScript
+    };
+    let (code, source_map) = transpile(found, source).map_err(JsErrorBox::from_err)?;
+    if let Some(source_map) = source_map {
+        source_maps
+            .borrow_mut()
+            .insert(found.to_string(), source_map.to_vec());
+    }
+
+    if requested == found {
         Ok(ModuleSource::new(
             module_type,
             ModuleSourceCode::String(code.into()),
-            specifier,
+            requested,
+            None,
+        ))
+    } else {
+        Ok(ModuleSource::new_with_redirect(
+            module_type,
+            ModuleSourceCode::String(code.into()),
+            requested,
+            found,
             None,
         ))
     }
@@ -453,9 +482,9 @@ impl ModuleLoader for ScriptModuleLoader {
             deno_core::resolve_import(specifier, &referrer).map_err(JsErrorBox::from_err)?
         };
 
-        // Gate remote-code imports against this isolate's `import` allowlist BEFORE the jsr provider
-        // (whose `resolve` fetches registry metadata) or the npm/https loaders run, so a denied
-        // import fetches nothing at all. A no-op for the allow-all main isolate.
+        // Gate remote-code imports against this isolate's `import` allowlist BEFORE a custom
+        // provider or the built-in npm/jsr/https loaders run, so a denied import fetches nothing
+        // at all. A no-op for the allow-all main isolate.
         self.enforce_import_allowed(&resolved)?;
 
         if let Some(result) = self
@@ -470,7 +499,9 @@ impl ModuleLoader for ScriptModuleLoader {
             // `smudgy-pkg` is the canonical scheme a package's relative imports resolve
             // into (e.g. `./util` from within a package); `smudgy` markers are emitted
             // by the early return above and never reach here.
-            "file" | "http" | "https" | "node" | "npm" | "smudgy" | "smudgy-pkg" => Ok(resolved),
+            "file" | "http" | "https" | "jsr" | "node" | "npm" | "smudgy" | "smudgy-pkg" => {
+                Ok(resolved)
+            }
             scheme => Err(generic_loader_error(format!(
                 "unsupported module scheme {scheme}: {resolved}"
             ))),
@@ -569,6 +600,48 @@ impl ModuleLoader for ScriptModuleLoader {
         {
             return ModuleLoadResponse::Sync(result);
         }
+
+        // Keep the jsr marker through synchronous `resolve()`. Metadata selection and the
+        // canonical source fetch both run here as an async module load, then redirect the marker
+        // to the pinned jsr.io URL so relative imports resolve against the real module location.
+        if module_specifier.scheme() == "jsr" {
+            if !self.policy.allow_https {
+                return ModuleLoadResponse::Sync(Err(generic_loader_error(format!(
+                    "https imports are disabled: {module_specifier}"
+                ))));
+            }
+            let requested = module_specifier.clone();
+            let jsr = Rc::clone(&self.jsr);
+            let http = self.http.clone();
+            let source_maps = Rc::clone(&self.source_maps);
+            return ModuleLoadResponse::Async(Box::pin(async move {
+                let found = {
+                    let mut resolver = jsr.lock().await;
+                    resolver.resolve_jsr_specifier(&http, &requested).await?
+                };
+                let source = fetch_text(&http, found.as_str()).await?;
+                transpile_module(&source_maps, &requested, &found, &source)
+            }));
+        }
+
+        // Direct HTTP(S) imports use the same async client. Returning an Async response is the
+        // essential scheduling boundary: a slow module server yields to the session's action
+        // queue instead of blocking its V8/event-loop poll.
+        if matches!(module_specifier.scheme(), "http" | "https") {
+            if !self.policy.allow_https {
+                return ModuleLoadResponse::Sync(Err(generic_loader_error(format!(
+                    "https imports are disabled: {module_specifier}"
+                ))));
+            }
+            let specifier = module_specifier.clone();
+            let http = self.http.clone();
+            let source_maps = Rc::clone(&self.source_maps);
+            return ModuleLoadResponse::Async(Box::pin(async move {
+                let source = fetch_text(&http, specifier.as_str()).await?;
+                transpile_module(&source_maps, &specifier, &specifier, &source)
+            }));
+        }
+
         ModuleLoadResponse::Sync(self.load_sync(module_specifier))
     }
 
@@ -581,39 +654,38 @@ impl ModuleLoader for ScriptModuleLoader {
     }
 }
 
-#[derive(Default)]
-struct JsrImportProvider {
+struct JsrResolver {
+    registry_url: String,
     package_meta: HashMap<String, JsrPackageMeta>,
     version_meta: HashMap<(String, String), JsrVersionMeta>,
 }
 
-impl ImportProvider for JsrImportProvider {
-    fn resolve(
-        &mut self,
-        specifier: &ModuleSpecifier,
-        _referrer: &str,
-        _kind: ResolutionKind,
-    ) -> Option<Result<ModuleSpecifier, ModuleLoaderError>> {
-        if specifier.scheme() == "jsr" {
-            Some(self.resolve_jsr_specifier(specifier))
-        } else {
-            None
+impl Default for JsrResolver {
+    fn default() -> Self {
+        Self {
+            registry_url: JSR_REGISTRY_URL.to_string(),
+            package_meta: HashMap::new(),
+            version_meta: HashMap::new(),
         }
     }
 }
 
-impl JsrImportProvider {
-    fn resolve_jsr_specifier(
+impl JsrResolver {
+    async fn resolve_jsr_specifier(
         &mut self,
+        http: &reqwest::Client,
         specifier: &ModuleSpecifier,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
         let request = parse_jsr_specifier(specifier)?;
-        let version = self.resolve_version(&request.package, &request.range)?;
-        let version_meta = self.version_meta(&request.package, &version)?;
+        let version = self
+            .resolve_version(http, &request.package, &request.range)
+            .await?;
+        let version_meta = self.version_meta(http, &request.package, &version).await?;
         let export_path = version_meta.resolve_export(&request.export)?;
 
         ModuleSpecifier::parse(&format!(
-            "https://jsr.io/{}/{}/{}",
+            "{}/{}/{}/{}",
+            self.registry_url.trim_end_matches('/'),
             request.package,
             version,
             export_path.trim_start_matches("./")
@@ -621,8 +693,13 @@ impl JsrImportProvider {
         .map_err(JsErrorBox::from_err)
     }
 
-    fn resolve_version(&mut self, package: &str, range: &str) -> Result<String, ModuleLoaderError> {
-        let meta = self.package_meta(package)?;
+    async fn resolve_version(
+        &mut self,
+        http: &reqwest::Client,
+        package: &str,
+        range: &str,
+    ) -> Result<String, ModuleLoaderError> {
+        let meta = self.package_meta(http, package).await?;
         if range == "latest" {
             if let Some(latest) = &meta.latest {
                 return Ok(latest.clone());
@@ -653,10 +730,17 @@ impl JsrImportProvider {
             })
     }
 
-    fn package_meta(&mut self, package: &str) -> Result<&JsrPackageMeta, ModuleLoaderError> {
+    async fn package_meta(
+        &mut self,
+        http: &reqwest::Client,
+        package: &str,
+    ) -> Result<&JsrPackageMeta, ModuleLoaderError> {
         if !self.package_meta.contains_key(package) {
-            let url = format!("https://jsr.io/{package}/meta.json");
-            let meta = fetch_json::<JsrPackageMeta>(&url)?;
+            let url = format!(
+                "{}/{package}/meta.json",
+                self.registry_url.trim_end_matches('/')
+            );
+            let meta = fetch_json::<JsrPackageMeta>(http, &url).await?;
             self.package_meta.insert(package.to_string(), meta);
         }
         Ok(self
@@ -665,15 +749,19 @@ impl JsrImportProvider {
             .expect("package metadata cached"))
     }
 
-    fn version_meta(
+    async fn version_meta(
         &mut self,
+        http: &reqwest::Client,
         package: &str,
         version: &str,
     ) -> Result<&JsrVersionMeta, ModuleLoaderError> {
         let key = (package.to_string(), version.to_string());
         if !self.version_meta.contains_key(&key) {
-            let url = format!("https://jsr.io/{package}/{version}_meta.json");
-            let meta = fetch_json::<JsrVersionMeta>(&url)?;
+            let url = format!(
+                "{}/{package}/{version}_meta.json",
+                self.registry_url.trim_end_matches('/')
+            );
+            let meta = fetch_json::<JsrVersionMeta>(http, &url).await?;
             self.version_meta.insert(key.clone(), meta);
         }
         Ok(self
@@ -791,50 +879,128 @@ fn export_value_to_path(value: &Value) -> Option<String> {
     }
 }
 
-fn fetch_json<T>(url: &str) -> Result<T, ModuleLoaderError>
+async fn fetch_json<T>(http: &reqwest::Client, url: &str) -> Result<T, ModuleLoaderError>
 where
-    T: serde::de::DeserializeOwned + Send + 'static,
+    T: serde::de::DeserializeOwned,
 {
-    let url = url.to_string();
-    let thread_url = url.clone();
-    std::thread::spawn(move || {
-        let response = reqwest::blocking::get(&thread_url)
-            .map_err(|err| generic_loader_error(format!("GET {thread_url} failed: {err}")))?;
-        if !response.status().is_success() {
-            return Err(generic_loader_error(format!(
-                "GET {thread_url} failed with {}",
-                response.status()
-            )));
-        }
-        response
-            .json::<T>()
-            .map_err(|err| generic_loader_error(format!("invalid JSON from {thread_url}: {err}")))
-    })
-    .join()
-    .map_err(|_| generic_loader_error(format!("GET {url} panicked")))?
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| generic_loader_error(format!("GET {url} failed: {err}")))?;
+    if !response.status().is_success() {
+        return Err(generic_loader_error(format!(
+            "GET {url} failed with {}",
+            response.status()
+        )));
+    }
+    response
+        .json::<T>()
+        .await
+        .map_err(|err| generic_loader_error(format!("invalid JSON from {url}: {err}")))
 }
 
-/// Fetch a module source body as text. Like [`fetch_json`], the blocking HTTP
-/// runs on a spawned thread so reqwest::blocking's tokio runtime is created and
-/// dropped off the async event-loop thread (avoids a runtime-drop panic).
-fn fetch_text(url: &str) -> Result<String, ModuleLoaderError> {
-    let url = url.to_string();
-    let thread_url = url.clone();
-    std::thread::spawn(move || {
-        let response = reqwest::blocking::get(&thread_url)
-            .map_err(|err| generic_loader_error(format!("GET {thread_url} failed: {err}")))?;
-        if !response.status().is_success() {
-            return Err(generic_loader_error(format!(
-                "GET {thread_url} failed with {}",
-                response.status()
-            )));
+/// Fetch a module source body without blocking the current-thread session runtime.
+async fn fetch_text(http: &reqwest::Client, url: &str) -> Result<String, ModuleLoaderError> {
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| generic_loader_error(format!("GET {url} failed: {err}")))?;
+    if !response.status().is_success() {
+        return Err(generic_loader_error(format!(
+            "GET {url} failed with {}",
+            response.status()
+        )));
+    }
+    response
+        .text()
+        .await
+        .map_err(|err| generic_loader_error(format!("reading {url} failed: {err}")))
+}
+
+#[cfg(test)]
+mod jsr_async_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::time::Duration;
+
+    fn delayed_registry() -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test registry");
+        let address = listener.local_addr().expect("test registry address");
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept registry request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .expect("request path");
+                let body = match path {
+                    "/@scope/pkg/meta.json" => r#"{"latest":"1.2.0","versions":{"1.2.0":{}}}"#,
+                    "/@scope/pkg/1.2.0_meta.json" => r#"{"exports":{"./sub":"./sub.ts"}}"#,
+                    other => panic!("unexpected registry request {other}"),
+                };
+
+                // Long enough that a blocking loader deterministically prevents the timer below
+                // from winning its select, without making the regression test slow.
+                std::thread::sleep(Duration::from_millis(125));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write registry response");
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jsr_metadata_resolution_yields_to_the_runtime() {
+        let (registry_url, server) = delayed_registry();
+        let mut resolver = JsrResolver {
+            registry_url: registry_url.clone(),
+            package_meta: HashMap::new(),
+            version_meta: HashMap::new(),
+        };
+        let http = reqwest::Client::new();
+        let specifier = ModuleSpecifier::parse("jsr:@scope/pkg@^1/sub").unwrap();
+        let mut resolution = Box::pin(resolver.resolve_jsr_specifier(&http, &specifier));
+
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            result = &mut resolution => {
+                panic!("JSR metadata resolution blocked the runtime instead of yielding: {result:?}");
+            }
         }
-        response
-            .text()
-            .map_err(|err| generic_loader_error(format!("reading {thread_url} failed: {err}")))
-    })
-    .join()
-    .map_err(|_| generic_loader_error(format!("GET {url} panicked")))?
+
+        let found = tokio::time::timeout(Duration::from_secs(3), resolution)
+            .await
+            .expect("JSR metadata resolution timed out")
+            .expect("JSR metadata resolution failed");
+        assert_eq!(
+            found.as_str(),
+            format!("{registry_url}/@scope/pkg/1.2.0/sub.ts")
+        );
+        server.join().expect("test registry thread panicked");
+    }
 }
 
 #[cfg(test)]
@@ -866,8 +1032,10 @@ mod dep_gating_tests {
             cwd: std::env::temp_dir(),
             policy: ModulePolicy { allow_https: true, ..Default::default() },
             source_maps: Default::default(),
-            import_provider: RefCell::new(Box::new(JsrImportProvider::default())),
+            import_provider: RefCell::new(Box::new(NoopImportProvider)),
             npm: None,
+            jsr: Rc::new(tokio::sync::Mutex::new(JsrResolver::default())),
+            http: reqwest::Client::new(),
             package_provider: Some(Rc::new(provider)),
         }
     }
@@ -1029,10 +1197,8 @@ mod dep_gating_tests {
 
 /// The per-isolate `import` policy gate (`ModulePolicy::import_policy`), exercised through
 /// `resolve()` across the three levels. Hermetic by construction: `resolve()` fetches nothing for
-/// `npm:`/`http:`/`https:` (only `load()` does), so those resolve synchronously, and every denied
-/// case short-circuits at the gate. Only `jsr:` fetches registry metadata *during* `resolve` (via
-/// the import provider), so the allowed-`jsr:` case is covered by the decision table in
-/// `package_resolver::tests::import_policy_allows_import_decision_table`, keeping this offline.
+/// `npm:`/`jsr:`/`http:`/`https:` (only async `load()` does), so resolution is network-free and
+/// every denied case short-circuits at the gate.
 #[cfg(test)]
 mod import_gate_tests {
     use super::*;
@@ -1046,8 +1212,10 @@ mod import_gate_tests {
             cwd: std::env::temp_dir(),
             policy: ModulePolicy { allow_https: true, import_policy },
             source_maps: Default::default(),
-            import_provider: RefCell::new(Box::new(JsrImportProvider::default())),
+            import_provider: RefCell::new(Box::new(NoopImportProvider)),
             npm: None,
+            jsr: Rc::new(tokio::sync::Mutex::new(JsrResolver::default())),
+            http: reqwest::Client::new(),
             package_provider: None,
         }
     }
@@ -1061,7 +1229,7 @@ mod import_gate_tests {
         let off = loader(ImportPolicy::None);
         let npm = resolve(&off, "npm:left-pad").unwrap_err().to_string();
         assert!(npm.contains("blocked") && npm.contains("npm"), "npm blocked at None: {npm}");
-        // `jsr:` is rejected at the gate — BEFORE the jsr provider's metadata fetch (so, offline).
+        // `jsr:` is rejected at the gate before async metadata loading (so, offline).
         let jsr = resolve(&off, "jsr:@std/assert").unwrap_err().to_string();
         assert!(jsr.contains("blocked") && jsr.contains("jsr"), "jsr blocked at None: {jsr}");
         let web = resolve(&off, "https://cdn.example.com/x.js").unwrap_err().to_string();
@@ -1071,7 +1239,12 @@ mod import_gate_tests {
     #[test]
     fn registries_allows_npm_and_the_jsr_cdn_but_not_arbitrary_web() {
         let reg = loader(ImportPolicy::Registries);
-        assert!(resolve(&reg, "npm:left-pad").is_ok(), "npm allowed at Registries");
+        assert!(
+            resolve(&reg, "npm:left-pad").is_ok(),
+            "npm allowed at Registries"
+        );
+        let jsr = resolve(&reg, "jsr:@std/assert@1").expect("jsr allowed at Registries");
+        assert_eq!(jsr.as_str(), "jsr:@std/assert@1");
         // A jsr package's own `https://jsr.io` sub-module resolves (resolve does not fetch https).
         assert!(
             resolve(&reg, "https://jsr.io/@std/assert/1.0.0/mod.ts").is_ok(),
