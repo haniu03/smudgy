@@ -1439,17 +1439,27 @@ impl ManagedSession {
     /// Arm the obscured-blur mark on the input behind `key` (see
     /// [`session_input::SessionInput::note_obscured`]): the tab switch about
     /// to obscure the pane must not let the blur it inflicts clear the
-    /// user's in-progress text. A pane without an input takes no mark.
+    /// user's in-progress text. Publish the synthetic focus loss immediately;
+    /// the now-inactive widget subtree cannot deliver its real blur until it
+    /// is selected again. A pane without an input takes no mark.
     pub fn note_pane_input_obscured(&mut self, key: PaneKey) {
-        let input = if key == MAIN_PANE_KEY {
-            Some(&mut self.input)
-        } else {
-            self.panes
-                .get_mut(&key)
-                .and_then(|pane| pane.input.as_mut())
+        let noted = {
+            let input = if key == MAIN_PANE_KEY {
+                Some(&mut self.input)
+            } else {
+                self.panes
+                    .get_mut(&key)
+                    .and_then(|pane| pane.input.as_mut())
+            };
+            if let Some(input) = input {
+                input.note_obscured();
+                true
+            } else {
+                false
+            }
         };
-        if let Some(input) = input {
-            input.note_obscured();
+        if noted {
+            self.sync_input_mirror(key);
         }
     }
 
