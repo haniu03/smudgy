@@ -604,7 +604,13 @@ pub enum RuntimeAction {
     /// even though no terminal-buffer mutation was needed.
     LinkTooltipChanged,
     Connected,
-    Disconnected,
+    /// The socket task's teardown notification. `connection_generation`
+    /// identifies which socket ended: a replaced socket's late `Disconnected`
+    /// must not clear the NEW connection's pending deferred profile send
+    /// (the same staleness guard as [`Self::IncomingPacketProcessed`]).
+    Disconnected {
+        connection_generation: u64,
+    },
     /// One inbound GMCP message (`docs/gmcp.md` §3): the dotted message name and the
     /// raw data part exactly as received — unparsed; the dispatch arm parses on the session
     /// thread and writes the `gmcp` store subtree. Enqueued by the connection task at the

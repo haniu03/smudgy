@@ -194,7 +194,10 @@ createTrigger("^reload-now$", () => session.reload());
         }
     }
 
-    tx.send(RuntimeAction::Disconnected).unwrap();
+    tx.send(RuntimeAction::Disconnected {
+        connection_generation: 0,
+    })
+    .unwrap();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(30), events.next())
             .await
