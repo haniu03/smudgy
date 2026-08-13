@@ -1,5 +1,5 @@
 {
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "NukeFire command deck: vitals HUD, Navigator (MapView + live BIGMAP radar), GPS atlas, context deck, comms, affects, and Knowledge codex panes.",
   "entry": "index.ts",
   "min_smudgy_version": "0.5.3",
@@ -42,7 +42,7 @@
       "key": "showRadar",
       "label": "Show BIGMAP radar pane",
       "type": "bool",
-      "default": true
+      "default": false
     },
     {
       "key": "showAtlas",
@@ -66,7 +66,7 @@
       "key": "chatRendering",
       "label": "Chat rendering",
       "type": "dropdown",
-      "default": "plain",
+      "default": "full-ansi",
       "options": [
         {
           "value": "full-ansi",
@@ -94,7 +94,7 @@
       "key": "sessionLayout",
       "label": "Additional session layout",
       "type": "dropdown",
-      "default": "stacked-right",
+      "default": "tabbed",
       "options": [
         {
           "value": "stacked-right",
@@ -136,6 +136,9 @@
         "send",
         "echo",
         "reach-others"
+      ],
+      "mapper": [
+        "read"
       ],
       "display": [
         "change"

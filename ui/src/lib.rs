@@ -10,7 +10,7 @@ use iced::window;
 use iced::window::settings::PlatformSpecific;
 use iced::{Point, Rectangle, Size, Subscription, Task};
 use smudgy_cloud::cloud_api::{AreaPref, CloudApiClient};
-use smudgy_cloud::{AreaId, CloudError, Mapper};
+use smudgy_cloud::{AreaId, AtlasId, CloudError, MapStorage, Mapper};
 use smudgy_core::models::map_scopes::{MapScopes, ScopeState};
 use smudgy_core::models::settings::{MapAreaPref, Settings};
 use smudgy_core::session::runtime::pane::{
@@ -311,18 +311,15 @@ pub(crate) fn client_rounded_frame() -> bool {
         // Mirror winit's backend choice exactly: it goes Wayland when either
         // variable is set non-empty (an empty `WAYLAND_DISPLAY=` still lands
         // on X11, which must keep the opaque sharp look).
-        let non_empty =
-            |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+        let non_empty = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
         // wgpu's GL backend advertises only Opaque composite alpha, so the
         // transparent corners would render black there. The automatic
         // GL fallback isn't visible from here, but an explicit override is.
-        let forced_gl = std::env::var("WGPU_BACKEND").is_ok_and(|v| {
-            matches!(v.to_ascii_lowercase().as_str(), "gl" | "gles" | "opengl")
-        });
+        let forced_gl = std::env::var("WGPU_BACKEND")
+            .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "gl" | "gles" | "opengl"));
         (non_empty("WAYLAND_DISPLAY") || non_empty("WAYLAND_SOCKET"))
             && !forced_gl
-            && !std::env::var_os("SMUDGY_SQUARE_CORNERS")
-                .is_some_and(|v| v == "1" || v == "true")
+            && !std::env::var_os("SMUDGY_SQUARE_CORNERS").is_some_and(|v| v == "1" || v == "true")
     });
     *ACTIVE
 }
@@ -2236,6 +2233,9 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 SessionEvent::MapAreaCreated(area_id) => {
                     associate_created_area(smudgy, session_id, *area_id)
                 }
+                SessionEvent::MapAtlasCreated(atlas_id) => {
+                    associate_created_atlas(smudgy, session_id, *atlas_id)
+                }
                 _ => Task::none(),
             };
             // Pane lifecycle, def-state, and placement events touch both the
@@ -3733,12 +3733,11 @@ fn group_script_pane(
         .smudgy_windows
         .iter()
         .find_map(|(id, window)| window.hosts_pane(slot.session_id, slot.key).then_some(*id));
-    let target_id = smudgy
-        .smudgy_windows
-        .iter()
-        .find_map(|(id, window)| {
-            window.hosts_pane(reference.session_id, reference.key).then_some(*id)
-        });
+    let target_id = smudgy.smudgy_windows.iter().find_map(|(id, window)| {
+        window
+            .hosts_pane(reference.session_id, reference.key)
+            .then_some(*id)
+    });
     let (Some(source_id), Some(target_id)) = (source_id, target_id) else {
         log::warn!("Dropping groupWith because one of its panes is no longer hosted");
         return Task::none();
@@ -4979,7 +4978,9 @@ fn apply_scope_exclusions(smudgy: &Smudgy) {
 /// scoping a local area would wrongly hide its twin on another entry; ephemeral
 /// areas are session-scoped by nature.
 fn bind_target_for_area(mapper: &Mapper, area_id: AreaId) -> Option<BindTarget> {
-    if mapper.is_ephemeral(&area_id) || mapper.local_area_ids().contains(&area_id) {
+    if mapper.area_storage(&area_id) == MapStorage::Session
+        || mapper.local_area_ids().contains(&area_id)
+    {
         return None;
     }
     let atlas = mapper.get_current_atlas();
@@ -5100,6 +5101,31 @@ fn associate_created_area(
     }) else {
         return Task::none();
     };
+    if target_scope(&smudgy.map_scopes, target, &server_name) == ScopeState::Here {
+        return Task::none();
+    }
+    set_scope_entry(&mut smudgy.map_scopes, target, &server_name, true);
+    commit_scope_change(smudgy)
+}
+
+/// Associate a deliberately created/promoted cloud atlas with this session's
+/// server entry. Local atlases remain entry-isolated.
+fn associate_created_atlas(
+    smudgy: &mut Smudgy,
+    session_id: SessionId,
+    atlas_id: AtlasId,
+) -> Task<Message> {
+    let Some(session) = smudgy.sessions.get(session_id) else {
+        return Task::none();
+    };
+    let Some(mapper) = session.mapper.as_ref() else {
+        return Task::none();
+    };
+    if mapper.atlas_storage(&atlas_id) != smudgy_cloud::MapStorage::Cloud {
+        return Task::none();
+    }
+    let server_name = session.server_name.clone();
+    let target = BindTarget::Atlas(atlas_id);
     if target_scope(&smudgy.map_scopes, target, &server_name) == ScopeState::Here {
         return Task::none();
     }

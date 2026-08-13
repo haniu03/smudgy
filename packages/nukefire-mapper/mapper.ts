@@ -32,6 +32,11 @@ import {
   type DecisionLogRecord,
 } from "./decision-log.ts";
 import {
+  findAreaByNukeFireId,
+  findCompatibleAreaByName,
+  NUKEFIRE_AREA_ID_PROPERTY,
+} from "./area-resolution.ts";
+import {
   directRoomObstructions,
   routeAroundRooms,
   routeEndSide,
@@ -39,8 +44,13 @@ import {
   routeTurnPoints,
   type RouteSide,
 } from "./routing.ts";
+import {
+  verticalExitObservations,
+  verticalMapLinks,
+  type VerticalExitObservation,
+} from "./room-info.ts";
+import { reflowPolicy } from "./reflow-policy.ts";
 
-const AREA_ZONE_PROPERTY = "nukefire.zone";
 const AREA_SOURCE_PROPERTY = "nukefire.mapper";
 const ROOM_ZONE_PROPERTY = "nukefire.zone";
 const ROOM_TERRAIN_PROPERTY = "terrain";
@@ -50,7 +60,12 @@ const SOURCE_NAME = "NukeFire.Map.Local";
 export interface NukeFireMapperOptions {
   /** Prefix used when Room.Info has not supplied the zone's display name. */
   areaPrefix?: string;
-  /** Create new areas as session-only maps. Defaults to false (durable maps). */
+  /** Explicit storage for newly managed areas. Defaults to local. */
+  storage?: MapStorage;
+  /**
+   * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+   * Use `storage: "session"` instead.
+   */
   ephemeral?: boolean;
   /** Allow the integral-grid planner to reflow existing NukeFire rooms. Default true. */
   updateCoordinates?: boolean;
@@ -64,6 +79,16 @@ interface Assignment {
   room?: RoomMirror;
   position?: GridPosition;
   positionApplied?: boolean;
+}
+
+interface AssignmentPlanStats {
+  plannedAreas: number;
+  topologyGrowthAreas: number;
+  movedRooms: number;
+  plannerMs: number;
+  coordinateWriteMs: number;
+  routeWriteMs: number;
+  batchCommitMs: number;
 }
 
 interface ExitMirror {
@@ -106,7 +131,7 @@ interface ConnectionMirror {
 interface AreaMirror {
   id: AreaId;
   name: string;
-  isEphemeral: boolean;
+  storage: MapStorage;
   zone?: string;
   source?: string;
   roomsByNumber: Map<RoomNumber, RoomMirror>;
@@ -220,6 +245,16 @@ function topologyTraversalKey(from: number, to: number, command: string): string
   return `${from}>${to}:${command}`;
 }
 
+function verticalPendingKey(link: Readonly<NukeFireMapLink>): string {
+  return `${link.from}:${mapDirection(link.direction).direction}`;
+}
+
+function observedLinkKey(link: Readonly<NukeFireMapLink>): string {
+  const mapped = mapDirection(link.direction);
+  const identity = mapped.direction === "Special" ? mapped.command : mapped.direction;
+  return `${link.from}>${link.to}:${identity}`;
+}
+
 function copyEndpoint(endpoint: ConnectionEndpoint): ConnectionEndpoint {
   return {
     room_number: endpoint.room_number,
@@ -307,7 +342,9 @@ function connectionMirrorKey(id: ConnectionId): string {
  * Calls are serialized because mapper mutations acknowledge asynchronously.
  */
 export class NukeFireMapper {
-  readonly #options: Required<NukeFireMapperOptions>;
+  readonly #options: Required<Omit<NukeFireMapperOptions, "ephemeral" | "storage">> & {
+    storage: MapStorage;
+  };
   readonly #decisionLogger: MappingDecisionLogger;
   readonly #subscriptions: EventSubscription[] = [];
   readonly #zoneAreas = new Map<number, AreaMirror>();
@@ -318,6 +355,10 @@ export class NukeFireMapper {
   readonly #pending: NukeFireMapLocal[] = [];
   /** Traversals already allowed to trigger one expensive geometry reflow. */
   readonly #plannedTopology = new Set<string>();
+  /** Areas which grew while newer movement snapshots were already queued. */
+  readonly #deferredReflowAreas = new Set<string>();
+  /** Numeric Room.Info vertical exits waiting for their destination room. */
+  readonly #pendingVerticalLinks = new Map<string, NukeFireMapLink>();
   #running = false;
   #started = false;
   #currentLocation = "";
@@ -327,7 +368,7 @@ export class NukeFireMapper {
   constructor(options: NukeFireMapperOptions = {}) {
     this.#options = {
       areaPrefix: options.areaPrefix ?? "NukeFire Zone",
-      ephemeral: options.ephemeral ?? false,
+      storage: options.storage ?? (options.ephemeral ? "session" : "local"),
       updateCoordinates: options.updateCoordinates ?? true,
       decisionLogFile: options.decisionLogFile ?? DEFAULT_DECISION_LOG_FILE,
     };
@@ -365,13 +406,16 @@ export class NukeFireMapper {
           this.#roomsByVnum.delete(room.vnum);
         }
       }
+      for (const [zone, area] of this.#zoneAreas) {
+        if (area === known) this.#zoneAreas.delete(zone);
+      }
     }
 
     const area: AreaMirror = {
       id,
       name: source.name,
-      isEphemeral: source.isEphemeral,
-      zone: source.data(AREA_ZONE_PROPERTY),
+      storage: source.storage,
+      zone: source.data(NUKEFIRE_AREA_ID_PROPERTY),
       source: source.data(AREA_SOURCE_PROPERTY),
       roomsByNumber: new Map(),
       connections: new Map(),
@@ -422,6 +466,29 @@ export class NukeFireMapper {
     echo(`[nukefire-mapper] ${error}`);
   }
 
+  /**
+   * Draft callbacks update the VM-owned mirror so later writes in the same batch
+   * see their predecessors. If submission fails (including after an oversized
+   * batch partially commits), rebuild that mirror from the mapper's durable
+   * state before allowing the serialized mapping loop to continue.
+   */
+  async #mutateArea(
+    areaId: AreaId,
+    callback: (mutation: AreaMutator) => void | Promise<void>,
+    description: string,
+  ): Promise<void> {
+    try {
+      await mapper.mutateArea(areaId, callback, { description });
+    } catch (error) {
+      try {
+        this.#hydrateArea(mapper.getAreaById(areaId), true);
+      } catch {
+        // Preserve the original mutation failure if recovery itself cannot read.
+      }
+      throw error;
+    }
+  }
+
   start(): void {
     if (this.#started) return;
     this.#started = true;
@@ -467,6 +534,8 @@ export class NukeFireMapper {
     this.#areasById.clear();
     this.#roomsByVnum.clear();
     this.#plannedTopology.clear();
+    this.#deferredReflowAreas.clear();
+    this.#pendingVerticalLinks.clear();
     this.#currentLocation = "";
     this.#started = false;
   }
@@ -493,7 +562,10 @@ export class NukeFireMapper {
         const snapshot = this.#pending.shift();
         if (!snapshot) continue;
         try {
-          await this.#syncSnapshot(snapshot);
+          // Ingest intermediate movement snapshots without repeatedly moving
+          // the entire atlas. The newest queued snapshot performs the one
+          // deferred full reflow for every area it contains.
+          await this.#syncSnapshot(snapshot, this.#pending.length === 0);
           this.#lastError = "";
         } catch (caught) {
           const message = caught instanceof Error ? caught.message : String(caught);
@@ -517,7 +589,8 @@ export class NukeFireMapper {
     }
   }
 
-  async #syncSnapshot(snapshot: NukeFireMapLocal): Promise<void> {
+  async #syncSnapshot(snapshot: NukeFireMapLocal, allowExistingReflow: boolean): Promise<void> {
+    const startedAt = performance.now();
     if (!isUsableVnum(snapshot.center)) {
       throw new Error(`ignored Map.Local with invalid center ${snapshot.center}`);
     }
@@ -531,12 +604,31 @@ export class NukeFireMapper {
       throw new Error(`Map.Local omitted its center room #${snapshot.center}`);
     }
 
+    const currentRoomInfo = this.#lastRoomInfo?.num === snapshot.center
+      ? this.#lastRoomInfo
+      : undefined;
+    const verticalExits = currentRoomInfo
+      ? verticalExitObservations(currentRoomInfo.exits)
+      : [];
+    const supplementalLinks = verticalMapLinks(snapshot.center, verticalExits);
+    for (const link of supplementalLinks) {
+      this.#pendingVerticalLinks.set(verticalPendingKey(link), link);
+    }
+    const links: NukeFireMapLink[] = [];
+    const linkKeys = new Set<string>();
+    for (const link of [...snapshot.links, ...this.#pendingVerticalLinks.values()]) {
+      const key = observedLinkKey(link);
+      if (linkKeys.has(key)) continue;
+      linkKeys.add(key);
+      links.push(link);
+    }
+
     const sources = [...byVnum.values()];
     const existing = new Map<number, RoomMirror>();
     for (const source of sources) {
       const room = this.#roomsByVnum.get(source.vnum);
       const area = room && this.#areasById.get(areaIdKey(room.areaId));
-      if (room && area?.isEphemeral === this.#options.ephemeral) existing.set(source.vnum, room);
+      if (room && area?.storage === this.#options.storage) existing.set(source.vnum, room);
     }
 
     // Hydrate an existing matching area at most once. Subsequent snapshots use
@@ -546,14 +638,14 @@ export class NukeFireMapper {
         if (existing.has(source.vnum)) continue;
         const cached = this.#roomsByVnum.get(source.vnum);
         const cachedArea = cached && this.#areasById.get(areaIdKey(cached.areaId));
-        if (cached && cachedArea?.isEphemeral === this.#options.ephemeral) {
+        if (cached && cachedArea?.storage === this.#options.storage) {
           existing.set(source.vnum, cached);
           continue;
         }
         const hostRoom = mapper.findRoomByExternalId(externalRoomId(source.vnum));
         if (!hostRoom) continue;
         const hostArea = mapper.getAreaById(hostRoom.area_id);
-        if (hostArea.isEphemeral !== this.#options.ephemeral) continue;
+        if (hostArea.storage !== this.#options.storage) continue;
         this.#hydrateArea(hostArea);
         const room = this.#roomsByVnum.get(source.vnum);
         if (room) existing.set(source.vnum, room);
@@ -565,7 +657,7 @@ export class NukeFireMapper {
       const wanted = new Set(sources.map((source) => source.vnum));
       for (const hostArea of mapper.areas) {
         if (existing.size >= wanted.size) break;
-        if (hostArea.isEphemeral !== this.#options.ephemeral) continue;
+        if (hostArea.storage !== this.#options.storage) continue;
         const area = this.#hydrateArea(hostArea);
         for (const room of area.roomsByNumber.values()) {
           if (room.vnum !== undefined && wanted.has(room.vnum) && !existing.has(room.vnum)) {
@@ -599,19 +691,43 @@ export class NukeFireMapper {
     }
 
     const assignments: Assignment[] = sources.map((source) => {
-      const room = existing.get(source.vnum);
-      const area = room ? this.#areasById.get(areaIdKey(room.areaId)) : areaByZone.get(source.zone);
+      const area = areaByZone.get(source.zone);
       if (!area) throw new Error(`could not resolve an area for NukeFire zone ${source.zone}`);
+      const indexedRoom = existing.get(source.vnum);
+      const room = indexedRoom && sameAreaId(indexedRoom.areaId, area.id)
+        ? indexedRoom
+        : [...area.roomsByNumber.values()].find((candidate) => candidate.vnum === source.vnum);
       return { source, area, room };
     });
 
-    await this.#planAssignments(assignments, snapshot, centerSource);
+    const planningStartedAt = performance.now();
+    const planning = await this.#planAssignments(
+      assignments,
+      snapshot,
+      centerSource,
+      links,
+      allowExistingReflow,
+    );
+    const planningFinishedAt = performance.now();
 
     const rooms = new Map<number, RoomMirror>();
+    const assignmentsByArea = new Map<string, Assignment[]>();
     for (const assignment of assignments) {
-      const mapped = await this.#syncRoom(assignment);
-      rooms.set(assignment.source.vnum, mapped);
+      const key = areaIdKey(assignment.area.id);
+      const group = assignmentsByArea.get(key) ?? [];
+      group.push(assignment);
+      assignmentsByArea.set(key, group);
     }
+    for (const group of assignmentsByArea.values()) {
+      const area = group[0].area;
+      await this.#mutateArea(area.id, async (mutation) => {
+        for (const assignment of group) {
+          const mapped = await this.#syncRoom(assignment, mutation);
+          rooms.set(assignment.source.vnum, mapped);
+        }
+      }, `Apply NukeFire rooms for ${area.name}`);
+    }
+    const roomsFinishedAt = performance.now();
 
     const current = rooms.get(snapshot.center);
     if (current) {
@@ -622,7 +738,36 @@ export class NukeFireMapper {
       }
     }
 
-    await this.#syncLinks(snapshot.links, rooms);
+    await this.#syncLinks(links, rooms);
+    for (const [key, link] of this.#pendingVerticalLinks) {
+      const from = rooms.get(link.from) ?? this.#roomsByVnum.get(link.from);
+      const to = rooms.get(link.to) ?? this.#roomsByVnum.get(link.to);
+      const mapped = mapDirection(link.direction);
+      if (to && exitLeadsTo(from && matchingExit(from, mapped), to)) {
+        this.#pendingVerticalLinks.delete(key);
+      }
+    }
+    await this.#syncClosedVerticalExits(verticalExits, rooms.get(snapshot.center));
+
+    const finishedAt = performance.now();
+    if (planning.plannedAreas > 0 || finishedAt - startedAt >= 100) {
+      this.#logDecision({
+        kind: "mapping-performance",
+        center: snapshot.center,
+        rooms: assignments.length,
+        links: links.length,
+        allowExistingReflow,
+        queuedSnapshots: this.#pending.length,
+        planning,
+        durationMs: {
+          total: finishedAt - startedAt,
+          resolve: planningStartedAt - startedAt,
+          planning: planningFinishedAt - planningStartedAt,
+          roomWrites: roomsFinishedAt - planningFinishedAt,
+          linkWrites: finishedAt - roomsFinishedAt,
+        },
+      });
+    }
   }
 
   async #resolveArea(
@@ -630,44 +775,52 @@ export class NukeFireMapper {
     known: AreaMirror | undefined,
     preferredName: string,
   ): Promise<AreaMirror> {
-    let area = known?.isEphemeral === this.#options.ephemeral
-      ? known
-      : this.#zoneAreas.get(zone);
+    const areaId = String(zone);
+    const exact = findAreaByNukeFireId(mapper.areas, this.#options.storage, areaId);
+    let area = exact ? this.#hydrateArea(exact) : undefined;
     if (!area) {
-      const source = mapper.areas.find((candidate) =>
-        candidate.isEphemeral === this.#options.ephemeral &&
-        candidate.data(AREA_ZONE_PROPERTY) === String(zone)
-      );
-      if (source) area = this.#hydrateArea(source);
+      const cached = this.#zoneAreas.get(zone);
+      if (cached?.storage === this.#options.storage && (!cached.zone || cached.zone === areaId)) {
+        area = cached;
+      }
+    }
+    if (!area && known?.storage === this.#options.storage && (!known.zone || known.zone === areaId)) {
+      area = known;
     }
     if (!area && preferredName) {
-      const source = mapper.areas.find((candidate) =>
-        candidate.isEphemeral === this.#options.ephemeral &&
-        candidate.name.localeCompare(preferredName, undefined, { sensitivity: "accent" }) === 0
+      const source = findCompatibleAreaByName(
+        mapper.areas,
+        this.#options.storage,
+        areaId,
+        preferredName,
       );
       if (source) area = this.#hydrateArea(source);
     }
     if (!area) {
       const source = await mapper.createArea(
         preferredName || `${this.#options.areaPrefix} ${zone}`,
-        { ephemeral: this.#options.ephemeral },
+        { storage: this.#options.storage },
       );
       area = this.#registerArea({
         id: source.id,
         name: source.name,
-        isEphemeral: source.isEphemeral,
+        storage: source.storage,
         roomsByNumber: new Map(),
         connections: new Map(),
       });
     }
 
     this.#zoneAreas.set(zone, area);
-    if (!area.zone) {
-      await mapper.setAreaProperty(area.id, AREA_ZONE_PROPERTY, String(zone));
-      area.zone = String(zone);
-    }
-    if (area.source !== SOURCE_NAME) {
-      await mapper.setAreaProperty(area.id, AREA_SOURCE_PROPERTY, SOURCE_NAME);
+    if (!area.zone || area.source !== SOURCE_NAME) {
+      await this.#mutateArea(area.id, async (mutation) => {
+        if (!area.zone) {
+          await mutation.setAreaProperty(NUKEFIRE_AREA_ID_PROPERTY, areaId);
+        }
+        if (area.source !== SOURCE_NAME) {
+          await mutation.setAreaProperty(AREA_SOURCE_PROPERTY, SOURCE_NAME);
+        }
+      }, `Bind NukeFire zone ${areaId}`);
+      area.zone = areaId;
       area.source = SOURCE_NAME;
     }
 
@@ -683,7 +836,18 @@ export class NukeFireMapper {
     assignments: Assignment[],
     snapshot: Readonly<NukeFireMapLocal>,
     centerSource: Readonly<NukeFireMapRoom>,
-  ): Promise<void> {
+    links: readonly NukeFireMapLink[],
+    allowExistingReflow: boolean,
+  ): Promise<AssignmentPlanStats> {
+    const stats: AssignmentPlanStats = {
+      plannedAreas: 0,
+      topologyGrowthAreas: 0,
+      movedRooms: 0,
+      plannerMs: 0,
+      coordinateWriteMs: 0,
+      routeWriteMs: 0,
+      batchCommitMs: 0,
+    };
     const groups = new Map<string, Assignment[]>();
     for (const assignment of assignments) {
       const key = areaKey(assignment.area);
@@ -694,7 +858,6 @@ export class NukeFireMapper {
 
     for (const group of groups.values()) {
       const area = group[0].area;
-      const groupVnums = new Set(group.map((assignment) => assignment.source.vnum));
       const assignmentByVnum = new Map(group.map((assignment) => [assignment.source.vnum, assignment]));
       const residentRooms = new Map(area.roomsByNumber);
       for (const assignment of group) {
@@ -725,12 +888,23 @@ export class NukeFireMapper {
         });
       }
 
+      const layoutIdForVnum = (vnum: number): string | undefined => {
+        const assignment = assignmentByVnum.get(vnum);
+        if (assignment && sameAreaId(assignment.area.id, area.id)) return assignmentIds.get(vnum);
+        const room = this.#roomsByVnum.get(vnum);
+        return room && sameAreaId(room.areaId, area.id)
+          ? idByRoomNumber.get(room.roomNumber)
+          : undefined;
+      };
+      const knownRoomForVnum = (vnum: number): RoomMirror | undefined =>
+        assignmentByVnum.get(vnum)?.room ?? this.#roomsByVnum.get(vnum);
+
       const introducesRoom = group.some((assignment) => !assignment.room);
       const introducedTopology = new Set<string>();
-      for (const link of snapshot.links) {
-        if (!groupVnums.has(link.from) || !groupVnums.has(link.to)) continue;
-        const from = assignmentByVnum.get(link.from)?.room;
-        const to = assignmentByVnum.get(link.to)?.room;
+      for (const link of links) {
+        if (!layoutIdForVnum(link.from) || !layoutIdForVnum(link.to)) continue;
+        const from = knownRoomForVnum(link.from);
+        const to = knownRoomForVnum(link.to);
         const mapped = mapDirection(link.direction);
         const forwardKey = topologyTraversalKey(link.from, link.to, mapped.command);
         if (!this.#plannedTopology.has(forwardKey) && !exitLeadsTo(from && matchingExit(from, mapped), to)) {
@@ -751,9 +925,18 @@ export class NukeFireMapper {
         }
       }
       const topologyGrowth = introducesRoom || introducedTopology.size > 0;
+      const deferredReflow = this.#deferredReflowAreas.has(areaKey(area));
+      const policy = reflowPolicy(
+        topologyGrowth,
+        deferredReflow,
+        allowExistingReflow,
+        this.#options.updateCoordinates,
+      );
+      const { runPlanner, moveExisting } = policy;
+      if (topologyGrowth) stats.topologyGrowthAreas += 1;
 
       let plan: Pick<ReturnType<typeof planIntegralLayout>, "positions" | "movedExisting">;
-      if (!topologyGrowth) {
+      if (!runPlanner) {
         // The common walking path is intentionally O(residents): no edge graph,
         // candidate generation, scoring, or routing search is needed.
         plan = {
@@ -761,6 +944,7 @@ export class NukeFireMapper {
           movedExisting: new Set<string>(),
         };
       } else {
+        stats.plannedAreas += 1;
         const nodes: LayoutNode[] = group.map((assignment) => ({
           id: assignmentIds.get(assignment.source.vnum) as string,
           relative: roundedPosition(
@@ -792,10 +976,9 @@ export class NukeFireMapper {
           }
         }
 
-        for (const link of snapshot.links) {
-          if (!groupVnums.has(link.from) || !groupVnums.has(link.to)) continue;
-          const from = assignmentIds.get(link.from);
-          const to = assignmentIds.get(link.to);
+        for (const link of links) {
+          const from = layoutIdForVnum(link.from);
+          const to = layoutIdForVnum(link.to);
           if (!from || !to) continue;
           const mapped = mapDirection(link.direction);
           pushEdge(from, to, mapped.direction as LayoutDirection);
@@ -805,32 +988,8 @@ export class NukeFireMapper {
         }
 
         const centerId = assignmentIds.get(snapshot.center);
-        const trace: LayoutTraceEvent[] = [];
-        const identities = new Map<string, {
-          id: string;
-          vnum?: number;
-          roomNumber?: RoomNumber;
-          title: string;
-        }>();
-        for (const room of residentRooms.values()) {
-          const id = residentId(room.roomNumber);
-          identities.set(id, {
-            id,
-            vnum: room.vnum,
-            roomNumber: room.roomNumber,
-            title: room.title,
-          });
-        }
-        for (const assignment of group) {
-          const id = assignmentIds.get(assignment.source.vnum) as string;
-          identities.set(id, {
-            id,
-            vnum: assignment.source.vnum,
-            roomNumber: assignment.room?.roomNumber,
-            title: assignment.source.name,
-          });
-        }
-        const diagnosticContext = {
+        const trace: LayoutTraceEvent[] | undefined = this.#decisionLogger.path ? [] : undefined;
+        const diagnosticContext = trace ? {
           area: {
             id: area.id,
             name: area.name,
@@ -838,53 +997,92 @@ export class NukeFireMapper {
           },
           trigger: {
             introducesRoom,
+            deferredReflow,
+            moveExisting,
             introducedRooms: group
               .filter((assignment) => !assignment.room)
               .map((assignment) => assignment.source.vnum)
               .sort((a, b) => a - b),
             introducedTopology: [...introducedTopology].sort(),
           },
-          identities: [...identities.values()].sort((a, b) => a.id.localeCompare(b.id)),
+          identities: (() => {
+            const identities = new Map<string, {
+              id: string;
+              vnum?: number;
+              roomNumber?: RoomNumber;
+              title: string;
+            }>();
+            for (const room of residentRooms.values()) {
+              const id = residentId(room.roomNumber);
+              identities.set(id, {
+                id,
+                vnum: room.vnum,
+                roomNumber: room.roomNumber,
+                title: room.title,
+              });
+            }
+            for (const assignment of group) {
+              const id = assignmentIds.get(assignment.source.vnum) as string;
+              identities.set(id, {
+                id,
+                vnum: assignment.source.vnum,
+                roomNumber: assignment.room?.roomNumber,
+                title: assignment.source.name,
+              });
+            }
+            return [...identities.values()].sort((a, b) => a.id.localeCompare(b.id));
+          })(),
           snapshot,
           request: {
             centerId,
-            allowExistingMoves: this.#options.updateCoordinates,
+            allowExistingMoves: moveExisting,
             nodes,
             residents,
             edges,
           },
-        };
+        } : undefined;
         try {
+          const plannerStartedAt = performance.now();
           const planned = planIntegralLayout({
             nodes,
             residents,
             edges,
             centerId,
-            allowExistingMoves: this.#options.updateCoordinates,
-            trace: (event) => trace.push(event),
+            allowExistingMoves: moveExisting,
+            trace: trace ? (event) => trace.push(event) : undefined,
           });
+          stats.plannerMs += performance.now() - plannerStartedAt;
           plan = planned;
-          this.#logDecision({
-            kind: "layout-decision",
-            ...diagnosticContext,
-            trace,
-            result: {
-              quality: planned.quality,
-              movedExisting: [...planned.movedExisting].sort(),
-              positions: serializedPositions(planned.positions),
-            },
-          });
+          if (diagnosticContext) {
+            this.#logDecision({
+              kind: "layout-decision",
+              ...diagnosticContext,
+              trace,
+              result: {
+                quality: planned.quality,
+                movedExisting: [...planned.movedExisting].sort(),
+                positions: serializedPositions(planned.positions),
+              },
+            });
+          }
         } catch (caught) {
-          this.#logDecision({
-            kind: "layout-error",
-            ...diagnosticContext,
-            trace,
-            error: {
-              message: caught instanceof Error ? caught.message : String(caught),
-              stack: caught instanceof Error ? caught.stack : undefined,
-            },
-          });
+          if (diagnosticContext) {
+            this.#logDecision({
+              kind: "layout-error",
+              ...diagnosticContext,
+              trace,
+              error: {
+                message: caught instanceof Error ? caught.message : String(caught),
+                stack: caught instanceof Error ? caught.stack : undefined,
+              },
+            });
+          }
           throw caught;
+        }
+        if (policy.deferExistingReflow) {
+          this.#deferredReflowAreas.add(areaKey(area));
+        } else {
+          this.#deferredReflowAreas.delete(areaKey(area));
         }
       }
 
@@ -906,21 +1104,29 @@ export class NukeFireMapper {
           level: position.level,
         }]);
       }
-      if (updates.length > 0) {
-        await mapper.updateRooms(area.id, updates);
-        for (const [number, fields] of updates) {
-          const room = residentRooms.get(number);
-          if (!room) continue;
-          room.position = roundedPosition(
-            fields.x ?? room.position.x,
-            fields.y ?? room.position.y,
-            fields.level ?? room.position.level,
-          );
-        }
-      }
-
       if (topologyGrowth || updates.length > 0) {
-        await this.#syncAreaConnectionRoutes(area, residentRooms, plan.positions);
+        const batchStartedAt = performance.now();
+        await this.#mutateArea(area.id, async (mutation) => {
+          if (updates.length > 0) {
+            const coordinateWriteStartedAt = performance.now();
+            await mutation.updateRooms(updates);
+            stats.coordinateWriteMs += performance.now() - coordinateWriteStartedAt;
+            stats.movedRooms += updates.length;
+            for (const [number, fields] of updates) {
+              const room = residentRooms.get(number);
+              if (!room) continue;
+              room.position = roundedPosition(
+                fields.x ?? room.position.x,
+                fields.y ?? room.position.y,
+                fields.level ?? room.position.level,
+              );
+            }
+          }
+          const routeWriteStartedAt = performance.now();
+          await this.#syncAreaConnectionRoutes(area, residentRooms, plan.positions, mutation);
+          stats.routeWriteMs += performance.now() - routeWriteStartedAt;
+        }, `Reflow NukeFire area ${area.name}`);
+        stats.batchCommitMs += performance.now() - batchStartedAt;
       }
 
       for (const key of introducedTopology) this.#plannedTopology.add(key);
@@ -930,6 +1136,7 @@ export class NukeFireMapper {
         assignment.positionApplied = assignment.room !== undefined && plan.movedExisting.has(id);
       }
     }
+    return stats;
   }
 
   #desiredConnectionGeometry(
@@ -983,6 +1190,7 @@ export class NukeFireMapper {
     area: AreaMirror,
     residentRooms: ReadonlyMap<RoomNumber, RoomMirror>,
     positions: ReadonlyMap<string, GridPosition>,
+    mutation?: AreaMutator,
   ): Promise<void> {
     const byRoomNumber = new Map<RoomNumber, GridPosition>();
     for (const number of residentRooms.keys()) {
@@ -1041,7 +1249,8 @@ export class NukeFireMapper {
         segment_shape: connection.segmentShape,
         route_points: connection.routePoints.map((point) => ({ ...point })),
       };
-      await mapper.setConnection(area.id, connection.id, desired);
+      if (mutation) await mutation.setConnection(connection.id, desired);
+      else await mapper.setConnection(area.id, connection.id, desired);
       connection.endpointA = copyEndpoint(desired.endpoint_a);
       connection.endpointB = copyEndpoint(desired.endpoint_b);
       connection.routing = desired.routing;
@@ -1082,7 +1291,7 @@ export class NukeFireMapper {
     }
   }
 
-  async #syncRoom(assignment: Assignment): Promise<RoomMirror> {
+  async #syncRoom(assignment: Assignment, mutation: AreaMutator): Promise<RoomMirror> {
     const source = assignment.source;
     const position = assignment.position;
     if (!position) throw new Error(`layout omitted room #${source.vnum}`);
@@ -1092,7 +1301,7 @@ export class NukeFireMapper {
     const created = !room;
 
     if (!room) {
-      const number = await mapper.createRoom(assignment.area.id, {
+      const number = await mutation.createRoom({
         title: source.name,
         level,
         x,
@@ -1124,7 +1333,7 @@ export class NukeFireMapper {
       if (room.position.y !== y) updates.y = y;
     }
     if (Object.keys(updates).length > 0) {
-      await mapper.updateRoom(room.areaId, room.roomNumber, updates);
+      await mutation.updateRoom(room.roomNumber, updates);
       if (updates.title !== undefined) room.title = updates.title;
       if (updates.color !== undefined) room.color = updates.color;
       room.position = roundedPosition(
@@ -1135,11 +1344,11 @@ export class NukeFireMapper {
     }
 
     if (room.zone !== String(source.zone)) {
-      await mapper.setRoomProperty(room.areaId, room.roomNumber, ROOM_ZONE_PROPERTY, String(source.zone));
+      await mutation.setRoomProperty(room.roomNumber, ROOM_ZONE_PROPERTY, String(source.zone));
       room.zone = String(source.zone);
     }
     if (room.terrain !== source.terrain) {
-      await mapper.setRoomProperty(room.areaId, room.roomNumber, ROOM_TERRAIN_PROPERTY, source.terrain);
+      await mutation.setRoomProperty(room.roomNumber, ROOM_TERRAIN_PROPERTY, source.terrain);
       room.terrain = source.terrain;
     }
     return room;
@@ -1147,6 +1356,18 @@ export class NukeFireMapper {
 
   async #syncLinks(links: readonly NukeFireMapLink[], rooms: Map<number, RoomMirror>): Promise<void> {
     const processed = new Set<string>();
+    const batchable = new Map<string, {
+      link: NukeFireMapLink;
+      from: RoomMirror;
+      to: RoomMirror | undefined;
+      mapped: MappedDirection;
+    }[]>();
+    const crossArea: {
+      link: NukeFireMapLink;
+      from: RoomMirror;
+      to: RoomMirror | undefined;
+      mapped: MappedDirection;
+    }[] = [];
     for (const link of links) {
       if (!isUsableVnum(link.from) || !isUsableVnum(link.to)) continue;
       const mapped = mapDirection(link.direction);
@@ -1160,8 +1381,90 @@ export class NukeFireMapper {
       const from = rooms.get(link.from) ?? this.#roomsByVnum.get(link.from);
       if (!from) continue;
       const to = rooms.get(link.to) ?? this.#roomsByVnum.get(link.to);
-      await this.#syncLink(link, from, to, mapped);
+      const work = { link, from, to, mapped };
+      if (link.bidirectional && to && !sameAreaId(from.areaId, to.areaId)) {
+        crossArea.push(work);
+      } else {
+        const key = areaIdKey(from.areaId);
+        const group = batchable.get(key) ?? [];
+        group.push(work);
+        batchable.set(key, group);
+      }
     }
+    for (const group of batchable.values()) {
+      const areaId = group[0].from.areaId;
+      try {
+        await this.#mutateArea(areaId, async (mutation) => {
+          for (const work of group) {
+            await this.#syncLink(work.link, work.from, work.to, work.mapped, mutation);
+          }
+        }, "Apply NukeFire map links");
+      } catch {
+        // A drafted createLink cannot discover a host topology rejection until
+        // submission. The failed batch has already rehydrated this area, so retry
+        // each link against fresh mirrors and preserve the established traversal
+        // fallback for unusual or duplicate topologies.
+        for (const work of group) {
+          const from = this.#roomsByVnum.get(work.link.from);
+          if (!from) continue;
+          const to = this.#roomsByVnum.get(work.link.to);
+          await this.#syncLink(work.link, from, to, work.mapped);
+        }
+      }
+    }
+    for (const work of crossArea) {
+      await this.#syncLink(work.link, work.from, work.to, work.mapped);
+    }
+  }
+
+  /**
+   * Room.Info reports a closed exit without its destination vnum. Preserve an
+   * already known destination, or create the missing vertical stub so Up/Down
+   * still exists in Smudgy's topology.
+   */
+  async #syncClosedVerticalExits(
+    observations: readonly VerticalExitObservation[],
+    room: RoomMirror | undefined,
+  ): Promise<void> {
+    if (!room) return;
+    const pending: {
+      observation: VerticalExitObservation;
+      existing?: ExitMirror;
+    }[] = [];
+    for (const observation of observations) {
+      if (!observation.closed || observation.destination !== undefined) continue;
+      const existing = matchingExit(room, observation.mapped);
+      if (existing?.closed) continue;
+      if (existing && !existing.id) {
+        const source = mapper.getAreaById(room.areaId).room(room.roomNumber);
+        const hostExit = source?.exits.find((exit) =>
+          exit.from_direction === observation.mapped.direction
+        );
+        if (!hostExit) continue;
+        existing.id = hostExit.id;
+      }
+      pending.push({ observation, existing });
+    }
+    if (pending.length === 0) return;
+
+    await this.#mutateArea(room.areaId, async (mutation) => {
+      for (const { observation, existing } of pending) {
+        if (!existing) {
+          const fields: ExitArgs = {
+            from_direction: observation.mapped.direction,
+            is_closed: true,
+            is_locked: false,
+            weight: 1,
+            command: observation.mapped.command,
+          };
+          const id = await mutation.createRoomExit(room.roomNumber, fields);
+          room.exits.push(exitFromFields(fields, id));
+          continue;
+        }
+        await mutation.setRoomExit(room.roomNumber, existing.id as ExitId, { is_closed: true });
+        existing.closed = true;
+      }
+    }, `Apply NukeFire vertical exits for room ${room.roomNumber}`);
   }
 
   async #syncLink(
@@ -1169,6 +1472,7 @@ export class NukeFireMapper {
     from: RoomMirror,
     to: RoomMirror | undefined,
     mapped: MappedDirection,
+    mutation?: AreaMutator,
   ): Promise<void> {
     const fromExit = matchingExit(from, mapped);
     const reverseMapped = mapped.opposite && mapped.reverseCommand
@@ -1185,7 +1489,7 @@ export class NukeFireMapper {
 
     if (!fromExit && !reverseExit && to && sameAreaId(from.areaId, to.areaId)) {
       try {
-        await this.#createLocalLink(link, from, to, mapped, reverseMapped);
+        await this.#createLocalLink(link, from, to, mapped, reverseMapped, mutation);
         return;
       } catch {
         // An unusual/duplicate topology can reject atomic pairing. The
@@ -1193,9 +1497,9 @@ export class NukeFireMapper {
       }
     }
 
-    await this.#ensureTraversal(from, to, mapped, fromExit, link.closed, link.locked);
+    await this.#ensureTraversal(from, to, mapped, fromExit, link.closed, link.locked, mutation);
     if (link.bidirectional && to && reverseMapped) {
-      await this.#ensureTraversal(to, from, reverseMapped, reverseExit, link.closed, link.locked);
+      await this.#ensureTraversal(to, from, reverseMapped, reverseExit, link.closed, link.locked, mutation);
     }
   }
 
@@ -1205,6 +1509,7 @@ export class NukeFireMapper {
     to: RoomMirror,
     mapped: MappedDirection,
     reverse: MappedDirection | undefined,
+    mutation?: AreaMutator,
   ): Promise<void> {
     const positionA = from.position;
     const positionB = to.position;
@@ -1251,10 +1556,15 @@ export class NukeFireMapper {
       });
     }
 
-    const connectionId = await mapper.createLink(from.areaId, {
-      ...geometry,
-      traversals,
-    });
+    const connectionId = mutation
+      ? await mutation.createLink({
+        ...geometry,
+        traversals,
+      })
+      : await mapper.createLink(from.areaId, {
+        ...geometry,
+        traversals,
+      });
     area.connections.set(connectionMirrorKey(connectionId), {
       id: connectionId,
       endpointA: copyEndpoint(geometry.endpoint_a),
@@ -1274,6 +1584,7 @@ export class NukeFireMapper {
     existing: ExitMirror | undefined,
     closed: boolean,
     locked: boolean,
+    mutation?: AreaMutator,
   ): Promise<void> {
     const destination = to
       ? {
@@ -1306,10 +1617,13 @@ export class NukeFireMapper {
         if (!hostExit) return;
         existing.id = hostExit.id;
       }
-      await mapper.setRoomExit(from.areaId, from.roomNumber, existing.id, fields);
+      if (mutation) await mutation.setRoomExit(from.roomNumber, existing.id, fields);
+      else await mapper.setRoomExit(from.areaId, from.roomNumber, existing.id, fields);
       applyExitFields(existing, fields);
     } else {
-      const id = await mapper.createRoomExit(from.areaId, from.roomNumber, fields);
+      const id = mutation
+        ? await mutation.createRoomExit(from.roomNumber, fields)
+        : await mapper.createRoomExit(from.areaId, from.roomNumber, fields);
       from.exits.push(exitFromFields(fields, id));
     }
   }

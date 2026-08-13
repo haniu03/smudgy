@@ -2,15 +2,22 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use iced::{
-    Length, Point, Rectangle, Size, Vector,
-    keyboard, mouse,
+    Length, Point, Rectangle, Size, Vector, keyboard, mouse,
     widget::{Canvas, canvas, container},
 };
-use smudgy_cloud::{AreaId, Mapper, RoomNumber, mapper::RoomKey};
+use smudgy_cloud::{
+    AreaId, Mapper, RoomNumber,
+    mapper::{
+        RoomKey,
+        room_connection::{RoomConnection, RoomConnectionEnd},
+    },
+};
 
 use iced_anim::{Animated, spring::Motion, transition::Easing};
 
-use crate::{Update, render, viewport::Viewport};
+use crate::{
+    MapViewPresentation, RoomOverlay, RouteExitOverlay, Update, render, viewport::Viewport,
+};
 use iced::event::Event as IcedEvent;
 use std::time::{Duration, Instant};
 pub type Renderer = iced::Renderer;
@@ -28,6 +35,7 @@ pub struct MapView {
     area_opacity: Animated<f32>,
     fade_phase: FadePhase,
     pending_area_change: Option<PendingAreaChange>,
+    presentation: MapViewPresentation,
 
     hovered_room: Option<RoomKey>,
 }
@@ -109,18 +117,44 @@ impl MapView {
             ),
             fade_phase: FadePhase::Idle,
             pending_area_change: None,
+            presentation: MapViewPresentation::default(),
         }
+    }
+
+    /// Replace the view-local appearance and ephemeral overlays. Changing
+    /// room spacing preserves the map's current visual center.
+    pub fn set_presentation(&mut self, presentation: MapViewPresentation) {
+        let presentation = presentation.normalized();
+        if self.presentation == presentation {
+            return;
+        }
+        let old_spacing = self.presentation.style.room_spacing;
+        let new_spacing = presentation.style.room_spacing;
+        if (old_spacing - new_spacing).abs() > f32::EPSILON {
+            let ratio = new_spacing / old_spacing;
+            let value = *self.translation.value() * ratio;
+            let target = *self.translation.target() * ratio;
+            self.translation.settle_at(value);
+            self.translation.set_target(target);
+            if let Some(pending) = &mut self.pending_area_change {
+                pending.translation = pending.translation * ratio;
+            }
+        }
+        self.presentation = presentation;
     }
 
     fn rooms_at_point(&self, point: &Point, bounds: &Size) -> Box<[RoomKey]> {
         let atlas = self.mapper.get_current_atlas();
 
         let point = self.viewport().project(*point, *bounds);
+        let spacing = self.presentation.style.room_spacing;
+        let lookup = Point::new(point.x / spacing, point.y / spacing);
         let half_size = render::MAP_ROOM_SIZE / 2.0;
-        let min_x = point.x - half_size;
-        let min_y = point.y - half_size;
-        let max_x = point.x + half_size;
-        let max_y = point.y + half_size;
+        let lookup_half = half_size / spacing;
+        let min_x = lookup.x - lookup_half;
+        let min_y = lookup.y - lookup_half;
+        let max_x = lookup.x + lookup_half;
+        let max_y = lookup.y + lookup_half;
 
         atlas
             .get_area(&self.active_area_id)
@@ -128,10 +162,10 @@ impl MapView {
                 let mut hits: Vec<RoomKey> = Vec::new();
                 area.with_rooms_in(min_x, min_y, max_x, max_y, |room| {
                     if room.get_level() == self.level
-                        && room.get_x() - half_size < point.x
-                        && room.get_x() + half_size > point.x
-                        && room.get_y() - half_size < point.y
-                        && room.get_y() + half_size > point.y
+                        && room.get_x() * spacing - half_size < point.x
+                        && room.get_x() * spacing + half_size > point.x
+                        && room.get_y() * spacing - half_size < point.y
+                        && room.get_y() * spacing + half_size > point.y
                     {
                         hits.push(RoomKey {
                             area_id: self.active_area_id,
@@ -181,8 +215,10 @@ impl MapView {
 
                         if let Some(room) = self.mapper.get_current_atlas().get_room(&room_key) {
                             pending.player_location = Some(room_key);
-                            pending.translation =
-                                Vector::new(-room.get_x() , -room.get_y() );
+                            pending.translation = Vector::new(
+                                -room.get_x() * self.presentation.style.room_spacing,
+                                -room.get_y() * self.presentation.style.room_spacing,
+                            );
                             pending.level = room.get_level();
                         }
                     } else {
@@ -204,10 +240,13 @@ impl MapView {
 
                     if let Some(room) = self.mapper.get_current_atlas().get_room(&room_key) {
                         self.player_location = Some(room_key);
-                        let target = Vector::new(-room.get_x() , -room.get_y() );
+                        let target = Vector::new(
+                            -room.get_x() * self.presentation.style.room_spacing,
+                            -room.get_y() * self.presentation.style.room_spacing,
+                        );
                         let visible = self.is_point_visible(Point {
-                            x: room.get_x(),
-                            y: room.get_y(),
+                            x: room.get_x() * self.presentation.style.room_spacing,
+                            y: room.get_y() * self.presentation.style.room_spacing,
                         });
                         if std::env::var_os("SMUDGY_MAP_DEBUG").is_some() {
                             eprintln!(
@@ -353,12 +392,7 @@ impl MapView {
     /// Zoom by a wheel step (±1 ≈ one notch), anchored at the cursor when
     /// possible. Captures the event even at the zoom limits so scrolling
     /// over the map never leaks to widgets beneath it.
-    fn zoom(
-        &self,
-        step: f32,
-        cursor: mouse::Cursor,
-        bounds: Rectangle,
-    ) -> canvas::Action<Message> {
+    fn zoom(&self, step: f32, cursor: mouse::Cursor, bounds: Rectangle) -> canvas::Action<Message> {
         if step < 0.0 && self.scaling > Self::MIN_SCALING
             || step > 0.0 && self.scaling < Self::MAX_SCALING
         {
@@ -367,8 +401,7 @@ impl MapView {
             let scaling =
                 (self.scaling * (1.0 + step / 10.0)).clamp(Self::MIN_SCALING, Self::MAX_SCALING);
 
-            let translation = if let Some(cursor_to_center) =
-                cursor.position_from(bounds.center())
+            let translation = if let Some(cursor_to_center) = cursor.position_from(bounds.center())
             {
                 let factor = scaling - old_scaling;
 
@@ -484,6 +517,9 @@ impl MapView {
         self.last_viewport_size.set(Some(bounds.size()));
         let atlas = self.mapper.get_current_atlas();
         let opacity = self.area_opacity.value().clamp(0.0, 1.0);
+        let style = &self.presentation.style;
+        let overlay = &self.presentation.overlay;
+        let spacing = style.room_spacing;
 
         let player_room_number = self.player_location.as_ref().and_then(|room_key| {
             (room_key.area_id == self.active_area_id).then_some(room_key.room_number)
@@ -500,10 +536,10 @@ impl MapView {
                 frame.scale(1.0_f32);
 
                 let region = self.viewport().visible_region(bounds.size());
-                let min_x = region.x - Self::SPATIAL_QUERY_PADDING;
-                let min_y = region.y - Self::SPATIAL_QUERY_PADDING;
-                let max_x = region.x + region.width + Self::SPATIAL_QUERY_PADDING;
-                let max_y = region.y + region.height + Self::SPATIAL_QUERY_PADDING;
+                let min_x = (region.x - Self::SPATIAL_QUERY_PADDING) / spacing;
+                let min_y = (region.y - Self::SPATIAL_QUERY_PADDING) / spacing;
+                let max_x = (region.x + region.width + Self::SPATIAL_QUERY_PADDING) / spacing;
+                let max_y = (region.y + region.height + Self::SPATIAL_QUERY_PADDING) / spacing;
 
                 // Ghosts of the levels above and below: just rooms and their
                 // connections (labels and shapes stay on their own level),
@@ -533,10 +569,11 @@ impl MapView {
                                 max_y,
                                 |connection| {
                                     if connection.from_level == ghost_level {
+                                        let connection = connection.with_room_spacing(spacing);
                                         render::draw_connection(
                                             frame,
                                             &atlas,
-                                            connection,
+                                            &connection,
                                             ghost_opacity,
                                             false,
                                             true,
@@ -546,7 +583,16 @@ impl MapView {
                             );
                             area.with_rooms_in(min_x, min_y, max_x, max_y, |room| {
                                 if room.get_level() == ghost_level {
-                                    render::draw_room(frame, room, ghost_opacity, false);
+                                    render::draw_room_styled(
+                                        frame,
+                                        room,
+                                        room.get_x() * spacing,
+                                        room.get_y() * spacing,
+                                        ghost_opacity,
+                                        false,
+                                        style,
+                                        None,
+                                    );
                                 }
                             });
                         });
@@ -555,20 +601,71 @@ impl MapView {
 
                 for shape in area.get_shapes() {
                     if shape.level == self.level {
-                        render::draw_shape(frame, shape, opacity, false);
+                        let mut shape = shape.clone();
+                        shape.x *= spacing;
+                        shape.y *= spacing;
+                        render::draw_shape(frame, &shape, opacity, false);
                     }
                 }
 
                 for label in area.get_labels() {
                     if label.level == self.level {
-                        render::draw_label(frame, label, opacity, false);
+                        let mut label = label.clone();
+                        label.x *= spacing;
+                        label.y *= spacing;
+                        render::draw_label(frame, &label, opacity, false);
                     }
                 }
 
                 let connections_drawn = Cell::new(0_usize);
                 area.with_room_connections_in(min_x, min_y, max_x, max_y, |connection| {
                     if connection.from_level == self.level {
-                        render::draw_connection(frame, &atlas, connection, opacity, false, false);
+                        let connection = connection.with_room_spacing(spacing);
+                        let on_route = if overlay.route_exits.is_empty() {
+                            connection_on_route(&connection, &overlay.route)
+                        } else {
+                            connection_on_route_exits(&connection, &overlay.route_exits)
+                        };
+                        let color = if on_route {
+                            render::parse_color(&style.route_color)
+                        } else {
+                            style.connection_color.as_deref().and_then(render::parse_color)
+                        };
+                        let width = if on_route {
+                            Some(style.route_width)
+                        } else {
+                            style.connection_width
+                        };
+                        let persisted = (connection.is_closed, connection.is_locked);
+                        let state = overlay
+                            .doors
+                            .iter()
+                            .find(|door| door.connection_id() == connection.connection_id)
+                            .map_or(persisted, |door| {
+                                (
+                                    door.closed.unwrap_or(persisted.0),
+                                    door.locked.unwrap_or(persisted.1),
+                                )
+                            });
+                        let door = style.show_doors.then(|| {
+                            (
+                                state.0,
+                                state.1,
+                                render::parse_color(&style.door_color)
+                                    .unwrap_or(iced::Color::from_rgb8(63, 63, 70)),
+                            )
+                        });
+                        render::draw_connection_styled(
+                            frame,
+                            &atlas,
+                            &connection,
+                            opacity,
+                            false,
+                            false,
+                            color,
+                            width,
+                            door,
+                        );
                         connections_drawn.set(connections_drawn.get() + 1);
                     }
                 });
@@ -576,7 +673,27 @@ impl MapView {
                 let rooms_drawn = Cell::new(0_usize);
                 area.with_rooms_in(min_x, min_y, max_x, max_y, |room| {
                     if room.get_level() == self.level {
-                        render::draw_room(frame, room, opacity, false);
+                        let explicit = overlay
+                            .rooms
+                            .iter()
+                            .find(|item| item.room == room.get_room_number().0);
+                        let room_overlay = merged_room_overlay(
+                            room.get_room_number().0,
+                            overlay.route.contains(&room.get_room_number().0),
+                            &style.route_color,
+                            style.route_width,
+                            explicit,
+                        );
+                        render::draw_room_styled(
+                            frame,
+                            room,
+                            room.get_x() * spacing,
+                            room.get_y() * spacing,
+                            opacity,
+                            false,
+                            style,
+                            room_overlay.as_ref(),
+                        );
                         rooms_drawn.set(rooms_drawn.get() + 1);
                     }
                 });
@@ -584,11 +701,12 @@ impl MapView {
                 if let Some(player_room_number) = player_room_number
                     && let Some(room) = area.get_room(&player_room_number)
                         && room.get_level() == self.level {
-                            render::draw_player_indicator(
+                            render::draw_player_indicator_styled(
                                 frame,
-                                room.get_x(),
-                                room.get_y(),
+                                room.get_x() * spacing,
+                                room.get_y() * spacing,
                                 opacity,
+                                style.player_color.as_deref().and_then(render::parse_color),
                             );
                         }
 
@@ -618,6 +736,94 @@ impl MapView {
 
         vec![frame.into_geometry()]
     }
+}
+
+fn connection_on_route(connection: &RoomConnection, route: &[i32]) -> bool {
+    let from = connection.room.get_room_number().0;
+    let to = match &connection.to {
+        RoomConnectionEnd::Normal { room, .. } | RoomConnectionEnd::ToLevel { room, .. } => {
+            room.get_room_number().0
+        }
+        RoomConnectionEnd::SelfLoop => from,
+        RoomConnectionEnd::None
+        | RoomConnectionEnd::External { .. }
+        | RoomConnectionEnd::Unknown { .. } => return false,
+    };
+    route
+        .windows(2)
+        .any(|pair| pair == [from, to] || pair == [to, from])
+}
+
+fn connection_on_route_exits(
+    connection: &RoomConnection,
+    route_exits: &[RouteExitOverlay],
+) -> bool {
+    let includes = |room: i32, direction| {
+        route_exits
+            .iter()
+            .any(|exit| exit.room == room && exit.direction == direction)
+    };
+    let anchor_room = connection.room.get_room_number().0;
+    let anchor_direction = match &connection.to {
+        RoomConnectionEnd::ToLevel { direction, .. } => *direction,
+        _ => connection.direction_a,
+    };
+    if includes(anchor_room, anchor_direction) {
+        return true;
+    }
+
+    match &connection.to {
+        RoomConnectionEnd::Normal {
+            room, direction, ..
+        } => includes(room.get_room_number().0, *direction),
+        RoomConnectionEnd::ToLevel { room, .. } => {
+            // Cross-level Connections render once per endpoint level. Match
+            // the opposite endpoint too so both involved Up/Down markers use
+            // the route accent, regardless of which half is currently drawn.
+            let other_direction = if anchor_direction == connection.direction_a {
+                connection.direction_b.unwrap_or(connection.direction_a)
+            } else {
+                connection.direction_a
+            };
+            includes(room.get_room_number().0, other_direction)
+        }
+        RoomConnectionEnd::SelfLoop => connection
+            .direction_b
+            .is_some_and(|direction| includes(anchor_room, direction)),
+        RoomConnectionEnd::None
+        | RoomConnectionEnd::External { .. }
+        | RoomConnectionEnd::Unknown { .. } => false,
+    }
+}
+
+fn merged_room_overlay(
+    room: i32,
+    on_route: bool,
+    route_color: &str,
+    route_width: f32,
+    explicit: Option<&RoomOverlay>,
+) -> Option<RoomOverlay> {
+    if !on_route {
+        return explicit.cloned();
+    }
+    let mut merged = RoomOverlay {
+        room,
+        fill: None,
+        stroke: Some(route_color.to_string()),
+        stroke_width: Some(route_width),
+    };
+    if let Some(explicit) = explicit {
+        if explicit.fill.is_some() {
+            merged.fill.clone_from(&explicit.fill);
+        }
+        if explicit.stroke.is_some() {
+            merged.stroke.clone_from(&explicit.stroke);
+        }
+        if explicit.stroke_width.is_some() {
+            merged.stroke_width = explicit.stroke_width;
+        }
+    }
+    Some(merged)
 }
 
 /// A cheaply cloneable, owning handle to a [`MapView`] — the canvas program
@@ -740,5 +946,20 @@ mod tests {
             weak.upgrade().is_none(),
             "dropping the element must free the view"
         );
+    }
+
+    #[test]
+    fn explicit_room_fill_does_not_erase_route_stroke() {
+        let explicit = RoomOverlay {
+            room: 3,
+            fill: Some("#111111".to_string()),
+            stroke: None,
+            stroke_width: None,
+        };
+        let merged = merged_room_overlay(3, true, "#00ff00", 5.0, Some(&explicit))
+            .expect("route creates an overlay");
+        assert_eq!(merged.fill.as_deref(), Some("#111111"));
+        assert_eq!(merged.stroke.as_deref(), Some("#00ff00"));
+        assert_eq!(merged.stroke_width, Some(5.0));
     }
 }

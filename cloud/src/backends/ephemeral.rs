@@ -25,7 +25,7 @@ use uuid::Uuid;
 use super::{MapperBackend, area_edits};
 use crate::{
     Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, CloudError, CloudResult,
-    CreateAreaRequest,
+    CreateAreaRequest, MapStorage,
     mutation::{MutationEnvelope, MutationResult},
 };
 
@@ -103,6 +103,19 @@ impl MapperBackend for EphemeralBackend {
         Ok(area)
     }
 
+    async fn create_area_at(
+        &self,
+        request: CreateAreaRequest,
+        storage: MapStorage,
+    ) -> CloudResult<Area> {
+        if storage != MapStorage::Session {
+            return Err(CloudError::InvalidInput(format!(
+                "the session backend cannot create a {storage} map"
+            )));
+        }
+        self.create_area(request).await
+    }
+
     async fn list_areas(&self) -> CloudResult<Vec<Area>> {
         Ok(self
             .areas
@@ -162,6 +175,10 @@ impl MapperBackend for EphemeralBackend {
         *stored = working;
         Ok(result)
     }
+
+    fn ephemeral_area_ids(&self) -> std::collections::HashSet<AreaId> {
+        self.areas.read().keys().copied().collect()
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +214,18 @@ mod tests {
             }],
             payload,
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_creation_rejects_a_durable_tier() {
+        let backend = EphemeralBackend::new();
+        assert!(matches!(
+            backend
+                .create_area_at(request("Wrong tier"), MapStorage::Local)
+                .await,
+            Err(CloudError::InvalidInput(_))
+        ));
+        assert!(backend.list_areas().await.expect("list").is_empty());
     }
 
     #[tokio::test]

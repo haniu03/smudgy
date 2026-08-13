@@ -41,7 +41,7 @@ export const panelVisibility: Readonly<Record<PanelKey, boolean>> = {
   affects: boolParam("showAffects", true),
   comms: boolParam("showComms", true),
   map: boolParam("showMap", true),
-  radar: boolParam("showRadar", true),
+  radar: boolParam("showRadar", false),
   atlas: boolParam("showAtlas", true),
   deck: boolParam("showDeck", true),
   codex: boolParam("showCodex", false),
@@ -66,13 +66,13 @@ export function widgetMetric(previousSize: number): number {
   return Math.max(1, Math.round(previousSize * widgetFontSize / DEFAULT_WIDGET_FONT_SIZE));
 }
 
-export const chatRendering: ChatRendering = stringParam("chatRendering") === "full-ansi"
-  ? "full-ansi"
-  : "plain";
+export const chatRendering: ChatRendering = stringParam("chatRendering") === "plain"
+  ? "plain"
+  : "full-ansi";
 
-export const sessionLayout: SessionLayout = stringParam("sessionLayout") === "tabbed"
-  ? "tabbed"
-  : "stacked-right";
+export const sessionLayout: SessionLayout = stringParam("sessionLayout") === "stacked-right"
+  ? "stacked-right"
+  : "tabbed";
 
 export const sessionVitalsLayout: SessionVitalsLayout = stringParam("sessionVitalsLayout") === "wide"
   ? "wide"

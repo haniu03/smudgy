@@ -10,6 +10,7 @@ pub mod image_source;
 pub mod mapper;
 pub mod mutation;
 pub mod package_api;
+pub mod relocation;
 pub mod store_bindings;
 pub mod store_node;
 
@@ -36,6 +37,7 @@ pub use package_api::{
     ResolvedDependency, ResolvedModuleWire, ResolvedPackageWire, SearchCategory, ShareClosureItem,
     StaleDependencyView, VersionListItem, highest_satisfying_version,
 };
+pub use relocation::{AtlasRelocation, MapRelocation, RelocationMode};
 pub use store_bindings::{StoreBindingCell, StoreBindings};
 pub use store_node::{ArrayNode, Node, ObjectNode, Usage};
 
@@ -75,11 +77,64 @@ pub struct WidgetIsolate(pub String);
 
 use crate::mapper::exit_cache::ExitCache;
 
+/// Where authoritative map content lives.
+///
+/// Storage and organization are deliberately separate concepts: an area may
+/// be loose or filed into an atlas, but either way it belongs to exactly one
+/// storage tier. Session maps disappear with the session, local maps are
+/// authoritative files on this device, and cloud maps sync through the map
+/// service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display)]
+#[serde(rename_all = "snake_case")]
+pub enum MapStorage {
+    Session,
+    Local,
+    Cloud,
+}
+
+/// A complete destination for creating, copying, or moving an area.
+///
+/// `atlas_id: None` means a loose area. Session maps cannot be filed into an
+/// atlas because the session tier has no durable folder inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapDestination {
+    pub storage: MapStorage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atlas_id: Option<AtlasId>,
+}
+
+impl MapDestination {
+    #[must_use]
+    pub const fn loose(storage: MapStorage) -> Self {
+        Self {
+            storage,
+            atlas_id: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn in_atlas(storage: MapStorage, atlas_id: AtlasId) -> Self {
+        Self {
+            storage,
+            atlas_id: Some(atlas_id),
+        }
+    }
+}
+
 /// The version this client advertises to the server in the
 /// `X-Smudgy-Client-Version` header. The smudgy crates are version-locked, so
 /// this crate's own package version is the app version; the cloud API compares
 /// it to its `MIN_CLIENT_VERSION` floor and replies 426 to anything older.
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Final release line that carries the pre-storage-model mapper compatibility
+/// shims. They are intentionally unavailable starting with 0.6.0.
+pub const MAP_STORAGE_COMPATIBILITY_LAST_RELEASE: &str = "0.5.x";
+
+/// First release in which the pre-storage-model mapper compatibility shims
+/// must be removed. A test below trips as soon as the crate reaches this
+/// version, preventing an accidental extra compatibility cycle.
+pub const MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION: &str = "0.6.0";
 
 /// Header carrying [`CLIENT_VERSION`] on every cloud request.
 pub(crate) const CLIENT_VERSION_HEADER: &str = "x-smudgy-client-version";
@@ -931,7 +986,7 @@ pub struct RoomConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::{AreaUpdates, AtlasId, Uuid};
+    use super::{AreaUpdates, AtlasId, MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION, Uuid};
     use serde_json::json;
 
     /// Regression: a name-only rename must not carry `atlas_id` on the wire,
@@ -965,6 +1020,29 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&pull_loose).unwrap(),
             json!({ "atlas_id": null })
+        );
+    }
+
+    #[test]
+    fn map_storage_compatibility_window_expires_before_0_6() {
+        let running = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("Cargo package versions are valid semver");
+        let removal = semver::Version::parse(MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION)
+            .expect("the removal milestone is valid semver");
+        assert!(
+            (running.major, running.minor) < (removal.major, removal.minor),
+            "remove the map-storage compatibility shims before releasing {running}; \
+             they are supported only through 0.5.x"
+        );
+
+        const RUST_DEPRECATION: &str = "supported through Smudgy 0.5.x and removed in 0.6.0";
+        let mapper_source = include_str!("mapper.rs");
+        assert_eq!(
+            mapper_source.matches(RUST_DEPRECATION).count(),
+            7,
+            "the Rust compatibility catalog must stay explicitly deprecated: \
+             create_area, create_area_ephemeral, create_area_in, is_ephemeral, \
+             ephemeral_area_ids, create_atlas, and create_atlas_in"
         );
     }
 }

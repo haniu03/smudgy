@@ -20,9 +20,7 @@ use crate::session::{HotkeyId, SessionId};
 use super::input::{InputOp, InputSnapshot, InputSource};
 use super::line_operation::LineOperation;
 use super::origin::{IsolateId, Origin};
-use super::pane::{
-    PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection, TabPosition,
-};
+use super::pane::{PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection, TabPosition};
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
 use super::store::{PublishedStore, PublishedWrite};
@@ -334,6 +332,9 @@ pub enum RuntimeAction {
     /// user-created starts unassigned. Translated to
     /// `SessionEvent::MapAreaCreated`.
     AssociateCreatedArea(AreaId),
+    /// A script created or promoted a cloud atlas in this session. The UI
+    /// daemon associates it with this session's server entry.
+    AssociateCreatedAtlas(AtlasId),
     /// Emit `SessionEvent::PaneOpened` for a pane the split op already
     /// created synchronously in the registry. Queued by the op so the event
     /// leaves on the ordered UI channel ahead of any `AppendTo` for the key.
@@ -427,7 +428,9 @@ pub enum RuntimeAction {
         selected: bool,
     },
     /// Select a pane's tab without requesting keyboard focus.
-    PaneSelect { key: PaneKey },
+    PaneSelect {
+        key: PaneKey,
+    },
     /// Forward `pane.tearOut` to the UI as `SessionEvent::PaneTearOut`.
     PaneTearOut {
         key: PaneKey,

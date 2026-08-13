@@ -41,7 +41,7 @@ applied on reload):
 ```
 map help                         Show help
 map area                         List areas
-map area create <name>           Create an area
+map area create <name>           Create a durable area (cloud when signed in, otherwise local)
 map select <area> [room]         Select the current area and room
 map rooms                        List rooms in the selected area
 map move <direction>             Move the selection along an existing exit

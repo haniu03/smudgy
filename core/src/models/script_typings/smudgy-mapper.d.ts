@@ -25,6 +25,12 @@
  */
 type AreaId = readonly [number, number];
 
+/** An atlas (map folder) identifier, opaque like {@link AreaId}. */
+type AtlasId = readonly [number, number];
+
+/** Where a map is stored. Session maps disappear when the session closes. */
+type MapStorage = "session" | "local" | "cloud";
+
 /** A room number within an area (a 32-bit integer). */
 type RoomNumber = number;
 
@@ -215,6 +221,11 @@ interface CreateRoomParams {
  *  set as creation. Any omitted field is left unchanged. */
 type UpdateRoomParams = CreateRoomParams;
 
+interface MutateAreaOptions {
+    /** Description shown by save/conflict diagnostics. */
+    description?: string;
+}
+
 /**
  * One exit read back from a room (`room.exits`). Optional links are present but `null`
  * when unset (not omitted).
@@ -338,6 +349,31 @@ interface LinkCreateArgs extends ConnectionUpdates {
     traversals: LinkTraversalArgs[];
 }
 
+/** Callback-scoped collector used by {@link Mapper.mutateArea}. Calls update a
+ * callback-local draft and are submitted only after the callback completes. */
+interface AreaMutator {
+    createRoom(params: CreateRoomParams): Promise<RoomNumber>;
+    updateRoom(room: Room | RoomNumber, fields: UpdateRoomParams): Promise<void>;
+    updateRooms(updates: [RoomNumber, UpdateRoomParams][]): Promise<void>;
+    setRoomTitle(room: Room | RoomNumber, title: string): Promise<void>;
+    setRoomDescription(room: Room | RoomNumber, description: string): Promise<void>;
+    setRoomColor(room: Room | RoomNumber, color: string): Promise<void>;
+    setRoomLevel(room: Room | RoomNumber, level: number): Promise<void>;
+    setRoomX(room: Room | RoomNumber, x: number): Promise<void>;
+    setRoomY(room: Room | RoomNumber, y: number): Promise<void>;
+    setRoomExternalId(room: Room | RoomNumber, externalId: string): Promise<void>;
+    setRoomProperty(room: Room | RoomNumber, name: string, value: string): Promise<void>;
+    setAreaProperty(name: string, value: string): Promise<void>;
+    addRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
+    removeRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
+    createRoomExit(room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId>;
+    setRoomExit(room: Room | RoomNumber, exitId: ExitId, exit: ExitUpdates): Promise<void>;
+    deleteRoom(room: Room | RoomNumber): Promise<void>;
+    deleteRoomExit(room: Room | RoomNumber, exitId: ExitId): Promise<void>;
+    createLink(link: LinkCreateArgs): Promise<ConnectionId>;
+    setConnection(connectionId: ConnectionId, updates: ConnectionUpdates): Promise<void>;
+}
+
 /** A room read from the map. Obtain one via `area.room(n)` or the `listRooms*` helpers. */
 interface Room {
     readonly room_number: RoomNumber;
@@ -380,10 +416,13 @@ interface Area {
     readonly room_numbers: RoomNumber[];
     /**
      * Whether this is a session map: it lives only for this session and is
-     * discarded when the session closes. Save it with `mapper.exportArea` +
-     * `mapper.importAreas` to keep it.
+     * discarded when the session closes.
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+     * Use `storage === "session"` instead.
      */
     readonly isEphemeral: boolean;
+    /** The area's actual storage tier. */
+    readonly storage: MapStorage;
     /** The next unused room number in this area. */
     readonly next_room_number: RoomNumber;
     /** The room with this number, or `undefined`. */
@@ -403,12 +442,44 @@ interface Area {
 
 /** Options for {@link Mapper.createArea}. */
 interface CreateAreaOptions {
+    /** Select the authoritative storage tier explicitly. */
+    storage: MapStorage;
+    /** Optionally create the area inside this atlas. Its storage must match. */
+    atlas?: Atlas | AtlasId;
+    ephemeral?: never;
+}
+
+/** Options accepted only for the pre-storage-model creation API. */
+interface LegacyCreateAreaOptions {
+    storage?: never;
+    atlas?: never;
     /**
      * Create a session map: it lives only for this session, is never saved
      * or synced, and is discarded when the session closes. Use this for maps
      * built automatically from server data.
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+     * Use `storage: "session"` instead.
      */
     ephemeral?: boolean;
+}
+
+/** An atlas (map folder). Session storage does not support atlases. */
+interface Atlas {
+    readonly id: AtlasId;
+    readonly name: string;
+    readonly storage: MapStorage;
+    toString(): string;
+}
+
+/** A destination used by map copy and move operations. */
+interface MapDestination {
+    storage: MapStorage;
+    /** Omit to leave the area loose (outside an atlas). */
+    atlas?: Atlas | AtlasId;
+}
+
+interface CreateAtlasOptions {
+    storage: "local" | "cloud";
 }
 
 /**
@@ -416,8 +487,28 @@ interface CreateAreaOptions {
  * location; changes to persistent areas sync to the cloud in the background.
  */
 interface Mapper {
-    /** Create a new area and return its handle. */
-    createArea(name: string, options?: CreateAreaOptions): Promise<Area>;
+    /** Create a new area in an explicit storage tier and return its handle. */
+    createArea(name: string, options: CreateAreaOptions): Promise<Area>;
+    /**
+     * Create using the old implicit default tier or `ephemeral` flag.
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+     * Pass a {@link CreateAreaOptions} object with explicit `storage` instead.
+     */
+    createArea(name: string, options?: LegacyCreateAreaOptions): Promise<Area>;
+    /** List local and cloud atlases. */
+    listAtlases(): Promise<Atlas[]>;
+    /** Create a durable atlas in an explicit storage tier. */
+    createAtlas(name: string, options: CreateAtlasOptions): Promise<Atlas>;
+    /** Copy areas together, preserving links between members of the set. */
+    copyAreas(areas: (Area | AreaId)[], destination: MapDestination): Promise<Area[]>;
+    /** Move areas together. Cross-tier moves copy completely before deleting sources. */
+    moveAreas(areas: (Area | AreaId)[], destination: MapDestination): Promise<Area[]>;
+    copyArea(area: Area | AreaId, destination: MapDestination): Promise<Area>;
+    moveArea(area: Area | AreaId, destination: MapDestination): Promise<Area>;
+    /** Copy an atlas and all of its areas to another durable storage tier. */
+    copyAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas>;
+    /** Move an atlas and all of its areas to another durable storage tier. */
+    moveAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas>;
     /** Set the current map location (the per-session "you are here" marker). */
     setCurrentLocation(areaId: AreaId, roomNumber?: RoomNumber): void;
     /** The current map location, or `undefined` if none is set. `room` is absent when the
@@ -426,6 +517,17 @@ interface Mapper {
     /** All active areas (areas marked inactive are excluded). */
     readonly areas: Area[];
     getAreaById(id: AreaId): Area;
+    /**
+     * Collect related writes to one area and submit them in the fewest practical ordered
+     * envelopes. Each emitted envelope is atomic, but the whole callback is a best-effort
+     * batch: oversized work may be split and earlier acknowledged envelopes are not rolled
+     * back if a later envelope fails. If the callback throws, nothing is submitted.
+     */
+    mutateArea(
+        area: Area | AreaId,
+        callback: (mutation: AreaMutator) => void | Promise<void>,
+        options?: MutateAreaOptions,
+    ): Promise<OperationId[]>;
     /** The cheapest route between two rooms, as a list of `[areaId, roomNumber]`
      *  steps (each exit's `weight` is its cost). */
     getPathBetweenRooms(

@@ -4,6 +4,7 @@ use crate::image_store::{EntryState, ImageEntryCell, ImageStore};
 use crate::{WidgetMessage, WidgetRoot};
 use deno_core::{GarbageCollected, OpState, ascii_str, op2, v8};
 use iced::alignment::{Horizontal, Vertical};
+use serde::{Deserialize, de::DeserializeOwned};
 use smudgy_cloud::image_source::{
     ImageSourcePolicy, RegisteredImageCreator, ResolvedImageSource, SrcMemoKey, memo_key,
     register_creator, resolve_src,
@@ -35,19 +36,23 @@ fn ensure_widgets(state: &OpState) -> Result<(), WidgetsNotCapable> {
 
 #[derive(Clone)]
 struct Element {
-    view_fn: Arc<dyn Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>>,
+    view_fn:
+        Arc<dyn Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>>,
 }
 
 impl Element {
     fn new(
-        f: impl Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer> + 'static,
+        f: impl Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>
+        + 'static,
     ) -> Self {
         Self {
             view_fn: Arc::new(f),
         }
     }
 
-    fn element(&self) -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer> {
+    fn element(
+        &self,
+    ) -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer> {
         (self.view_fn)()
     }
 }
@@ -58,7 +63,8 @@ static NEXT_TEXT_EDITOR_ID: AtomicU64 = AtomicU64::new(0);
 
 type ProgressBar = iced::widget::ProgressBar<'static, smudgy_theme::Theme>;
 type Column = iced::widget::Column<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
-type Container = iced::widget::Container<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
+type Container =
+    iced::widget::Container<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
 type Row = iced::widget::Row<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
 type Button = iced::widget::Button<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
 type Stack = iced::widget::Stack<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
@@ -377,6 +383,36 @@ impl<T: Clone> DynProp<T> {
     }
 }
 
+fn serde_from_node<T: DeserializeOwned>(node: &Node) -> Option<T> {
+    serde_json::to_value(node)
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+/// Resolve a structured prop from either a static JS value or a live store
+/// binding. Used by MapView's style/overlay objects.
+fn get_dyn_serde_prop<T: Clone + DeserializeOwned>(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    props: v8::Local<v8::Object>,
+    name: &'static str,
+) -> Option<DynProp<T>> {
+    let key = v8::String::new(scope, name)?.into();
+    let value = props.get(scope, key)?;
+    if value.is_null_or_undefined() {
+        return None;
+    }
+    if is_binding_token(scope, value) {
+        return bound_prop_from_v8(scope, state, value).map(|prop| DynProp::Bound {
+            prop,
+            parse: serde_from_node::<T>,
+        });
+    }
+    deno_core::serde_v8::from_v8::<T>(scope, value)
+        .ok()
+        .map(DynProp::Static)
+}
+
 // The `DynProp::Bound` parse fns: how a store value lands in each prop type. Truncating
 // f64 → f32 is the same conversion every static prop path already applies.
 #[allow(clippy::cast_possible_truncation)]
@@ -387,9 +423,9 @@ fn f32_from_value(value: &Node) -> Option<f32> {
 #[allow(clippy::cast_possible_truncation)]
 fn length_from_value(value: &Node) -> Option<iced::Length> {
     match value {
-        Node::Number(number) => {
-            number.as_f64().map(|number| iced::Length::Fixed(number as f32))
-        }
+        Node::Number(number) => number
+            .as_f64()
+            .map(|number| iced::Length::Fixed(number as f32)),
         Node::String(text) => match &**text {
             "fill" => Some(iced::Length::Fill),
             "shrink" => Some(iced::Length::Shrink),
@@ -436,7 +472,10 @@ macro_rules! get_dyn_f32_prop {
             .into();
         $obj.get($scope, prop).and_then(|v| {
             if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
-                Some(DynProp::Bound { prop: bound, parse: f32_from_value })
+                Some(DynProp::Bound {
+                    prop: bound,
+                    parse: f32_from_value,
+                })
             } else {
                 v.to_number($scope)
                     .and_then(|v| v.number_value($scope))
@@ -459,7 +498,10 @@ macro_rules! get_dyn_length_prop {
             .into();
         if let Some(v) = $obj.get($scope, prop) {
             if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
-                Some(DynProp::Bound { prop: bound, parse: length_from_value })
+                Some(DynProp::Bound {
+                    prop: bound,
+                    parse: length_from_value,
+                })
             } else {
                 get_length_prop!($scope, $obj, $name).map(DynProp::Static)
             }
@@ -477,7 +519,10 @@ macro_rules! get_dyn_color_prop {
             .into();
         if let Some(v) = $obj.get($scope, prop) {
             if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
-                Some(DynProp::Bound { prop: bound, parse: color_from_value })
+                Some(DynProp::Bound {
+                    prop: bound,
+                    parse: color_from_value,
+                })
             } else {
                 iced_color_from_maybe_v8_string!(get_string_prop!($scope, $obj, $name))
                     .map(DynProp::Static)
@@ -496,7 +541,10 @@ macro_rules! get_dyn_bool_prop {
             .into();
         $obj.get($scope, prop).and_then(|v| {
             if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
-                Some(DynProp::Bound { prop: bound, parse: bool_from_value })
+                Some(DynProp::Bound {
+                    prop: bound,
+                    parse: bool_from_value,
+                })
             } else if v.is_boolean() {
                 Some(DynProp::Static(v.boolean_value($scope)))
             } else {
@@ -514,7 +562,10 @@ macro_rules! get_dyn_string_prop {
             .into();
         $obj.get($scope, prop).and_then(|v| {
             if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
-                Some(DynProp::Bound { prop: bound, parse: string_from_value })
+                Some(DynProp::Bound {
+                    prop: bound,
+                    parse: string_from_value,
+                })
             } else {
                 get_opt_string_prop!($scope, $obj, $name).map(DynProp::Static)
             }
@@ -773,7 +824,11 @@ fn op_smudgy_widget_build_progress_bar(
 
     Element::new(move || {
         let min = min.as_ref().and_then(DynProp::get).unwrap_or(0.0);
-        let max = max.as_ref().and_then(DynProp::get).unwrap_or(100.0).max(min);
+        let max = max
+            .as_ref()
+            .and_then(DynProp::get)
+            .unwrap_or(100.0)
+            .max(min);
         let value = value
             .as_ref()
             .and_then(DynProp::get)
@@ -1031,13 +1086,15 @@ fn op_smudgy_widget_build_button(
 
     // The named emphasis variants from the theme. Script-spawned buttons overlay the terminal, so
     // an unspecified variant defaults to the low-emphasis `subtle` rather than the loud `primary`.
-    let style_fn: fn(&smudgy_theme::Theme, iced::widget::button::Status) -> iced::widget::button::Style =
-        match get_string_prop!(scope, props, "variant").as_deref() {
-            Some("primary") => smudgy_theme::builtins::button::primary,
-            Some("secondary") => smudgy_theme::builtins::button::secondary,
-            Some("link") => smudgy_theme::builtins::button::link,
-            _ => smudgy_theme::builtins::button::subtle,
-        };
+    let style_fn: fn(
+        &smudgy_theme::Theme,
+        iced::widget::button::Status,
+    ) -> iced::widget::button::Style = match get_string_prop!(scope, props, "variant").as_deref() {
+        Some("primary") => smudgy_theme::builtins::button::primary,
+        Some("secondary") => smudgy_theme::builtins::button::secondary,
+        Some("link") => smudgy_theme::builtins::button::link,
+        _ => smudgy_theme::builtins::button::subtle,
+    };
 
     Element::new(move || {
         let button = iced::widget::button(child.element()).style(style_fn);
@@ -1068,19 +1125,15 @@ fn op_smudgy_widget_build_scrollable(
     let mut attr_fns: Vec<Box<dyn Fn(Scrollable) -> Scrollable>> = Vec::new();
 
     if let Some(width) = width {
-        attr_fns.push(Box::new(move |scrollable: Scrollable| {
-            match width.get() {
-                Some(width) => scrollable.width(width),
-                None => scrollable,
-            }
+        attr_fns.push(Box::new(move |scrollable: Scrollable| match width.get() {
+            Some(width) => scrollable.width(width),
+            None => scrollable,
         }));
     }
     if let Some(height) = height {
-        attr_fns.push(Box::new(move |scrollable: Scrollable| {
-            match height.get() {
-                Some(height) => scrollable.height(height),
-                None => scrollable,
-            }
+        attr_fns.push(Box::new(move |scrollable: Scrollable| match height.get() {
+            Some(height) => scrollable.height(height),
+            None => scrollable,
         }));
     }
 
@@ -1103,9 +1156,13 @@ fn op_smudgy_widget_build_scrollable(
     // streamed transcript -- keeps its newest line on screen.
     if anchor_end {
         if is_horizontal {
-            attr_fns.push(Box::new(|scrollable: Scrollable| scrollable.anchor_x(Anchor::End)));
+            attr_fns.push(Box::new(|scrollable: Scrollable| {
+                scrollable.anchor_x(Anchor::End)
+            }));
         } else {
-            attr_fns.push(Box::new(|scrollable: Scrollable| scrollable.anchor_y(Anchor::End)));
+            attr_fns.push(Box::new(|scrollable: Scrollable| {
+                scrollable.anchor_y(Anchor::End)
+            }));
         }
     }
 
@@ -1226,7 +1283,10 @@ fn markdown_options() -> pulldown_cmark::Options {
 /// admits word and multi-word commands (`look`, `go north`, `enter the temple`) while leaving real
 /// HTML (`<a href="x">`, `</b>`, `<br/>`) and comments (`<!-- -->`) to render as before.
 fn is_command_autolink(inner: &str) -> bool {
-    inner.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+    inner
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
         && !inner
             .chars()
             .any(|c| matches!(c, '=' | '/' | '"' | '\'' | '<' | '>' | '\n'))
@@ -1381,8 +1441,13 @@ impl SmudgyMarkdownViewer {
     }
 }
 
-impl<'a> iced::widget::markdown::Viewer<'a, iced::widget::markdown::Uri, smudgy_theme::Theme, iced::Renderer>
-    for SmudgyMarkdownViewer
+impl<'a>
+    iced::widget::markdown::Viewer<
+        'a,
+        iced::widget::markdown::Uri,
+        smudgy_theme::Theme,
+        iced::Renderer,
+    > for SmudgyMarkdownViewer
 {
     fn on_link_click(url: iced::widget::markdown::Uri) -> iced::widget::markdown::Uri {
         url
@@ -1416,7 +1481,11 @@ impl<'a> iced::widget::markdown::Viewer<'a, iced::widget::markdown::Uri, smudgy_
             HeadingLevel::H6 => settings.h6_size,
         };
         // Match the default viewer's top padding so headings keep their breathing room.
-        let top = if index > 0 { settings.text_size.0 / 2.0 } else { 0.0 };
+        let top = if index > 0 {
+            settings.text_size.0 / 2.0
+        } else {
+            0.0
+        };
         iced::widget::container(
             iced::widget::rich_text(self.restyle(text, &settings.style))
                 .size(size)
@@ -1475,11 +1544,13 @@ impl<'a> iced::widget::markdown::Viewer<'a, iced::widget::markdown::Uri, smudgy_
         )
         .width(iced::Length::Fill)
         .padding(settings.code_size / 4)
-        .style(move |_theme: &smudgy_theme::Theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(panel_background)),
-            border: iced::border::rounded(4),
-            ..iced::widget::container::Style::default()
-        })
+        .style(
+            move |_theme: &smudgy_theme::Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(panel_background)),
+                border: iced::border::rounded(4),
+                ..iced::widget::container::Style::default()
+            },
+        )
         .into()
     }
 
@@ -1496,22 +1567,24 @@ impl<'a> iced::widget::markdown::Viewer<'a, iced::widget::markdown::Uri, smudgy_
         use iced::widget::markdown::Bullet;
         let body = self.colors.body;
         let rows = bullets.iter().map(move |bullet| {
-            let marker: iced::Element<'a, iced::widget::markdown::Uri, smudgy_theme::Theme, iced::Renderer> =
-                match bullet {
-                    Bullet::Point { .. } => iced::widget::text("\u{2022}")
-                        .size(settings.text_size)
-                        .color(body)
-                        .into(),
-                    Bullet::Task { done, .. } => iced::Element::from(
-                        iced::widget::container(
-                            iced::widget::checkbox(*done).size(settings.text_size),
-                        )
+            let marker: iced::Element<
+                'a,
+                iced::widget::markdown::Uri,
+                smudgy_theme::Theme,
+                iced::Renderer,
+            > = match bullet {
+                Bullet::Point { .. } => iced::widget::text("\u{2022}")
+                    .size(settings.text_size)
+                    .color(body)
+                    .into(),
+                Bullet::Task { done, .. } => iced::Element::from(
+                    iced::widget::container(iced::widget::checkbox(*done).size(settings.text_size))
                         .center_y(
                             iced::widget::text::LineHeight::default()
                                 .to_absolute(settings.text_size),
                         ),
-                    ),
-                };
+                ),
+            };
             let (Bullet::Point { items } | Bullet::Task { items, .. }) = bullet;
             iced::widget::Row::with_children([
                 marker,
@@ -1634,7 +1707,10 @@ fn op_smudgy_widget_build_text_editor(
         .map_or(isolate_token, |(_, role)| role);
     let key = match get_opt_string_prop!(scope, props, "id") {
         Some(id) if !id.is_empty() => format!("{stable_isolate}\u{1f}{id}"),
-        _ => format!("\u{1f}auto\u{1f}{}", NEXT_TEXT_EDITOR_ID.fetch_add(1, Ordering::Relaxed)),
+        _ => format!(
+            "\u{1f}auto\u{1f}{}",
+            NEXT_TEXT_EDITOR_ID.fetch_add(1, Ordering::Relaxed)
+        ),
     };
     let initial_text = get_opt_string_prop!(scope, props, "value").unwrap_or_default();
     let on_change = get_v8_function_prop!(scope, props, "onChange").map(Arc::new);
@@ -1716,10 +1792,12 @@ fn op_smudgy_widget_build_modal(
         let backdrop = iced::widget::container(iced::widget::space::horizontal())
             .width(iced::Length::Fill)
             .height(iced::Length::Fill)
-            .style(move |_theme: &smudgy_theme::Theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(background)),
-                ..Default::default()
-            });
+            .style(
+                move |_theme: &smudgy_theme::Theme| iced::widget::container::Style {
+                    background: Some(iced::Background::Color(background)),
+                    ..Default::default()
+                },
+            );
         let mut backdrop = iced::widget::mouse_area(backdrop);
         if let Some(on_dismiss) = &on_dismiss {
             backdrop = backdrop.on_press(WidgetMessage::InvokeCallback {
@@ -1729,7 +1807,9 @@ fn op_smudgy_widget_build_modal(
             });
         }
 
-        let layers: Vec<iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>> = vec![
+        let layers: Vec<
+            iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>,
+        > = vec![
             iced::widget::opaque(backdrop),
             iced::widget::center(child.element()).into(),
         ];
@@ -1739,8 +1819,14 @@ fn op_smudgy_widget_build_modal(
 
 #[op2]
 #[cppgc]
-fn op_smudgy_widget_build_map_view(state: &mut OpState) -> Element {
+fn op_smudgy_widget_build_map_view(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    props: v8::Local<v8::Object>,
+) -> Element {
     let mapper = state.borrow::<Option<Mapper>>().clone();
+    let style = get_dyn_serde_prop::<MapViewStyleProp>(scope, state, props, "style");
+    let overlay = get_dyn_serde_prop::<MapViewOverlayProp>(scope, state, props, "overlay");
     let widget_id = NEXT_MAP_WIDGET_ID.fetch_add(1, Ordering::Relaxed);
 
     // The reap guard rides inside the render closure: the closure is the only
@@ -1758,7 +1844,19 @@ fn op_smudgy_widget_build_map_view(state: &mut OpState) -> Element {
         if let Some(mapper) = mapper.clone() {
             crate::map::with_active_store(|store| {
                 let widget_id = reap.id();
-                let handle = store.ensure_map(mapper.clone(), widget_id);
+                let presentation = smudgy_map_widget::MapViewPresentation {
+                    style: style
+                        .as_ref()
+                        .and_then(DynProp::get)
+                        .map(Into::into)
+                        .unwrap_or_default(),
+                    overlay: overlay
+                        .as_ref()
+                        .and_then(DynProp::get)
+                        .map(Into::into)
+                        .unwrap_or_default(),
+                };
+                let handle = store.ensure_map(mapper.clone(), widget_id, presentation);
                 Some(
                     handle
                         .element()
@@ -1774,6 +1872,123 @@ fn op_smudgy_widget_build_map_view(state: &mut OpState) -> Element {
             iced::widget::text("map unavailable (no mapper)").into()
         }
     })
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct MapViewStyleProp {
+    room_spacing: Option<f32>,
+    room_border_radius: Option<f32>,
+    room_stroke: Option<String>,
+    room_stroke_width: Option<f32>,
+    connection_color: Option<String>,
+    connection_width: Option<f32>,
+    player_color: Option<String>,
+    route_color: Option<String>,
+    route_width: Option<f32>,
+    door_color: Option<String>,
+    show_doors: Option<bool>,
+}
+
+impl From<MapViewStyleProp> for smudgy_map_widget::MapViewStyle {
+    fn from(value: MapViewStyleProp) -> Self {
+        let mut style = Self::default();
+        if let Some(field) = value.room_spacing {
+            style.room_spacing = field;
+        }
+        style.room_border_radius = value.room_border_radius;
+        style.room_stroke = value.room_stroke;
+        style.room_stroke_width = value.room_stroke_width;
+        style.connection_color = value.connection_color;
+        style.connection_width = value.connection_width;
+        style.player_color = value.player_color;
+        if let Some(field) = value.route_color {
+            style.route_color = field;
+        }
+        if let Some(field) = value.route_width {
+            style.route_width = field;
+        }
+        if let Some(field) = value.door_color {
+            style.door_color = field;
+        }
+        if let Some(field) = value.show_doors {
+            style.show_doors = field;
+        }
+        style.normalized()
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MapViewRoomOverlayProp {
+    room: i32,
+    #[serde(default)]
+    fill: Option<String>,
+    #[serde(default)]
+    stroke: Option<String>,
+    #[serde(default)]
+    stroke_width: Option<f32>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MapViewDoorOverlayProp {
+    connection: (u64, u64),
+    #[serde(default)]
+    closed: Option<bool>,
+    #[serde(default)]
+    locked: Option<bool>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MapViewRouteExitOverlayProp {
+    room: i32,
+    direction: smudgy_cloud::ExitDirection,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct MapViewOverlayProp {
+    route: Vec<i32>,
+    route_exits: Vec<MapViewRouteExitOverlayProp>,
+    rooms: Vec<MapViewRoomOverlayProp>,
+    doors: Vec<MapViewDoorOverlayProp>,
+}
+
+impl From<MapViewOverlayProp> for smudgy_map_widget::MapViewOverlay {
+    fn from(value: MapViewOverlayProp) -> Self {
+        Self {
+            route: value.route,
+            route_exits: value
+                .route_exits
+                .into_iter()
+                .map(|exit| smudgy_map_widget::RouteExitOverlay {
+                    room: exit.room,
+                    direction: exit.direction,
+                })
+                .collect(),
+            rooms: value
+                .rooms
+                .into_iter()
+                .map(|room| smudgy_map_widget::RoomOverlay {
+                    room: room.room,
+                    fill: room.fill,
+                    stroke: room.stroke,
+                    stroke_width: room.stroke_width,
+                })
+                .collect(),
+            doors: value
+                .doors
+                .into_iter()
+                .map(|door| smudgy_map_widget::ConnectionDoorOverlay {
+                    connection: door.connection,
+                    closed: door.closed,
+                    locked: door.locked,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Parse an author-written scene (a static `scene` value or a binding fallback) with
@@ -1822,7 +2037,9 @@ fn op_smudgy_widget_build_canvas(
     //   of the same scene never re-run URL parsing or `data:` hashing.
     // - Live bound values re-parse on the UI thread (no OpState there) with the ctx below:
     //   bound provenance — descend-only srcs, no absolute paths (plan D2).
-    let image_store = state.try_borrow::<Option<ImageStore>>().and_then(Clone::clone);
+    let image_store = state
+        .try_borrow::<Option<ImageStore>>()
+        .and_then(Clone::clone);
     let bound_image_ctx = match &image_store {
         Some(store) => state
             .borrow::<RefCell<ImageRegistry>>()
@@ -1847,9 +2064,7 @@ fn op_smudgy_widget_build_canvas(
             .get(scope, key)
             .and_then(|v| deno_core::serde_v8::from_v8::<[f32; 4]>(scope, v).ok())
             .filter(|[_, _, w, h]| w.is_finite() && h.is_finite() && *w > 0.0 && *h > 0.0)
-            .map(|[x, y, w, h]| {
-                iced::Rectangle::new(iced::Point::new(x, y), iced::Size::new(w, h))
-            })
+            .map(|[x, y, w, h]| iced::Rectangle::new(iced::Point::new(x, y), iced::Size::new(w, h)))
     };
 
     // The scene: a store binding (the live path — repaints per store flush, parse memoized by
@@ -1862,9 +2077,10 @@ fn op_smudgy_widget_build_canvas(
         .into();
     let scene_value = props.get(scope, scene_key);
     let scene = match scene_value {
-        Some(value) if is_binding_token(scope, value) => match bound_prop_from_v8(scope, state, value) {
-            Some(bound) => {
-                let fallback = bound
+        Some(value) if is_binding_token(scope, value) => {
+            match bound_prop_from_v8(scope, state, value) {
+                Some(bound) => {
+                    let fallback = bound
                     .fallback
                     .as_ref()
                     .and_then(|node| {
@@ -1890,18 +2106,19 @@ fn op_smudgy_widget_build_canvas(
                         }
                     })
                     .unwrap_or_default();
-                SceneSource::Bound {
-                    cell: bound.cell,
-                    memo: Arc::new(std::sync::Mutex::new(SceneMemo::default())),
-                    fallback: Arc::new(fallback),
-                    // Live bound values re-parse on the UI thread with bound provenance:
-                    // descend-only srcs, no absolute paths (the producer of a bound scene
-                    // is not the widget's author — plan D2).
-                    image_ctx: bound_image_ctx.map(Arc::new),
+                    SceneSource::Bound {
+                        cell: bound.cell,
+                        memo: Arc::new(std::sync::Mutex::new(SceneMemo::default())),
+                        fallback: Arc::new(fallback),
+                        // Live bound values re-parse on the UI thread with bound provenance:
+                        // descend-only srcs, no absolute paths (the producer of a bound scene
+                        // is not the widget's author — plan D2).
+                        image_ctx: bound_image_ctx.map(Arc::new),
+                    }
                 }
+                None => SceneSource::Static(Arc::new(ParsedScene::default())),
             }
-            None => SceneSource::Static(Arc::new(ParsedScene::default())),
-        },
+        }
         Some(value) if !value.is_null_or_undefined() => {
             let parsed = deno_core::serde_v8::from_v8::<serde_json::Value>(scope, value)
                 .ok()
@@ -1930,10 +2147,11 @@ fn op_smudgy_widget_build_canvas(
         _ => SceneSource::Static(Arc::new(ParsedScene::default())),
     };
 
-    let on_pointer = get_v8_function_prop!(scope, props, "onPointer").map(|callback| PointerHandler {
-        callback: Arc::new(callback),
-        isolate: WidgetIsolate(isolate_token.to_string()),
-    });
+    let on_pointer =
+        get_v8_function_prop!(scope, props, "onPointer").map(|callback| PointerHandler {
+            callback: Arc::new(callback),
+            isolate: WidgetIsolate(isolate_token.to_string()),
+        });
 
     // `fit: "contain"` opts into uniform scale-to-fit with centering; the default is the
     // exact (possibly non-uniform) rect-to-bounds mapping.
@@ -1951,13 +2169,21 @@ fn op_smudgy_widget_build_canvas(
     };
 
     Element::new(move || {
-        let width = width.as_ref().and_then(DynProp::get).unwrap_or(iced::Length::Fill);
-        let height = height.as_ref().and_then(DynProp::get).unwrap_or(iced::Length::Fill);
+        let width = width
+            .as_ref()
+            .and_then(DynProp::get)
+            .unwrap_or(iced::Length::Fill);
+        let height = height
+            .as_ref()
+            .and_then(DynProp::get)
+            .unwrap_or(iced::Length::Fill);
         // Clipped like the map canvas: scene geometry may exceed the bounds (the burst-alert
         // ring deliberately does), and tiny-skia's damage-tracked partial redraws would leave
         // the spill on screen without the clipping container.
         iced::widget::container(
-            iced::widget::canvas(program.clone()).width(width).height(height),
+            iced::widget::canvas(program.clone())
+                .width(width)
+                .height(height),
         )
         .width(width)
         .height(height)
@@ -2045,7 +2271,9 @@ impl ImageRegistry {
         if token == 0 {
             return None;
         }
-        self.creators.get((token - 1) as usize).and_then(Option::as_ref)
+        self.creators
+            .get((token - 1) as usize)
+            .and_then(Option::as_ref)
     }
 
     fn bound_table(&self, token: u32) -> Option<Arc<BoundSrcTable>> {
@@ -2151,7 +2379,10 @@ impl std::fmt::Display for LogSrc<'_> {
         if self.0.len() <= MAX {
             f.write_str(self.0)
         } else {
-            let cut = (0..=MAX).rev().find(|i| self.0.is_char_boundary(*i)).unwrap_or(0);
+            let cut = (0..=MAX)
+                .rev()
+                .find(|i| self.0.is_char_boundary(*i))
+                .unwrap_or(0);
             write!(f, "{}… ({} bytes)", &self.0[..cut], self.0.len())
         }
     }
@@ -2168,7 +2399,9 @@ fn op_smudgy_widget_register_image_creator(
     #[string] creator_json: &str,
     #[string] module: &str,
 ) -> u32 {
-    let policy = state.try_borrow::<ImageSourcePolicy>().map(|p| Arc::new(p.clone()));
+    let policy = state
+        .try_borrow::<ImageSourcePolicy>()
+        .map(|p| Arc::new(p.clone()));
     let module = (!module.is_empty()).then_some(module);
     let creator = policy.and_then(|policy| register_creator(creator_json, module, policy));
     state
@@ -2247,13 +2480,14 @@ fn op_smudgy_widget_build_image(
     let opacity = get_dyn_f32_prop!(scope, state, props, "opacity");
     let content_fit =
         content_fit_from(get_opt_string_prop!(scope, props, "content_fit").as_deref());
-    let filter =
-        filter_method_from(get_opt_string_prop!(scope, props, "filter_method").as_deref());
+    let filter = filter_method_from(get_opt_string_prop!(scope, props, "filter_method").as_deref());
     // Degrees fit losslessly in f32 for any sane rotation; truncation is fine.
     #[allow(clippy::cast_possible_truncation)]
     let rotation_deg = get_number_prop!(scope, props, "rotation").unwrap_or(0.0) as f32;
 
-    let store = state.try_borrow::<Option<ImageStore>>().and_then(Clone::clone);
+    let store = state
+        .try_borrow::<Option<ImageStore>>()
+        .and_then(Clone::clone);
 
     // `src` is either a static string or a store binding (its value changes per frame).
     let src = get_dyn_string_prop!(scope, state, props, "src");
@@ -2294,7 +2528,10 @@ fn op_smudgy_widget_build_image(
     Element::new(move || {
         let w = width.as_ref().and_then(DynProp::get);
         let h = height.as_ref().and_then(DynProp::get);
-        let op = opacity.as_ref().and_then(DynProp::get).unwrap_or(default_opacity);
+        let op = opacity
+            .as_ref()
+            .and_then(DynProp::get)
+            .unwrap_or(default_opacity);
         // Resolve the live cell: static (captured once) or bound (per distinct value).
         let cell = match (&static_cell, &bound_ctx, &src) {
             (Some(cell), _, _) => Some(cell.clone()),
@@ -2370,7 +2607,10 @@ impl BoundSrcTable {
                 (Ok((source, key)), Some(cell))
             }
             Err(reason) => {
-                log::warn!("smudgy images: bound src '{}' rejected: {reason}", LogSrc(raw));
+                log::warn!(
+                    "smudgy images: bound src '{}' rejected: {reason}",
+                    LogSrc(raw)
+                );
                 (Err(()), None)
             }
         };
@@ -2519,8 +2759,7 @@ fn op_smudgy_widget_build_tooltip(
     let chrome = get_bool_prop!(scope, props, "tip_chrome").unwrap_or(false);
 
     Element::new(move || {
-        let mut tooltip: Tooltip =
-            iced::widget::tooltip(target.element(), tip.element(), position);
+        let mut tooltip: Tooltip = iced::widget::tooltip(target.element(), tip.element(), position);
         if let Some(gap) = gap.as_ref().and_then(DynProp::get) {
             tooltip = tooltip.gap(gap);
         }
@@ -2645,23 +2884,27 @@ fn op_smudgy_widget_build_table(
     let row_count = cells.len().checked_div(column_count).unwrap_or(0);
 
     Element::new(move || {
-        let columns = metas.iter().take(column_count).enumerate().map(|(index, meta)| {
-            let cells = cells.clone();
-            let mut column = iced::widget::table::column(
-                headers[index].element(),
-                move |row: usize| cells[row * column_count + index].element(),
-            );
-            if let Some(width) = meta.width {
-                column = column.width(width);
-            }
-            if let Some(align_x) = meta.align_x {
-                column = column.align_x(align_x);
-            }
-            if let Some(align_y) = meta.align_y {
-                column = column.align_y(align_y);
-            }
-            column
-        });
+        let columns = metas
+            .iter()
+            .take(column_count)
+            .enumerate()
+            .map(|(index, meta)| {
+                let cells = cells.clone();
+                let mut column =
+                    iced::widget::table::column(headers[index].element(), move |row: usize| {
+                        cells[row * column_count + index].element()
+                    });
+                if let Some(width) = meta.width {
+                    column = column.width(width);
+                }
+                if let Some(align_x) = meta.align_x {
+                    column = column.align_x(align_x);
+                }
+                if let Some(align_y) = meta.align_y {
+                    column = column.align_y(align_y);
+                }
+                column
+            });
         let mut table = iced::widget::table(columns, 0..row_count);
         if let Some(width) = width.as_ref().and_then(DynProp::get) {
             table = table.width(width);
@@ -2693,7 +2936,10 @@ mod tests {
             "[enter the temple](<enter the temple>)"
         );
         // Hyphens are fine; a command on its own line still parses as inline HTML.
-        assert_eq!(expand_command_autolinks("<go-north>"), "[go-north](<go-north>)");
+        assert_eq!(
+            expand_command_autolinks("<go-north>"),
+            "[go-north](<go-north>)"
+        );
     }
 
     #[test]
@@ -2706,7 +2952,7 @@ mod tests {
             "Email <foo@bar.com> me.",
             "Inline `<look>` stays literal.",
             "```\n<look>\n```",
-            "<say hi!>",  // `!` -> not tokenized as inline HTML
+            "<say hi!>", // `!` -> not tokenized as inline HTML
             "no angle brackets at all",
         ] {
             assert!(
@@ -2731,17 +2977,29 @@ mod tests {
     #[test]
     fn bound_display_text_renders_bare_values_fallback_and_format() {
         use serde_json::json;
-        assert_eq!(bound(json!("hi")).display_text(), "hi", "strings render unquoted");
+        assert_eq!(
+            bound(json!("hi")).display_text(),
+            "hi",
+            "strings render unquoted"
+        );
         assert_eq!(bound(json!(42.5)).display_text(), "42.5");
         assert_eq!(bound(json!(true)).display_text(), "true");
-        assert_eq!(bound(json!(null)).display_text(), "", "null/absent renders empty");
+        assert_eq!(
+            bound(json!(null)).display_text(),
+            "",
+            "null/absent renders empty"
+        );
         assert_eq!(bound(json!({ "a": 1 })).display_text(), r#"{"a":1}"#);
 
         let with_fallback = BoundProp {
             fallback: Some(Node::from(json!(0))),
             ..bound(json!(null))
         };
-        assert_eq!(with_fallback.display_text(), "0", "fallback covers null/absent");
+        assert_eq!(
+            with_fallback.display_text(),
+            "0",
+            "fallback covers null/absent"
+        );
 
         let formatted = BoundProp {
             format: Some("{} hp".to_string()),
@@ -2759,12 +3017,28 @@ mod tests {
         use serde_json::json;
         let node = |value: serde_json::Value| Node::from(value);
         assert_eq!(f32_from_value(&node(json!(12.5))), Some(12.5));
-        assert_eq!(f32_from_value(&node(json!("12"))), None, "no string-to-number coercion");
+        assert_eq!(
+            f32_from_value(&node(json!("12"))),
+            None,
+            "no string-to-number coercion"
+        );
 
-        assert_eq!(length_from_value(&node(json!(120))), Some(iced::Length::Fixed(120.0)));
-        assert_eq!(length_from_value(&node(json!("fill"))), Some(iced::Length::Fill));
-        assert_eq!(length_from_value(&node(json!("shrink"))), Some(iced::Length::Shrink));
-        assert_eq!(length_from_value(&node(json!("64"))), Some(iced::Length::Fixed(64.0)));
+        assert_eq!(
+            length_from_value(&node(json!(120))),
+            Some(iced::Length::Fixed(120.0))
+        );
+        assert_eq!(
+            length_from_value(&node(json!("fill"))),
+            Some(iced::Length::Fill)
+        );
+        assert_eq!(
+            length_from_value(&node(json!("shrink"))),
+            Some(iced::Length::Shrink)
+        );
+        assert_eq!(
+            length_from_value(&node(json!("64"))),
+            Some(iced::Length::Fixed(64.0))
+        );
         assert_eq!(length_from_value(&node(json!(null))), None);
 
         assert_eq!(
@@ -2789,8 +3063,34 @@ mod tests {
         if let DynProp::Bound { prop: inner, .. } = &prop {
             inner.cell.set(json!(75));
         }
-        assert_eq!(prop.get(), Some(75.0), "a live value wins over the fallback");
+        assert_eq!(
+            prop.get(),
+            Some(75.0),
+            "a live value wins over the fallback"
+        );
         assert_eq!(DynProp::Static(1.0f32).get(), Some(1.0));
+    }
+
+    #[test]
+    fn map_view_overlay_parses_from_store_node() {
+        use serde_json::json;
+        let node = Node::from(json!({
+            "route": [1, 2, 3],
+            "routeExits": [{ "room": 3, "direction": "Up" }],
+            "rooms": [{ "room": 2, "stroke": "#ff00ff" }],
+            "doors": [{ "connection": [12, 34], "locked": true }]
+        }));
+        let prop = serde_from_node::<MapViewOverlayProp>(&node).expect("overlay parses");
+        let overlay: smudgy_map_widget::MapViewOverlay = prop.into();
+        assert_eq!(overlay.route, vec![1, 2, 3]);
+        assert_eq!(overlay.route_exits[0].room, 3);
+        assert_eq!(
+            overlay.route_exits[0].direction,
+            smudgy_cloud::ExitDirection::Up
+        );
+        assert_eq!(overlay.rooms[0].room, 2);
+        assert_eq!(overlay.doors[0].connection, (12, 34));
+        assert_eq!(overlay.doors[0].locked, Some(true));
     }
 
     fn link(label: &str, url: &str) -> MarkdownLink {
@@ -2840,7 +3140,11 @@ mod tests {
             "![alt](image.png)",
             "Compare x < y and a > b here.",
         ] {
-            assert_eq!(extract_markdown_links(src), vec![], "expected no links in `{src}`");
+            assert_eq!(
+                extract_markdown_links(src),
+                vec![],
+                "expected no links in `{src}`"
+            );
         }
         // An image nested in a link's label contributes no (invisible) alt text to the label.
         assert_eq!(

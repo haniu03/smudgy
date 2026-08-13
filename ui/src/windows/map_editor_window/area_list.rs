@@ -539,7 +539,7 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     // Copy-family membership (over copied_from edges + family_token) for the
     // "copy" badge; computed once for the whole list.
     let family_members = window.family_members();
-    let ephemeral = window.mapper.ephemeral_area_ids();
+    let ephemeral = window.mapper.session_area_ids();
     let local_areas = window.mapper.local_area_ids();
     let folders = owned_folders(
         &atlas,
@@ -859,7 +859,11 @@ fn scope_control(window: &MapEditorWindow) -> Option<ThemedElement<'_, Message>>
                 !window.scope_all,
                 false
             ),
-            tab(crate::i18n::t!("area-list-all-atlases"), window.scope_all, true),
+            tab(
+                crate::i18n::t!("area-list-all-atlases"),
+                window.scope_all,
+                true
+            ),
         ]
         .spacing(4)
         .align_y(Vertical::Center)
@@ -980,10 +984,17 @@ fn folder_header<'a>(
                 "Delete folder",
                 tooltip::Position::Bottom,
             ));
+            let atlas_is_local = window.local_atlas_ids.contains(&atlas_id);
+            if !atlas_is_local || window.cloud.snapshot.get().signed_in {
+                header = header.push(text_button(
+                    crate::i18n::ts!("area-list-move-action"),
+                    Message::MoveAtlasStorageRequested(atlas_id),
+                ));
+            }
             // Sharing is cloud-only — a local folder has no server identity, so
             // the affordance would always 404. New-map/rename/delete work on
             // both tiers.
-            if !window.local_atlas_ids.contains(&atlas_id) {
+            if !atlas_is_local {
                 header = header.push(text_button(
                     "Share\u{2026}",
                     Message::ShareAtlasRequested(atlas_id),
@@ -1114,9 +1125,15 @@ fn area_row<'a>(
     // current state (switch on = active), the tooltip the action.
     if is_selected {
         let (codepoint, tip) = if area.enabled {
-            (bootstrap_icons::TOGGLE_ON, crate::i18n::ts!("inspector-active-tip"))
+            (
+                bootstrap_icons::TOGGLE_ON,
+                crate::i18n::ts!("inspector-active-tip"),
+            )
         } else {
-            (bootstrap_icons::TOGGLE_OFF, crate::i18n::ts!("inspector-inactive-tip"))
+            (
+                bootstrap_icons::TOGGLE_OFF,
+                crate::i18n::ts!("inspector-inactive-tip"),
+            )
         };
         item = item.push(tooltip(
             icon_button(codepoint, Message::ToggleAreaEnabled(area.id)),

@@ -1931,7 +1931,8 @@ impl ManagedSession {
                     // session store has nothing to do with them.
                     SessionEvent::MapperNavigated(_)
                     | SessionEvent::OfferMapRescue { .. }
-                    | SessionEvent::MapAreaCreated(_) => Task::none(),
+                    | SessionEvent::MapAreaCreated(_)
+                    | SessionEvent::MapAtlasCreated(_) => Task::none(),
                     // Placement commands — applied by the daemon (which owns
                     // the windows and their cluster models) before this
                     // forward; no session-store state is involved.

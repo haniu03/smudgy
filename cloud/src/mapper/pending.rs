@@ -1738,6 +1738,13 @@ impl PendingQueue {
         self.state.lock().delete_intents.contains(&area_id)
     }
 
+    /// Whether an in-session delete/move fence or a recovered durable delete
+    /// intent currently makes metadata writes unsafe for this area.
+    pub(crate) fn is_delete_fenced(&self, area_id: AreaId) -> bool {
+        let state = self.state.lock();
+        state.deleting.contains(&area_id) || state.delete_intents.contains(&area_id)
+    }
+
     #[must_use]
     pub(crate) fn delete_intent_is_cloud(&self, area_id: AreaId) -> bool {
         self.state

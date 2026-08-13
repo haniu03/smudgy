@@ -176,8 +176,59 @@ declare module "smudgy:widgets" {
         children?: WidgetChildren;
     }
 
-    /** Props for the map view (a leaf -- props and children are ignored). */
+    /** View-local defaults. These never modify or sync the underlying map. */
+    export interface MapViewStyle {
+        /** Multiply room coordinates while keeping room glyphs the same size. Default 1. */
+        roomSpacing?: number;
+        /** Rounded-room radius in map units, clamped to 0..0.25. */
+        roomBorderRadius?: number;
+        roomStroke?: string;
+        roomStrokeWidth?: number;
+        connectionColor?: string;
+        connectionWidth?: number;
+        playerColor?: string;
+        routeColor?: string;
+        routeWidth?: number;
+        doorColor?: string;
+        /** Render persisted or overlaid closed/locked door state. Default true. */
+        showDoors?: boolean;
+    }
+
+    export interface MapViewRoomOverlay {
+        room: RoomNumber;
+        fill?: string;
+        stroke?: string;
+        strokeWidth?: number;
+    }
+
+    export interface MapViewRouteExitOverlay {
+        /** Room from which this route step leaves. */
+        room: RoomNumber;
+        /** Exit direction used by this route step. */
+        direction: ExitDirection;
+    }
+
+    export interface MapViewDoorOverlay {
+        connection: ConnectionId;
+        /** Override persisted state; omit either field to retain its map value. */
+        closed?: boolean;
+        locked?: boolean;
+    }
+
+    /** Ephemeral presentation data for one MapView. Suitable for a store binding. */
+    export interface MapViewOverlay {
+        /** Ordered room numbers in the active area. Rooms and connecting links are accented. */
+        route?: RoomNumber[];
+        /** Exact route exits. When supplied, these select connections instead of room adjacency. */
+        routeExits?: MapViewRouteExitOverlay[];
+        rooms?: MapViewRoomOverlay[];
+        doors?: MapViewDoorOverlay[];
+    }
+
+    /** Props for the map view (a leaf). */
     export interface MapViewProps {
+        style?: Bindable<MapViewStyle>;
+        overlay?: Bindable<MapViewOverlay>;
         children?: WidgetChildren;
     }
 

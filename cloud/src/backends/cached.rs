@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::{LEGACY_ACCESS_FINGERPRINT, MapperBackend, cloud::CloudMapper};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CloudError, CloudResult, CreateAreaRequest, SyncRow,
+    CloudError, CloudResult, CreateAreaRequest, MapStorage, SyncRow,
     mutation::{MutationEnvelope, MutationResult},
 };
 
@@ -488,6 +488,16 @@ where
         Ok(area)
     }
 
+    async fn create_area_at(
+        &self,
+        request: CreateAreaRequest,
+        storage: MapStorage,
+    ) -> CloudResult<Area> {
+        let area = self.inner.create_area_at(request, storage).await?;
+        self.invalidate_area(&area.id).await;
+        Ok(area)
+    }
+
     async fn list_areas(&self) -> CloudResult<Vec<Area>> {
         let auth_generation = self.inner.auth_generation();
         self.check_auth_generation();
@@ -719,12 +729,28 @@ where
         self.inner.create_atlas(name).await
     }
 
+    async fn create_atlas_at(&self, name: &str, storage: MapStorage) -> CloudResult<Atlas> {
+        self.inner.create_atlas_at(name, storage).await
+    }
+
     async fn rename_atlas(&self, atlas_id: &AtlasId, name: &str) -> CloudResult<Atlas> {
         self.inner.rename_atlas(atlas_id, name).await
     }
 
     async fn delete_atlas(&self, atlas_id: &AtlasId) -> CloudResult<()> {
         self.inner.delete_atlas(atlas_id).await
+    }
+
+    fn local_atlas_ids(&self) -> HashSet<AtlasId> {
+        self.inner.local_atlas_ids()
+    }
+
+    fn local_area_ids(&self) -> HashSet<AreaId> {
+        self.inner.local_area_ids()
+    }
+
+    fn ephemeral_area_ids(&self) -> HashSet<AreaId> {
+        self.inner.ephemeral_area_ids()
     }
 
     fn last_area_source(&self, area_id: &AreaId) -> AreaLoadSource {

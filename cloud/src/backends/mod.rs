@@ -1,6 +1,6 @@
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CloudError, CloudResult, CreateAreaRequest, SyncRow,
+    CloudError, CloudResult, CreateAreaRequest, MapStorage, SyncRow,
     mutation::{MutationEnvelope, MutationResult},
 };
 use async_trait::async_trait;
@@ -31,6 +31,19 @@ pub trait MapperBackend: Send + Sync {
     // ===== AREA OPERATIONS =====
 
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area>;
+
+    /// Create an area in an explicit storage tier. A backend must either
+    /// prove it implements that tier or reject the request; silently ignoring
+    /// the tier would make the canonical API lie about where data landed.
+    async fn create_area_at(
+        &self,
+        _request: CreateAreaRequest,
+        storage: MapStorage,
+    ) -> CloudResult<Area> {
+        Err(CloudError::InvalidInput(format!(
+            "this backend does not support explicit {storage} map creation"
+        )))
+    }
 
     async fn list_areas(&self) -> CloudResult<Vec<Area>>;
 
@@ -213,6 +226,14 @@ pub trait MapperBackend: Send + Sync {
     async fn create_atlas_in(&self, name: &str, prefer_local: bool) -> CloudResult<Atlas> {
         let _ = prefer_local;
         self.create_atlas(name).await
+    }
+
+    /// Create an atlas in an explicit durable storage tier. As with areas,
+    /// the default rejects rather than silently choosing a backend.
+    async fn create_atlas_at(&self, _name: &str, storage: MapStorage) -> CloudResult<Atlas> {
+        Err(CloudError::InvalidInput(format!(
+            "this backend does not support explicit {storage} atlas creation"
+        )))
     }
 
     /// Rename an atlas. Default: unsupported.

@@ -1878,13 +1878,82 @@ export function make() { return createEvent('dynamic'); }
         );
     }
 
-    /// Rust↔TS enum drift guard: every serde variant name of the map enums must appear
-    /// (quoted) in BOTH the published contract and the runtime impl, whose string unions
-    /// mirror the Rust enums by hand. The impl↔contract guards above cannot catch this class
-    /// (they compare TS against TS); this pins both to the Rust source of truth — the
-    /// original regression was a Rust-side enum variant invisible to scripts. A tripwire on
-    /// quoted-name presence, not a union parser: adding a Rust variant fails here until the
-    /// unions name it.
+    /// The compatibility catalog is deliberately finite. These assertions do
+    /// three jobs together: old scripts still type-check during 0.5.x, every
+    /// compatibility member carries an editor-visible deprecation, and the
+    /// test itself blocks the first 0.6 build until the shims are removed.
+    #[test]
+    fn map_storage_compatibility_is_deprecated_and_expires_in_0_6() {
+        use std::collections::BTreeMap;
+
+        const DEPRECATION: &str = "@deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.";
+
+        assert_eq!(
+            smudgy_cloud::MAP_STORAGE_COMPATIBILITY_LAST_RELEASE,
+            "0.5.x"
+        );
+        assert_eq!(
+            smudgy_cloud::MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION,
+            "0.6.0"
+        );
+        let running = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("Cargo package versions are valid semver");
+        assert!(
+            (running.major, running.minor) < (0, 6),
+            "remove the legacy mapper creation overload, `ephemeral`, and `isEphemeral` \
+             before building the 0.6 release line"
+        );
+
+        assert_eq!(
+            SMUDGY_MAPPER_DTS.matches(DEPRECATION).count(),
+            3,
+            "the compatibility catalog is exactly: omitted-storage createArea, \
+             LegacyCreateAreaOptions.ephemeral, and Area.isEphemeral"
+        );
+        assert_eq!(
+            SMUDGY_MAPPER_TS.matches(DEPRECATION).count(),
+            2,
+            "the runtime implementation must mark its ephemeral option and getter"
+        );
+        let nukefire_mapper = include_str!("../../../packages/nukefire-mapper/mapper.ts");
+        assert_eq!(
+            nukefire_mapper.matches(DEPRECATION).count(),
+            1,
+            "the first-party NukeFire mapper's ephemeral option is part of the same finite window"
+        );
+        // Arctic deliberately uses the deprecated implicit durable destination so
+        // signed-in sessions prefer cloud and signed-out sessions fall back to local.
+        // The 0.6 release-version guard above, rather than a first-party source
+        // assertion, owns removal of that compatibility path.
+
+        let mut ambient = BTreeMap::new();
+        ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "compatibility-consumer.ts".to_string(),
+            "import { mapper } from \"smudgy:core\";\n\
+             declare const area: Area;\n\
+             export const oldDefault = mapper.createArea(\"old default\");\n\
+             export const oldSession = mapper.createArea(\"old session\", { ephemeral: true });\n\
+             export const oldPredicate: boolean = area.isEphemeral;\n\
+             export const canonical = mapper.createArea(\"canonical\", { storage: \"local\" });\n"
+                .to_string(),
+        );
+        let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+            .expect("compile legacy and canonical mapper creation forms");
+        assert!(
+            out.diagnostics.is_empty(),
+            "0.5 compatibility forms or their canonical replacements stopped type-checking:\n{:#?}",
+            out.diagnostics
+        );
+    }
+
+    /// Rust↔TS enum drift guard: every serde variant name of the map enums must
+    /// appear in both the published contract and runtime implementation.
     #[test]
     fn map_enum_unions_cover_rust_variants() {
         fn assert_covered<T: serde::Serialize>(variants: &[T], enum_name: &str) {
@@ -2003,6 +2072,11 @@ export function make() { return createEvent('dynamic'); }
               const newArea: Area = await mapper.createArea("Town");
               const runtimeCheck: boolean = newArea instanceof Area;
               const newRoom: RoomNumber = await mapper.createRoom(room.area_id, { title: "x" });
+              const batchIds: OperationId[] = await mapper.mutateArea(room.area_id, async (mutation) => {
+                const batchedRoom: RoomNumber = await mutation.createRoom({ title: "batch" });
+                await mutation.setRoomProperty(batchedRoom, "terrain", "city");
+                await mutation.createRoomExit(batchedRoom, { from_direction: "South" });
+              }, { description: "typed batch" });
               const exitId: ExitId = await mapper.createRoomExit(room.area_id, room.room_number, { from_direction: "North" });
               const updateId: OperationId | null = await mapper.setRoomExit(room.area_id, room.room_number, exitId, { command: "enter hole" });
               const mergeId: OperationId | null = await mapper.mergeRooms(room.area_id, room.room_number, room.room_number + 1);
@@ -2020,7 +2094,7 @@ export function make() { return createEvent('dynamic'); }
               await mapper.setRoomTitle(room.area_id, room.room_number, "t");
               await mapper.setRoomDescription(room.area_id, room.room_number, "d");
               await mapper.renameArea(room.area_id, "n");
-              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void runtimeCheck; void newRoom; void updateId; void mergeId;
+              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void runtimeCheck; void newRoom; void batchIds; void updateId; void mergeId;
             }
             export { useRoom, useArea, useExit, useMapper };
             "##

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
-    AreaId, ConnectionDash, ConnectionId, ConnectionKind, ConnectionRouting, CornerStyle,
-    ExitDirection,
-    connection_geometry::{ConnectionGeometry, StubAxis},
+    AreaId, Connection, ConnectionDash, ConnectionId, ConnectionKind, ConnectionRouting,
+    CornerStyle, ExitDirection, MapPoint,
+    connection_geometry::{ConnectionGeometry, EndpointGeometry, GeometryInput, StubAxis},
     mapper::room_cache::RoomCache,
 };
 
@@ -51,11 +51,72 @@ pub struct RoomConnection {
     /// True when any member exit or either endpoint room is secret-marked
     /// (cleared views only ever see this); renderers draw these distinctly.
     pub is_secret: bool,
+    /// Persisted member state, aggregated so a closed/locked traversal is
+    /// visible even when its reciprocal member is open.
+    pub is_closed: bool,
+    pub is_locked: bool,
     pub to: RoomConnectionEnd,
     /// Endpoint A's room (grouping/level anchor). For the far half of a
     /// cross-level Connection this is endpoint B's room instead — each half
     /// anchors on its own room.
     pub room: Arc<RoomCache>,
+    pub(super) source: Connection,
+    pub(super) endpoint_a_room: Arc<RoomCache>,
+    pub(super) endpoint_b_room: Option<Arc<RoomCache>>,
+    /// Coordinate multiplier used by view-local room-spacing presentation.
+    pub layout_spacing: f32,
+}
+
+impl RoomConnection {
+    /// Re-resolve this render view with multiplied room/route coordinates,
+    /// keeping room glyph dimensions and port geometry unchanged.
+    #[must_use]
+    pub fn with_room_spacing(&self, spacing: f32) -> Self {
+        if (spacing - 1.0).abs() < f32::EPSILON {
+            return self.clone();
+        }
+        let scale = |point: MapPoint| MapPoint::new(point.x * spacing, point.y * spacing);
+        let route_points: Vec<_> = self
+            .source
+            .route_points
+            .iter()
+            .copied()
+            .map(scale)
+            .collect();
+        let endpoint_a = &self.source.endpoint_a;
+        let geometry = crate::connection_geometry::resolve(&GeometryInput {
+            kind: self.source.kind,
+            routing: self.source.routing,
+            corner: self.source.corner,
+            endpoint_a: EndpointGeometry {
+                room_center: MapPoint::new(
+                    self.endpoint_a_room.get_x() * spacing,
+                    self.endpoint_a_room.get_y() * spacing,
+                ),
+                side: endpoint_a.side,
+                port_offset: endpoint_a.port_offset,
+                stub: self.stub_a,
+            },
+            endpoint_b: self
+                .source
+                .endpoint_b
+                .as_ref()
+                .zip(self.endpoint_b_room.as_ref())
+                .map(|(endpoint, room)| EndpointGeometry {
+                    room_center: MapPoint::new(room.get_x() * spacing, room.get_y() * spacing),
+                    side: endpoint.side,
+                    port_offset: endpoint.port_offset,
+                    stub: self.stub_b,
+                }),
+            route_points: &route_points,
+            thickness: self.source.thickness,
+        });
+        Self {
+            geometry: Arc::new(geometry),
+            layout_spacing: spacing,
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

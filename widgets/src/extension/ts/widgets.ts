@@ -254,8 +254,8 @@ function makeWidgets(creator: { kind: string } | string, module?: string) {
         return op_smudgy_widget_build_button(props || {}, child, isolateToken);
     };
 
-    const MapView = (_props?: Record<string, any>, _children?: any) =>
-        op_smudgy_widget_build_map_view();
+    const MapView = (props?: Record<string, any>, _children?: any) =>
+        op_smudgy_widget_build_map_view(props || {});
 
     const Space = (props: Record<string, any>, _children?: any) =>
         op_smudgy_widget_build_space(props || {});

@@ -1,6 +1,6 @@
 use smudgy_cloud::{
-    CachedCloudMapper, ExitArgs, ExitDirection, LabelArgs, Mapper, RoomNumber, RoomUpdates,
-    ShapeArgs, ShapeType, mapper::RoomKey,
+    CachedCloudMapper, ExitArgs, ExitDirection, LabelArgs, MapDestination, MapStorage, Mapper,
+    RoomNumber, RoomUpdates, ShapeArgs, ShapeType, mapper::RoomKey,
 };
 use std::{fs, sync::Arc};
 use tokio::time::{Duration, sleep};
@@ -36,7 +36,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n📋 Phase 1: Setting up test area...");
 
     // Create a test area
-    let area_id = mapper.create_area("Demo Dungeon".to_string()).await?;
+    let area_id = mapper
+        .create_area_at(
+            "Demo Dungeon".to_string(),
+            MapDestination::loose(MapStorage::Cloud),
+        )
+        .await?;
 
     println!("✅ Created area: {area_id}");
 

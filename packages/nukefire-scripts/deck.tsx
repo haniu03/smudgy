@@ -85,12 +85,6 @@ function actionButton(entry: NukeFireContextEntry, action: NukeFireContextAction
 
 const CARD_W = widgetMetric(270);
 
-function chunk<T>(items: T[], size: number): T[][] {
-  const rows: T[][] = [];
-  for (let i = 0; i < items.length; i += size) rows.push(items.slice(i, i + size));
-  return rows;
-}
-
 function card(entry: NukeFireContextEntry) {
   return (
     <Container width={CARD_W} height="fill" background={themeBackground.bind()}>
@@ -101,17 +95,18 @@ function card(entry: NukeFireContextEntry) {
             <Space width="fill" />
             <Text size={widgetTextSize(9)} color={UI.faint}>{entry.kind}</Text>
           </Row>,
-          <Text size={widgetTextSize(10)} color={UI.dim}>{entry.summary}</Text>,
+          entry.id?.toLowerCase() === "zone-intelligence" ? null : (
+            <Text size={widgetTextSize(10)} color={UI.dim}>{entry.summary}</Text>
+          ),
           ...entry.status.map((s) => (
             <Row spacing={6}>
               <Text size={widgetTextSize(10)} color={UI.dim}>{s.label}:</Text>
               <Text size={widgetTextSize(10)} color={toneColor(s.tone)}>{String(s.value)}</Text>
             </Row>
           )),
-          // two actions per row so long labels never escape the card
-          ...chunk(entry.actions, 2).map((pair) => (
-            <Row spacing={4}>{pair.map((a) => actionButton(entry, a))}</Row>
-          )),
+          <Column spacing={4}>
+            {entry.actions.map((action) => actionButton(entry, action))}
+          </Column>,
         ]}
       </Column>
     </Container>

@@ -3521,7 +3521,7 @@ mod tests {
     use smudgy_cloud::mapper::RoomKey;
     use smudgy_cloud::{
         Area, AreaUpdates, AreaWithDetails, CloudError, CloudResult, CreateAreaRequest,
-        ExitDirection, MapperBackend, RoomSide, Uuid,
+        ExitDirection, MapDestination, MapStorage, MapperBackend, RoomSide, Uuid,
     };
     use smudgy_map_widget::map_editor::{EntityId, Selection};
 
@@ -3549,6 +3549,14 @@ mod tests {
                 family_token: None,
                 atlas_name: None,
             })
+        }
+
+        async fn create_area_at(
+            &self,
+            request: CreateAreaRequest,
+            _storage: MapStorage,
+        ) -> CloudResult<Area> {
+            self.create_area(request).await
         }
 
         async fn list_areas(&self) -> CloudResult<Vec<Area>> {
@@ -3665,7 +3673,10 @@ mod tests {
     }
 
     async fn area_with_rooms(mapper: &Mapper, rooms: &[(i32, f32, f32)]) -> AreaId {
-        let area_id = mapper.create_area("Test".into()).await.expect("area");
+        let area_id = mapper
+            .create_area_at("Test".into(), MapDestination::loose(MapStorage::Cloud))
+            .await
+            .expect("area");
         for (number, x, y) in rooms {
             mapper
                 .upsert_room(
@@ -4351,7 +4362,10 @@ mod tests {
     #[tokio::test]
     async fn paste_creates_offset_copies_and_undo_removes_them() {
         let mapper = test_mapper();
-        let area_id = mapper.create_area("Test".into()).await.expect("area");
+        let area_id = mapper
+            .create_area_at("Test".into(), MapDestination::loose(MapStorage::Cloud))
+            .await
+            .expect("area");
 
         let clipboard = EntityClipboard {
             source_area_id: Some(area_id),
@@ -4428,7 +4442,10 @@ mod tests {
     #[tokio::test]
     async fn transparent_styling_survives_create_snapshot_and_paste() {
         let mapper = test_mapper();
-        let area_id = mapper.create_area("Test".into()).await.expect("area");
+        let area_id = mapper
+            .create_area_at("Test".into(), MapDestination::loose(MapStorage::Cloud))
+            .await
+            .expect("area");
 
         // The drag-rect builder must request transparency explicitly: the
         // mock (like the deployed server) turns absent backgrounds white.
