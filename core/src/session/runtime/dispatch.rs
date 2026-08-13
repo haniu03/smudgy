@@ -335,11 +335,29 @@ impl Inner<'_> {
                 compression,
                 tls,
             } => {
-                let mut connection = Connection::new(
+                self.connection_generation = self.connection_generation.wrapping_add(1);
+                let connection_generation = self.connection_generation;
+                self.pending_send_on_connect = send_on_connect.map(|text| {
+                    // When the auto-login text carries secrets (a substituted
+                    // $PASSWORD), send it with redactions so it reaches the wire
+                    // but is masked in the client view + log; otherwise keep the
+                    // ordinary Send path (alias matching / separator splitting).
+                    if send_on_connect_redactions.is_empty() {
+                        RuntimeAction::Send(text)
+                    } else {
+                        RuntimeAction::SendWithRedactions {
+                            text,
+                            redactions: send_on_connect_redactions,
+                        }
+                    }
+                });
+
+                let mut connection = Connection::with_generation(
                     self.session_runtime_tx.clone(),
                     self.ui_tx.clone(),
                     self.trigger_manager.raw_wanted_flag(),
                     self.window_size.clone(),
+                    connection_generation,
                 );
 
                 // Resolve the configured encoding label; an unresolvable one falls back
@@ -360,26 +378,6 @@ impl Inner<'_> {
                     }
                     resolved
                 });
-
-                if let Some(send_on_connect) = send_on_connect {
-                    let local_tx = self.session_runtime_tx.clone();
-                    let redactions = send_on_connect_redactions;
-                    connection.on_connect(move || {
-                        // When the auto-login text carries secrets (a substituted
-                        // $PASSWORD), send it with redactions so it reaches the wire
-                        // but is masked in the client view + log; otherwise keep the
-                        // ordinary Send path (alias matching / separator splitting).
-                        let action = if redactions.is_empty() {
-                            RuntimeAction::Send(send_on_connect)
-                        } else {
-                            RuntimeAction::SendWithRedactions {
-                                text: send_on_connect,
-                                redactions,
-                            }
-                        };
-                        local_tx.send(action).ok();
-                    });
-                }
 
                 // Raw logging is decided per connection: load settings fresh
                 // so toggling `log_raw` applies to the next connect.
@@ -420,6 +418,7 @@ impl Inner<'_> {
                 if let Some(connection) = self.connection.as_mut() {
                     connection.disconnect();
                 }
+                self.pending_send_on_connect = None;
                 Ok(ActionResult::None)
             }
             RuntimeAction::HandleIncomingLine(line) => {
@@ -474,6 +473,18 @@ impl Inner<'_> {
                     fut.await?;
                 }
                 Ok(ActionResult::None)
+            }
+            RuntimeAction::IncomingPacketProcessed {
+                connection_generation,
+                has_displayable_text,
+            } => {
+                if connection_generation != self.connection_generation || !has_displayable_text {
+                    return Ok(ActionResult::None);
+                }
+                match self.pending_send_on_connect.take() {
+                    Some(action) => Ok(ActionResult::Run(vec![action])),
+                    None => Ok(ActionResult::None),
+                }
             }
             RuntimeAction::LinkTooltipChanged => {
                 self.ui_tx
@@ -1118,6 +1129,7 @@ impl Inner<'_> {
                 Ok(self.run_host_event("sys:connect", "{}"))
             }
             RuntimeAction::Disconnected => {
+                self.pending_send_on_connect = None;
                 if self
                     .connected
                     .swap(false, std::sync::atomic::Ordering::AcqRel)
