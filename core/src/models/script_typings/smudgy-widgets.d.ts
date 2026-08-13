@@ -176,59 +176,65 @@ declare module "smudgy:widgets" {
         children?: WidgetChildren;
     }
 
-    /** View-local defaults. These never modify or sync the underlying map. */
-    export interface MapViewStyle {
-        /** Multiply room coordinates while keeping room glyphs the same size. Default 1. */
-        roomSpacing?: number;
-        /** Rounded-room radius in map units, clamped to 0..0.25. */
-        roomBorderRadius?: number;
+    /** Paintable channels for individual rooms, connections, and doors. Absent fields
+     *  inherit defaultStyle, then the widget default. Colors are CSS color strings.
+     *  Nothing here modifies or syncs the underlying map. */
+    export interface MapStyle {
+        roomFill?: string;
         roomStroke?: string;
         roomStrokeWidth?: number;
+        /** Rounded-room corner radius in map units, clamped to 0..0.25. */
+        roomBorderRadius?: number;
         connectionColor?: string;
         connectionWidth?: number;
-        playerColor?: string;
-        routeColor?: string;
-        routeWidth?: number;
         doorColor?: string;
-        /** Render persisted or overlaid closed/locked door state. Default true. */
-        showDoors?: boolean;
     }
 
-    export interface MapViewRoomOverlay {
+    /** One Connection selected from either endpoint. room+direction (never ConnectionId)
+     *  disambiguates parallel Connections, reaches the visible half of outbound
+     *  cross-area links, and survives JSON store bindings. */
+    export interface MapExitRef {
         room: RoomNumber;
-        fill?: string;
-        stroke?: string;
-        strokeWidth?: number;
-    }
-
-    export interface MapViewRouteExitOverlay {
-        /** Room from which this route step leaves. */
-        room: RoomNumber;
-        /** Exit direction used by this route step. */
         direction: ExitDirection;
     }
 
-    export interface MapViewDoorOverlay {
-        connection: ConnectionId;
-        /** Override persisted state; omit either field to retain its map value. */
+    /** Associates a named style with rooms and/or exits. Later entries win
+     *  field-by-field over earlier ones and over defaultStyle. */
+    export interface MapStyleApplication {
+        /** Key into MapViewProps.styles. */
+        style: string;
+        rooms?: RoomNumber[];
+        exits?: MapExitRef[];
+        /** Optional scope; entries for other areas are ignored. Note the id-halves
+         *  caveat on {@link AreaId}: mapper-issued ids do not survive JSON store
+         *  bindings, so scope statically-authored entries or omit the field. */
+        area?: AreaId;
+    }
+
+    /** Semantic door-state override — state, not style (a door's look comes from
+     *  doorColor in the styles). Omitted fields retain the persisted map value. */
+    export interface MapDoorState {
+        exit: MapExitRef;
         closed?: boolean;
         locked?: boolean;
     }
 
-    /** Ephemeral presentation data for one MapView. Suitable for a store binding. */
-    export interface MapViewOverlay {
-        /** Ordered room numbers in the active area. Rooms and connecting links are accented. */
-        route?: RoomNumber[];
-        /** Exact route exits. When supplied, these select connections instead of room adjacency. */
-        routeExits?: MapViewRouteExitOverlay[];
-        rooms?: MapViewRoomOverlay[];
-        doors?: MapViewDoorOverlay[];
-    }
-
-    /** Props for the map view (a leaf). */
+    /** Props for the map view (a leaf). The static styles palette names each look
+     *  once; apply associates palette entries with rooms/exits and is the intended
+     *  store-bound hot path (small payloads, no re-mount, zoom/pan preserved). */
     export interface MapViewProps {
-        style?: Bindable<MapViewStyle>;
-        overlay?: Bindable<MapViewOverlay>;
+        // View-global knobs, meaningless per-item, so not in MapStyle.
+        /** Multiply room coordinates while keeping room glyphs the same size. Default 1. */
+        roomSpacing?: Bindable<number>;
+        playerColor?: Bindable<string>;
+        /** Render persisted or overridden closed/locked door state. Default true. */
+        showDoors?: Bindable<boolean>;
+
+        defaultStyle?: Bindable<MapStyle>;
+        /** The static named-style palette apply entries reference. */
+        styles?: Record<string, MapStyle>;
+        apply?: Bindable<MapStyleApplication[]>;
+        doors?: Bindable<MapDoorState[]>;
         children?: WidgetChildren;
     }
 

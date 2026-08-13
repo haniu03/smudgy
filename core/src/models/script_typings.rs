@@ -1553,10 +1553,13 @@ export function make() { return createEvent('dynamic'); }
         sources.insert(
             "ui.tsx".to_string(),
             "import { createWidget, Column, Row, Text, ProgressBar, Button, MapView } from \"smudgy:widgets\";\n\
+             import type { MapStyleApplication, MapDoorState } from \"smudgy:widgets\";\n\
              import { session, createState } from \"smudgy:core\";\n\
              interface Vitals { hp: number; maxhp: number; name: string }\n\
+             interface Gps { apply: MapStyleApplication[]; doors: MapDoorState[] }\n\
              const vitals = createState<Vitals>('vitals');\n\
              const untyped = createState('untyped');\n\
+             const gps = createState<Gps>('gps');\n\
              export function mount() {\n\
                const panel = (\n\
                  <Column spacing={4} width=\"fill\">\n\
@@ -1567,6 +1570,16 @@ export function make() { return createEvent('dynamic'); }
                    </Row>\n\
                    {false && <Text>conditional</Text>}\n\
                    <MapView />\n\
+                   <MapView\n\
+                     roomSpacing={1.25} playerColor=\"#fff\" showDoors={true}\n\
+                     defaultStyle={{ connectionColor: \"#888\" }}\n\
+                     styles={{ route: { connectionColor: \"gold\", connectionWidth: 2, roomStroke: \"gold\", roomStrokeWidth: 2 },\n\
+                               visited: { roomFill: \"#223\", roomBorderRadius: 0.2, doorColor: \"#f00\" } }}\n\
+                     apply={[{ style: \"route\", rooms: [1, 2], exits: [{ room: 1, direction: \"North\" }] },\n\
+                             { style: \"visited\", rooms: [9], area: [1, 2] }]}\n\
+                     doors={[{ exit: { room: 1, direction: \"North\" }, closed: true, locked: false }]}\n\
+                   />\n\
+                   <MapView apply={gps.bind('apply')} doors={gps.bind('doors')} roomSpacing={vitals.bind('hp')} />\n\
                  </Column>\n\
                );\n\
                createWidget(\"panel\", panel);\n\

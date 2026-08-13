@@ -21,7 +21,9 @@
  * An area's identifier. Treat it as **opaque**: take it from one mapper call and
  * pass it back to another, unchanged. **Careful:** this is not the same as the
  * UUID **string** the `map:room` event delivers; the two are not
- * interchangeable.
+ * interchangeable. Real ids carry `BigInt` halves (see {@link ConnectionId}),
+ * which `JSON.stringify` rejects — so mapper-issued ids cannot travel
+ * session-store writes or store bindings.
  */
 type AreaId = readonly [number, number];
 
@@ -36,7 +38,18 @@ type RoomNumber = number;
 
 /** An exit's identifier: a 2-element `[hi, lo]` pair, like {@link AreaId}. Opaque. */
 type ExitId = readonly [number, number];
-/** A Connection's identifier, opaque like {@link ExitId}. */
+/**
+ * A Connection's identifier, opaque like {@link ExitId}.
+ *
+ * **Careful:** the `[hi, lo]` halves are 64-bit UUID halves. Values beyond
+ * `Number.MAX_SAFE_INTEGER` (essentially always for real ids) are delivered
+ * as `BigInt`, so despite this type's spelling the halves are `bigint` at
+ * runtime. `JSON.stringify` throws on `BigInt`, which means these ids cannot
+ * travel session-store writes or store bindings, and coercing a half with
+ * `Number()` rounds it and will silently never match. Pass ids straight back
+ * to mapper calls; for widget-facing selection use room + direction exit
+ * refs instead (see `MapExitRef` in `smudgy:widgets`).
+ */
 type ConnectionId = readonly [number, number];
 /** A queued mapper mutation's identifier, opaque like {@link ExitId}. */
 type OperationId = readonly [number, number];
