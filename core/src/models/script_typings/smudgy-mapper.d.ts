@@ -20,10 +20,12 @@
 /**
  * An area's identifier. Treat it as **opaque**: take it from one mapper call and
  * pass it back to another, unchanged. **Careful:** this is not the same as the
- * UUID **string** the `map:room` event delivers; the two are not
- * interchangeable. Real ids carry `BigInt` halves (see {@link ConnectionId}),
+ * UUID **string** the `map:room` event delivers; mapper calls accept only the
+ * pair. Real ids carry `BigInt` halves (see {@link ConnectionId}),
  * which `JSON.stringify` rejects — so mapper-issued ids cannot travel
- * session-store writes or store bindings.
+ * session-store writes or store bindings. Where an area scope must ride JSON —
+ * store-bound MapView `apply` arrays — use the UUID string spelling instead:
+ * `MapStyleApplication.area` in `smudgy:widgets` accepts either form.
  */
 type AreaId = readonly [number, number];
 

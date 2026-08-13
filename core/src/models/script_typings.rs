@@ -1576,7 +1576,8 @@ export function make() { return createEvent('dynamic'); }
                      styles={{ route: { connectionColor: \"gold\", connectionWidth: 2, roomStroke: \"gold\", roomStrokeWidth: 2 },\n\
                                visited: { roomFill: \"#223\", roomBorderRadius: 0.2, doorColor: \"#f00\" } }}\n\
                      apply={[{ style: \"route\", rooms: [1, 2], exits: [{ room: 1, direction: \"North\" }] },\n\
-                             { style: \"visited\", rooms: [9], area: [1, 2] }]}\n\
+                             { style: \"visited\", rooms: [9], area: [1, 2] },\n\
+                             { style: \"visited\", rooms: [10], area: \"67e55044-10b1-426f-9247-bb680e5fe0c8\" }]}\n\
                      doors={[{ exit: { room: 1, direction: \"North\" }, closed: true, locked: false }]}\n\
                    />\n\
                    <MapView apply={gps.bind('apply')} doors={gps.bind('doors')} roomSpacing={vitals.bind('hp')} />\n\

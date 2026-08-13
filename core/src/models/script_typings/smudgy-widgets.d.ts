@@ -205,10 +205,15 @@ declare module "smudgy:widgets" {
         style: string;
         rooms?: RoomNumber[];
         exits?: MapExitRef[];
-        /** Optional scope; entries for other areas are ignored. Note the id-halves
-         *  caveat on {@link AreaId}: mapper-issued ids do not survive JSON store
-         *  bindings, so scope statically-authored entries or omit the field. */
-        area?: AreaId;
+        /** Optional scope; entries for other areas are ignored. Accepts a
+         *  mapper-issued {@link AreaId} pair or the area's canonical UUID
+         *  string. Mapper-issued pairs carry `BigInt` halves that
+         *  `JSON.stringify` rejects (the {@link AreaId} caveat), so apply
+         *  arrays written to session state must scope with the string form —
+         *  the `map:room` event's `areaId` field delivers it ready-made. An
+         *  entry whose string does not parse as a UUID is skipped (with a
+         *  one-time warning) rather than applied unscoped. */
+        area?: AreaId | string;
     }
 
     /** Semantic door-state override — state, not style (a door's look comes from
