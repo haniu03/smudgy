@@ -3551,6 +3551,14 @@ mod tests {
             })
         }
 
+        async fn create_area_at(
+            &self,
+            request: CreateAreaRequest,
+            _storage: MapStorage,
+        ) -> CloudResult<Area> {
+            self.create_area(request).await
+        }
+
         async fn list_areas(&self) -> CloudResult<Vec<Area>> {
             Ok(vec![])
         }
