@@ -15,7 +15,7 @@ import {
   Space,
   Text,
   createWidget,
-  type MapViewOverlay,
+  type MapStyleApplication,
 } from "smudgy:widgets";
 import {
   nukefire,
@@ -23,7 +23,12 @@ import {
   type CharGps,
 } from "smudgy://kapusniak/nukefire-gmcp";
 import { widgetTextSize } from "./config.ts";
-import { gpsRouteRaw, mapViewRoute, type RouteRoom } from "./map-route.ts";
+import {
+  ROUTE_STYLE,
+  gpsRouteRaw,
+  mapViewRoute,
+  type RouteRoom,
+} from "./map-route.ts";
 import { GPS_CLEAR, UI } from "./theme.ts";
 
 const PANE = "Map";
@@ -35,8 +40,8 @@ interface GpsView {
 
 const gpsView = createState<GpsView>("gpsView");
 gpsView.set({ line: "no route set", color: UI.faint });
-const gpsMapOverlay = createState<MapViewOverlay>("gpsMapOverlay");
-gpsMapOverlay.set({ route: [], routeExits: [] });
+const gpsMapApply = createState<MapStyleApplication[]>("gpsMapApply");
+gpsMapApply.set([]);
 
 let latestGps: Readonly<CharGps> | undefined;
 
@@ -54,24 +59,20 @@ function currentMappedRoom(): Room | undefined {
 function refreshGpsRoute(): void {
   const routeRaw = gpsRouteRaw(latestGps);
   if (!latestGps?.active || !routeRaw) {
-    gpsMapOverlay.set({ route: [], routeExits: [] });
+    gpsMapApply.set([]);
     return;
   }
   try {
-    const route = mapViewRoute(
+    gpsMapApply.set(mapViewRoute(
       currentMappedRoom() as RouteRoom | undefined,
       routeRaw,
       (areaId, roomNumber) =>
         mapper.getAreaById(areaId).room(roomNumber) as RouteRoom | undefined,
-    );
-    gpsMapOverlay.set({
-      route: route.rooms,
-      routeExits: route.exits,
-    });
+    ));
   } catch {
     // The mapper can be between area snapshots while movement GMCP arrives.
     // Its subsequent map:room event retries against the settled topology.
-    gpsMapOverlay.set({ route: [], routeExits: [] });
+    gpsMapApply.set([]);
   }
 }
 
@@ -106,8 +107,15 @@ function mount(): void {
         </Text>
       </Row>
       <MapView
-        style={{ routeColor: UI.gold, routeWidth: 2 }}
-        overlay={gpsMapOverlay.bind()}
+        styles={{
+          [ROUTE_STYLE]: {
+            connectionColor: UI.gold,
+            connectionWidth: 2,
+            roomStroke: UI.gold,
+            roomStrokeWidth: 2,
+          },
+        }}
+        apply={gpsMapApply.bind()}
       />
       <Row spacing={8}>
         <Text size={widgetTextSize(11)} color={UI.gold}>GPS</Text>

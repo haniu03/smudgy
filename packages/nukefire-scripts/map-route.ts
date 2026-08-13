@@ -32,7 +32,12 @@ export type RouteRoomLookup = (
   roomNumber: number,
 ) => RouteRoom | undefined;
 
-export interface ResolvedMapViewRoute {
+/** The name this module's output expects in the MapView styles palette. */
+export const ROUTE_STYLE = "route";
+
+/** One resolved application of {@link ROUTE_STYLE}, in MapView `apply` shape. */
+export interface RouteStyleApplication {
+  style: typeof ROUTE_STYLE;
   rooms: number[];
   exits: { room: number; direction: RouteDirection }[];
 }
@@ -67,11 +72,13 @@ function exitForStep(room: RouteRoom, step: string): RouteExit | undefined {
 }
 
 /**
- * Resolve NukeFire's compact GPS route against the durable Smudgy topology.
+ * Resolve NukeFire's compact GPS route against the durable Smudgy topology,
+ * in MapView `apply` shape: one {@link ROUTE_STYLE} application carrying the
+ * traversed rooms and exact exits (empty when there is no resolvable start).
  *
  * A MapView displays one area at a time, so resolution stops when the route
  * leaves the starting area or reaches topology the mapper has not learned yet.
- * The ordered rooms drive room accents; the exact source room + direction for
+ * The listed rooms drive room accents; the exact source room + direction for
  * each step selects only the traversed Connection, including Up/Down and the
  * visible end of an outbound cross-area route.
  */
@@ -79,8 +86,8 @@ export function mapViewRoute(
   start: RouteRoom | undefined,
   routeRaw: string,
   lookup: RouteRoomLookup,
-): ResolvedMapViewRoute {
-  if (!start) return { rooms: [], exits: [] };
+): RouteStyleApplication[] {
+  if (!start) return [];
   const areaId = start.area_id;
   const rooms = [start.room_number];
   const exits: { room: number; direction: RouteDirection }[] = [];
@@ -97,7 +104,7 @@ export function mapViewRoute(
     rooms.push(next.room_number);
     room = next;
   }
-  return { rooms, exits };
+  return [{ style: ROUTE_STYLE, rooms, exits }];
 }
 
 /** Accept the live `route_raw` spelling and the older GMCP package's `route`. */

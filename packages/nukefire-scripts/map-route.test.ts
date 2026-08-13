@@ -39,7 +39,8 @@ test("walks compact GPS directions through cardinal and vertical topology", () =
   ]);
   assert.deepEqual(
     mapViewRoute(rooms.get(1), "neud", (_area, number) => rooms.get(number)),
-    {
+    [{
+      style: "route",
       rooms: [1, 2, 3, 4, 5],
       exits: [
         { room: 1, direction: "North" },
@@ -47,7 +48,7 @@ test("walks compact GPS directions through cardinal and vertical topology", () =
         { room: 3, direction: "Up" },
         { room: 4, direction: "Down" },
       ],
-    },
+    }],
   );
 });
 
@@ -59,7 +60,11 @@ test("prefers an explicit one-letter traversal command", () => {
   ]);
   assert.deepEqual(
     mapViewRoute(rooms.get(1), "n", (_area, number) => rooms.get(number)),
-    { rooms: [1, 3], exits: [{ room: 1, direction: "Special" }] },
+    [{
+      style: "route",
+      rooms: [1, 3],
+      exits: [{ room: 1, direction: "Special" }],
+    }],
   );
 });
 
@@ -67,8 +72,16 @@ test("includes the outbound connection when leaving the active MapView area", ()
   const start = room(1, [exit("East", 9, null, OTHER_AREA)]);
   assert.deepEqual(
     mapViewRoute(start, "e", () => undefined),
-    { rooms: [1], exits: [{ room: 1, direction: "East" }] },
+    [{
+      style: "route",
+      rooms: [1],
+      exits: [{ room: 1, direction: "East" }],
+    }],
   );
+});
+
+test("yields no applications without a resolvable start room", () => {
+  assert.deepEqual(mapViewRoute(undefined, "n", () => undefined), []);
 });
 
 test("supports route_raw while retaining compatibility with route", () => {
