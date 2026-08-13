@@ -314,11 +314,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deprecated
 
-- Creating a map with the `ephemeral` flag — or with no storage choice
-  at all, the old implicit default — is deprecated in favor of an
-  explicit `storage` tier (`"session"` replaces `ephemeral: true`), as
-  is the `isEphemeral` read (use `storage === "session"`). The old forms
-  keep working through 0.5.x and are removed in 0.6.0.
+- Creating a map with the `ephemeral` flag is deprecated in favor of an
+  explicit `storage: "session"`, as is the `isEphemeral` read (use
+  `storage === "session"`). Both keep working through 0.5.x and are
+  removed in 0.6.0. Creating a map with no storage choice at all remains
+  fully supported: it saves to the cloud when signed in and to this
+  device when not.
 
 ### Fixed
 
