@@ -12,8 +12,8 @@ import {
   Button,
   Column,
   Container,
-  Modal,
   Row,
+  Scrollable,
   Text,
   createWidget,
   removeWidget,
@@ -44,6 +44,8 @@ const PANE = "Comms";
 const TABS_WIDGET = "nf-comms-tabs";
 const BUFFER = 250;
 const ALL = "all";
+const SELECTOR_HEIGHT = 34;
+const CHANNEL_MENU_HEIGHT = 260;
 const CHANNEL_TABS = [
   ALL,
   "gossip",
@@ -259,21 +261,21 @@ function channelOption(channel: string) {
 
 function channelMenu() {
   if (!channelMenuOpen) return null;
-  const dismiss = () => {
-    channelMenuOpen = false;
-    mountTabs();
-  };
   return (
-    <Modal onDismiss={dismiss}>
-      <Container background={themeBackground.bind()}>
+    <Container
+      width={widgetMetric(240)}
+      height={widgetMetric(CHANNEL_MENU_HEIGHT)}
+      background={themeBackground.bind()}
+    >
+      <Scrollable width="fill" height="fill">
         <Column width={widgetMetric(240)} padding={8} spacing={3}>
           {[
             <Text size={widgetTextSize(12)} color={UI.header}>Comms channel</Text>,
             ...CHANNEL_TABS.map(channelOption),
           ]}
         </Column>
-      </Container>
-    </Modal>
+      </Scrollable>
+    </Container>
   );
 }
 
@@ -300,9 +302,13 @@ function mountTabs(): void {
   if (!pane) return;
   createWidget(
     TABS_WIDGET,
-    <Container width="fill" height={widgetMetric(34)} background={themeBackground.bind()}>
+    <Container
+      width="fill"
+      height={widgetMetric(SELECTOR_HEIGHT + (channelMenuOpen ? CHANNEL_MENU_HEIGHT : 0))}
+      background={themeBackground.bind()}
+    >
       <Column width="fill" height="fill" spacing={0}>
-        <Row height={widgetMetric(34)} spacing={6} padding={3}>
+        <Row height={widgetMetric(SELECTOR_HEIGHT)} spacing={6} padding={3}>
           <Button
             variant="subtle"
             onPress={() => {
@@ -311,7 +317,7 @@ function mountTabs(): void {
             }}
           >
             <Text size={widgetTextSize(10)} color={channelColor(selected)}>
-              {selected.toUpperCase()} ▾
+              {selected.toUpperCase()} {channelMenuOpen ? "▴" : "▾"}
             </Text>
           </Button>
           <Text size={widgetTextSize(9)} color={UI.dim}>{inputHint()}</Text>
