@@ -870,6 +870,22 @@ pub struct Inner {
     /// pending-queue order. This becomes the write-ahead journal boundary:
     /// cache order and replay order must never diverge.
     mutation_gate: Mutex<()>,
+    /// Room numbers handed out to open scripted mutators but not yet
+    /// occupied by a committed room (see [`Mapper::reserve_room_number`]).
+    /// Every ambient allocation path consults this through
+    /// [`Mapper::next_room_number`] so a draft and a concurrent create can
+    /// never receive the same number.
+    room_reservations: Mutex<HashMap<AreaId, RoomReservations>>,
+}
+
+/// Per-area reservation state: the next number a reservation would take and
+/// the tokens (one per open mutator) holding numbers below it. The entry is
+/// dropped when the last holder releases, returning allocation to the cache
+/// maximum — an aborted mutator's numbers become available again.
+#[derive(Debug, Default)]
+struct RoomReservations {
+    floor: i32,
+    holders: HashMap<Uuid, u32>,
 }
 
 /// The outcome of a presence-checked import: what was added and what was
@@ -959,6 +975,7 @@ impl Mapper {
             initial_load: tokio::sync::watch::channel(None).0,
             import_gate: tokio::sync::Mutex::new(()),
             mutation_gate: Mutex::new(()),
+            room_reservations: Mutex::new(HashMap::new()),
         };
 
         let mapper = Self {
@@ -1158,6 +1175,64 @@ impl Mapper {
             MapStorage::Local
         } else {
             MapStorage::Cloud
+        }
+    }
+
+    /// The next free room number for an area, skipping numbers reserved by
+    /// open scripted mutators. Every ambient creation path (script
+    /// `createRoom`, the map editor's place/paste gestures) must allocate
+    /// through this rather than the raw cache maximum, or a concurrent
+    /// mutator draft and the ambient create would silently merge into one
+    /// room. Returns `None` when the area is not loaded.
+    #[must_use]
+    pub fn next_room_number(&self, area_id: &AreaId) -> Option<RoomNumber> {
+        let base = self
+            .inner
+            .atlas_cache
+            .load()
+            .get_area(area_id)?
+            .next_room_number()
+            .0;
+        let reservations = self.inner.room_reservations.lock();
+        let floor = reservations.get(area_id).map_or(base, |state| state.floor);
+        Some(RoomNumber(base.max(floor)))
+    }
+
+    /// Reserve the next free room number for an open scripted mutator.
+    /// The number is provisional: no room exists until the mutator's batch
+    /// commits, but ambient allocation skips it until every reservation
+    /// held under `token` is released. Releasing without committing (an
+    /// aborted mutator) returns the numbers to the allocator.
+    ///
+    /// # Errors
+    /// [`CloudError::AreaNotFound`] when the area is not loaded.
+    pub fn reserve_room_number(&self, area_id: &AreaId, token: Uuid) -> CloudResult<RoomNumber> {
+        let base = self
+            .inner
+            .atlas_cache
+            .load()
+            .get_area(area_id)
+            .ok_or(CloudError::AreaNotFound(*area_id))?
+            .next_room_number()
+            .0;
+        let mut reservations = self.inner.room_reservations.lock();
+        let state = reservations.entry(*area_id).or_default();
+        let number = base.max(state.floor);
+        state.floor = number + 1;
+        *state.holders.entry(token).or_insert(0) += 1;
+        Ok(RoomNumber(number))
+    }
+
+    /// Release every room-number reservation held under `token` for an
+    /// area. Idempotent; when the last holder releases, allocation falls
+    /// back to the cache maximum.
+    pub fn release_room_reservations(&self, area_id: &AreaId, token: Uuid) {
+        let mut reservations = self.inner.room_reservations.lock();
+        if let Some(state) = reservations.get_mut(area_id) {
+            state.holders.remove(&token);
+            if state.holders.is_empty() {
+                reservations.remove(area_id);
+            }
         }
     }
 
@@ -5749,4 +5824,57 @@ mod tests {
         drop(fences);
     }
 
+    /// Numbers drafted by an open scripted mutator are reserved against the
+    /// live allocator: an ambient create landing mid-callback takes the next
+    /// number past the drafts instead of silently merging with one, and an
+    /// aborted mutator returns its numbers.
+    #[tokio::test]
+    async fn ambient_creates_skip_room_numbers_reserved_by_open_mutators() {
+        let a_id = AreaId(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![sample_area(a_id, "Plaza")]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+
+        // The sample area holds room 1; two mutator drafts reserve 2 and 3.
+        let token = Uuid::new_v4();
+        assert_eq!(
+            mapper.reserve_room_number(&a_id, token).expect("reserve"),
+            RoomNumber(2)
+        );
+        assert_eq!(
+            mapper.reserve_room_number(&a_id, token).expect("reserve"),
+            RoomNumber(3)
+        );
+
+        // The ambient allocator skips the drafted range.
+        let ambient = mapper.next_room_number(&a_id).expect("area loaded");
+        assert_eq!(ambient, RoomNumber(4), "ambient create lands past the drafts");
+        mapper
+            .upsert_room(RoomKey::new(a_id, ambient), RoomUpdates::default())
+            .expect("enqueue ambient room");
+        wait_until(|| matches!(mapper.area_save_status(a_id), AreaSaveStatus::Saved)).await;
+
+        // Later drafts continue past the ambient room; a second open mutator
+        // holds its own reservations.
+        assert_eq!(
+            mapper.reserve_room_number(&a_id, token).expect("reserve"),
+            RoomNumber(5)
+        );
+        let other = Uuid::new_v4();
+        assert_eq!(
+            mapper.reserve_room_number(&a_id, other).expect("reserve"),
+            RoomNumber(6)
+        );
+
+        // Releasing one mutator keeps the other's range guarded; releasing
+        // the last returns allocation to the cache maximum.
+        mapper.release_room_reservations(&a_id, token);
+        assert_eq!(mapper.next_room_number(&a_id), Some(RoomNumber(7)));
+        mapper.release_room_reservations(&a_id, other);
+        assert_eq!(
+            mapper.next_room_number(&a_id),
+            Some(RoomNumber(5)),
+            "an aborted mutator's numbers become available again"
+        );
+    }
 }

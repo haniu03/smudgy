@@ -352,6 +352,15 @@ interface LinkCreateArgs extends ConnectionUpdates {
 /** Callback-scoped collector used by {@link Mapper.mutateArea}. Calls update a
  * callback-local draft and are submitted only after the callback completes. */
 interface AreaMutator {
+    /**
+     * Draft a room under a number reserved from the live allocator: ambient
+     * creators in this client (`mapper.createRoom`, the map editor, other
+     * open mutators) skip reserved numbers, so a create landing while the
+     * callback is open cannot collide with the draft. The number is
+     * provisional (the room exists only once the mutation commits), and the
+     * reservation is released when the callback finishes or aborts, so an
+     * aborted draft's numbers become available again.
+     */
     createRoom(params: CreateRoomParams): Promise<RoomNumber>;
     updateRoom(room: Room | RoomNumber, fields: UpdateRoomParams): Promise<void>;
     updateRooms(updates: [RoomNumber, UpdateRoomParams][]): Promise<void>;
@@ -519,9 +528,13 @@ interface Mapper {
     getAreaById(id: AreaId): Area;
     /**
      * Collect related writes to one area and submit them in the fewest practical ordered
-     * envelopes. Each emitted envelope is atomic, but the whole callback is a best-effort
-     * batch: oversized work may be split and earlier acknowledged envelopes are not rolled
-     * back if a later envelope fails. If the callback throws, nothing is submitted.
+     * envelopes. The whole callback is validated and durably staged before anything is
+     * published, so a locally invalid batch submits nothing, even when oversized work is
+     * split into several envelopes. Each envelope is atomic at the backend; acknowledged
+     * envelopes are never rolled back, so if a later envelope fails after earlier ones
+     * were accepted, the thrown `Error` carries the acknowledged prefix on its
+     * `committedOperations` property (an `OperationId[]`). If the callback throws,
+     * nothing is submitted.
      */
     mutateArea(
         area: Area | AreaId,

@@ -1413,7 +1413,11 @@ impl MapEditorWindow {
             ));
             return;
         };
-        let new_number = area.next_room_number();
+        // Reservation-aware: skips numbers held by open scripted mutators.
+        let new_number = self
+            .mapper
+            .next_room_number(&draft.area_id)
+            .unwrap_or_else(|| area.next_room_number());
         let Some((_, mut draft, old_number)) = self.recovering_new_room_link.take() else {
             return;
         };
@@ -1460,7 +1464,12 @@ impl MapEditorWindow {
                 let Some(area) = atlas.get_area(&area_id) else {
                     return Update::none();
                 };
-                let room_number = area.next_room_number();
+                // Reservation-aware: skips numbers held by open scripted
+                // mutators.
+                let room_number = self
+                    .mapper
+                    .next_room_number(&area_id)
+                    .unwrap_or_else(|| area.next_room_number());
                 let update = self.push_command(Some(commands::create_room(
                     area_id,
                     room_number,
@@ -1501,7 +1510,10 @@ impl MapEditorWindow {
                             return Update::none();
                         };
                         commands::NewExitTarget::NewRoom {
-                            room_number: area.next_room_number(),
+                            room_number: self
+                                .mapper
+                                .next_room_number(&area_id)
+                                .unwrap_or_else(|| area.next_room_number()),
                             at,
                             level: self.editor.level(),
                         }
@@ -1781,6 +1793,9 @@ impl MapEditorWindow {
             &clipboard,
             self.editor.level(),
             offset,
+            // Reservation-aware allocation base: skips numbers held by open
+            // scripted mutators.
+            self.mapper.next_room_number(&area_id),
         );
         if skipped_connections > 0 {
             self.editor_notice = Some((
