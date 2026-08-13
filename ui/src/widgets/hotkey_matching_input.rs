@@ -199,14 +199,43 @@ where
     }
 }
 
-#[derive(Default)]
 struct State {
     /// Whether the wrapped input held focus as of the previous event, so a
     /// focused→unfocused edge can fire `on_unfocus` exactly once.
     was_focused: bool,
+    /// iced retains a text input's internal focus when its OS window becomes
+    /// inactive. Track the window half separately so effective focus loses
+    /// and regains an edge across an OS focus round trip.
+    window_focused: bool,
     /// The caret state as of the previous event, so `on_caret_change` fires
     /// only on an actual change.
     last_caret: Option<CaretState>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            was_focused: false,
+            // A newly mounted widget receives no initial window-state query;
+            // the hosting window is the safe default until an Unfocused event.
+            window_focused: true,
+            last_caret: None,
+        }
+    }
+}
+
+impl State {
+    fn observe_window_event(&mut self, event: &iced::Event) {
+        match event {
+            iced::Event::Window(iced::window::Event::Focused) => self.window_focused = true,
+            iced::Event::Window(iced::window::Event::Unfocused) => self.window_focused = false,
+            _ => {}
+        }
+    }
+
+    fn effective_focus(&self, widget_focused: bool) -> bool {
+        self.window_focused && widget_focused
+    }
 }
 
 impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -358,29 +387,26 @@ where
             viewport,
         );
 
-        // Publish focus transitions after the wrapped widget processes the
-        // event. `on_unfocus` also fires when the OS window loses focus:
-        //  (a) the focused→unfocused edge — a click away, Escape, or a focus
-        //      operation pointing elsewhere, after which `is_focused` is None;
-        //  (b) the OS window losing focus while the input still holds it. iced
-        //      keeps `is_focused` Some on `Window::Unfocused` (only an internal
-        //      blink flag flips), so the edge in (a) never trips when the user
-        //      alt-tabs to another application — so match that event directly.
+        // Publish effective focus transitions after the wrapped widget
+        // processes the event. iced keeps the child internally focused while
+        // its OS window is inactive, so window focus is an explicit half of
+        // the state; this produces both the alt-tab loss and matching gain.
         if self.on_focus.is_some() || self.on_unfocus.is_some() {
-            let now_focused = tree.children[0]
+            let widget_focused = tree.children[0]
                 .state
                 .downcast_ref::<text_input::State<Renderer::Paragraph>>()
                 .is_focused();
-            let window_blurred =
-                matches!(event, iced::Event::Window(iced::window::Event::Unfocused));
             let state = tree.state.downcast_mut::<State>();
+            state.observe_window_event(event);
+            let now_focused = state.effective_focus(widget_focused);
             if !state.was_focused
                 && now_focused
                 && let Some(on_focus) = self.on_focus.as_ref()
             {
                 shell.publish(on_focus.clone());
             }
-            if ((state.was_focused && !now_focused) || (window_blurred && now_focused))
+            if state.was_focused
+                && !now_focused
                 && let Some(on_unfocus) = self.on_unfocus.as_ref()
             {
                 shell.publish(on_unfocus.clone());
@@ -392,16 +418,19 @@ where
         // plus the raw cursor, published as-is (see [`CaretState`]). Only a
         // change publishes, so idle event traffic costs one compare.
         if let Some(on_caret_change) = self.on_caret_change.as_ref() {
-            let caret = {
+            let (widget_focused, cursor) = {
                 let input_state = tree.children[0]
                     .state
                     .downcast_ref::<text_input::State<Renderer::Paragraph>>();
-                CaretState {
-                    focused: input_state.is_focused(),
-                    cursor: input_state.cursor(),
-                }
+                (input_state.is_focused(), input_state.cursor())
             };
             let state = tree.state.downcast_mut::<State>();
+            // Keep this path correct even when no focus callbacks were bound.
+            state.observe_window_event(event);
+            let caret = CaretState {
+                focused: state.effective_focus(widget_focused),
+                cursor,
+            };
             if state.last_caret != Some(caret) {
                 state.last_caret = Some(caret);
                 shell.publish(on_caret_change(caret));
@@ -425,6 +454,24 @@ where
 mod tests {
     use super::*;
     use iced::keyboard::key::{Code, Physical};
+
+    #[test]
+    fn effective_focus_round_trips_with_the_os_window() {
+        let mut state = State::default();
+        assert!(state.effective_focus(true));
+
+        state.observe_window_event(&iced::Event::Window(iced::window::Event::Unfocused));
+        assert!(
+            !state.effective_focus(true),
+            "internal widget focus is inactive with the window"
+        );
+
+        state.observe_window_event(&iced::Event::Window(iced::window::Event::Focused));
+        assert!(
+            state.effective_focus(true),
+            "reactivating the window restores effective input focus"
+        );
+    }
 
     /// The clipboard-write gate `suppress_clipboard_writes` hangs on: copy
     /// and cut (command-modified) are write shortcuts; paste and unmodified

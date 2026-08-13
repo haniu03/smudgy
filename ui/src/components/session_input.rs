@@ -8,7 +8,7 @@ use crate::terminal_buffer::TerminalBuffer;
 use crate::theme::{Element, builtins};
 use crate::update::Update;
 use crate::widgets::hotkey_matching_input::{CaretState, HotkeyMatchingInput};
-use iced::advanced::widget::operation::{Focusable, Operation};
+use iced::advanced::widget::operation::{Focusable, Operation, Outcome};
 use iced::widget::{Id, Space, operation, row, text_input};
 use iced::{Alignment, Length, Task, keyboard};
 use smudgy_core::models::hotkeys::HotkeyDefinition;
@@ -52,23 +52,34 @@ fn utf16_to_grapheme(value: &str, utf16: usize) -> usize {
 /// moved on to another widget, this lands on nothing.
 struct UnfocusTarget {
     target: Id,
+    found: bool,
 }
 
-impl<T> Operation<T> for UnfocusTarget {
+impl Operation<bool> for UnfocusTarget {
     fn focusable(&mut self, id: Option<&Id>, _bounds: iced::Rectangle, state: &mut dyn Focusable) {
         if id == Some(&self.target) {
+            self.found = true;
             state.unfocus();
         }
     }
 
-    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<T>)) {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<bool>)) {
         operate(self);
+    }
+
+    fn finish(&self) -> Outcome<bool> {
+        Outcome::Some(self.found)
     }
 }
 
-/// A [`Task`] running [`UnfocusTarget`] against `target`.
-pub fn unfocus_target<T: Send + 'static>(target: Id) -> Task<T> {
-    iced::advanced::widget::operate(UnfocusTarget { target })
+/// Run [`UnfocusTarget`] against `target`, reporting whether the widget was
+/// actually found. This lets the model publish focus loss after the operation
+/// instead of waiting for another event that an obscured tab may never see.
+pub fn unfocus_target(target: Id) -> Task<bool> {
+    iced::advanced::widget::operate(UnfocusTarget {
+        target,
+        found: false,
+    })
 }
 
 /// An [`Operation`] that gives focus to exactly the widget carrying
@@ -79,11 +90,13 @@ pub fn unfocus_target<T: Send + 'static>(target: Id) -> Task<T> {
 /// caret position and selection for no state change.
 struct FocusTarget {
     target: Id,
+    found: bool,
 }
 
-impl<T> Operation<T> for FocusTarget {
+impl Operation<bool> for FocusTarget {
     fn focusable(&mut self, id: Option<&Id>, _bounds: iced::Rectangle, state: &mut dyn Focusable) {
         if id == Some(&self.target) {
+            self.found = true;
             if !state.is_focused() {
                 state.focus();
             }
@@ -92,15 +105,22 @@ impl<T> Operation<T> for FocusTarget {
         }
     }
 
-    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<T>)) {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<bool>)) {
         operate(self);
+    }
+
+    fn finish(&self) -> Outcome<bool> {
+        Outcome::Some(self.found)
     }
 }
 
 /// A [`Task`] running [`FocusTarget`] against `target` — the caret-friendly
 /// focus transfer for chrome-driven moves (tab selection, activation).
-pub fn focus_target<T: Send + 'static>(target: Id) -> Task<T> {
-    iced::advanced::widget::operate(FocusTarget { target })
+pub fn focus_target(target: Id) -> Task<bool> {
+    iced::advanced::widget::operate(FocusTarget {
+        target,
+        found: false,
+    })
 }
 
 fn effective_font_size(pane_font_size: Option<f32>, global_font_size: f32) -> f32 {
@@ -241,6 +261,10 @@ pub enum Message {
     FocusLost,
     /// The input gained focus; the parent clears stale terminal link focus.
     FocusGained,
+    /// A targeted widget operation completed. `found` distinguishes a real
+    /// focus mutation (or an already-satisfied target) from an unlaid/stale
+    /// target that the operation could not reach.
+    FocusSettled { focused: bool, found: bool },
     /// Escape pressed in a pane input: hand focus back to the main input.
     EscapePressed,
     /// The widget's caret (focus/cursor) changed.
@@ -421,8 +445,19 @@ impl SessionInput {
     /// Idempotent across repeated switches while no blur has landed.
     pub fn note_obscured(&mut self) {
         self.obscured_blur_pending = true;
-        self.caret.focused = false;
+        self.note_focus_state(false);
+    }
+
+    /// Reconcile the component-side focus mirror after an explicit widget
+    /// operation. A successful focus gain also settles any deferred obscure:
+    /// the input returned before its hidden subtree could publish the blur,
+    /// so that stale marker must not excuse a later genuine focus loss.
+    pub fn note_focus_state(&mut self, focused: bool) {
+        self.caret.focused = focused;
         self.last_source = InputSource::Other;
+        if focused {
+            self.obscured_blur_pending = false;
+        }
     }
 
     /// Register a new hotkey with the given ID
@@ -866,13 +901,23 @@ impl SessionInput {
             }
             InputOp::Focus => {
                 self.pending_caret_echo = Some(InputSource::Script);
-                Update::with_task(operation::focus(self.input_id.clone()))
+                Update::with_task(focus_target(self.input_id.clone()).map(|found| {
+                    Message::FocusSettled {
+                        focused: true,
+                        found,
+                    }
+                }))
             }
             InputOp::Blur => {
                 // Targeted: only this input is released, and only if it still
                 // holds focus — never whatever else focus moved on to.
                 self.pending_caret_echo = Some(InputSource::Script);
-                Update::with_task(unfocus_target(self.input_id.clone()))
+                Update::with_task(unfocus_target(self.input_id.clone()).map(|found| {
+                    Message::FocusSettled {
+                        focused: false,
+                        found,
+                    }
+                }))
             }
             InputOp::Submit => self.submit(),
             InputOp::HistoryPush(text) => {
@@ -960,6 +1005,17 @@ impl SessionInput {
                 Update::none()
             }
             Message::FocusGained => Update::with_event(Event::FocusGained),
+            Message::FocusSettled { focused, found } => {
+                if !found {
+                    return Update::none();
+                }
+                self.note_focus_state(focused);
+                if focused {
+                    Update::with_event(Event::FocusGained)
+                } else {
+                    Update::none()
+                }
+            }
             Message::HotkeyTriggered(hotkey_id) => {
                 Update::with_event(Event::HotkeyTriggered(hotkey_id))
             }
@@ -992,7 +1048,12 @@ impl SessionInput {
                 self.pending_caret_echo = Some(InputSource::Other);
                 // Clicking the eye moved focus onto the button; hand it
                 // straight back so typing continues without a re-click.
-                Update::with_task(operation::focus(self.input_id.clone()))
+                Update::with_task(focus_target(self.input_id.clone()).map(|found| {
+                    Message::FocusSettled {
+                        focused: true,
+                        found,
+                    }
+                }))
             }
         }
     }
@@ -1165,10 +1226,11 @@ mod tests {
         let other = Id::unique();
         let mut op = UnfocusTarget {
             target: target.clone(),
+            found: false,
         };
 
         let mut unrelated = FakeFocusable { focused: true };
-        Operation::<()>::focusable(
+        Operation::<bool>::focusable(
             &mut op,
             Some(&other),
             iced::Rectangle::default(),
@@ -1177,17 +1239,18 @@ mod tests {
         assert!(unrelated.focused, "an unrelated widget keeps focus");
 
         let mut anonymous = FakeFocusable { focused: true };
-        Operation::<()>::focusable(&mut op, None, iced::Rectangle::default(), &mut anonymous);
+        Operation::<bool>::focusable(&mut op, None, iced::Rectangle::default(), &mut anonymous);
         assert!(anonymous.focused, "an id-less widget keeps focus");
 
         let mut targeted = FakeFocusable { focused: true };
-        Operation::<()>::focusable(
+        Operation::<bool>::focusable(
             &mut op,
             Some(&target),
             iced::Rectangle::default(),
             &mut targeted,
         );
         assert!(!targeted.focused, "the target is released");
+        assert!(matches!(op.finish(), Outcome::Some(true)));
     }
 
     /// The focus-transfer operation focuses the target and releases every
@@ -1218,13 +1281,14 @@ mod tests {
         let other = Id::unique();
         let mut op = FocusTarget {
             target: target.clone(),
+            found: false,
         };
 
         let mut unfocused_target = FakeFocusable {
             focused: false,
             focus_calls: 0,
         };
-        Operation::<()>::focusable(
+        Operation::<bool>::focusable(
             &mut op,
             Some(&target),
             iced::Rectangle::default(),
@@ -1237,7 +1301,7 @@ mod tests {
             focused: true,
             focus_calls: 0,
         };
-        Operation::<()>::focusable(
+        Operation::<bool>::focusable(
             &mut op,
             Some(&target),
             iced::Rectangle::default(),
@@ -1253,13 +1317,58 @@ mod tests {
             focused: true,
             focus_calls: 0,
         };
-        Operation::<()>::focusable(
+        Operation::<bool>::focusable(
             &mut op,
             Some(&other),
             iced::Rectangle::default(),
             &mut holder,
         );
         assert!(!holder.focused, "every other focusable is released");
+        assert!(matches!(op.finish(), Outcome::Some(true)));
+    }
+
+    /// An Aâ†’Bâ†’A tab round trip can complete entirely through widget
+    /// operations, without either hidden input receiving a normal event.
+    /// Operation settlement must therefore restore the target's focus mirror
+    /// and retire the old obscure marker; otherwise A misses its second gain
+    /// and its next genuine blur is incorrectly excused.
+    #[test]
+    fn tab_round_trip_focus_settlement_restores_exactly_one_active_input() {
+        assert_eq!(
+            crate::prefs::current().command_input_behavior,
+            CommandInputBehavior::SelectAllClearOnBlur,
+            "precondition: the default preference is in force"
+        );
+        let mut a = SessionInput::new();
+        let mut b = SessionInput::new();
+        let _ = a.update(Message::InputChanged("unfinished command".to_string()));
+        a.note_focus_state(true);
+
+        // A â†’ B: window selection publishes A's synthetic loss, then the
+        // successful focus operation settles B's gain.
+        a.note_obscured();
+        let b_gain = b.update(Message::FocusSettled {
+            focused: true,
+            found: true,
+        });
+        assert!(matches!(b_gain.event, Some(Event::FocusGained)));
+        assert!(!a.mirror_snapshot().focused);
+        assert!(b.mirror_snapshot().focused);
+
+        // B â†’ A before A ever receives its deferred widget blur. Settlement
+        // is authoritative and clears A's obsolete obscure marker.
+        b.note_obscured();
+        let a_gain = a.update(Message::FocusSettled {
+            focused: true,
+            found: true,
+        });
+        assert!(matches!(a_gain.event, Some(Event::FocusGained)));
+        assert!(a.mirror_snapshot().focused);
+        assert!(!b.mirror_snapshot().focused);
+
+        // The next blur is real, so the default behavior clears the line.
+        let _ = a.update(Message::FocusLost);
+        assert_eq!(a.value(), "");
     }
 
     /// Switching tabs must preserve every input's text — TabHost keeps
