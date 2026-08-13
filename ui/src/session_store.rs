@@ -16,8 +16,7 @@ use crate::terminal_buffer::{LinkClickEvent, LinkProtocolState, TerminalBuffer};
 use crate::theme::Element;
 use crate::widgets::split_terminal_pane;
 use iced::widget::{
-    button, center, checkbox, column, container, mouse_area, opaque, operation, row, space, stack,
-    svg, text,
+    button, center, checkbox, column, container, mouse_area, opaque, row, space, stack, svg, text,
 };
 use iced::{Alignment, Border, Color, Length, Padding, Subscription, Task};
 use log::info;
@@ -119,6 +118,38 @@ impl SessionStore {
 
     pub fn iter(&self) -> impl Iterator<Item = (SessionId, &ManagedSession)> {
         self.sessions.iter().map(|(id, session)| (*id, session))
+    }
+
+    /// Reconcile the application-wide input-focus invariant. A successful
+    /// focus gain belongs to exactly one session input, so publish loss for
+    /// every other input before publishing the target's gain. A focus loss
+    /// only changes its named input; it must not guess which input receives
+    /// focus next.
+    pub fn note_input_focus(&mut self, session_id: SessionId, key: PaneKey, focused: bool) -> bool {
+        if !focused {
+            return self
+                .sessions
+                .get_mut(&session_id)
+                .is_some_and(|session| session.note_input_focus_state(key, false));
+        }
+
+        let target_exists = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.input_for(key).is_some());
+        if !target_exists {
+            return false;
+        }
+
+        for (other_id, session) in &mut self.sessions {
+            if *other_id != session_id {
+                session.clear_input_focus();
+            }
+        }
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.focus_only_input(key);
+        }
+        true
     }
 
     /// Collect and clear every session's workspace-dirty mark (connection-
@@ -325,6 +356,32 @@ pub enum Message {
     LinkConfirmProceed,
     /// Dismiss the pending server link without acting.
     LinkConfirmCancel,
+}
+
+impl Message {
+    /// The input-focus edge carried by this session message, if any. Window
+    /// chrome uses the edge before delegating the message so a user click and
+    /// an explicit widget operation both update activation through the same
+    /// path.
+    pub fn input_focus_change(&self) -> Option<(PaneKey, bool)> {
+        fn focused(message: &session_input::Message) -> Option<bool> {
+            match message {
+                session_input::Message::FocusGained => Some(true),
+                session_input::Message::FocusLost => Some(false),
+                session_input::Message::FocusSettled {
+                    focused,
+                    found: true,
+                } => Some(*focused),
+                _ => None,
+            }
+        }
+
+        match self {
+            Self::Input(message) => focused(message).map(|focused| (MAIN_PANE_KEY, focused)),
+            Self::PaneInput(key, message) => focused(message).map(|focused| (*key, focused)),
+            _ => None,
+        }
+    }
 }
 
 /// The unit a per-server cloud-map scope association is written against, mirrored
@@ -1375,7 +1432,12 @@ impl ManagedSession {
             }
             session_input::Event::FocusMain => {
                 self.note_command_input_focus(MAIN_PANE_KEY);
-                operation::focus(self.input.input_id())
+                session_input::focus_target(self.input.input_id()).map(|found| {
+                    Message::Input(session_input::Message::FocusSettled {
+                        focused: true,
+                        found,
+                    })
+                })
             }
         }
     }
@@ -1426,6 +1488,47 @@ impl ManagedSession {
         } else {
             self.panes.get(&key).and_then(|pane| pane.input.as_ref())
         }
+    }
+
+    fn input_for_mut(&mut self, key: PaneKey) -> Option<&mut session_input::SessionInput> {
+        if key == MAIN_PANE_KEY {
+            Some(&mut self.input)
+        } else {
+            self.panes
+                .get_mut(&key)
+                .and_then(|pane| pane.input.as_mut())
+        }
+    }
+
+    /// Set one input's model-side focus state and publish the mirror edge.
+    /// The widget tree is deliberately not touched here: this is the
+    /// authoritative completion/observation half of an iced focus change.
+    fn note_input_focus_state(&mut self, key: PaneKey, focused: bool) -> bool {
+        let Some(input) = self.input_for_mut(key) else {
+            return false;
+        };
+        input.note_focus_state(focused);
+        self.sync_input_mirror(key);
+        true
+    }
+
+    fn clear_input_focus(&mut self) {
+        let mut keys = self.pane_input_keys();
+        keys.push(MAIN_PANE_KEY);
+        for key in keys {
+            self.note_input_focus_state(key, false);
+        }
+    }
+
+    fn focus_only_input(&mut self, target: PaneKey) {
+        let mut keys = self.pane_input_keys();
+        keys.push(MAIN_PANE_KEY);
+        for key in keys {
+            if key != target {
+                self.note_input_focus_state(key, false);
+            }
+        }
+        self.note_input_focus_state(target, true);
     }
 
     /// The exact widget id for the input hosted by `key`, if any. Window
@@ -1613,14 +1716,26 @@ impl ManagedSession {
                 let Some(pane) = self.panes.get(&key) else {
                     return Task::none();
                 };
-                let Some(input) = pane.input.as_ref() else {
+                let Some(input_id) = pane
+                    .input
+                    .as_ref()
+                    .map(session_input::SessionInput::input_id)
+                else {
                     return Task::none();
                 };
                 if pane.selection.borrow().blocks_focus() {
                     Task::none()
                 } else {
                     self.note_command_input_focus(key);
-                    operation::focus(input.input_id())
+                    session_input::focus_target(input_id).map(move |found| {
+                        Message::PaneInput(
+                            key,
+                            session_input::Message::FocusSettled {
+                                focused: true,
+                                found,
+                            },
+                        )
+                    })
                 }
             }
             Message::SessionEvent(event) => {
@@ -1966,7 +2081,12 @@ impl ManagedSession {
                     Task::none()
                 } else {
                     self.note_command_input_focus(MAIN_PANE_KEY);
-                    operation::focus(self.input.input_id())
+                    session_input::focus_target(self.input.input_id()).map(|found| {
+                        Message::Input(session_input::Message::FocusSettled {
+                            focused: true,
+                            found,
+                        })
+                    })
                 }
             }
             Message::Disconnect => {
@@ -2409,6 +2529,35 @@ fn migrate_global_local_maps(legacy: &Path, server_local_dirs: &[PathBuf]) {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn input_focus_edges_are_visible_to_window_and_daemon_routers() {
+        assert_eq!(
+            Message::Input(session_input::Message::FocusGained).input_focus_change(),
+            Some((MAIN_PANE_KEY, true))
+        );
+        assert_eq!(
+            Message::Input(session_input::Message::FocusLost).input_focus_change(),
+            Some((MAIN_PANE_KEY, false))
+        );
+        assert_eq!(
+            Message::Input(session_input::Message::FocusSettled {
+                focused: true,
+                found: true,
+            })
+            .input_focus_change(),
+            Some((MAIN_PANE_KEY, true))
+        );
+        assert_eq!(
+            Message::Input(session_input::Message::FocusSettled {
+                focused: true,
+                found: false,
+            })
+            .input_focus_change(),
+            None,
+            "an operation that found no widget must not invent activation"
+        );
+    }
 
     #[test]
     fn link_confirmation_escapes_deceptive_action_target_text() {

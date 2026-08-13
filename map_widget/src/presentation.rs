@@ -4,7 +4,7 @@
 //! can therefore highlight a speedwalk, restyle a shared map, or override a
 //! live door state without writing collaborative map data.
 
-use smudgy_cloud::{ConnectionId, Uuid};
+use smudgy_cloud::{ConnectionId, ExitDirection, Uuid};
 
 fn default_room_spacing() -> f32 {
     1.0
@@ -94,6 +94,13 @@ pub struct RoomOverlay {
     pub stroke_width: Option<f32>,
 }
 
+/// One route traversal endpoint, identified without a persistent Connection ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteExitOverlay {
+    pub room: i32,
+    pub direction: ExitDirection,
+}
+
 /// A `[hi, lo]` script-facing connection id with a transient door override.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConnectionDoorOverlay {
@@ -115,6 +122,9 @@ pub struct MapViewOverlay {
     /// Ordered rooms in the active area. Consecutive connected rooms receive
     /// the route accent; every listed room is highlighted.
     pub route: Vec<i32>,
+    /// Exact traversed exits. This disambiguates parallel Connections and can
+    /// identify outbound cross-area links without putting opaque IDs in state.
+    pub route_exits: Vec<RouteExitOverlay>,
     pub rooms: Vec<RoomOverlay>,
     pub doors: Vec<ConnectionDoorOverlay>,
 }
@@ -182,5 +192,19 @@ mod tests {
         }
         .normalized();
         assert_eq!(overlay.rooms[0].stroke_width, Some(2.0));
+    }
+
+    #[test]
+    fn overlay_keeps_exact_route_exits() {
+        let overlay = MapViewOverlay {
+            route_exits: vec![RouteExitOverlay {
+                room: 12,
+                direction: ExitDirection::Up,
+            }],
+            ..MapViewOverlay::default()
+        };
+
+        assert_eq!(overlay.route_exits[0].room, 12);
+        assert_eq!(overlay.route_exits[0].direction, ExitDirection::Up);
     }
 }

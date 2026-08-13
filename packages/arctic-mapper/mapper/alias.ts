@@ -318,8 +318,10 @@ async function areaCommand([subcommand, ...args]: string[]) {
                 echo("Usage: area create <name>");
                 return;
             }
-            await mapper.createArea(name, { storage: "local" });
-            echo(`Created local area ${name}`);
+            // The default durable destination is cloud when signed in and local
+            // otherwise. An explicit `storage: "cloud"` would not fall back.
+            const area = await mapper.createArea(name);
+            echo(`Created ${area.storage} area ${name}`);
             break;
         }
         default:
@@ -409,15 +411,15 @@ async function roomCommand([subcommand, ...args]: string[]) {
                 return;
             }
             const offset = options.moveCoordinates[intent];
-            if (offset[0] !== 0) {
-                await mapper.setRoomX(state.area.id, state.room.room_number, state.room.x + offset[0]);
-            }
-            if (offset[1] !== 0) {
-                await mapper.setRoomY(state.area.id, state.room.room_number, state.room.y + offset[1]);
-            }
-            if (offset[2] !== 0) {
-                await mapper.setRoomLevel(state.area.id, state.room.room_number, state.room.level + offset[2]);
-            }
+            const selectedRoom = state.room;
+            await mapper.mutateArea(state.area.id, (mutation) => mutation.updateRoom(
+                selectedRoom,
+                {
+                    ...(offset[0] !== 0 ? { x: selectedRoom.x + offset[0] } : {}),
+                    ...(offset[1] !== 0 ? { y: selectedRoom.y + offset[1] } : {}),
+                    ...(offset[2] !== 0 ? { level: selectedRoom.level + offset[2] } : {}),
+                },
+            ), { description: "Shift Arctic room" });
             state.refreshRoomAndArea();
             break;
         }
@@ -885,46 +887,45 @@ const commands = {
         send("look");
         mapEvent.once("room", (room: RoomEvent) => {
             void (async () => {
-            echo(`Room: ${room.title}`);
-            echo(`Description: ${room.description}`);
-            echo(`Exits: ${room.exits}`);
+                echo(`Room: ${room.title}`);
+                echo(`Description: ${room.description}`);
+                echo(`Exits: ${room.exits}`);
 
-            if (!state.room) {
+                const currentExits = new Set([
+                    ...(state.room?.exits ?? []).map((e) => e.from_direction),
+                ]);
+                const createdExits: [Direction, ExitId][] = [];
+                await mapper.mutateArea(areaId, async (mutation) => {
+                    if (!state.room) {
+                        roomNumber = await mutation.createRoom({
+                            title: room.title,
+                            description: room.description.join("\n"),
+                        });
+                    } else if (roomNumber !== undefined) {
+                        await mutation.updateRoom(roomNumber, {
+                            title: room.title,
+                            description: room.description.join("\n"),
+                        });
+                    }
 
-                roomNumber = await mapper.createRoom(areaId, {
-                    title: room.title,
-                    description: room.description.join("\n"),
-                });
-
+                    for (const exit of parseRoomExitsDetailed(room.exits)) {
+                        if (!currentExits.has(exit.direction) && roomNumber !== undefined) {
+                            const id = await mutation.createRoomExit(roomNumber, {
+                                from_direction: exit.direction,
+                                is_closed: exit.closed,
+                            });
+                            createdExits.push([exit.direction, id]);
+                        }
+                    }
+                }, { description: "Refresh Arctic room" });
+                if (roomNumber === undefined) {
+                    throw new Error("map refresh did not resolve a room number");
+                }
                 state.area = mapper.getAreaById(areaId);
                 state.room = state.area.room(roomNumber);
-            } else {
-                await mapper.setRoomTitle(areaId, roomNumber, room.title);
-                await mapper.setRoomDescription(
-                    areaId,
-                    roomNumber,
-                    room.description.join("\n"),
-                );
-            }
-
-            const currentExits = new Set([
-                ...state.room.exits.map((e) => e.from_direction),
-            ]);
-
-            for (
-                const exit of parseRoomExitsDetailed(room.exits)
-            ) {
-                if (!currentExits.has(exit.direction)) {
-                    const id = await mapper.createRoomExit(areaId, roomNumber, {
-                        from_direction: exit.direction,
-                        is_closed: exit.closed,
-                    });
-                    echo(
-                        `Created exit ${exit.direction} (${id.map((c) => c.toString(16)).join("")
-                        })`,
-                    );
+                for (const [direction, id] of createdExits) {
+                    echo(`Created exit ${direction} (${id.map((c) => c.toString(16)).join("")})`);
                 }
-            }
             })().catch((error) => {
                 echo(`Map refresh failed: ${error instanceof Error ? error.message : String(error)}`);
             });
@@ -1106,7 +1107,11 @@ function elevationPreference(): ElevationPreference {
         : options.zMode === ZMode.Normal ? "levels" : "projected";
 }
 
-async function applyLayoutMoves(areaId: AreaId, result: AreaChangePlan): Promise<void> {
+async function applyLayoutMoves(
+    areaId: AreaId,
+    result: AreaChangePlan,
+    mutation?: AreaMutator,
+): Promise<void> {
     const updates: [RoomNumber, UpdateRoomParams][] = result.patch.moves.map((move) => {
         if (move.roomNumber === undefined) {
             throw new Error(`layout move ${move.id} has no Smudgy room number`);
@@ -1117,7 +1122,10 @@ async function applyLayoutMoves(areaId: AreaId, result: AreaChangePlan): Promise
             level: move.to.level,
         }];
     });
-    if (updates.length > 0) await mapper.updateRooms(areaId, updates);
+    if (updates.length > 0) {
+        if (mutation) await mutation.updateRooms(updates);
+        else await mapper.updateRooms(areaId, updates);
+    }
 }
 
 function matchingRoomsWithReciprocalStub(
@@ -1181,31 +1189,47 @@ async function createNewRoomInDirection(roomEvent: RoomEvent, direction: Directi
     });
     const placement = layout.patch.placements.find((value) => value.id === PROPOSED_ROOM_ID);
     if (!placement) throw new Error("layout did not place the new Arctic room");
-    await applyLayoutMoves(areaId, layout);
+    let newRoomNumber: RoomNumber;
+    const exitIds: ExitId[] = [];
+    await mapper.mutateArea(areaId, async (mutation) => {
+        await applyLayoutMoves(areaId, layout, mutation);
+        newRoomNumber = await mutation.createRoom({
+            ...placement.position,
+            title: roomEvent.title,
+            description: roomEvent.description.join("\n"),
+        });
 
-    let newRoomNumber = await mapper.createRoom(areaId, {
-        ...placement.position,
-        title: roomEvent.title,
-        description: roomEvent.description.join("\n"),
-    });
+        for (const exit of prevRoom.exits.filter((candidate) =>
+            candidate.from_direction === direction && candidate.to_room_number !== newRoomNumber
+        )) {
+            await mutation.deleteRoomExit(prevRoom.room_number, exit.id);
+        }
+        exitIds.push(await mutation.createRoomExit(prevRoom.room_number, {
+            from_direction: direction,
+            to_direction: OppositeDirection[direction],
+            to_area_id: areaId,
+            to_room_number: newRoomNumber,
+        }));
+        exitIds.push(await mutation.createRoomExit(newRoomNumber, {
+            from_direction: OppositeDirection[direction],
+            to_direction: direction,
+            to_area_id: areaId,
+            to_room_number: prevRoom.room_number,
+        }));
+        for (const exit of parseRoomExitsDetailed(roomEvent.exits)) {
+            if (exit.direction !== OppositeDirection[direction]) {
+                exitIds.push(await mutation.createRoomExit(newRoomNumber, {
+                    from_direction: exit.direction,
+                    is_closed: exit.closed,
+                }));
+            }
+        }
+    }, { description: "Map Arctic room and exits" });
 
 
     state.area = mapper.getAreaById(areaId);
     state.room = state.area.room(newRoomNumber)!;
-    const reflowedPreviousRoom = state.area.room(prevRoom.room_number) ?? prevRoom;
-
-    // Link the previous room with the newly-created one, and create stub exits for all other exits in the new room
-    const newLinkExits = linkRooms(reflowedPreviousRoom, state.room, direction);
-    const stubExitDirections = parseRoomExitsDetailed(roomEvent.exits)
-        .filter((exit) => exit.direction !== OppositeDirection[direction])
-        .map((exit) =>
-            mapper.createRoomExit(areaId, newRoomNumber, {
-                from_direction: exit.direction,
-                is_closed: exit.closed,
-            })
-        );
-
-    return [...await newLinkExits, ...await Promise.all(stubExitDirections)];
+    return exitIds;
 }
 
 async function handleRoomEvent(roomEvent: RoomEvent) {

@@ -57,6 +57,8 @@ import {
     op_smudgy_mapper_create_room,
     op_smudgy_mapper_update_room,
     op_smudgy_mapper_update_rooms,
+    op_smudgy_mapper_generate_id,
+    op_smudgy_mapper_mutate_area,
     op_smudgy_mapper_create_room_exit,
     op_smudgy_mapper_set_room_exit,
     op_smudgy_mapper_merge_rooms,
@@ -158,6 +160,10 @@ interface CreateAtlasOptions {
     storage: "local" | "cloud";
 }
 
+interface MutateAreaOptions {
+    description?: string;
+}
+
 function atlasIdOf(atlas: Atlas | AtlasId | undefined): AtlasId | undefined {
     return atlas instanceof Atlas ? atlas.id : atlas;
 }
@@ -255,6 +261,32 @@ const mapper = {
     getAreaById(id: AreaId) {
         let area = op_smudgy_mapper_get_area_by_id(id);
         return new Area(area);
+    },
+
+    /** Collect related writes to one area and submit them in the fewest practical
+     * ordered envelopes. Each emitted envelope is atomic; an oversized callback may
+     * become several envelopes, and acknowledged earlier envelopes are not rolled back
+     * if a later one fails. */
+    async mutateArea(
+        area: Area | AreaId,
+        callback: (mutation: AreaMutator) => void | Promise<void>,
+        options?: MutateAreaOptions,
+    ): Promise<OperationId[]> {
+        // Always start from the current host snapshot. A script may retain an Area
+        // wrapper across prior writes, including a now-stale next_room_number.
+        const target = this.getAreaById(area instanceof Area ? area.id : area);
+        const mutation = new AreaMutator(target);
+        try {
+            await callback(mutation);
+            return await op_smudgy_mapper_mutate_area(
+                target.id,
+                mutation.finish(),
+                options?.description ?? "Scripted area mutation",
+            );
+        } catch (error) {
+            mutation.abort();
+            throw error;
+        }
     },
 
     getPathBetweenRooms(fromAreaId: AreaId, fromRoomNumber: RoomNumber, toAreaId: AreaId, toRoomNumber: RoomNumber): [AreaId, RoomNumber][] {
@@ -651,6 +683,192 @@ interface LinkCreateArgs extends ConnectionUpdates {
     endpoint_a: ConnectionEndpoint;
     endpoint_b?: ConnectionEndpoint;
     traversals: LinkTraversalArgs[];
+}
+
+type AreaBatchOperation =
+    | { upsert_room: { room_number: RoomNumber; body: CreateRoomParams } }
+    | { delete_room: { room_number: RoomNumber } }
+    | { upsert_room_property: { room_number: RoomNumber; name: string; value: string } }
+    | { upsert_area_property: { name: string; value: string } }
+    | { add_room_tag: { room_number: RoomNumber; tag: string } }
+    | { remove_room_tag: { room_number: RoomNumber; tag: string } }
+    | { create_exit: { room_number: RoomNumber; id: ExitId; body: ExitArgs } }
+    | { update_exit: { exit_id: ExitId; body: ExitUpdates } }
+    | { delete_exit: { exit_id: ExitId } }
+    | { create_link: { connection_id: ConnectionId; body: LinkCreateArgs } }
+    | { update_connection: { connection_id: ConnectionId; body: ConnectionUpdates } };
+
+function roomNumberInArea(areaId: AreaId, room: Room | RoomNumber): RoomNumber {
+    if (!(room instanceof Room)) return room;
+    if (room.area_id[0] !== areaId[0] || room.area_id[1] !== areaId[1]) {
+        throw new TypeError("mutateArea cannot edit a room from another area");
+    }
+    return room.room_number;
+}
+
+/** A callback-scoped write collector. Its methods preserve the familiar async
+ * mapper shape, but only record draft operations; the host is touched once the
+ * callback completes. */
+class AreaMutator {
+    readonly #areaId: AreaId;
+    #nextRoomNumber: RoomNumber;
+    #operations: AreaBatchOperation[] = [];
+    #open = true;
+
+    constructor(area: Area) {
+        this.#areaId = area.id;
+        this.#nextRoomNumber = area.next_room_number;
+    }
+
+    #record(operation: AreaBatchOperation): void {
+        if (!this.#open) throw new TypeError("this mutateArea callback has finished");
+        this.#operations.push(operation);
+    }
+
+    async createRoom(params: CreateRoomParams): Promise<RoomNumber> {
+        const roomNumber = this.#nextRoomNumber++;
+        this.#record({
+            upsert_room: { room_number: roomNumber, body: { ...params } },
+        });
+        return roomNumber;
+    }
+
+    async updateRoom(room: Room | RoomNumber, fields: UpdateRoomParams): Promise<void> {
+        this.#record({
+            upsert_room: {
+                room_number: roomNumberInArea(this.#areaId, room),
+                body: { ...fields },
+            },
+        });
+    }
+
+    async updateRooms(updates: [RoomNumber, UpdateRoomParams][]): Promise<void> {
+        for (const [roomNumber, fields] of updates) {
+            this.#record({
+                upsert_room: { room_number: roomNumber, body: { ...fields } },
+            });
+        }
+    }
+
+    setRoomTitle(room: Room | RoomNumber, title: string): Promise<void> {
+        return this.updateRoom(room, { title });
+    }
+
+    setRoomDescription(room: Room | RoomNumber, description: string): Promise<void> {
+        return this.updateRoom(room, { description });
+    }
+
+    setRoomColor(room: Room | RoomNumber, color: string): Promise<void> {
+        return this.updateRoom(room, { color });
+    }
+
+    setRoomLevel(room: Room | RoomNumber, level: number): Promise<void> {
+        return this.updateRoom(room, { level });
+    }
+
+    setRoomX(room: Room | RoomNumber, x: number): Promise<void> {
+        return this.updateRoom(room, { x });
+    }
+
+    setRoomY(room: Room | RoomNumber, y: number): Promise<void> {
+        return this.updateRoom(room, { y });
+    }
+
+    setRoomExternalId(room: Room | RoomNumber, externalId: string): Promise<void> {
+        return this.updateRoom(room, { externalId });
+    }
+
+    async setRoomProperty(room: Room | RoomNumber, name: string, value: string): Promise<void> {
+        this.#record({
+            upsert_room_property: {
+                room_number: roomNumberInArea(this.#areaId, room),
+                name,
+                value,
+            },
+        });
+    }
+
+    async setAreaProperty(name: string, value: string): Promise<void> {
+        this.#record({ upsert_area_property: { name, value } });
+    }
+
+    async addRoomTag(room: Room | RoomNumber, tag: string): Promise<void> {
+        this.#record({
+            add_room_tag: {
+                room_number: roomNumberInArea(this.#areaId, room),
+                tag,
+            },
+        });
+    }
+
+    async removeRoomTag(room: Room | RoomNumber, tag: string): Promise<void> {
+        this.#record({
+            remove_room_tag: {
+                room_number: roomNumberInArea(this.#areaId, room),
+                tag,
+            },
+        });
+    }
+
+    async createRoomExit(room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId> {
+        const id: ExitId = op_smudgy_mapper_generate_id();
+        this.#record({
+            create_exit: {
+                room_number: roomNumberInArea(this.#areaId, room),
+                id,
+                body: { ...exit },
+            },
+        });
+        return id;
+    }
+
+    async setRoomExit(
+        room: Room | RoomNumber,
+        exitId: ExitId,
+        exit: ExitUpdates,
+    ): Promise<void> {
+        roomNumberInArea(this.#areaId, room);
+        this.#record({ update_exit: { exit_id: exitId, body: { ...exit } } });
+    }
+
+    async deleteRoom(room: Room | RoomNumber): Promise<void> {
+        this.#record({
+            delete_room: { room_number: roomNumberInArea(this.#areaId, room) },
+        });
+    }
+
+    async deleteRoomExit(room: Room | RoomNumber, exitId: ExitId): Promise<void> {
+        roomNumberInArea(this.#areaId, room);
+        this.#record({ delete_exit: { exit_id: exitId } });
+    }
+
+    async createLink(link: LinkCreateArgs): Promise<ConnectionId> {
+        const connectionId: ConnectionId = op_smudgy_mapper_generate_id();
+        this.#record({
+            create_link: {
+                connection_id: connectionId,
+                body: { ...link, traversals: link.traversals.map((value) => ({ ...value })) },
+            },
+        });
+        return connectionId;
+    }
+
+    async setConnection(connectionId: ConnectionId, updates: ConnectionUpdates): Promise<void> {
+        this.#record({
+            update_connection: { connection_id: connectionId, body: { ...updates } },
+        });
+    }
+
+    finish(): AreaBatchOperation[] {
+        if (!this.#open) throw new TypeError("this mutateArea callback has finished");
+        this.#open = false;
+        return this.#operations;
+    }
+
+    abort(): void {
+        this.#open = false;
+        this.#operations = [];
+    }
 }
 
 // A label/shape id: a 2-element `[hi, lo]` UUID pair, like `AreaId`/`ExitId`. Opaque.

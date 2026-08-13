@@ -766,6 +766,13 @@ pub struct VtProcessor {
     /// like the rest of the parse state.
     pending_cr: Option<usize>,
     session_runtime_tx: UnboundedSender<RuntimeAction>,
+    /// Identifies the connection that owns this processor. Packet-completion
+    /// markers carry it back to the runtime so a replaced socket cannot
+    /// release the next connection's deferred profile send.
+    connection_generation: u64,
+    /// Whether the current read batch produced any non-empty terminal text.
+    /// Telnet-only traffic and empty line terminators do not qualify.
+    packet_has_displayable_text: bool,
     /// Whether any trigger currently carries a raw pattern — the only consumer
     /// of `StyledLine::raw`. Owned by the trigger manager on the session thread
     /// and read here from the socket runtime; `None` (tests, benches) means
@@ -788,6 +795,14 @@ const INPUT_BUFFER_CAPACITY: usize = 1024;
 impl VtProcessor {
     #[must_use]
     pub fn new(session_runtime_tx: UnboundedSender<RuntimeAction>) -> Self {
+        Self::with_connection_generation(session_runtime_tx, 0)
+    }
+
+    #[must_use]
+    pub(super) fn with_connection_generation(
+        session_runtime_tx: UnboundedSender<RuntimeAction>,
+        connection_generation: u64,
+    ) -> Self {
         VtProcessor {
             cursor_style: Style::default(),
             buf: String::with_capacity(INPUT_BUFFER_CAPACITY),
@@ -798,6 +813,8 @@ impl VtProcessor {
             link_open_pos: 0,
             pending_cr: None,
             session_runtime_tx,
+            connection_generation,
+            packet_has_displayable_text: false,
             raw_wanted: None,
             capture_raw: true,
             link_presets: HashMap::new(),
@@ -926,6 +943,7 @@ impl VtProcessor {
     pub fn notify_end_of_buffer(&mut self) {
         let pending_line = Arc::new(self.consume_into_pending_line());
         if !self.buf.is_empty() {
+            self.packet_has_displayable_text = true;
             self.session_runtime_tx
                 .send(RuntimeAction::HandleIncomingPartialLine(pending_line))
                 .ok();
@@ -942,6 +960,12 @@ impl VtProcessor {
         }
         self.session_runtime_tx
             .send(RuntimeAction::RequestRepaint)
+            .ok();
+        self.session_runtime_tx
+            .send(RuntimeAction::IncomingPacketProcessed {
+                connection_generation: self.connection_generation,
+                has_displayable_text: std::mem::take(&mut self.packet_has_displayable_text),
+            })
             .ok();
         // The batch boundary is the one place capture may RISE: no parse run is
         // in flight (the reader calls this between batches) and the line buffers
@@ -972,6 +996,7 @@ impl VtProcessor {
             return;
         }
         let pending_line = Arc::new(self.consume_into_pending_line());
+        self.packet_has_displayable_text = true;
         self.session_runtime_tx
             .send(RuntimeAction::HandleIncomingPartialLine(pending_line))
             .ok();
@@ -987,6 +1012,9 @@ impl VtProcessor {
 
     fn commit_line(&mut self) {
         let pending_line = Arc::new(self.consume_into_pending_line());
+        if !pending_line.text.is_empty() {
+            self.packet_has_displayable_text = true;
+        }
         self.session_runtime_tx
             .send(RuntimeAction::HandleIncomingLine(pending_line))
             .ok();
@@ -1209,6 +1237,43 @@ mod tests {
         let mut h = harness();
         h.feed(b"a\r\nb\r\n");
         assert_eq!(transcript(&h.actions()), ["line:a", "line:b"]);
+    }
+
+    #[test]
+    fn packet_marker_requires_non_empty_terminal_text() {
+        let mut h = harness();
+
+        h.feed(b"\r\n");
+        h.processor.notify_end_of_buffer();
+        assert!(h.actions().iter().any(|action| matches!(
+            action,
+            RuntimeAction::IncomingPacketProcessed {
+                connection_generation: 0,
+                has_displayable_text: false,
+            }
+        )));
+
+        h.feed(b"Welcome\r\n");
+        h.processor.notify_end_of_buffer();
+        assert!(h.actions().iter().any(|action| matches!(
+            action,
+            RuntimeAction::IncomingPacketProcessed {
+                connection_generation: 0,
+                has_displayable_text: true,
+            }
+        )));
+
+        // An unterminated prompt is displayable too: the batch boundary sends
+        // it through the partial-line pipeline before the packet marker.
+        h.feed(b"Login: ");
+        h.processor.notify_end_of_buffer();
+        assert!(h.actions().iter().any(|action| matches!(
+            action,
+            RuntimeAction::IncomingPacketProcessed {
+                connection_generation: 0,
+                has_displayable_text: true,
+            }
+        )));
     }
 
     #[test]

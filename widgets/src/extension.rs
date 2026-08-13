@@ -1940,10 +1940,18 @@ struct MapViewDoorOverlayProp {
     locked: Option<bool>,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MapViewRouteExitOverlayProp {
+    room: i32,
+    direction: smudgy_cloud::ExitDirection,
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct MapViewOverlayProp {
     route: Vec<i32>,
+    route_exits: Vec<MapViewRouteExitOverlayProp>,
     rooms: Vec<MapViewRoomOverlayProp>,
     doors: Vec<MapViewDoorOverlayProp>,
 }
@@ -1952,6 +1960,14 @@ impl From<MapViewOverlayProp> for smudgy_map_widget::MapViewOverlay {
     fn from(value: MapViewOverlayProp) -> Self {
         Self {
             route: value.route,
+            route_exits: value
+                .route_exits
+                .into_iter()
+                .map(|exit| smudgy_map_widget::RouteExitOverlay {
+                    room: exit.room,
+                    direction: exit.direction,
+                })
+                .collect(),
             rooms: value
                 .rooms
                 .into_iter()
@@ -3060,12 +3076,18 @@ mod tests {
         use serde_json::json;
         let node = Node::from(json!({
             "route": [1, 2, 3],
+            "routeExits": [{ "room": 3, "direction": "Up" }],
             "rooms": [{ "room": 2, "stroke": "#ff00ff" }],
             "doors": [{ "connection": [12, 34], "locked": true }]
         }));
         let prop = serde_from_node::<MapViewOverlayProp>(&node).expect("overlay parses");
         let overlay: smudgy_map_widget::MapViewOverlay = prop.into();
         assert_eq!(overlay.route, vec![1, 2, 3]);
+        assert_eq!(overlay.route_exits[0].room, 3);
+        assert_eq!(
+            overlay.route_exits[0].direction,
+            smudgy_cloud::ExitDirection::Up
+        );
         assert_eq!(overlay.rooms[0].room, 2);
         assert_eq!(overlay.doors[0].connection, (12, 34));
         assert_eq!(overlay.doors[0].locked, Some(true));

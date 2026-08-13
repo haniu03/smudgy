@@ -201,6 +201,13 @@ declare module "smudgy:widgets" {
         strokeWidth?: number;
     }
 
+    export interface MapViewRouteExitOverlay {
+        /** Room from which this route step leaves. */
+        room: RoomNumber;
+        /** Exit direction used by this route step. */
+        direction: ExitDirection;
+    }
+
     export interface MapViewDoorOverlay {
         connection: ConnectionId;
         /** Override persisted state; omit either field to retain its map value. */
@@ -212,6 +219,8 @@ declare module "smudgy:widgets" {
     export interface MapViewOverlay {
         /** Ordered room numbers in the active area. Rooms and connecting links are accented. */
         route?: RoomNumber[];
+        /** Exact route exits. When supplied, these select connections instead of room adjacency. */
+        routeExits?: MapViewRouteExitOverlay[];
         rooms?: MapViewRoomOverlay[];
         doors?: MapViewDoorOverlay[];
     }

@@ -17,7 +17,7 @@ use smudgy_cloud::{
     RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId, ShapeType, ShapeUpdates, Uuid,
     VerticalAlignment,
     mapper::{MutationSubmission, RoomKey, area_cache::AreaCache, room_cache::RoomCache},
-    mutation::AreaMutation,
+    mutation::{AreaMutation, MAX_MUTATION_OPERATIONS},
 };
 
 deno_core::extension!(
@@ -73,6 +73,8 @@ deno_core::extension!(
       op_smudgy_mapper_create_room,
       op_smudgy_mapper_update_room,
       op_smudgy_mapper_update_rooms,
+      op_smudgy_mapper_generate_id,
+      op_smudgy_mapper_mutate_area,
       op_smudgy_mapper_create_room_exit,
       op_smudgy_mapper_set_room_exit,
       op_smudgy_mapper_merge_rooms,
@@ -1584,6 +1586,270 @@ struct JSLinkTraversalParams {
     exit: JSExitCreateParams,
 }
 
+/// One author-facing operation recorded by `mapper.mutateArea`. These are
+/// deliberately higher-level than the wire contract: a `create_link` remains
+/// one indivisible author operation even though it expands to a Connection and
+/// one or two exits in the mutation envelope.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JSAreaBatchOperation {
+    UpsertRoom {
+        room_number: i32,
+        body: JSRoomParams,
+    },
+    DeleteRoom {
+        room_number: i32,
+    },
+    UpsertRoomProperty {
+        room_number: i32,
+        name: String,
+        value: String,
+    },
+    UpsertAreaProperty {
+        name: String,
+        value: String,
+    },
+    AddRoomTag {
+        room_number: i32,
+        tag: String,
+    },
+    RemoveRoomTag {
+        room_number: i32,
+        tag: String,
+    },
+    CreateExit {
+        room_number: i32,
+        id: (u64, u64),
+        body: JSExitCreateParams,
+    },
+    UpdateExit {
+        exit_id: (u64, u64),
+        body: JSExitUpdateParams,
+    },
+    DeleteExit {
+        exit_id: (u64, u64),
+    },
+    CreateLink {
+        connection_id: (u64, u64),
+        body: JSLinkCreateParams,
+    },
+    UpdateConnection {
+        connection_id: (u64, u64),
+        body: JSConnectionUpdateParams,
+    },
+}
+
+fn script_exit_args(
+    params: JSExitCreateParams,
+    id: ExitId,
+    connection_id: Option<ConnectionId>,
+) -> ExitArgs {
+    ExitArgs {
+        id: Some(id),
+        connection_id,
+        new_connection_id: None,
+        from_direction: params.from_direction,
+        to_direction: params.to_direction,
+        to_area_id: params
+            .to_area_id
+            .map(|area_id| AreaId(Uuid::from_u64_pair(area_id.0, area_id.1))),
+        to_room_number: params.to_room_number.map(RoomNumber),
+        is_hidden: params.is_hidden.unwrap_or(false),
+        is_closed: params.is_closed.unwrap_or(false),
+        is_locked: params.is_locked.unwrap_or(false),
+        weight: params.weight.unwrap_or(1.0),
+        command: params.command,
+        path: None,
+        is_secret: None,
+    }
+}
+
+fn script_connection_args(
+    connection_id: ConnectionId,
+    params: &mut JSLinkCreateParams,
+) -> ConnectionArgs {
+    ConnectionArgs {
+        id: connection_id,
+        endpoint_a: params.endpoint_a.into(),
+        endpoint_b: params.endpoint_b.map(Into::into),
+        routing: params.routing.unwrap_or_default(),
+        segment_shape: params.segment_shape.unwrap_or_default(),
+        corner: params.corner.unwrap_or_default(),
+        route_points: std::mem::take(&mut params.route_points).unwrap_or_default(),
+        dash: params.dash.unwrap_or_default(),
+        color: params
+            .color
+            .take()
+            .unwrap_or_else(|| DEFAULT_CONNECTION_COLOR.to_string()),
+        thickness: params.thickness.unwrap_or(DEFAULT_CONNECTION_THICKNESS),
+    }
+}
+
+impl JSAreaBatchOperation {
+    fn into_group(self) -> Vec<AreaMutation> {
+        match self {
+            Self::UpsertRoom { room_number, body } => vec![AreaMutation::UpsertRoom {
+                room_number: RoomNumber(room_number),
+                body: body.into(),
+            }],
+            Self::DeleteRoom { room_number } => vec![AreaMutation::DeleteRoom {
+                room_number: RoomNumber(room_number),
+            }],
+            Self::UpsertRoomProperty {
+                room_number,
+                name,
+                value,
+            } => vec![AreaMutation::UpsertRoomProperty {
+                room_number: RoomNumber(room_number),
+                name,
+                value,
+                is_secret: None,
+            }],
+            Self::UpsertAreaProperty { name, value } => {
+                vec![AreaMutation::UpsertAreaProperty {
+                    name,
+                    value,
+                    is_secret: None,
+                }]
+            }
+            Self::AddRoomTag { room_number, tag } => vec![AreaMutation::AddRoomTag {
+                room_number: RoomNumber(room_number),
+                tag,
+            }],
+            Self::RemoveRoomTag { room_number, tag } => vec![AreaMutation::RemoveRoomTag {
+                room_number: RoomNumber(room_number),
+                tag,
+            }],
+            Self::CreateExit {
+                room_number,
+                id,
+                body,
+            } => vec![AreaMutation::CreateExit {
+                room_number: RoomNumber(room_number),
+                body: script_exit_args(body, ExitId(Uuid::from_u64_pair(id.0, id.1)), None),
+            }],
+            Self::UpdateExit { exit_id, body } => vec![AreaMutation::UpdateExit {
+                exit_id: ExitId(Uuid::from_u64_pair(exit_id.0, exit_id.1)),
+                body: ExitUpdates {
+                    from_direction: body.from_direction,
+                    to_direction: body.to_direction,
+                    to_area_id: body
+                        .to_area_id
+                        .map(|area_id| AreaId(Uuid::from_u64_pair(area_id.0, area_id.1))),
+                    to_room_number: body.to_room_number.map(RoomNumber),
+                    is_hidden: body.is_hidden,
+                    is_closed: body.is_closed,
+                    is_locked: body.is_locked,
+                    weight: body.weight,
+                    command: body.command,
+                    path: None,
+                    is_secret: None,
+                    clear_to: None,
+                },
+            }],
+            Self::DeleteExit { exit_id } => vec![AreaMutation::DeleteExit {
+                exit_id: ExitId(Uuid::from_u64_pair(exit_id.0, exit_id.1)),
+            }],
+            Self::CreateLink {
+                connection_id,
+                mut body,
+            } => {
+                let connection_id =
+                    ConnectionId(Uuid::from_u64_pair(connection_id.0, connection_id.1));
+                let mut operations = Vec::with_capacity(body.traversals.len() + 1);
+                operations.push(AreaMutation::CreateConnection {
+                    body: script_connection_args(connection_id, &mut body),
+                });
+                operations.extend(body.traversals.into_iter().map(|traversal| {
+                    AreaMutation::CreateExit {
+                        room_number: RoomNumber(traversal.room_number),
+                        body: script_exit_args(traversal.exit, ExitId::new(), Some(connection_id)),
+                    }
+                }));
+                operations
+            }
+            Self::UpdateConnection {
+                connection_id,
+                body,
+            } => vec![AreaMutation::UpdateConnection {
+                connection_id: ConnectionId(Uuid::from_u64_pair(connection_id.0, connection_id.1)),
+                body: body.into(),
+            }],
+        }
+    }
+}
+
+fn pack_area_batch_operations(
+    operations: Vec<JSAreaBatchOperation>,
+) -> Result<Vec<Vec<AreaMutation>>, MapperError> {
+    let mut chunks = Vec::<Vec<AreaMutation>>::new();
+    let mut current = Vec::<AreaMutation>::new();
+    for group in operations.into_iter().map(JSAreaBatchOperation::into_group) {
+        if group.len() > MAX_MUTATION_OPERATIONS {
+            return Err(MapperError::FailedToCreate(format!(
+                "one scripted mapper operation expands to {} mutations; the limit is {MAX_MUTATION_OPERATIONS}",
+                group.len()
+            )));
+        }
+        if !current.is_empty() && current.len() + group.len() > MAX_MUTATION_OPERATIONS {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.extend(group);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    Ok(chunks)
+}
+
+/// Mint an opaque mapper id without touching storage. Scoped batch editors use
+/// this so create calls can return stable ids before their envelope is sent.
+#[op2]
+#[serde]
+fn op_smudgy_mapper_generate_id(state: &OpState) -> Result<(u64, u64), MapperError> {
+    ensure_mapper(state, true)?;
+    Ok(Uuid::new_v4().as_u64_pair())
+}
+
+/// Best-effort single-area batching for the script API. Author operations are
+/// packed without splitting an individual high-level operation; oversized
+/// work becomes ordered envelopes, each independently atomic and durable.
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_mutate_area(
+    state: Rc<RefCell<OpState>>,
+    #[serde] area_id: (u64, u64),
+    #[serde] operations: Vec<JSAreaBatchOperation>,
+    #[string] description: String,
+) -> Result<Vec<(u64, u64)>, MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    let mapper = state
+        .try_borrow::<Mapper>()
+        .cloned()
+        .ok_or(MapperError::MapperNotEnabled)?;
+    drop(state);
+
+    let chunks = pack_area_batch_operations(operations)?;
+    let chunk_count = chunks.len();
+    let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
+    let mut operation_ids = Vec::with_capacity(chunk_count);
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let chunk_description = if chunk_count > 1 {
+            format!("{description} ({}/{chunk_count})", index + 1)
+        } else {
+            description.clone()
+        };
+        let submission = mapper
+            .mutate_area(area_id, chunk, chunk_description)
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        if let Some(operation_id) = await_mapper_submission(&mapper, submission).await? {
+            operation_ids.push(operation_id);
+        }
+    }
+    Ok(operation_ids)
+}
+
 #[op2]
 #[serde]
 fn op_smudgy_mapper_get_area_connections(#[cppgc] area_wrapper: &JSArea) -> Vec<JSConnection> {
@@ -2406,7 +2672,12 @@ fn op_smudgy_mapper_find_nearest_room_in_area(
 
 #[cfg(test)]
 mod compatibility_tests {
-    use super::{MapStorage, resolve_compat_create_storage};
+    use super::{
+        AreaMutation, JSAreaBatchOperation, JSRoomParams, MAX_MUTATION_OPERATIONS, MapStorage,
+        pack_area_batch_operations, resolve_compat_create_storage,
+    };
+    use deno_core::{FastString, JsRuntime, RuntimeOptions};
+    use serde_json::json;
 
     #[test]
     fn legacy_create_area_options_remain_pinned_through_0_7() {
@@ -2420,5 +2691,133 @@ mod compatibility_tests {
             Some(MapStorage::Local),
             "the canonical explicit storage value wins over the compatibility flag"
         );
+    }
+
+    #[test]
+    fn scripted_area_batches_split_only_at_operation_boundaries() {
+        let operations = (0..MAX_MUTATION_OPERATIONS + 1)
+            .map(|index| JSAreaBatchOperation::UpsertRoom {
+                room_number: i32::try_from(index + 1).expect("test room number"),
+                body: JSRoomParams {
+                    title: Some(format!("room {index}")),
+                    description: None,
+                    color: None,
+                    level: None,
+                    x: None,
+                    y: None,
+                    external_id: None,
+                },
+            })
+            .collect();
+
+        let chunks = pack_area_batch_operations(operations).expect("batch packs");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), MAX_MUTATION_OPERATIONS);
+        assert_eq!(chunks[1].len(), 1);
+        assert!(matches!(chunks[1][0], AreaMutation::UpsertRoom { .. }));
+    }
+
+    #[test]
+    fn scripted_link_stays_whole_when_a_batch_boundary_is_reached() {
+        let mut operations = (0..MAX_MUTATION_OPERATIONS - 1)
+            .map(|index| JSAreaBatchOperation::UpsertRoom {
+                room_number: i32::try_from(index + 1).expect("test room number"),
+                body: JSRoomParams {
+                    title: None,
+                    description: None,
+                    color: None,
+                    level: None,
+                    x: None,
+                    y: None,
+                    external_id: None,
+                },
+            })
+            .collect::<Vec<_>>();
+        operations.push(
+            serde_json::from_value(json!({
+                "create_link": {
+                    "connection_id": [1, 2],
+                    "body": {
+                        "endpoint_a": {
+                            "room_number": 1,
+                            "side": "East",
+                            "port_offset": 0.5,
+                            "port_mode": "AutoPinned"
+                        },
+                        "endpoint_b": {
+                            "room_number": 2,
+                            "side": "West",
+                            "port_offset": 0.5,
+                            "port_mode": "AutoPinned"
+                        },
+                        "traversals": [
+                            {
+                                "room_number": 1,
+                                "from_direction": "East",
+                                "to_direction": "West",
+                                "to_area_id": [3, 4],
+                                "to_room_number": 2
+                            },
+                            {
+                                "room_number": 2,
+                                "from_direction": "West",
+                                "to_direction": "East",
+                                "to_area_id": [3, 4],
+                                "to_room_number": 1
+                            }
+                        ]
+                    }
+                }
+            }))
+            .expect("link payload deserializes"),
+        );
+
+        let chunks = pack_area_batch_operations(operations).expect("batch packs");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), MAX_MUTATION_OPERATIONS - 1);
+        assert_eq!(chunks[1].len(), 3);
+
+        let connection_id = match &chunks[1][0] {
+            AreaMutation::CreateConnection { body } => body.id,
+            other => panic!("expected connection first, got {other:?}"),
+        };
+        for mutation in &chunks[1][1..] {
+            match mutation {
+                AreaMutation::CreateExit { body, .. } => {
+                    assert_eq!(body.connection_id, Some(connection_id));
+                }
+                other => panic!("expected linked exit, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn externally_tagged_batch_decodes_v8_bigint_ids() {
+        let mut runtime = JsRuntime::new(RuntimeOptions::default());
+        let value = runtime
+            .execute_script(
+                "<mapper-batch-bigint>",
+                FastString::from_static(
+                    r#"[{ create_exit: {
+                        room_number: 1,
+                        id: [18446744073709551615n, 9223372036854775808n],
+                        body: {
+                            from_direction: "East",
+                            to_direction: "West",
+                            to_area_id: [18446744073709551614n, 9223372036854775809n],
+                            to_room_number: 2
+                        }
+                    } }]"#,
+                ),
+            )
+            .expect("evaluate bigint payload");
+        deno_core::scope!(scope, &mut runtime);
+        let local = deno_core::v8::Local::new(scope, value);
+        let operations: Vec<JSAreaBatchOperation> =
+            deno_core::serde_v8::from_v8(scope, local).expect("decode bigint ids");
+
+        let chunks = pack_area_batch_operations(operations).expect("batch packs");
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0][0], AreaMutation::CreateExit { .. }));
     }
 }

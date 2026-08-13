@@ -1,0 +1,107 @@
+export type RouteDirection =
+  | "North"
+  | "East"
+  | "South"
+  | "West"
+  | "Up"
+  | "Down"
+  | "Northeast"
+  | "Northwest"
+  | "Southeast"
+  | "Southwest"
+  | "In"
+  | "Out"
+  | "Special"
+  | "Other";
+
+export interface RouteExit {
+  from_direction: RouteDirection;
+  to_area_id: readonly [number, number] | null;
+  to_room_number: number | null;
+  command: string | null;
+}
+
+export interface RouteRoom {
+  area_id: readonly [number, number];
+  room_number: number;
+  exits: readonly RouteExit[];
+}
+
+export type RouteRoomLookup = (
+  areaId: readonly [number, number],
+  roomNumber: number,
+) => RouteRoom | undefined;
+
+export interface ResolvedMapViewRoute {
+  rooms: number[];
+  exits: { room: number; direction: RouteDirection }[];
+}
+
+const DIRECTIONS: Readonly<Record<string, string>> = {
+  n: "north",
+  e: "east",
+  s: "south",
+  w: "west",
+  u: "up",
+  d: "down",
+};
+
+function sameArea(
+  left: readonly [number, number],
+  right: readonly [number, number],
+): boolean {
+  return left[0] === right[0] && left[1] === right[1];
+}
+
+function normalizedCommand(command: string | null): string {
+  return (command ?? "").trim().toLowerCase();
+}
+
+function exitForStep(room: RouteRoom, step: string): RouteExit | undefined {
+  const direction = DIRECTIONS[step];
+  if (!direction) return undefined;
+  // Explicit traversal commands win. This matters when a room has a Special
+  // exit alongside an ordinary direction which happens to share its command.
+  return room.exits.find((exit) => normalizedCommand(exit.command) === step) ??
+    room.exits.find((exit) => exit.from_direction.toLowerCase() === direction);
+}
+
+/**
+ * Resolve NukeFire's compact GPS route against the durable Smudgy topology.
+ *
+ * A MapView displays one area at a time, so resolution stops when the route
+ * leaves the starting area or reaches topology the mapper has not learned yet.
+ * The ordered rooms drive room accents; the exact source room + direction for
+ * each step selects only the traversed Connection, including Up/Down and the
+ * visible end of an outbound cross-area route.
+ */
+export function mapViewRoute(
+  start: RouteRoom | undefined,
+  routeRaw: string,
+  lookup: RouteRoomLookup,
+): ResolvedMapViewRoute {
+  if (!start) return { rooms: [], exits: [] };
+  const areaId = start.area_id;
+  const rooms = [start.room_number];
+  const exits: { room: number; direction: RouteDirection }[] = [];
+  let room = start;
+
+  for (const step of routeRaw.trim().toLowerCase()) {
+    const exit = exitForStep(room, step);
+    if (!exit) break;
+    exits.push({ room: room.room_number, direction: exit.from_direction });
+    if (!exit.to_area_id || exit.to_room_number === null) break;
+    if (!sameArea(areaId, exit.to_area_id)) break;
+    const next = lookup(exit.to_area_id, exit.to_room_number);
+    if (!next) break;
+    rooms.push(next.room_number);
+    room = next;
+  }
+  return { rooms, exits };
+}
+
+/** Accept the live `route_raw` spelling and the older GMCP package's `route`. */
+export function gpsRouteRaw(gps: { route_raw?: unknown; route?: unknown } | undefined): string {
+  if (typeof gps?.route_raw === "string") return gps.route_raw;
+  return typeof gps?.route === "string" ? gps.route : "";
+}

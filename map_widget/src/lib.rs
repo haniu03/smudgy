@@ -9,6 +9,7 @@ pub use map_editor::MapEditor;
 pub use map_view::{Event, MapView, Message, Renderer, Theme};
 pub use presentation::{
     ConnectionDoorOverlay, MapViewOverlay, MapViewPresentation, MapViewStyle, RoomOverlay,
+    RouteExitOverlay,
 };
 pub use update::Update;
 pub use viewport::Viewport;

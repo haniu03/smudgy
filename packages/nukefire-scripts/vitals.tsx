@@ -1,7 +1,7 @@
 // Aggregated vitals for the all-sessions tab layout. Every runtime publishes
 // one retained `sessionVitals` state; the primary reads directed views of that
-// state and renders ordinary identity widgets over one bar-only canvas per
-// player. Canvas geometry may stretch, but text never does.
+// state and renders ordinary identity widgets above fixed-cap/stretch-center
+// bar slices. Text and corner radii remain stable as the pane grows.
 
 import {
   createState,
@@ -14,16 +14,12 @@ import {
 import { focus as inputFocus } from "smudgy:events/input";
 import { created, destroyed } from "smudgy:events/sessions";
 import {
-  Canvas,
   Column,
   Container,
   Row,
   Space,
-  Stack,
-  Text,
   createWidget,
   removeWidget,
-  type CanvasFill,
   type CanvasShape,
 } from "smudgy:widgets";
 import {
@@ -37,22 +33,28 @@ import {
 // installed package version, so they cannot know this new export yet.
 // @ts-ignore generated self-state module
 import { sessionVitals as generatedSessionVitalsConsumer } from "smudgy:state/kapusniak/nukefire-scripts";
-import { sessionVitalsLayout, widgetMetric, widgetTextSize } from "./config.ts";
+import { sessionVitalsLayout, widgetMetric } from "./config.ts";
 import { sessionVitals } from "./index.ts";
 import { UI, themeBackground } from "./theme.ts";
+import {
+  type BarSlices,
+  buildVitalBarSlices,
+  characterName,
+  classAndLevel,
+  compactVital,
+  sessionBadge,
+  vitalRatio,
+  vitalReadoutColor,
+  wideVital as sharedWideVital,
+} from "./vitals-ui.tsx";
 
-const PANE = "Session Vitals";
+const PANE = "Vitals";
 const WIDGET = "nf-session-vitals";
 
-const BAR_VIEW_WIDTH = 100;
-const BAR_VIEW_HEIGHT = 20;
-const BAR_WIDTH = 96;
-const BAR_HEIGHT = 14;
-const TWEEN_MS = 320;
 const COMPACT_PLAYER_HEIGHT = 52;
-const WIDE_PLAYER_HEIGHT = 38;
-const WIDE_IDENTITY_WIDTH = 240;
-const WIDE_VITAL_WIDTH = 210;
+const WIDE_PLAYER_HEIGHT = 30;
+const WIDE_IDENTITY_WIDTH = 125;
+const WIDE_IDENTITY_GAP = 4;
 
 export interface VitalsSnapshot {
   sessionId: number;
@@ -70,15 +72,21 @@ export interface VitalsSnapshot {
 
 interface PlayerDisplay {
   name: string;
-  details: string;
+  nameColor: string;
+  className: string;
+  levelLabel: string;
+  detailSeparator: string;
   badgeScene: CanvasShape[];
   badgeColor: string;
-  hpLabel: string;
-  manaLabel: string;
-  moveLabel: string;
-  hpBars: CanvasShape[];
-  manaBars: CanvasShape[];
-  moveBars: CanvasShape[];
+  hpValue: string;
+  manaValue: string;
+  moveValue: string;
+  hpValueColor: string;
+  manaValueColor: string;
+  moveValueColor: string;
+  hpBar: BarSlices;
+  manaBar: BarSlices;
+  moveBar: BarSlices;
 }
 
 interface DirectedVitals {
@@ -88,7 +96,6 @@ interface DirectedVitals {
 
 interface VitalSpec {
   key: "hp" | "mana" | "move";
-  label: "HP" | "MN" | "MV";
   current: number;
   maximum: number;
   gradient: readonly [string, string, string];
@@ -101,7 +108,7 @@ let shown = false;
 let widgetMounted = false;
 let mountedSessionIds = "";
 let previousRatios = new Map<string, number>();
-const cachedBarShapes = new Map<string, CanvasShape[]>();
+const cachedBarShapes = new Map<string, BarSlices>();
 
 const directedConsumer = generatedSessionVitalsConsumer as StateConsumer<VitalsSnapshot>;
 const directedVitals = new Map<number, DirectedVitals>();
@@ -160,94 +167,6 @@ export function initialize(): void {
   // first report establishes a baseline rather than emitting a focus edge, so
   // publish once more after that warm-up can arrive.
   setTimeout(publish, 100);
-}
-
-function ratio(current: number, maximum: number): number {
-  return Math.min(1, Math.max(0, current / Math.max(1, maximum)));
-}
-
-function gradient(
-  from: [number, number],
-  to: [number, number],
-  stops: readonly [string, string, string],
-): CanvasFill {
-  return {
-    gradient: {
-      from,
-      to,
-      stops: [[0, stops[0]], [0.55, stops[1]], [1, stops[2]]],
-    },
-  };
-}
-
-function barShapes(
-  sessionId: number,
-  spec: VitalSpec,
-  oldRatio: number | undefined,
-): CanvasShape[] {
-  const nextRatio = ratio(spec.current, spec.maximum);
-  const fillWidth = BAR_WIDTH * nextRatio;
-  const fromWidth = BAR_WIDTH * (oldRatio ?? nextRatio);
-  const shouldTween = oldRatio !== undefined && Math.abs(oldRatio - nextRatio) > 0.0001;
-  const widthTween = shouldTween
-    ? { width: { from: fromWidth, to: fillWidth, duration: TWEEN_MS, ease: "out" as const } }
-    : undefined;
-  const x = 2;
-  const y = 3;
-  const shapeId = `session-${sessionId}-${spec.key}`;
-
-  return [
-    {
-      kind: "rect",
-      x,
-      y,
-      width: BAR_WIDTH,
-      height: BAR_HEIGHT,
-      rx: 5,
-      fill: gradient(
-        [x, y],
-        [x + BAR_WIDTH, y],
-        ["rgba(255,255,255,0.035)", "rgba(10,18,32,0.78)", "rgba(255,255,255,0.055)"],
-      ),
-      stroke: { color: "rgba(110,127,150,0.52)", width: 1 },
-    },
-    {
-      kind: "rect",
-      id: `${shapeId}-fill`,
-      x,
-      y,
-      width: fillWidth,
-      height: BAR_HEIGHT,
-      rx: 5,
-      fill: gradient([x, y], [x + BAR_WIDTH, y], spec.gradient),
-      animate: widthTween,
-    },
-    {
-      kind: "rect",
-      id: `${shapeId}-gloss`,
-      x: x + 1,
-      y: y + 1,
-      width: Math.max(0, fillWidth - 2),
-      height: 5,
-      rx: 4,
-      fill: gradient(
-        [x, y + 1],
-        [x, y + 7],
-        ["rgba(255,255,255,0.44)", "rgba(255,255,255,0.17)", "rgba(255,255,255,0.01)"],
-      ),
-      opacity: 0.72,
-      animate: shouldTween
-        ? {
-          width: {
-            from: Math.max(0, fromWidth - 2),
-            to: Math.max(0, fillWidth - 2),
-            duration: TWEEN_MS,
-            ease: "out",
-          },
-        }
-        : undefined,
-    },
-  ];
 }
 
 function placeholder(target: ReturnType<typeof getSessions>[number]): VitalsSnapshot {
@@ -309,35 +228,32 @@ function displayFor(snapshot: Readonly<VitalsSnapshot>): PlayerDisplay {
   const specs: readonly VitalSpec[] = [
     {
       key: "hp",
-      label: "HP",
       current: snapshot.hp,
       maximum: snapshot.mhp,
       gradient: ["#71131d", UI.hp, "#ff6672"],
     },
     {
       key: "mana",
-      label: "MN",
       current: snapshot.mana,
       maximum: snapshot.mmana,
       gradient: ["#173a63", UI.mana, "#65b7e6"],
     },
     {
       key: "move",
-      label: "MV",
       current: snapshot.move,
       maximum: snapshot.mmove,
       gradient: ["#155548", UI.move, "#55c5a5"],
     },
   ];
-  const barScenes: CanvasShape[][] = [];
+  const barScenes: BarSlices[] = [];
 
   specs.forEach((spec) => {
     const ratioKey = `${snapshot.sessionId}:${spec.key}`;
     const oldRatio = previousRatios.get(ratioKey);
-    const nextRatio = ratio(spec.current, spec.maximum);
+    const nextRatio = vitalRatio(spec.current, spec.maximum);
     let shapes = cachedBarShapes.get(ratioKey);
     if (!shapes || oldRatio === undefined || Math.abs(oldRatio - nextRatio) > 0.0001) {
-      shapes = barShapes(snapshot.sessionId, spec, oldRatio);
+      shapes = buildVitalBarSlices(`session-${snapshot.sessionId}`, spec, oldRatio);
       cachedBarShapes.set(ratioKey, shapes);
     }
     barScenes.push(shapes);
@@ -346,17 +262,21 @@ function displayFor(snapshot: Readonly<VitalsSnapshot>): PlayerDisplay {
 
   return {
     name: snapshot.name,
-    details: snapshot.className === ""
-      ? ""
-      : `${snapshot.className}${snapshot.level > 0 ? ` · level ${snapshot.level}` : ""}`,
+    nameColor: snapshot.focused ? UI.gold : "#d8e0e8",
+    className: snapshot.className || "connecting",
+    levelLabel: snapshot.level > 0 ? `LV ${snapshot.level}` : "",
+    detailSeparator: snapshot.className && snapshot.level > 0 ? "/" : "",
     badgeScene: ordinalBadgeScene(snapshot.focused),
     badgeColor: snapshot.focused ? UI.gold : UI.dim,
-    hpLabel: `${snapshot.hp}/${snapshot.mhp} HP`,
-    manaLabel: `${snapshot.mana}/${snapshot.mmana} MN`,
-    moveLabel: `${snapshot.move}/${snapshot.mmove} MV`,
-    hpBars: barScenes[0] ?? [],
-    manaBars: barScenes[1] ?? [],
-    moveBars: barScenes[2] ?? [],
+    hpValue: `${snapshot.hp} / ${snapshot.mhp}`,
+    manaValue: `${snapshot.mana} / ${snapshot.mmana}`,
+    moveValue: `${snapshot.move} / ${snapshot.mmove}`,
+    hpValueColor: vitalReadoutColor(snapshot.hp, snapshot.mhp),
+    manaValueColor: vitalReadoutColor(snapshot.mana, snapshot.mmana),
+    moveValueColor: vitalReadoutColor(snapshot.move, snapshot.mmove),
+    hpBar: barScenes[0] ?? { start: [], middle: [], end: [] },
+    manaBar: barScenes[1] ?? { start: [], middle: [], end: [] },
+    moveBar: barScenes[2] ?? { start: [], middle: [], end: [] },
   };
 }
 
@@ -383,66 +303,79 @@ function displayPath(targetId: number, field: keyof PlayerDisplay): string {
 }
 
 function ordinalBadge(targetId: number, ordinal: number) {
-  return (
-    <Stack width={widgetMetric(30)} height={widgetMetric(22)}>
-      <Canvas
-        width="fill"
-        height="fill"
-        view_box={[0, 0, 30, 22]}
-        fit="fill"
-        scene={playerDisplay.bind(displayPath(targetId, "badgeScene"), { fallback: [] })}
-      />
-      <Container width="fill" height="fill" align_x="center" align_y="center">
-        <Text
-          size={widgetTextSize(13)}
-          color={playerDisplay.bind(displayPath(targetId, "badgeColor"), { fallback: UI.dim })}
-        >
-          {ordinal}
-        </Text>
-      </Container>
-    </Stack>
+  return sessionBadge(
+    ordinal,
+    playerDisplay.bind(displayPath(targetId, "badgeScene"), { fallback: [] }),
+    playerDisplay.bind(displayPath(targetId, "badgeColor"), { fallback: UI.dim }),
   );
 }
 
-type LabelKey = "hpLabel" | "manaLabel" | "moveLabel";
-type BarKey = "hpBars" | "manaBars" | "moveBars";
+type ValueKey = "hpValue" | "manaValue" | "moveValue";
+type ValueColorKey = "hpValueColor" | "manaValueColor" | "moveValueColor";
+type BarKey = "hpBar" | "manaBar" | "moveBar";
+
+function barSlicePath(targetId: number, barKey: BarKey, slice: keyof BarSlices): string {
+  return `${displayPath(targetId, barKey)}.${slice}`;
+}
+
+function barBindings(targetId: number, barKey: BarKey) {
+  return {
+    start: playerDisplay.bind(barSlicePath(targetId, barKey, "start"), { fallback: [] }),
+    middle: playerDisplay.bind(barSlicePath(targetId, barKey, "middle"), { fallback: [] }),
+    end: playerDisplay.bind(barSlicePath(targetId, barKey, "end"), { fallback: [] }),
+  };
+}
 
 function vitalStack(
   targetId: number,
-  labelKey: LabelKey,
+  label: "HP" | "MN" | "MV",
+  valueKey: ValueKey,
+  valueColorKey: ValueColorKey,
   barKey: BarKey,
-  width: number | "fill",
-  textSize: number,
+  color: string,
 ) {
-  return (
-    <Stack width={width} height={widgetMetric(BAR_VIEW_HEIGHT)}>
-      <Canvas
-        width="fill"
-        height="fill"
-        view_box={[0, 0, BAR_VIEW_WIDTH, BAR_VIEW_HEIGHT]}
-        fit="fill"
-        scene={playerDisplay.bind(displayPath(targetId, barKey), { fallback: [] })}
-      />
-      <Container width="fill" height="fill" align_x="center" align_y="center">
-        <Text size={widgetTextSize(textSize)} color={UI.bright}>
-          {playerDisplay.bind(displayPath(targetId, labelKey), { fallback: "—" })}
-        </Text>
-      </Container>
-    </Stack>
+  return compactVital(
+    label,
+    playerDisplay.bind(displayPath(targetId, valueKey), { fallback: "—" }),
+    playerDisplay.bind(displayPath(targetId, valueColorKey), { fallback: UI.bright }),
+    barBindings(targetId, barKey),
+    color,
   );
 }
 
 function identityText(target: ReturnType<typeof getSessions>[number]) {
   return [
-    <Text size={widgetTextSize(13)} color={UI.gold}>
-      {playerDisplay.bind(displayPath(target.id, "name"), {
+    characterName(
+      playerDisplay.bind(displayPath(target.id, "name"), {
         fallback: target.profile.name ?? "Session",
-      })}
-    </Text>,
-    <Text size={widgetTextSize(10)} color={UI.teal}>
-      {playerDisplay.bind(displayPath(target.id, "details"), { fallback: "" })}
-    </Text>,
+      }),
+      13,
+      playerDisplay.bind(displayPath(target.id, "nameColor"), { fallback: UI.bright }),
+    ),
+    classAndLevel(
+      playerDisplay.bind(displayPath(target.id, "className"), { fallback: "connecting" }),
+      playerDisplay.bind(displayPath(target.id, "levelLabel"), { fallback: "" }),
+      10,
+      playerDisplay.bind(displayPath(target.id, "detailSeparator"), { fallback: "" }),
+    ),
   ];
+}
+
+function wideVital(
+  targetId: number,
+  label: "HP" | "MN" | "MV",
+  valueKey: ValueKey,
+  valueColorKey: ValueColorKey,
+  barKey: BarKey,
+  color: string,
+) {
+  return sharedWideVital(
+    label,
+    playerDisplay.bind(displayPath(targetId, valueKey), { fallback: "—" }),
+    playerDisplay.bind(displayPath(targetId, valueColorKey), { fallback: UI.bright }),
+    barBindings(targetId, barKey),
+    color,
+  );
 }
 
 function compactPlayerRow(
@@ -450,20 +383,16 @@ function compactPlayerRow(
   ordinal: number,
 ) {
   return (
-    <Container
-      width="fill"
-      height={widgetMetric(COMPACT_PLAYER_HEIGHT)}
-      background="rgba(20,29,61,0.46)"
-    >
+    <Container width="fill" height={widgetMetric(COMPACT_PLAYER_HEIGHT)}>
       <Column width="fill" height="fill" padding={3} spacing={1}>
         <Row width="fill" height={widgetMetric(22)} spacing={7}>
           {[ordinalBadge(target.id, ordinal), ...identityText(target), <Space width="fill" />]}
         </Row>
-        <Row width="fill" height={widgetMetric(BAR_VIEW_HEIGHT)} spacing={4}>
+        <Row width="fill" height={widgetMetric(18)} spacing={4}>
           {[
-            vitalStack(target.id, "hpLabel", "hpBars", "fill", 9),
-            vitalStack(target.id, "manaLabel", "manaBars", "fill", 9),
-            vitalStack(target.id, "moveLabel", "moveBars", "fill", 9),
+            vitalStack(target.id, "HP", "hpValue", "hpValueColor", "hpBar", UI.hp),
+            vitalStack(target.id, "MN", "manaValue", "manaValueColor", "manaBar", UI.mana),
+            vitalStack(target.id, "MV", "moveValue", "moveValueColor", "moveBar", UI.move),
           ]}
         </Row>
       </Column>
@@ -479,17 +408,20 @@ function widePlayerRow(
     <Container
       width="fill"
       height={widgetMetric(WIDE_PLAYER_HEIGHT)}
-      background="rgba(20,29,61,0.46)"
     >
-      <Row width="fill" height="fill" padding={4} spacing={8}>
+      <Row width="fill" height="fill" padding={0} spacing={widgetMetric(WIDE_IDENTITY_GAP)}>
         {[
           ordinalBadge(target.id, ordinal),
-          <Row width={widgetMetric(WIDE_IDENTITY_WIDTH)} height="fill" spacing={7}>
-            {[...identityText(target), <Space width="fill" />]}
+          <Column width={widgetMetric(WIDE_IDENTITY_WIDTH)} height="fill" spacing={0}>
+            {identityText(target)}
+          </Column>,
+          <Row width="fill" height="fill" spacing={widgetMetric(14)}>
+            {[
+              wideVital(target.id, "HP", "hpValue", "hpValueColor", "hpBar", UI.hp),
+              wideVital(target.id, "MN", "manaValue", "manaValueColor", "manaBar", UI.mana),
+              wideVital(target.id, "MV", "moveValue", "moveValueColor", "moveBar", UI.move),
+            ]}
           </Row>,
-          vitalStack(target.id, "hpLabel", "hpBars", widgetMetric(WIDE_VITAL_WIDTH), 10),
-          vitalStack(target.id, "manaLabel", "manaBars", widgetMetric(WIDE_VITAL_WIDTH), 10),
-          vitalStack(target.id, "moveLabel", "moveBars", widgetMetric(WIDE_VITAL_WIDTH), 10),
         ]}
       </Row>
     </Container>
@@ -508,7 +440,10 @@ function playerHeight(): number {
 }
 
 function desiredHeight(sessionCount: number): number {
-  return widgetMetric(4 + Math.max(1, sessionCount) * (playerHeight() + 2));
+  const count = Math.max(1, sessionCount);
+  const spacing = sessionVitalsLayout === "wide" ? 0 : 2;
+  const outerPadding = sessionVitalsLayout === "wide" ? 0 : 4;
+  return widgetMetric(outerPadding + count * playerHeight() + Math.max(0, count - 1) * spacing);
 }
 
 function render(): void {
@@ -532,7 +467,12 @@ function render(): void {
     createWidget(
       WIDGET,
       <Container width="fill" height="fill" background={themeBackground.bind()}>
-        <Column width="fill" height="fill" padding={2} spacing={2}>
+        <Column
+          width="fill"
+          height="fill"
+          padding={sessionVitalsLayout === "wide" ? 0 : widgetMetric(2)}
+          spacing={sessionVitalsLayout === "wide" ? 0 : widgetMetric(2)}
+        >
           {sessions.map(playerRow)}
         </Column>
       </Container>,

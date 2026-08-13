@@ -221,6 +221,11 @@ interface CreateRoomParams {
  *  set as creation. Any omitted field is left unchanged. */
 type UpdateRoomParams = CreateRoomParams;
 
+interface MutateAreaOptions {
+    /** Description shown by save/conflict diagnostics. */
+    description?: string;
+}
+
 /**
  * One exit read back from a room (`room.exits`). Optional links are present but `null`
  * when unset (not omitted).
@@ -342,6 +347,31 @@ interface LinkCreateArgs extends ConnectionUpdates {
     endpoint_a: ConnectionEndpoint;
     endpoint_b?: ConnectionEndpoint;
     traversals: LinkTraversalArgs[];
+}
+
+/** Callback-scoped collector used by {@link Mapper.mutateArea}. Calls update a
+ * callback-local draft and are submitted only after the callback completes. */
+interface AreaMutator {
+    createRoom(params: CreateRoomParams): Promise<RoomNumber>;
+    updateRoom(room: Room | RoomNumber, fields: UpdateRoomParams): Promise<void>;
+    updateRooms(updates: [RoomNumber, UpdateRoomParams][]): Promise<void>;
+    setRoomTitle(room: Room | RoomNumber, title: string): Promise<void>;
+    setRoomDescription(room: Room | RoomNumber, description: string): Promise<void>;
+    setRoomColor(room: Room | RoomNumber, color: string): Promise<void>;
+    setRoomLevel(room: Room | RoomNumber, level: number): Promise<void>;
+    setRoomX(room: Room | RoomNumber, x: number): Promise<void>;
+    setRoomY(room: Room | RoomNumber, y: number): Promise<void>;
+    setRoomExternalId(room: Room | RoomNumber, externalId: string): Promise<void>;
+    setRoomProperty(room: Room | RoomNumber, name: string, value: string): Promise<void>;
+    setAreaProperty(name: string, value: string): Promise<void>;
+    addRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
+    removeRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
+    createRoomExit(room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId>;
+    setRoomExit(room: Room | RoomNumber, exitId: ExitId, exit: ExitUpdates): Promise<void>;
+    deleteRoom(room: Room | RoomNumber): Promise<void>;
+    deleteRoomExit(room: Room | RoomNumber, exitId: ExitId): Promise<void>;
+    createLink(link: LinkCreateArgs): Promise<ConnectionId>;
+    setConnection(connectionId: ConnectionId, updates: ConnectionUpdates): Promise<void>;
 }
 
 /** A room read from the map. Obtain one via `area.room(n)` or the `listRooms*` helpers. */
@@ -487,6 +517,17 @@ interface Mapper {
     /** All active areas (areas marked inactive are excluded). */
     readonly areas: Area[];
     getAreaById(id: AreaId): Area;
+    /**
+     * Collect related writes to one area and submit them in the fewest practical ordered
+     * envelopes. Each emitted envelope is atomic, but the whole callback is a best-effort
+     * batch: oversized work may be split and earlier acknowledged envelopes are not rolled
+     * back if a later envelope fails. If the callback throws, nothing is submitted.
+     */
+    mutateArea(
+        area: Area | AreaId,
+        callback: (mutation: AreaMutator) => void | Promise<void>,
+        options?: MutateAreaOptions,
+    ): Promise<OperationId[]>;
     /** The cheapest route between two rooms, as a list of `[areaId, roomNumber]`
      *  steps (each exit's `weight` is its cost). */
     getPathBetweenRooms(

@@ -88,6 +88,14 @@ pub enum Message {
         session_id: SessionId,
         msg: session_store::Message,
     },
+    /// Completion of a targeted session-input widget operation initiated by
+    /// window chrome. Only a found target may change model focus/activation.
+    InputFocusSettled {
+        session_id: SessionId,
+        key: PaneKey,
+        focused: bool,
+        found: bool,
+    },
     /// A left press anywhere in a pane (title bar or body): activate that
     /// pane's session.
     PaneClicked(pane_grid::Pane),
@@ -1685,17 +1693,29 @@ impl SmudgyWindow {
     }
 
     /// Set the active session, deactivating all others
-    fn set_active_session(
-        &mut self,
-        session_id: SessionId,
-        sessions: &SessionStore,
-    ) -> Task<Message> {
+    fn remember_active_session(&mut self, session_id: SessionId) {
         if self.active_session_id != Some(session_id) {
             self.previous_active_session_id = self.active_session_id;
             // The active session is persisted per window.
             self.mark_workspace_dirty();
         }
         self.active_session_id = Some(session_id);
+    }
+
+    /// A store-level input operation has confirmed focus for a pane hosted in
+    /// this window. The daemon supplies the hosting check; the window owns
+    /// its persisted active-session identity.
+    pub fn note_session_input_focus(&mut self, session_id: SessionId) {
+        self.remember_active_session(session_id);
+    }
+
+    /// Set the active session, deactivating all others.
+    fn set_active_session(
+        &mut self,
+        session_id: SessionId,
+        sessions: &SessionStore,
+    ) -> Task<Message> {
+        self.remember_active_session(session_id);
 
         // Focus the session's input only when its main pane is in this
         // window *and* is the tab its group currently renders: focusing an
@@ -1713,9 +1733,15 @@ impl SmudgyWindow {
             return Task::none();
         }
         if let Some(session) = sessions.get(session_id) {
-            session.note_command_input_focus(MAIN_PANE_KEY);
             let input_id = session.input.input_id();
-            operation::focus(input_id)
+            components::session_input::focus_target(input_id).map(move |found| {
+                Message::InputFocusSettled {
+                    session_id,
+                    key: MAIN_PANE_KEY,
+                    focused: true,
+                    found,
+                }
+            })
         } else {
             Task::none()
         }
@@ -1792,11 +1818,7 @@ impl SmudgyWindow {
 
         let mut focus_task = Task::none();
         if let Some(slot) = slot {
-            if self.active_session_id != Some(slot.session_id) {
-                self.previous_active_session_id = self.active_session_id;
-                self.active_session_id = Some(slot.session_id);
-                self.mark_workspace_dirty();
-            }
+            self.remember_active_session(slot.session_id);
             let rendered = newly_rendered;
             if request_focus
                 && rendered == Some(slot)
@@ -1807,8 +1829,14 @@ impl SmudgyWindow {
                 // every other holder) without re-focusing it when it already
                 // holds focus — the stock focus operation would move its
                 // caret to the end.
-                session.note_command_input_focus(MAIN_PANE_KEY);
-                focus_task = components::session_input::focus_target(session.input.input_id());
+                focus_task = components::session_input::focus_target(session.input.input_id()).map(
+                    move |found| Message::InputFocusSettled {
+                        session_id: slot.session_id,
+                        key: MAIN_PANE_KEY,
+                        focused: true,
+                        found,
+                    },
+                );
             } else {
                 // Release only the input this selection displaced. Iced runs
                 // widget operations through every application window, so the
@@ -1827,12 +1855,20 @@ impl SmudgyWindow {
                     previously_rendered,
                     previously_focused,
                 );
-                if let Some(input_id) = displaced.and_then(|pane| {
-                    sessions
-                        .get(pane.session_id)
-                        .and_then(|session| session.pane_input_id(pane.key))
-                }) {
-                    focus_task = components::session_input::unfocus_target(input_id);
+                if let Some(displaced) = displaced
+                    && let Some(input_id) = sessions
+                        .get(displaced.session_id)
+                        .and_then(|session| session.pane_input_id(displaced.key))
+                {
+                    focus_task =
+                        components::session_input::unfocus_target(input_id).map(move |found| {
+                            Message::InputFocusSettled {
+                                session_id: displaced.session_id,
+                                key: displaced.key,
+                                focused: false,
+                                found,
+                            }
+                        });
                 }
             }
             // The newly rendered pane occupies the group's existing region;
@@ -2926,45 +2962,68 @@ impl SmudgyWindow {
                 let focus_task = self.set_active_session(session_id, sessions);
                 Update::with_task(focus_task)
             }
-            Message::SessionPaneUserAction { session_id, msg } => match msg {
-                session_store::Message::SetMapperCurrentLocation(area_id, room_number) => {
-                    // Keep the session's own map widgets in step, and bubble
-                    // up for the standalone map editor windows.
-                    let task = sessions
-                        .get_mut(session_id)
-                        .map(|session| {
-                            session
-                                .update(session_store::Message::SetMapperCurrentLocation(
-                                    area_id,
-                                    room_number,
-                                ))
-                                .map(move |pane_msg| Message::SessionPaneUserAction {
+            Message::InputFocusSettled {
+                session_id,
+                key,
+                focused,
+                found,
+            } => {
+                if found && sessions.note_input_focus(session_id, key, focused) && focused {
+                    if let Some(session) = sessions.get(session_id) {
+                        session.note_command_input_focus(key);
+                    }
+                    self.remember_active_session(session_id);
+                }
+                Update::none()
+            }
+            Message::SessionPaneUserAction { session_id, msg } => {
+                if let Some((key, focused)) = msg.input_focus_change()
+                    && sessions.note_input_focus(session_id, key, focused)
+                    && focused
+                {
+                    self.remember_active_session(session_id);
+                }
+
+                match msg {
+                    session_store::Message::SetMapperCurrentLocation(area_id, room_number) => {
+                        // Keep the session's own map widgets in step, and bubble
+                        // up for the standalone map editor windows.
+                        let task = sessions
+                            .get_mut(session_id)
+                            .map(|session| {
+                                session
+                                    .update(session_store::Message::SetMapperCurrentLocation(
+                                        area_id,
+                                        room_number,
+                                    ))
+                                    .map(move |pane_msg| Message::SessionPaneUserAction {
+                                        session_id,
+                                        msg: pane_msg,
+                                    })
+                            })
+                            .unwrap_or_else(Task::none);
+                        Update::new(
+                            task,
+                            Some(Event::SetMapperCurrentLocation(area_id, room_number)),
+                        )
+                    }
+                    msg => {
+                        if let Some(session) = sessions.get_mut(session_id) {
+                            Update::with_task(session.update(msg).map(move |pane_msg| {
+                                Message::SessionPaneUserAction {
                                     session_id,
                                     msg: pane_msg,
-                                })
-                        })
-                        .unwrap_or_else(Task::none);
-                    Update::new(
-                        task,
-                        Some(Event::SetMapperCurrentLocation(area_id, room_number)),
-                    )
-                }
-                msg => {
-                    if let Some(session) = sessions.get_mut(session_id) {
-                        Update::with_task(session.update(msg).map(move |pane_msg| {
-                            Message::SessionPaneUserAction {
-                                session_id,
-                                msg: pane_msg,
-                            }
-                        }))
-                    } else {
-                        // The session was torn down with this action already
-                        // in flight; dropping it is the designed behavior.
-                        log::debug!("Dropping action for closed session {session_id}");
-                        Update::none()
+                                }
+                            }))
+                        } else {
+                            // The session was torn down with this action already
+                            // in flight; dropping it is the designed behavior.
+                            log::debug!("Dropping action for closed session {session_id}");
+                            Update::none()
+                        }
                     }
                 }
-            },
+            }
             Message::PaneClicked(pane) => {
                 // The clicked pane's group becomes the keyboard focus group.
                 if let Some(&group) = self.grid.as_ref().and_then(|grid| grid.panes.get(&pane)) {

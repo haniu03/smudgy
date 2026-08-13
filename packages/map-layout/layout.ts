@@ -70,16 +70,41 @@ export interface IntegralLayoutPlan {
   quality: Readonly<LayoutQuality>;
 }
 
+interface RayQuality {
+  cardinalRayViolations: number;
+  cardinalSlack: number;
+}
+
+interface CandidateScore {
+  // Each stage is populated only if every earlier lexicographic stage ties.
+  collisions?: number;
+  ray?: RayQuality;
+  indexed?: PositionIndex;
+  physicalEdges?: ScoredPhysicalEdge[];
+  roomObstructions?: number;
+  linkCrossings?: number;
+  movedExisting?: Set<string>;
+  quality?: LayoutQuality;
+}
+
+interface CandidateDerivation {
+  base: Candidate;
+  changedIds: ReadonlySet<string>;
+}
+
 interface Candidate {
   positions: Map<string, GridPosition>;
-  movedExisting: Set<string>;
-  quality: LayoutQuality;
-  collisions: number;
+  current: ReadonlyMap<string, GridPosition>;
+  edges: readonly LayoutEdge[];
+  score: CandidateScore;
+  derivation?: CandidateDerivation;
+  cacheHash?: number;
 }
 
 interface CandidateEvaluator {
   ids: string[];
-  cache: Map<string, Candidate>;
+  idIndexes: Map<string, number>;
+  cache: Map<number, Candidate[]>;
 }
 
 const CANDIDATE_EVALUATORS = new WeakMap<ReadonlyMap<string, GridPosition>, CandidateEvaluator>();
@@ -223,6 +248,8 @@ const DIRECTION_VECTORS: Partial<Record<LayoutDirection, GridPosition>> = {
 
 const SEARCH_RADIUS = 12;
 const ISLAND_GAP = 4;
+/** Small edits are cheaper to rescore from their exact edge/room deltas. */
+const INCREMENTAL_SCORE_ROOM_LIMIT = 4;
 
 interface IndexedPhysicalLink {
   a: string;
@@ -414,6 +441,27 @@ function collisionGroups(positions: ReadonlyMap<string, GridPosition>): string[]
   return [...cells.values()].filter((occupants) => occupants.length > 1);
 }
 
+function collisionGroupCount(positions: ReadonlyMap<string, GridPosition>): number {
+  const occupied = new Set<string>();
+  const collided = new Set<string>();
+  for (const position of positions.values()) {
+    const key = cellKey(position);
+    if (occupied.has(key)) collided.add(key);
+    else occupied.add(key);
+  }
+  return collided.size;
+}
+
+function hasCollisions(positions: ReadonlyMap<string, GridPosition>): boolean {
+  const occupied = new Set<string>();
+  for (const position of positions.values()) {
+    const key = cellKey(position);
+    if (occupied.has(key)) return true;
+    occupied.add(key);
+  }
+  return false;
+}
+
 function translationOffsets(radius = SEARCH_RADIUS): Origin[] {
   const result: Origin[] = [{ x: 0, y: 0, level: 0 }];
   for (let distance = 1; distance <= radius; distance += 1) {
@@ -477,22 +525,18 @@ interface PositionIndex {
   columns: Map<string, number[]>;
   footprintArea: number;
   footprintPerimeter: number;
-  collisions: number;
 }
 
 function positionIndex(positions: ReadonlyMap<string, GridPosition>): PositionIndex {
   const entries = [...positions];
   const rows = new Map<string, number[]>();
   const columns = new Map<string, number[]>();
-  const cells = new Map<string, number>();
   const levelBounds = new Map<number, {
     minX: number;
     maxX: number;
     minY: number;
     maxY: number;
   }>();
-  let collisions = 0;
-
   for (const [, position] of entries) {
     const rowKey = `${position.level}:${position.y}`;
     const row = rows.get(rowKey) ?? [];
@@ -502,11 +546,6 @@ function positionIndex(positions: ReadonlyMap<string, GridPosition>): PositionIn
     const column = columns.get(columnKey) ?? [];
     column.push(position.y);
     columns.set(columnKey, column);
-
-    const key = cellKey(position);
-    const cellCount = cells.get(key) ?? 0;
-    if (cellCount === 1) collisions += 1;
-    cells.set(key, cellCount + 1);
 
     const known = levelBounds.get(position.level);
     if (known) {
@@ -540,7 +579,6 @@ function positionIndex(positions: ReadonlyMap<string, GridPosition>): PositionIn
     columns,
     footprintArea,
     footprintPerimeter,
-    collisions,
   };
 }
 
@@ -681,90 +719,292 @@ function linkCrossingCount(edges: readonly ScoredPhysicalEdge[]): number {
   return crossings;
 }
 
-function layoutQuality(
+function edgeRayQuality(
+  positions: ReadonlyMap<string, GridPosition>,
+  edge: LayoutEdge,
+): RayQuality {
+  const from = positions.get(edge.from);
+  const to = positions.get(edge.to);
+  const expected = protectedVector(edge);
+  if (!expected || !from || !to) {
+    return { cardinalRayViolations: 0, cardinalSlack: 0 };
+  }
+  const distance = protectedRayDistance(edge, subtract(to, from));
+  return distance === undefined
+    ? { cardinalRayViolations: 1, cardinalSlack: 0 }
+    : { cardinalRayViolations: 0, cardinalSlack: Math.max(0, distance - 1) };
+}
+
+function fullRayQuality(
   positions: ReadonlyMap<string, GridPosition>,
   edges: readonly LayoutEdge[],
-  indexed: PositionIndex = positionIndex(positions),
-): LayoutQuality {
-  const result: LayoutQuality = {
-    cardinalRayViolations: 0,
-    roomObstructions: 0,
-    linkCrossings: 0,
-    cardinalSlack: 0,
-    footprintArea: indexed.footprintArea,
-    footprintPerimeter: indexed.footprintPerimeter,
-  };
-
+): RayQuality {
+  const result = { cardinalRayViolations: 0, cardinalSlack: 0 };
   for (const edge of edges) {
-    const from = positions.get(edge.from);
-    const to = positions.get(edge.to);
-    const expected = protectedVector(edge);
-    if (!expected || !from || !to) continue;
-    const delta = subtract(to, from);
-    const distance = protectedRayDistance(edge, delta);
-    if (distance !== undefined) {
-      result.cardinalSlack += Math.max(0, distance - 1);
-    } else {
-      result.cardinalRayViolations += 1;
-    }
+    const contribution = edgeRayQuality(positions, edge);
+    result.cardinalRayViolations += contribution.cardinalRayViolations;
+    result.cardinalSlack += contribution.cardinalSlack;
+  }
+  return result;
+}
+
+function candidateRayQuality(value: Candidate): RayQuality {
+  if (value.score.ray) return value.score.ray;
+  const derivation = value.derivation;
+  if (!derivation || derivation.base.edges !== value.edges) {
+    value.score.ray = fullRayQuality(value.positions, value.edges);
+    return value.score.ray;
   }
 
-  const physicalEdges: ScoredPhysicalEdge[] = [];
-  for (const link of topologyIndex(edges).physical) {
-    const from = positions.get(link.a);
-    const to = positions.get(link.b);
+  const base = candidateRayQuality(derivation.base);
+  const result = { ...base };
+  const affected = new Set<LayoutEdge>();
+  const incident = topologyIndex(value.edges).incident;
+  for (const id of derivation.changedIds) {
+    for (const edge of incident.get(id) ?? []) affected.add(edge);
+  }
+  for (const edge of affected) {
+    const before = edgeRayQuality(derivation.base.positions, edge);
+    const after = edgeRayQuality(value.positions, edge);
+    result.cardinalRayViolations += after.cardinalRayViolations - before.cardinalRayViolations;
+    result.cardinalSlack += after.cardinalSlack - before.cardinalSlack;
+  }
+  value.score.ray = result;
+  return result;
+}
+
+function candidateIndex(value: Candidate): PositionIndex {
+  value.score.indexed ??= positionIndex(value.positions);
+  return value.score.indexed;
+}
+
+function candidatePhysicalEdges(value: Candidate): ScoredPhysicalEdge[] {
+  if (value.score.physicalEdges) return value.score.physicalEdges;
+  const result: ScoredPhysicalEdge[] = [];
+  for (const link of topologyIndex(value.edges).physical) {
+    const from = value.positions.get(link.a);
+    const to = value.positions.get(link.b);
     if (!from || !to || from.level !== to.level) continue;
-    physicalEdges.push({ fromId: link.a, toId: link.b, from, to });
+    result.push({ fromId: link.a, toId: link.b, from, to });
+  }
+  value.score.physicalEdges = result;
+  return result;
+}
+
+function physicalLinkObstructions(
+  positions: ReadonlyMap<string, GridPosition>,
+  link: IndexedPhysicalLink,
+): number {
+  const from = positions.get(link.a);
+  const to = positions.get(link.b);
+  if (!from || !to || from.level !== to.level) return 0;
+  let result = 0;
+  for (const room of positions.values()) {
+    if (segmentIntersectsRoomCell(from, to, room)) result += 1;
+  }
+  return result;
+}
+
+function changedRoomObstructionDelta(
+  before: ReadonlyMap<string, GridPosition>,
+  after: ReadonlyMap<string, GridPosition>,
+  link: IndexedPhysicalLink,
+  changedIds: ReadonlySet<string>,
+): number {
+  const from = after.get(link.a);
+  const to = after.get(link.b);
+  if (!from || !to || from.level !== to.level) return 0;
+  let result = 0;
+  for (const id of changedIds) {
+    const beforeRoom = before.get(id);
+    const afterRoom = after.get(id);
+    if (beforeRoom && segmentIntersectsRoomCell(from, to, beforeRoom)) result -= 1;
+    if (afterRoom && segmentIntersectsRoomCell(from, to, afterRoom)) result += 1;
+  }
+  return result;
+}
+
+function candidateRoomObstructions(value: Candidate): number {
+  if (value.score.roomObstructions !== undefined) return value.score.roomObstructions;
+  const derivation = value.derivation;
+  if (derivation && derivation.base.edges === value.edges &&
+    derivation.changedIds.size <= INCREMENTAL_SCORE_ROOM_LIMIT) {
+    let result = candidateRoomObstructions(derivation.base);
+    for (const link of topologyIndex(value.edges).physical) {
+      if (derivation.changedIds.has(link.a) || derivation.changedIds.has(link.b)) {
+        result += physicalLinkObstructions(value.positions, link) -
+          physicalLinkObstructions(derivation.base.positions, link);
+      } else {
+        result += changedRoomObstructionDelta(
+          derivation.base.positions,
+          value.positions,
+          link,
+          derivation.changedIds,
+        );
+      }
+    }
+    value.score.roomObstructions = result;
+    return result;
+  }
+
+  const indexed = candidateIndex(value);
+  let result = 0;
+  for (const edge of candidatePhysicalEdges(value)) {
+    const { from, to } = edge;
     if (from.y === to.y) {
-      result.roomObstructions += countStrictlyBetween(
+      result += countStrictlyBetween(
         indexed.rows.get(`${from.level}:${from.y}`),
         from.x,
         to.x,
       );
     } else if (from.x === to.x) {
-      result.roomObstructions += countStrictlyBetween(
+      result += countStrictlyBetween(
         indexed.columns.get(`${from.level}:${from.x}`),
         from.y,
         to.y,
       );
     } else {
       for (const [, room] of indexed.entries) {
-        if (segmentIntersectsRoomCell(from, to, room)) result.roomObstructions += 1;
+        if (segmentIntersectsRoomCell(from, to, room)) result += 1;
       }
     }
   }
-  result.linkCrossings = linkCrossingCount(physicalEdges);
+  value.score.roomObstructions = result;
   return result;
 }
 
-/** Positive means `a` is the greedily preferred layout. */
+function scoredPhysicalLink(
+  positions: ReadonlyMap<string, GridPosition>,
+  link: IndexedPhysicalLink,
+): ScoredPhysicalEdge | undefined {
+  const from = positions.get(link.a);
+  const to = positions.get(link.b);
+  return from && to && from.level === to.level
+    ? { fromId: link.a, toId: link.b, from, to }
+    : undefined;
+}
+
+function physicalLinksCross(
+  positions: ReadonlyMap<string, GridPosition>,
+  first: IndexedPhysicalLink,
+  second: IndexedPhysicalLink,
+): number {
+  if (first.a === second.a || first.a === second.b ||
+    first.b === second.a || first.b === second.b) return 0;
+  const a = scoredPhysicalLink(positions, first);
+  const b = scoredPhysicalLink(positions, second);
+  return a && b && strictSegmentsIntersect(a.from, a.to, b.from, b.to) ? 1 : 0;
+}
+
+function candidateLinkCrossings(value: Candidate): number {
+  if (value.score.linkCrossings !== undefined) return value.score.linkCrossings;
+  const derivation = value.derivation;
+  if (derivation && derivation.base.edges === value.edges &&
+    derivation.changedIds.size <= INCREMENTAL_SCORE_ROOM_LIMIT) {
+    const links = topologyIndex(value.edges).physical;
+    const changedLinks: number[] = [];
+    for (let index = 0; index < links.length; index += 1) {
+      const link = links[index];
+      if (derivation.changedIds.has(link.a) || derivation.changedIds.has(link.b)) {
+        changedLinks.push(index);
+      }
+    }
+    let result = candidateLinkCrossings(derivation.base);
+    const visited = new Set<number>();
+    for (const first of changedLinks) {
+      for (let second = 0; second < links.length; second += 1) {
+        if (first === second) continue;
+        const lower = Math.min(first, second);
+        const upper = Math.max(first, second);
+        const key = lower * links.length + upper;
+        if (visited.has(key)) continue;
+        visited.add(key);
+        result += physicalLinksCross(value.positions, links[lower], links[upper]) -
+          physicalLinksCross(derivation.base.positions, links[lower], links[upper]);
+      }
+    }
+    value.score.linkCrossings = result;
+    return result;
+  }
+  value.score.linkCrossings = linkCrossingCount(candidatePhysicalEdges(value));
+  return value.score.linkCrossings;
+}
+
+function candidateCollisions(value: Candidate): number {
+  value.score.collisions ??= collisionGroupCount(value.positions);
+  return value.score.collisions;
+}
+
+function candidateMovedExisting(value: Candidate): Set<string> {
+  if (value.score.movedExisting) return value.score.movedExisting;
+  const result = new Set<string>();
+  for (const [id, before] of value.current) {
+    const after = value.positions.get(id);
+    if (after && !samePosition(before, after)) result.add(id);
+  }
+  value.score.movedExisting = result;
+  return result;
+}
+
+function candidateQuality(value: Candidate): LayoutQuality {
+  if (value.score.quality) return value.score.quality;
+  const ray = candidateRayQuality(value);
+  const roomObstructions = candidateRoomObstructions(value);
+  const linkCrossings = candidateLinkCrossings(value);
+  const indexed = candidateIndex(value);
+  value.score.quality = {
+    cardinalRayViolations: ray.cardinalRayViolations,
+    roomObstructions,
+    linkCrossings,
+    cardinalSlack: ray.cardinalSlack,
+    footprintArea: indexed.footprintArea,
+    footprintPerimeter: indexed.footprintPerimeter,
+  };
+  return value.score.quality;
+}
+
+/**
+ * Positive means `a` is the greedily preferred layout. Pulling score stages
+ * in tuple order is intentional: a candidate that loses early never pays for
+ * spatial indexes, link crossings, footprint bounds, or movement accounting.
+ */
 function compareCandidates(a: Candidate, b: Candidate): number {
-  if (a.collisions !== b.collisions) return b.collisions - a.collisions;
-  if (a.quality.cardinalRayViolations !== b.quality.cardinalRayViolations) {
-    return b.quality.cardinalRayViolations - a.quality.cardinalRayViolations;
+  const collisionsA = candidateCollisions(a);
+  const collisionsB = candidateCollisions(b);
+  if (collisionsA !== collisionsB) return collisionsB - collisionsA;
+
+  const rayA = candidateRayQuality(a);
+  const rayB = candidateRayQuality(b);
+  if (rayA.cardinalRayViolations !== rayB.cardinalRayViolations) {
+    return rayB.cardinalRayViolations - rayA.cardinalRayViolations;
   }
-  if (a.quality.roomObstructions !== b.quality.roomObstructions) {
-    return b.quality.roomObstructions - a.quality.roomObstructions;
+
+  const obstructionsA = candidateRoomObstructions(a);
+  const obstructionsB = candidateRoomObstructions(b);
+  if (obstructionsA !== obstructionsB) return obstructionsB - obstructionsA;
+
+  const crossingsA = candidateLinkCrossings(a);
+  const crossingsB = candidateLinkCrossings(b);
+  if (crossingsA !== crossingsB) return crossingsB - crossingsA;
+  if (rayA.cardinalSlack !== rayB.cardinalSlack) {
+    return rayB.cardinalSlack - rayA.cardinalSlack;
   }
-  if (a.quality.linkCrossings !== b.quality.linkCrossings) {
-    return b.quality.linkCrossings - a.quality.linkCrossings;
+
+  const indexedA = candidateIndex(a);
+  const indexedB = candidateIndex(b);
+  if (indexedA.footprintArea !== indexedB.footprintArea) {
+    return indexedB.footprintArea - indexedA.footprintArea;
   }
-  if (a.quality.cardinalSlack !== b.quality.cardinalSlack) {
-    return b.quality.cardinalSlack - a.quality.cardinalSlack;
+  if (indexedA.footprintPerimeter !== indexedB.footprintPerimeter) {
+    return indexedB.footprintPerimeter - indexedA.footprintPerimeter;
   }
-  if (a.quality.footprintArea !== b.quality.footprintArea) {
-    return b.quality.footprintArea - a.quality.footprintArea;
-  }
-  if (a.quality.footprintPerimeter !== b.quality.footprintPerimeter) {
-    return b.quality.footprintPerimeter - a.quality.footprintPerimeter;
-  }
-  return b.movedExisting.size - a.movedExisting.size;
+  return candidateMovedExisting(b).size - candidateMovedExisting(a).size;
 }
 
 function traceCandidate(value: Candidate, includePositions = true): LayoutTraceCandidate {
   const result: LayoutTraceCandidate = {
-    quality: { ...value.quality },
-    movedExisting: [...value.movedExisting].sort(),
+    quality: { ...candidateQuality(value) },
+    movedExisting: [...candidateMovedExisting(value)].sort(),
   };
   if (includePositions) {
     result.positions = [...value.positions]
@@ -781,7 +1021,7 @@ function traceCandidateBatch(
 ): void {
   if (!trace) return;
   const generated = values.filter((value): value is Candidate => value !== undefined);
-  const collisionFree = generated.filter((value) => value.collisions === 0);
+  const collisionFree = generated.filter((value) => candidateCollisions(value) === 0);
   collisionFree.sort((a, b) => compareCandidates(b, a));
   trace({
     type: "candidate-batch",
@@ -849,24 +1089,47 @@ function candidate(
   positions: Map<string, GridPosition>,
   current: ReadonlyMap<string, GridPosition>,
   edges: readonly LayoutEdge[],
+  derivation?: CandidateDerivation,
 ): Candidate {
   const evaluator = CANDIDATE_EVALUATORS.get(current);
-  const key = evaluator ? evaluationKey(positions, evaluator.ids) : undefined;
-  const known = key === undefined ? undefined : evaluator?.cache.get(key);
-  if (known) return known;
-  const indexed = positionIndex(positions);
-  const movedExisting = new Set<string>();
-  for (const [id, before] of current) {
-    const after = positions.get(id);
-    if (after && !samePosition(before, after)) movedExisting.add(id);
+  const hash = evaluator ? evaluationHash(positions, evaluator, derivation) : undefined;
+  // The incremental hash only selects a bucket; exact coordinate comparison
+  // below makes collisions harmless and preserves deterministic selection.
+  const known = hash === undefined
+    ? undefined
+    : evaluator?.cache.get(hash)?.find((value) =>
+      sameEvaluation(value.positions, positions, evaluator.ids)
+    );
+  if (known) {
+    if (!known.derivation && derivation) known.derivation = derivation;
+    return known;
   }
-  const result = {
+  const result: Candidate = {
     positions,
-    movedExisting,
-    quality: layoutQuality(positions, edges, indexed),
-    collisions: indexed.collisions,
+    current,
+    edges,
+    score: {},
+    derivation,
+    cacheHash: hash,
   };
-  if (key !== undefined) evaluator?.cache.set(key, result);
+  if (hash !== undefined && evaluator) {
+    const bucket = evaluator.cache.get(hash) ?? [];
+    bucket.push(result);
+    evaluator.cache.set(hash, bucket);
+  }
+  return result;
+}
+
+function changedPositionIds(
+  before: ReadonlyMap<string, GridPosition>,
+  after: ReadonlyMap<string, GridPosition>,
+): Set<string> {
+  const result = new Set<string>();
+  for (const id of new Set([...before.keys(), ...after.keys()])) {
+    const a = before.get(id);
+    const b = after.get(id);
+    if (!a || !b || !samePosition(a, b)) result.add(id);
+  }
   return result;
 }
 
@@ -1018,12 +1281,16 @@ function componentPositions(
   return result;
 }
 
-function fits(
-  placement: ReadonlyMap<string, GridPosition>,
-  positions: ReadonlyMap<string, GridPosition>,
-): boolean {
+function occupiedCells(positions: ReadonlyMap<string, GridPosition>): Map<string, string> {
   const occupied = new Map<string, string>();
   for (const [id, position] of positions) occupied.set(cellKey(position), id);
+  return occupied;
+}
+
+function fits(
+  placement: ReadonlyMap<string, GridPosition>,
+  occupied: ReadonlyMap<string, string>,
+): boolean {
   const staged = new Set<string>();
   for (const [id, position] of placement) {
     const key = cellKey(position);
@@ -1114,6 +1381,8 @@ function bestStablePlacement(
     const componentSet = new Set(component);
     const origins = anchorOrigins(componentSet, positions, nodes, edges, centerId);
     if (origins.length === 0) origins.push(packedOrigin(component, positions, nodes));
+    const occupied = occupiedCells(positions);
+    const baseCandidate = candidate(new Map(positions), current, edges);
 
     let best: Candidate | undefined;
     for (const origin of origins) {
@@ -1124,10 +1393,13 @@ function bestStablePlacement(
       ]);
       for (const offset of offsets) {
         const placement = componentPositions(component, nodes, origin, offset);
-        if (!fits(placement, positions)) continue;
+        if (!fits(placement, occupied)) continue;
         const trial = new Map(positions);
         for (const [id, position] of placement) trial.set(id, position);
-        const evaluated = candidate(trial, current, edges);
+        const evaluated = candidate(trial, current, edges, {
+          base: baseCandidate,
+          changedIds: componentSet,
+        });
         if (!best || compareCandidates(evaluated, best) > 0) best = evaluated;
       }
     }
@@ -1184,6 +1456,8 @@ function moveCollisionBlocks(
     const movingPositions = movingIds.map((id) => positions.get(id)).filter((value): value is GridPosition => !!value);
     const stationary = new Map(positions);
     for (const id of movingIds) stationary.delete(id);
+    const occupied = occupiedCells(stationary);
+    const baseCandidate = candidate(new Map(positions), current, edges);
 
     let best: Candidate | undefined;
     const movingIdSet = new Set(movingIds);
@@ -1201,9 +1475,12 @@ function moveCollisionBlocks(
       }
       // Other collisions may still be waiting for the next loop iteration;
       // this translation only has to avoid introducing one for this block.
-      if (!fits(placement, stationary)) continue;
+      if (!fits(placement, occupied)) continue;
       for (const [id, position] of placement) trial.set(id, position);
-      const evaluated = candidate(trial, current, edges);
+      const evaluated = candidate(trial, current, edges, {
+        base: baseCandidate,
+        changedIds: movingIdSet,
+      });
       if (!best || compareCandidates(evaluated, best) > 0) best = evaluated;
     }
     if (!best) return undefined;
@@ -1220,18 +1497,55 @@ function positionMapKey(positions: ReadonlyMap<string, GridPosition>): string {
     .join("|");
 }
 
-function evaluationKey(
+function positionHash(index: number, position: GridPosition): number {
+  let result = Math.imul(index + 1, -1640531527);
+  result ^= Math.imul(position.x | 0, -2048144789);
+  result ^= Math.imul(position.y | 0, -1028477387);
+  result ^= Math.imul(position.level | 0, 668265263);
+  return result >>> 0;
+}
+
+function evaluationHash(
   positions: ReadonlyMap<string, GridPosition>,
-  ids: readonly string[],
-): string {
-  let result = "";
-  for (const id of ids) {
-    const position = positions.get(id);
-    result += position
-      ? `${position.level}:${position.x}:${position.y}|`
-      : "_|";
+  evaluator: CandidateEvaluator,
+  derivation?: CandidateDerivation,
+): number {
+  if (derivation?.base.cacheHash !== undefined) {
+    let result = derivation.base.cacheHash;
+    for (const id of derivation.changedIds) {
+      const index = evaluator.idIndexes.get(id);
+      if (index === undefined) continue;
+      const before = derivation.base.positions.get(id);
+      const after = positions.get(id);
+      if (before) result ^= positionHash(index, before);
+      if (after) result ^= positionHash(index, after);
+    }
+    return result >>> 0;
   }
-  return result;
+  let result = 0;
+  for (let index = 0; index < evaluator.ids.length; index += 1) {
+    const id = evaluator.ids[index];
+    const position = positions.get(id);
+    if (position) result ^= positionHash(index, position);
+  }
+  return result >>> 0;
+}
+
+function sameEvaluation(
+  a: ReadonlyMap<string, GridPosition>,
+  b: ReadonlyMap<string, GridPosition>,
+  ids: readonly string[],
+): boolean {
+  for (const id of ids) {
+    const left = a.get(id);
+    const right = b.get(id);
+    if (left === undefined || right === undefined) {
+      if (left !== right) return false;
+    } else if (!samePosition(left, right)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 interface ExpansionAxis {
@@ -1406,7 +1720,7 @@ export function safePushRepairs(
       }
       moving = closure;
 
-      if (collisionGroups(positions).length > 0) continue;
+      if (hasCollisions(positions)) continue;
       const key = positionMapKey(positions);
       if (!seen.has(key)) {
         seen.add(key);
@@ -1589,10 +1903,13 @@ function obstructionRepairCandidates(
           distance + pushDistancePastLine(trial, closure, from, offset),
         );
 
-        if (collisionGroups(trial).length > 0) continue;
+        if (hasCollisions(trial)) continue;
         if (obstructingRoomIds(trial, edge.from, edge.to).length >= ids.length) continue;
         const repair = {
-          candidate: candidate(new Map(trial), current, edges),
+          candidate: candidate(new Map(trial), current, edges, {
+            base,
+            changedIds: new Set(allMoved),
+          }),
           edge,
           offset: {
             x: offset.x * distance,
@@ -1713,7 +2030,7 @@ function expansionRepairs(
           if (position) trial.set(id, add(position, offset));
         }
 
-        const repaired = collisionGroups(trial).length === 0
+        const repaired = !hasCollisions(trial)
           ? trial
           : moveCollisionBlocks(
             trial,
@@ -1724,7 +2041,7 @@ function expansionRepairs(
             edges,
             centerId,
           );
-        if (!repaired || collisionGroups(repaired).length > 0) continue;
+        if (!repaired || hasCollisions(repaired)) continue;
         const key = positionMapKey(repaired);
         if (seen.has(key)) continue;
         seen.add(key);
@@ -1802,7 +2119,7 @@ function shiftedRegionRepairs(
   }
 
   const maps: Map<string, GridPosition>[] = [];
-  if (collisionGroups(shifted).length === 0) {
+  if (!hasCollisions(shifted)) {
     maps.push(shifted);
   } else {
     const repaired = moveCollisionBlocks(
@@ -1819,14 +2136,17 @@ function shiftedRegionRepairs(
 
   const seen = new Set<string>();
   return maps
-    .filter((positions) => collisionGroups(positions).length === 0)
+    .filter((positions) => !hasCollisions(positions))
     .filter((positions) => {
       const key = positionMapKey(positions);
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     })
-    .map((positions) => candidate(positions, current, edges));
+    .map((positions) => candidate(positions, current, edges, {
+      base,
+      changedIds: changedPositionIds(base.positions, positions),
+    }));
 }
 
 interface RayAlignmentAttempt {
@@ -1902,6 +2222,7 @@ function repeatedRayAlignmentPush(
   const protectedIds = new Set([attempt.stationaryId]);
   if (centerId) protectedIds.add(centerId);
   let moving = new Set([attempt.movingId]);
+  const allMoved = new Set<string>();
 
   for (let step = 0; step < attempt.distance; step += 1) {
     const closure = safePushClosure(
@@ -1916,11 +2237,12 @@ function repeatedRayAlignmentPush(
     for (const id of closure) {
       const position = positions.get(id);
       if (position) positions.set(id, add(position, attempt.unit));
+      allMoved.add(id);
     }
-    if (collisionGroups(positions).length > 0) return undefined;
+    if (hasCollisions(positions)) return undefined;
     moving = closure;
   }
-  return candidate(positions, current, edges);
+  return candidate(positions, current, edges, { base, changedIds: allMoved });
 }
 
 /** Try rigid-block and whole-side translations which make a bad orthogonal edge exact. */
@@ -2113,7 +2435,7 @@ function reflowCandidates(
   for (const origin of origins) {
     const positions = new Map(initial);
     const patch = componentPositions([...nodeIds], nodes, origin);
-    if (collisionGroups(patch).length > 0) continue;
+    if (hasCollisions(patch)) continue;
     for (const [id, position] of patch) positions.set(id, position);
     for (const pushed of safePushRepairs(positions, nodeIds, residents, edges)) {
       result.push(candidate(pushed, current, edges));
@@ -2216,6 +2538,7 @@ function goldenCandidate(
 
   const placed = new Map<string, GridPosition>();
   for (const component of components) {
+    const componentSet = new Set(component.ids);
     const fixedOrigins = component.ids
       .filter((id) => residents.get(id)?.movable === false && current.has(id))
       .map((id) => subtract(current.get(id) as GridPosition, component.relative.get(id) as GridPosition));
@@ -2247,6 +2570,8 @@ function goldenCandidate(
       }];
     }
 
+    const occupied = occupiedCells(placed);
+    const baseCandidate = candidate(new Map(placed), current, edges);
     let best: Candidate | undefined;
     for (const origin of origins) {
       const base = new Map(component.ids.map((id) => [
@@ -2261,10 +2586,13 @@ function goldenCandidate(
         ]);
       for (const offset of offsets) {
         const placement = new Map([...base].map(([id, position]) => [id, add(position, offset)]));
-        if (!fits(placement, placed)) continue;
+        if (!fits(placement, occupied)) continue;
         const trial = new Map(placed);
         for (const [id, position] of placement) trial.set(id, position);
-        const evaluated = candidate(trial, current, edges);
+        const evaluated = candidate(trial, current, edges, {
+          base: baseCandidate,
+          changedIds: componentSet,
+        });
         if (!best || compareCandidates(evaluated, best) > 0) best = evaluated;
       }
     }
@@ -2276,7 +2604,8 @@ function goldenCandidate(
   }
 
   const result = candidate(placed, current, edges);
-  return result.quality.cardinalRayViolations === 0 && result.quality.cardinalSlack === 0
+  const ray = candidateRayQuality(result);
+  return ray.cardinalRayViolations === 0 && ray.cardinalSlack === 0
     ? result
     : undefined;
 }
@@ -2425,6 +2754,9 @@ function bridgeSlideCandidates(
     for (const attempt of attempts) {
       const moving = bridgeSide(attempt.movingEndpoint, link.key, adjacency);
       if (!movableRegion(moving, residents)) continue;
+      const stationary = new Map(base.positions);
+      for (const id of moving) stationary.delete(id);
+      const occupied = occupiedCells(stationary);
       const movingPosition = base.positions.get(attempt.movingEndpoint) as GridPosition;
       const stationaryPosition = base.positions.get(attempt.stationaryEndpoint) as GridPosition;
       const unit = {
@@ -2439,13 +2771,15 @@ function bridgeSlideCandidates(
           y: unit.y * distance,
           level: 0,
         };
-        const trial = new Map(base.positions);
+        const placement = new Map<string, GridPosition>();
         for (const id of moving) {
-          const position = trial.get(id);
-          if (position) trial.set(id, add(position, offset));
+          const position = base.positions.get(id);
+          if (position) placement.set(id, add(position, offset));
         }
-        if (collisionGroups(trial).length > 0) break;
-        const evaluated = candidate(trial, current, edges);
+        if (!fits(placement, occupied)) break;
+        const trial = new Map(stationary);
+        for (const [id, position] of placement) trial.set(id, position);
+        const evaluated = candidate(trial, current, edges, { base, changedIds: moving });
         const slide = {
           candidate: evaluated,
           edge: representative,
@@ -2555,8 +2889,8 @@ function vacuumLayout(
               [axis]: position[axis] + distance,
             });
           }
-          if (collisionGroups(trial).length > 0) continue;
-          const evaluated = candidate(trial, current, edges);
+          if (hasCollisions(trial)) continue;
+          const evaluated = candidate(trial, current, edges, { base: best, changedIds: moving });
           if (compareCandidates(evaluated, next) > 0) {
             next = evaluated;
             accepted = {
@@ -2605,8 +2939,10 @@ export function planIntegralLayout(request: IntegralLayoutRequest): IntegralLayo
     position: integral(resident.position),
   }]));
   const current = new Map([...residents].map(([id, resident]) => [id, resident.position]));
+  const evaluationIds = [...new Set([...current.keys(), ...nodes.keys()])].sort();
   CANDIDATE_EVALUATORS.set(current, {
-    ids: [...new Set([...current.keys(), ...nodes.keys()])].sort(),
+    ids: evaluationIds,
+    idIndexes: new Map(evaluationIds.map((id, index) => [id, index])),
     cache: new Map(),
   });
   const blocks = coherentBlocks(current, request.edges);
@@ -2659,7 +2995,7 @@ export function planIntegralLayout(request: IntegralLayoutRequest): IntegralLayo
   traceCandidateBatch(request.trace, "chart-reflow", chartReflow);
 
   const collisionFree = [stable, ...alternatives]
-    .filter((value): value is Candidate => value !== undefined && value.collisions === 0);
+    .filter((value): value is Candidate => value !== undefined && candidateCollisions(value) === 0);
   traceCandidateBatch(request.trace, "all-candidates", [stable, ...alternatives]);
   if (collisionFree.length === 0) {
     throw new Error("could not produce a collision-free integral layout");
@@ -2678,8 +3014,8 @@ export function planIntegralLayout(request: IntegralLayoutRequest): IntegralLayo
     // clean whole-map translation.
     const initialWinner = collisionFree[0];
     const repairSeeds = [initialWinner];
-    if (stable && stable !== initialWinner && stable.collisions === 0 &&
-      stable.quality.cardinalRayViolations > 0) {
+    if (stable && stable !== initialWinner && candidateCollisions(stable) === 0 &&
+      candidateRayQuality(stable).cardinalRayViolations > 0) {
       repairSeeds.push(stable);
     }
     const cardinalRepairs: Candidate[] = [];
@@ -2697,7 +3033,8 @@ export function planIntegralLayout(request: IntegralLayoutRequest): IntegralLayo
       // primary objective. Otherwise its unrelated packing can displace the
       // established/current component merely to win on footprint.
       const improvesPrimary = repaired &&
-        repaired.quality.cardinalRayViolations < seed.quality.cardinalRayViolations;
+        candidateRayQuality(repaired).cardinalRayViolations <
+          candidateRayQuality(seed).cardinalRayViolations;
       if (repaired && (seed === initialWinner || improvesPrimary)) {
         cardinalRepairs.push(repaired);
         collisionFree.push(repaired);
@@ -2745,7 +3082,7 @@ export function planIntegralLayout(request: IntegralLayoutRequest): IntegralLayo
   });
   return {
     positions: selected.positions,
-    movedExisting: selected.movedExisting,
-    quality: selected.quality,
+    movedExisting: candidateMovedExisting(selected),
+    quality: candidateQuality(selected),
   };
 }

@@ -1,24 +1,19 @@
 // =============================================================================
 //  Vitals HUD — a compact strip on the main pane
 // =============================================================================
-//  HP / Mana / Move bars are bound straight to the GMCP tree, so
-//  they repaint on every Char.Vitals without a handler or remount. The only
-//  structural change is the opponent block, which appears while Char.Vitals
-//  carries an `opponent` and vanishes when combat ends — that transition is
-//  the one thing that remounts the widget.
+//  HP / Mana / Move updates rebuild bound scenes from the same shared bar
+//  renderer as the aggregate tabbed-session display. The only structural
+//  change is the wide header's opponent block, which appears while
+//  Char.Vitals carries an `opponent`; that transition remounts the widget.
 
-import { createState, getSessions, session, type Binding } from "smudgy:core";
+import { createState, getSessions, session } from "smudgy:core";
 import { focus as inputFocus } from "smudgy:events/input";
 import { created, destroyed } from "smudgy:events/sessions";
 import {
-  Canvas,
   Column,
   Container,
-  ProgressBar,
   Row,
   Space,
-  Stack,
-  Text,
   createWidget,
   removeWidget,
   type CanvasShape,
@@ -27,9 +22,21 @@ import {
   nukefire,
   watchMessage,
   type CharStatus,
+  type CharVitals,
 } from "smudgy://kapusniak/nukefire-gmcp";
-import { widgetMetric, widgetTextSize } from "./config.ts";
+import { widgetMetric } from "./config.ts";
 import { UI, fmtNum, themeBackground } from "./theme.ts";
+import {
+  type BarSlices,
+  buildVitalBarSlices,
+  characterName,
+  classAndLevel,
+  compactVital,
+  sessionBadge,
+  vitalRatio,
+  vitalReadoutColor,
+  wideVital,
+} from "./vitals-ui.tsx";
 
 const WIDGET = "nf-hud";
 const MINI_WIDGET = "nf-mini-hud";
@@ -37,6 +44,7 @@ const MINI_WIDGET = "nf-mini-hud";
 interface OrdinalBadgeStyle {
   scene: CanvasShape[];
   text: string;
+  name: string;
 }
 
 function ordinalBadgeStyle(active: boolean): OrdinalBadgeStyle {
@@ -55,6 +63,7 @@ function ordinalBadgeStyle(active: boolean): OrdinalBadgeStyle {
       },
     }],
     text: active ? UI.gold : UI.dim,
+    name: active ? UI.gold : "#d8e0e8",
   };
 }
 
@@ -119,109 +128,156 @@ watchMessage("Char.Status", updateStatus);
 // Seed the HUD immediately when scripts reload after Char.Status arrived.
 updateStatus(nukefire.value?.Char?.Status);
 
-/** Bind a numeric GMCP path for a ProgressBar (deep tree paths type as
- *  `unknown` past the optional levels, so narrow them here). */
-function numBind(path: string, fallback: number): Binding<number> {
-  return nukefire.bind(path, { fallback }) as Binding<number>;
-}
-
-function inlineVital(label: string, color: string, cur: string, max: string) {
-  return (
-    <Row width="fill" spacing={4}>
-      <Text size={widgetTextSize(11)} color={color}>{label}</Text>
-      <ProgressBar
-        width="fill"
-        height={widgetMetric(12)}
-        color={color}
-        background="rgba(255,255,255,0.12)"
-        value={numBind(cur, 0)}
-        max={numBind(max, 100)}
-      />
-      <Text size={widgetTextSize(11)} color={UI.bright}>
-        {nukefire.bind(cur, { fallback: 0 })}
-        {"/"}
-        {nukefire.bind(max, { fallback: 0 })}
-      </Text>
-    </Row>
-  );
-}
-
 function ordinalBadge() {
-  return (
-    <Stack width={widgetMetric(30)} height={widgetMetric(22)}>
-      <Canvas
-        width="fill"
-        height="fill"
-        view_box={[0, 0, 30, 22]}
-        fit="fill"
-        scene={badgeStyle.bind("scene")}
-      />
-      <Container width="fill" height="fill" align_x="center" align_y="top">
-        <Text size={widgetTextSize(18)} color={badgeStyle.bind("text")}>{sessionOrdinal.bind()}</Text>
-      </Container>
-    </Stack>
+  return sessionBadge(sessionOrdinal.bind(), badgeStyle.bind("scene"), badgeStyle.bind("text"));
+}
+
+type HudBarKey = "hpBar" | "manaBar" | "moveBar" | "opponentBar";
+
+interface HudVitalsDisplay {
+  hpValue: string;
+  manaValue: string;
+  moveValue: string;
+  opponentValue: string;
+  hpValueColor: string;
+  manaValueColor: string;
+  moveValueColor: string;
+  opponentValueColor: string;
+  hpBar: BarSlices;
+  manaBar: BarSlices;
+  moveBar: BarSlices;
+  opponentBar: BarSlices;
+}
+
+const hudVitals = createState<HudVitalsDisplay>("hudVitalsDisplay");
+const previousRatios = new Map<string, number>();
+
+function localBar(
+  key: "hp" | "mana" | "move" | "opponent",
+  current: number,
+  maximum: number,
+  gradient: readonly [string, string, string],
+): BarSlices {
+  const oldRatio = previousRatios.get(key);
+  const nextRatio = vitalRatio(current, maximum);
+  previousRatios.set(key, nextRatio);
+  return buildVitalBarSlices(
+    `hud-${session.id}`,
+    { key, current, maximum, gradient },
+    oldRatio,
   );
 }
 
-function inlineOpponent() {
-  return (
-    <Row width="fill" spacing={4}>
-      <Text size={widgetTextSize(11)} color={UI.danger}>
-        {"⚔ "}
-        {nukefire.bind("Char.Vitals.opponent.name", { fallback: "opponent" })}
-      </Text>
-      <ProgressBar
-        width="fill"
-        height={widgetMetric(12)}
-        color={UI.danger}
-        background="rgba(160,40,40,0.3)"
-        value={numBind("Char.Vitals.opponent.hp", 0)}
-        max={numBind("Char.Vitals.opponent.mhp", 100)}
-      />
-    </Row>
+function updateVitals(value: Readonly<CharVitals> | undefined): void {
+  const hp = value?.hp ?? 0;
+  const mhp = value?.mhp ?? 1;
+  const mana = value?.mana ?? 0;
+  const mmana = value?.mmana ?? 1;
+  const move = value?.move ?? 0;
+  const mmove = value?.mmove ?? 1;
+  const opponentHp = value?.opponent?.hp ?? 0;
+  const opponentMhp = value?.opponent?.mhp ?? 1;
+
+  hudVitals.set({
+    hpValue: `${hp} / ${mhp}`,
+    manaValue: `${mana} / ${mmana}`,
+    moveValue: `${move} / ${mmove}`,
+    opponentValue: `${opponentHp} / ${opponentMhp}`,
+    hpValueColor: vitalReadoutColor(hp, mhp),
+    manaValueColor: vitalReadoutColor(mana, mmana),
+    moveValueColor: vitalReadoutColor(move, mmove),
+    opponentValueColor: vitalReadoutColor(opponentHp, opponentMhp),
+    hpBar: localBar("hp", hp, mhp, ["#71131d", UI.hp, "#ff6672"]),
+    manaBar: localBar("mana", mana, mmana, ["#173a63", UI.mana, "#65b7e6"]),
+    moveBar: localBar("move", move, mmove, ["#155548", UI.move, "#55c5a5"]),
+    opponentBar: localBar("opponent", opponentHp, opponentMhp, ["#71131d", UI.hp, "#ff6672"]),
+  });
+}
+
+function barBindings(key: HudBarKey) {
+  return {
+    start: hudVitals.bind(`${key}.start`, { fallback: [] }),
+    middle: hudVitals.bind(`${key}.middle`, { fallback: [] }),
+    end: hudVitals.bind(`${key}.end`, { fallback: [] }),
+  };
+}
+
+function localCompactVital(
+  label: "HP" | "MN" | "MV",
+  valueKey: "hpValue" | "manaValue" | "moveValue",
+  colorKey: "hpValueColor" | "manaValueColor" | "moveValueColor",
+  barKey: Exclude<HudBarKey, "opponentBar">,
+  color: string,
+) {
+  return compactVital(
+    label,
+    hudVitals.bind(valueKey, { fallback: "—" }),
+    hudVitals.bind(colorKey, { fallback: UI.bright }),
+    barBindings(barKey),
+    color,
   );
 }
 
-function themedDetails() {
-  return (
-    <Row spacing={8}>
-      <Text size={widgetTextSize(11)} color={UI.teal}>{hudMeta.bind("className")}</Text>
-      <Text size={widgetTextSize(11)} color={UI.faint}>·</Text>
-      <Text size={widgetTextSize(11)} color={UI.gold}>
-        level {hudMeta.bind("level")}
-      </Text>
-    </Row>
+function localWideVital(
+  label: "HP" | "MN" | "MV" | "OP",
+  valueKey: "hpValue" | "manaValue" | "moveValue" | "opponentValue",
+  colorKey: "hpValueColor" | "manaValueColor" | "moveValueColor" | "opponentValueColor",
+  barKey: HudBarKey,
+  color: string,
+) {
+  return wideVital(
+    label,
+    hudVitals.bind(valueKey, { fallback: "—" }),
+    hudVitals.bind(colorKey, { fallback: UI.bright }),
+    barBindings(barKey),
+    color,
   );
+}
+
+function identityText() {
+  return [
+    characterName(hudMeta.bind("name"), 13, badgeStyle.bind("name")),
+    classAndLevel(hudMeta.bind("className"), ["LV ", hudMeta.bind("level")], 10),
+  ];
 }
 
 /** Height reserved by the HUD on the main pane. */
-export const HUD_HEIGHT = widgetMetric(56);
-const MINI_HUD_HEIGHT = widgetMetric(56);
+export const HUD_HEIGHT = widgetMetric(30);
+const MINI_HUD_HEIGHT = widgetMetric(52);
+const WIDE_IDENTITY_WIDTH = 125;
+const WIDE_IDENTITY_GAP = 4;
 
-let fighting = false;
+let fighting = nukefire.value?.Char?.Vitals?.opponent !== undefined;
 let shown = false;
 
 function mount(): void {
   createWidget(
     WIDGET,
     <Container width="fill" height={HUD_HEIGHT} background={themeBackground.bind()}>
-      <Column width="fill" height="fill" padding={6} spacing={2}>
-        <Row width="fill" height={widgetMetric(24)} spacing={8}>
-          {[
-            ordinalBadge(),
-            <Text size={widgetTextSize(18)} color={UI.gold}>{hudMeta.bind("name")}</Text>,
-            inlineVital("HP", UI.hp, "Char.Vitals.hp", "Char.Vitals.mhp"),
-            inlineVital("MN", UI.mana, "Char.Vitals.mana", "Char.Vitals.mmana"),
-            inlineVital("MV", UI.move, "Char.Vitals.move", "Char.Vitals.mmove"),
-            ...(fighting ? [inlineOpponent()] : []),
-          ]}
-        </Row>
-        <Row width="fill" height={widgetMetric(16)} spacing={8}>
-          {themedDetails()}
-          <Space width="fill" />
-          <Text size={widgetTextSize(11)} color={UI.good}>{hudMeta.bind("tnl")}</Text>
-        </Row>
-      </Column>
+      <Row width="fill" height="fill" padding={0} spacing={widgetMetric(WIDE_IDENTITY_GAP)}>
+        {[
+          ordinalBadge(),
+          <Column width={widgetMetric(WIDE_IDENTITY_WIDTH)} height="fill" spacing={0}>
+            {identityText()}
+          </Column>,
+          <Row width="fill" height="fill" spacing={widgetMetric(14)}>
+            {[
+              localWideVital("HP", "hpValue", "hpValueColor", "hpBar", UI.hp),
+              localWideVital("MN", "manaValue", "manaValueColor", "manaBar", UI.mana),
+              localWideVital("MV", "moveValue", "moveValueColor", "moveBar", UI.move),
+              ...(fighting
+                ? [localWideVital(
+                  "OP",
+                  "opponentValue",
+                  "opponentValueColor",
+                  "opponentBar",
+                  UI.danger,
+                )]
+                : []),
+            ]}
+          </Row>,
+        ]}
+      </Row>
     </Container>,
   );
 }
@@ -230,20 +286,16 @@ function mountMini(): void {
   createWidget(
     MINI_WIDGET,
     <Container width="fill" height={MINI_HUD_HEIGHT} background={themeBackground.bind()}>
-      <Column width="fill" height="fill" padding={6} spacing={2}>
-        <Row width="fill" height={widgetMetric(24)} spacing={8}>
-          {[
-            ordinalBadge(),
-            <Text size={widgetTextSize(18)} color={UI.gold}>{hudMeta.bind("name")}</Text>,
-            inlineVital("HP", UI.hp, "Char.Vitals.hp", "Char.Vitals.mhp"),
-            inlineVital("MN", UI.mana, "Char.Vitals.mana", "Char.Vitals.mmana"),
-            inlineVital("MV", UI.move, "Char.Vitals.move", "Char.Vitals.mmove"),
-          ]}
+      <Column width="fill" height="fill" padding={3} spacing={1}>
+        <Row width="fill" height={widgetMetric(22)} spacing={7}>
+          {[ordinalBadge(), ...identityText(), <Space width="fill" />]}
         </Row>
-        <Row width="fill" height={widgetMetric(16)} spacing={8}>
-          {themedDetails()}
-          <Space width="fill" />
-          <Text size={widgetTextSize(11)} color={UI.good}>{hudMeta.bind("tnl")}</Text>
+        <Row width="fill" height={widgetMetric(18)} spacing={4}>
+          {[
+            localCompactVital("HP", "hpValue", "hpValueColor", "hpBar", UI.hp),
+            localCompactVital("MN", "manaValue", "manaValueColor", "manaBar", UI.mana),
+            localCompactVital("MV", "moveValue", "moveValueColor", "moveBar", UI.move),
+          ]}
         </Row>
       </Column>
     </Container>,
@@ -251,12 +303,14 @@ function mountMini(): void {
 }
 
 watchMessage("Char.Vitals", (v) => {
+  updateVitals(v);
   const now = v?.opponent !== undefined;
   if (now !== fighting) {
     fighting = now;
     if (shown) mount();
   }
 });
+updateVitals(nukefire.value?.Char?.Vitals);
 
 export function open(): void {
   shown = true;
@@ -268,7 +322,7 @@ export function close(): void {
   removeWidget(WIDGET);
 }
 
-/** A shallow identity/vitals strip used on docked secondary terminals. */
+/** The compact identity/vitals header used on docked secondary terminals. */
 export function openMini(): void {
   mountMini();
 }

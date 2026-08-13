@@ -7,12 +7,17 @@ use iced::{
 };
 use smudgy_cloud::{
     AreaId, Mapper, RoomNumber,
-    mapper::{RoomKey, room_connection::RoomConnectionEnd},
+    mapper::{
+        RoomKey,
+        room_connection::{RoomConnection, RoomConnectionEnd},
+    },
 };
 
 use iced_anim::{Animated, spring::Motion, transition::Easing};
 
-use crate::{MapViewPresentation, RoomOverlay, Update, render, viewport::Viewport};
+use crate::{
+    MapViewPresentation, RoomOverlay, RouteExitOverlay, Update, render, viewport::Viewport,
+};
 use iced::event::Event as IcedEvent;
 use std::time::{Duration, Instant};
 pub type Renderer = iced::Renderer;
@@ -616,7 +621,11 @@ impl MapView {
                 area.with_room_connections_in(min_x, min_y, max_x, max_y, |connection| {
                     if connection.from_level == self.level {
                         let connection = connection.with_room_spacing(spacing);
-                        let on_route = connection_on_route(&connection, &overlay.route);
+                        let on_route = if overlay.route_exits.is_empty() {
+                            connection_on_route(&connection, &overlay.route)
+                        } else {
+                            connection_on_route_exits(&connection, &overlay.route_exits)
+                        };
                         let color = if on_route {
                             render::parse_color(&style.route_color)
                         } else {
@@ -729,10 +738,7 @@ impl MapView {
     }
 }
 
-fn connection_on_route(
-    connection: &smudgy_cloud::mapper::room_connection::RoomConnection,
-    route: &[i32],
-) -> bool {
+fn connection_on_route(connection: &RoomConnection, route: &[i32]) -> bool {
     let from = connection.room.get_room_number().0;
     let to = match &connection.to {
         RoomConnectionEnd::Normal { room, .. } | RoomConnectionEnd::ToLevel { room, .. } => {
@@ -746,6 +752,48 @@ fn connection_on_route(
     route
         .windows(2)
         .any(|pair| pair == [from, to] || pair == [to, from])
+}
+
+fn connection_on_route_exits(
+    connection: &RoomConnection,
+    route_exits: &[RouteExitOverlay],
+) -> bool {
+    let includes = |room: i32, direction| {
+        route_exits
+            .iter()
+            .any(|exit| exit.room == room && exit.direction == direction)
+    };
+    let anchor_room = connection.room.get_room_number().0;
+    let anchor_direction = match &connection.to {
+        RoomConnectionEnd::ToLevel { direction, .. } => *direction,
+        _ => connection.direction_a,
+    };
+    if includes(anchor_room, anchor_direction) {
+        return true;
+    }
+
+    match &connection.to {
+        RoomConnectionEnd::Normal {
+            room, direction, ..
+        } => includes(room.get_room_number().0, *direction),
+        RoomConnectionEnd::ToLevel { room, .. } => {
+            // Cross-level Connections render once per endpoint level. Match
+            // the opposite endpoint too so both involved Up/Down markers use
+            // the route accent, regardless of which half is currently drawn.
+            let other_direction = if anchor_direction == connection.direction_a {
+                connection.direction_b.unwrap_or(connection.direction_a)
+            } else {
+                connection.direction_a
+            };
+            includes(room.get_room_number().0, other_direction)
+        }
+        RoomConnectionEnd::SelfLoop => connection
+            .direction_b
+            .is_some_and(|direction| includes(anchor_room, direction)),
+        RoomConnectionEnd::None
+        | RoomConnectionEnd::External { .. }
+        | RoomConnectionEnd::Unknown { .. } => false,
+    }
 }
 
 fn merged_room_overlay(

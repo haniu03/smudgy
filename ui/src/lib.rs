@@ -2461,6 +2461,21 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             }
         }
         Message::SessionAction(session_id, msg) => {
+            // Store-routed task continuations (notably script input.focus())
+            // carry no window wrapper. Reconcile their confirmed focus edge
+            // here so they obey the same single-focused-input invariant as a
+            // user action routed through SmudgyWindow.
+            if let Some((key, focused)) = msg.input_focus_change()
+                && smudgy.sessions.note_input_focus(session_id, key, focused)
+                && focused
+            {
+                for window in smudgy.smudgy_windows.values_mut() {
+                    if window.hosts_pane(session_id, key) {
+                        window.note_session_input_focus(session_id);
+                    }
+                }
+            }
+
             // The session's own map widgets update below; the standalone map
             // editor windows track the current location too, and a sustained
             // locate streak is the passive bind-on-use signal (daemon-owned).

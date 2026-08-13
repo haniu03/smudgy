@@ -665,6 +665,11 @@ pub fn draw_connection_styled(
             match level_treatment(connection, suppress_level_stubs) {
                 Some(LevelTreatment::Triangle { center, up }) => {
                     draw_level_triangle(frame, center.x, center.y, up, marker_color);
+                    // View-local connection accents (such as a GPS route)
+                    // outline the otherwise fill-only Up/Down marker too.
+                    if color_override.is_some() {
+                        draw_level_triangle_outline(frame, center.x, center.y, up, color, width);
+                    }
                 }
                 Some(LevelTreatment::FadingStub { edge, tip }) => {
                     draw_cross_level_stub(

@@ -2072,6 +2072,11 @@ export function make() { return createEvent('dynamic'); }
               const newArea: Area = await mapper.createArea("Town");
               const runtimeCheck: boolean = newArea instanceof Area;
               const newRoom: RoomNumber = await mapper.createRoom(room.area_id, { title: "x" });
+              const batchIds: OperationId[] = await mapper.mutateArea(room.area_id, async (mutation) => {
+                const batchedRoom: RoomNumber = await mutation.createRoom({ title: "batch" });
+                await mutation.setRoomProperty(batchedRoom, "terrain", "city");
+                await mutation.createRoomExit(batchedRoom, { from_direction: "South" });
+              }, { description: "typed batch" });
               const exitId: ExitId = await mapper.createRoomExit(room.area_id, room.room_number, { from_direction: "North" });
               const updateId: OperationId | null = await mapper.setRoomExit(room.area_id, room.room_number, exitId, { command: "enter hole" });
               const mergeId: OperationId | null = await mapper.mergeRooms(room.area_id, room.room_number, room.room_number + 1);
@@ -2089,7 +2094,7 @@ export function make() { return createEvent('dynamic'); }
               await mapper.setRoomTitle(room.area_id, room.room_number, "t");
               await mapper.setRoomDescription(room.area_id, room.room_number, "d");
               await mapper.renameArea(room.area_id, "n");
-              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void runtimeCheck; void newRoom; void updateId; void mergeId;
+              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void runtimeCheck; void newRoom; void batchIds; void updateId; void mergeId;
             }
             export { useRoom, useArea, useExit, useMapper };
             "##
