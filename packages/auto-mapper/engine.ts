@@ -1231,6 +1231,9 @@ function start() {
 
     if (enableRoomModule) gmcpCtl.enableModule("Room");
 
+    // The first word parses as a tier when it is `local` or `cloud`, shadowing
+    // zones literally named that; such a zone is reachable through the
+    // two-word form (`savemap local cloud`).
     createAlias(/^savemap(?:\s+(?<args>.+))?$/, (matches: { args?: string }) => {
         const args = matches.args?.trim();
         const tier = args?.match(/^(local|cloud)(?:\s+(.*))?$/i);
