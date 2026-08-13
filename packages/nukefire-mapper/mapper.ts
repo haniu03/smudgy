@@ -32,8 +32,10 @@ import {
   type DecisionLogRecord,
 } from "./decision-log.ts";
 import {
+  areaForObservedRoom,
   findAreaByNukeFireId,
   findCompatibleAreaByName,
+  isAdoptableStorage,
   NUKEFIRE_AREA_ID_PROPERTY,
 } from "./area-resolution.ts";
 import {
@@ -628,7 +630,9 @@ export class NukeFireMapper {
     for (const source of sources) {
       const room = this.#roomsByVnum.get(source.vnum);
       const area = room && this.#areasById.get(areaIdKey(room.areaId));
-      if (room && area?.storage === this.#options.storage) existing.set(source.vnum, room);
+      if (room && area && isAdoptableStorage(area.storage, this.#options.storage)) {
+        existing.set(source.vnum, room);
+      }
     }
 
     // Hydrate an existing matching area at most once. Subsequent snapshots use
@@ -638,14 +642,14 @@ export class NukeFireMapper {
         if (existing.has(source.vnum)) continue;
         const cached = this.#roomsByVnum.get(source.vnum);
         const cachedArea = cached && this.#areasById.get(areaIdKey(cached.areaId));
-        if (cached && cachedArea?.storage === this.#options.storage) {
+        if (cached && cachedArea && isAdoptableStorage(cachedArea.storage, this.#options.storage)) {
           existing.set(source.vnum, cached);
           continue;
         }
         const hostRoom = mapper.findRoomByExternalId(externalRoomId(source.vnum));
         if (!hostRoom) continue;
         const hostArea = mapper.getAreaById(hostRoom.area_id);
-        if (hostArea.storage !== this.#options.storage) continue;
+        if (!isAdoptableStorage(hostArea.storage, this.#options.storage)) continue;
         this.#hydrateArea(hostArea);
         const room = this.#roomsByVnum.get(source.vnum);
         if (room) existing.set(source.vnum, room);
@@ -657,7 +661,7 @@ export class NukeFireMapper {
       const wanted = new Set(sources.map((source) => source.vnum));
       for (const hostArea of mapper.areas) {
         if (existing.size >= wanted.size) break;
-        if (hostArea.storage !== this.#options.storage) continue;
+        if (!isAdoptableStorage(hostArea.storage, this.#options.storage)) continue;
         const area = this.#hydrateArea(hostArea);
         for (const room of area.roomsByNumber.values()) {
           if (room.vnum !== undefined && wanted.has(room.vnum) && !existing.has(room.vnum)) {
@@ -691,9 +695,12 @@ export class NukeFireMapper {
     }
 
     const assignments: Assignment[] = sources.map((source) => {
-      const area = areaByZone.get(source.zone);
-      if (!area) throw new Error(`could not resolve an area for NukeFire zone ${source.zone}`);
       const indexedRoom = existing.get(source.vnum);
+      const area = areaForObservedRoom(
+        areaByZone.get(source.zone),
+        indexedRoom && this.#areasById.get(areaIdKey(indexedRoom.areaId)),
+      );
+      if (!area) throw new Error(`could not resolve an area for NukeFire zone ${source.zone}`);
       const room = indexedRoom && sameAreaId(indexedRoom.areaId, area.id)
         ? indexedRoom
         : [...area.roomsByNumber.values()].find((candidate) => candidate.vnum === source.vnum);
@@ -780,11 +787,17 @@ export class NukeFireMapper {
     let area = exact ? this.#hydrateArea(exact) : undefined;
     if (!area) {
       const cached = this.#zoneAreas.get(zone);
-      if (cached?.storage === this.#options.storage && (!cached.zone || cached.zone === areaId)) {
+      if (
+        cached && isAdoptableStorage(cached.storage, this.#options.storage) &&
+        (!cached.zone || cached.zone === areaId)
+      ) {
         area = cached;
       }
     }
-    if (!area && known?.storage === this.#options.storage && (!known.zone || known.zone === areaId)) {
+    if (
+      !area && known && isAdoptableStorage(known.storage, this.#options.storage) &&
+      (!known.zone || known.zone === areaId)
+    ) {
       area = known;
     }
     if (!area && preferredName) {
