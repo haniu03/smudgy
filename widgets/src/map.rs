@@ -7,7 +7,7 @@ use std::{
 
 use smudgy_cloud::{AreaId, Mapper, Uuid};
 use smudgy_map_widget::{
-    Update,
+    MapViewPresentation, Update,
     map_view::{self, MapView, Message as MapMessage, SharedMapView},
 };
 
@@ -47,8 +47,14 @@ impl MapStore {
     }
 
     #[must_use]
-    pub fn ensure_map(&self, mapper: Mapper, id: MapWidgetId) -> MapHandle {
+    pub fn ensure_map(
+        &self,
+        mapper: Mapper,
+        id: MapWidgetId,
+        presentation: MapViewPresentation,
+    ) -> MapHandle {
         if let Some(entry) = self.maps.borrow().get(&id) {
+            entry.view.borrow_mut().set_presentation(presentation);
             return MapHandle {
                 entry: Rc::clone(entry),
             };
@@ -57,7 +63,11 @@ impl MapStore {
         let area_id = AreaId(Uuid::nil());
         let entry = Rc::new(MapEntry {
             id,
-            view: Rc::new(RefCell::new(MapView::new(mapper, area_id))),
+            view: Rc::new(RefCell::new({
+                let mut view = MapView::new(mapper, area_id);
+                view.set_presentation(presentation);
+                view
+            })),
         });
 
         self.maps.borrow_mut().insert(id, Rc::clone(&entry));
@@ -232,7 +242,7 @@ mod tests {
 
         let rendered = reaper.guard(1);
         let never_rendered = reaper.guard(2);
-        let handle = store.ensure_map(mapper, rendered.id());
+        let handle = store.ensure_map(mapper, rendered.id(), MapViewPresentation::default());
         drop(handle);
         assert!(
             store

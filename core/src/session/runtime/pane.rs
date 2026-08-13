@@ -156,10 +156,10 @@ pub struct PaneDef {
     /// Always `false` for main via scripts (hiding main throws); the user's
     /// eyeball may still set it.
     pub hidden: bool,
-    /// Per-pane terminal font size override in px (validated to the same
+    /// Per-pane font size override in px (validated to the same
     /// 8–40 range as the global setting); `None` follows the global setting.
-    /// Affects the pane's terminal scrollback rendering only — input lines
-    /// stay on the global preference.
+    /// Applies to the pane's scrollback and input, including inputs hosted by
+    /// widgets-only panes.
     pub font_size: Option<f32>,
     /// The pane's own input line, when the creating spec asked for one.
     /// Creation-time identity, like `kind`: a `split()` hitting an existing
@@ -192,15 +192,74 @@ impl SplitDirection {
     }
 }
 
-/// Where the UI should place a freshly created pane: split off `reference`
-/// toward `direction`, with an optional initial extent in pixels along the
-/// split axis (converted to a ratio against the reference pane's measured
-/// extent at placement time; `None` ⇒ an even 0.5 split).
-#[derive(Debug, Clone, Copy)]
-pub struct PanePlacement {
-    pub reference: PaneKey,
-    pub direction: SplitDirection,
-    pub size_px: Option<f32>,
+/// Where a pane moved into a tab group lands relative to its reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabPosition {
+    Before,
+    After,
+    End,
+}
+
+impl TabPosition {
+    /// Parse the script-facing string union (`'before'|'after'|'end'`).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "before" => Some(Self::Before),
+            "after" => Some(Self::After),
+            "end" => Some(Self::End),
+            _ => None,
+        }
+    }
+}
+
+/// Where the UI should place a freshly created pane: either split beside a
+/// reference group or insert into the reference's current tab group.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PanePlacement {
+    Split {
+        reference: PaneKey,
+        direction: SplitDirection,
+        size_px: Option<f32>,
+    },
+    Tab {
+        reference: PaneKey,
+        position: TabPosition,
+        selected: bool,
+    },
+}
+
+impl PanePlacement {
+    #[must_use]
+    pub fn reference(self) -> PaneKey {
+        match self {
+            Self::Split { reference, .. } | Self::Tab { reference, .. } => reference,
+        }
+    }
+
+    #[must_use]
+    pub fn with_reference(self, reference: PaneKey) -> Self {
+        match self {
+            Self::Split {
+                direction,
+                size_px,
+                ..
+            } => Self::Split {
+                reference,
+                direction,
+                size_px,
+            },
+            Self::Tab {
+                position,
+                selected,
+                ..
+            } => Self::Tab {
+                reference,
+                position,
+                selected,
+            },
+        }
+    }
 }
 
 /// Why a registry mutation was refused. Surfaced to scripts as a thrown error
@@ -353,7 +412,12 @@ const RESERVED_MEMBER_NAMES: [&str; 4] = ["get", "list", "exists", "then"];
 /// Case-fold a pane name to its identity form. Pane identity is
 /// case-insensitive (chosen now because MXP FRAME names are case-insensitive,
 /// and changing identity later would break get-or-create).
-fn fold(name: &str) -> String {
+///
+/// Public because persisted pane descriptors share this identity: anything
+/// that stores a pane name durably folds it through this same function, so a
+/// stored descriptor and a live registry entry can never disagree on identity.
+#[must_use]
+pub fn fold(name: &str) -> String {
     name.to_lowercase()
 }
 
@@ -365,9 +429,15 @@ pub fn is_main_pane_name(name: &str) -> bool {
     fold(name) == MAIN_PANE_NAME
 }
 
-/// Validate a pane name at `split()` time: non-empty, ≤ 64 chars, printable
-/// (no control characters, which covers newlines).
-fn validate_name(name: &str) -> Result<(), PaneError> {
+/// Validate a pane name: non-empty, ≤ 64 chars, printable (no control
+/// characters, which covers newlines). `split()` enforces this at creation;
+/// consumers of persisted pane descriptors apply the same rule, so a stored
+/// name is valid exactly when the registry would have accepted it.
+///
+/// # Errors
+///
+/// [`PaneError::InvalidName`] naming the violated rule.
+pub fn validate_name(name: &str) -> Result<(), PaneError> {
     if name.is_empty() {
         return Err(PaneError::InvalidName("name is empty".to_string()));
     }

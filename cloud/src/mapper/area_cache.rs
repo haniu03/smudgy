@@ -367,6 +367,8 @@ impl AreaCache {
             let is_secret = members.iter().any(|(_, exit)| exit.is_secret)
                 || room_a.is_secret()
                 || room_b.is_some_and(|room| room.is_secret());
+            let is_closed = members.iter().any(|(_, exit)| exit.is_closed);
+            let is_locked = members.iter().any(|(_, exit)| exit.is_locked);
             let base = RoomConnection {
                 connection_id: connection.id,
                 from_level: room_a.get_level(),
@@ -384,8 +386,14 @@ impl AreaCache {
                 is_bidirectional,
                 arrow_toward_b,
                 is_secret,
+                is_closed,
+                is_locked,
                 to: RoomConnectionEnd::None,
                 room: (*room_a).clone(),
+                source: connection.clone(),
+                endpoint_a_room: (*room_a).clone(),
+                endpoint_b_room: room_b.cloned(),
+                layout_spacing: 1.0,
             };
 
             match connection.kind {
@@ -1470,6 +1478,47 @@ mod tests {
         assert_eq!(conns.len(), 1);
         assert!(conns[0].is_bidirectional);
         assert!(conns[0].arrow_toward_b.is_none());
+    }
+
+    #[test]
+    fn door_state_folds_both_connection_members() {
+        let area = AreaId(Uuid::from_u128(1));
+        let (a, b) = (RoomNumber(1), RoomNumber(2));
+        let connection_id = ConnectionId::new();
+        let mut from_a = member_exit(
+            10,
+            connection_id,
+            ExitDirection::East,
+            Some(area),
+            Some(b),
+            Some(ExitDirection::West),
+        );
+        from_a.is_closed = true;
+        let mut from_b = member_exit(
+            11,
+            connection_id,
+            ExitDirection::West,
+            Some(area),
+            Some(a),
+            Some(ExitDirection::East),
+        );
+        from_b.is_locked = true;
+        let room_a = placed_room(a, 0.0, 0.0, 0).upsert_exit(from_a);
+        let room_b = placed_room(b, 4.0, 0.0, 0).upsert_exit(from_b);
+        let connections = vec![stored_connection(
+            connection_id,
+            ConnectionKind::Internal,
+            endpoint(a, RoomSide::East),
+            Some(endpoint(b, RoomSide::West)),
+        )];
+
+        let conns = AreaCache::build_room_connections(
+            &area,
+            &connections,
+            &rooms_by_number(vec![room_a, room_b]),
+        );
+        assert!(conns[0].is_closed);
+        assert!(conns[0].is_locked);
     }
 
     #[test]

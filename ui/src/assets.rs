@@ -5,9 +5,15 @@ pub mod fonts {
     #![allow(dead_code)]
     use iced::Font;
 
-    pub const GEIST_VF_BYTES: &[u8] = include_bytes!("../../assets/fonts/GeistVF.ttf");
+    // Geist's regular and italic variable faces share a family name so
+    // cosmic-text can resolve style and weight without changing families.
+    pub const GEIST_VF_BYTES: &[u8] = include_bytes!("../../assets/fonts/Geist[wght].ttf");
+    pub const GEIST_ITALIC_VF_BYTES: &[u8] =
+        include_bytes!("../../assets/fonts/Geist-Italic[wght].ttf");
     pub const GEIST_VF: Font = Font::with_name("Geist");
-    pub const GEIST_MONO_VF_BYTES: &[u8] = include_bytes!("../../assets/fonts/GeistMonoVF.ttf");
+    pub const GEIST_MONO_VF_BYTES: &[u8] = include_bytes!("../../assets/fonts/GeistMono[wght].ttf");
+    pub const GEIST_MONO_ITALIC_VF_BYTES: &[u8] =
+        include_bytes!("../../assets/fonts/GeistMono-Italic[wght].ttf");
     pub const GEIST_MONO_VF: Font = Font::with_name("Geist Mono");
     pub const BOOTSTRAP_ICONS_BYTES: &[u8] =
         include_bytes!("../../assets/fonts/bootstrap-icons.ttf");
@@ -77,7 +83,9 @@ pub mod fonts {
         fn bundled_font_family_names_match_ttf_metadata() {
             let cases: &[(&[u8], &str)] = &[
                 (super::GEIST_VF_BYTES, "Geist"),
+                (super::GEIST_ITALIC_VF_BYTES, "Geist"),
                 (super::GEIST_MONO_VF_BYTES, "Geist Mono"),
+                (super::GEIST_MONO_ITALIC_VF_BYTES, "Geist Mono"),
                 (super::BOOTSTRAP_ICONS_BYTES, "bootstrap-icons"),
                 (super::MONASPACE_ARGON_BYTES, "Monaspace Argon Var"),
                 (super::MONASPACE_KRYPTON_BYTES, "Monaspace Krypton Var"),
@@ -103,6 +111,96 @@ pub mod fonts {
                     families.contains(expected),
                     "expected family {expected:?}, TTF reports {families:?}"
                 );
+            }
+        }
+
+        #[test]
+        fn geist_faces_have_the_expected_style_and_spacing_metadata() {
+            let cases: &[(&[u8], fontdb::Style, bool)] = &[
+                (super::GEIST_VF_BYTES, fontdb::Style::Normal, false),
+                (super::GEIST_ITALIC_VF_BYTES, fontdb::Style::Italic, false),
+                (super::GEIST_MONO_VF_BYTES, fontdb::Style::Normal, true),
+                (
+                    super::GEIST_MONO_ITALIC_VF_BYTES,
+                    fontdb::Style::Italic,
+                    true,
+                ),
+            ];
+
+            for (bytes, expected_style, expected_monospaced) in cases {
+                let mut db = fontdb::Database::new();
+                db.load_font_data(bytes.to_vec());
+                let faces: Vec<_> = db.faces().collect();
+                assert_eq!(faces.len(), 1, "expected one face, got {faces:?}");
+                assert_eq!(faces[0].style, *expected_style);
+                assert_eq!(faces[0].monospaced, *expected_monospaced);
+            }
+        }
+
+        /// Unpatched cosmic-text 0.15 rejects a variable face when the
+        /// requested weight differs from the face's default; guards the
+        /// `variable_weight_match` backport in
+        /// `patches/cosmic-text+0.15.0.patch`.
+        #[test]
+        fn geist_mono_variable_weights_keep_the_requested_family() {
+            use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Weight};
+
+            let mut db = fontdb::Database::new();
+            for bytes in [
+                super::GEIST_VF_BYTES,
+                super::GEIST_ITALIC_VF_BYTES,
+                super::GEIST_MONO_VF_BYTES,
+                super::GEIST_MONO_ITALIC_VF_BYTES,
+            ] {
+                db.load_font_data(bytes.to_vec());
+            }
+            let mut font_system = FontSystem::new_with_locale_and_db("en-US".into(), db);
+
+            for (style, expected_style) in [
+                (cosmic_text::Style::Normal, fontdb::Style::Normal),
+                (cosmic_text::Style::Italic, fontdb::Style::Italic),
+            ] {
+                for weight in [100, 400, 700, 900] {
+                    let mut buffer = Buffer::new(&mut font_system, Metrics::new(16.0, 20.0));
+                    let glyph_font_ids;
+                    {
+                        let mut buffer = buffer.borrow_with(&mut font_system);
+                        let attrs = Attrs::new()
+                            .family(Family::Name("Geist Mono"))
+                            .style(style)
+                            .weight(Weight(weight));
+                        buffer.set_size(Some(300.0), Some(100.0));
+                        buffer.set_text("Bold terminal text", &attrs, Shaping::Advanced, None);
+                        buffer.shape_until_scroll(true);
+                        glyph_font_ids = buffer
+                            .layout_runs()
+                            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.font_id))
+                            .collect::<Vec<_>>();
+                    }
+
+                    assert!(
+                        !glyph_font_ids.is_empty(),
+                        "weight {weight}: no glyphs produced"
+                    );
+                    for id in glyph_font_ids {
+                        let face = font_system
+                            .db()
+                            .face(id)
+                            .expect("shaped face is registered");
+                        assert!(
+                            face.families
+                                .iter()
+                                .any(|(family, _)| family == "Geist Mono"),
+                            "weight {weight}: expected Geist Mono, got {:?}",
+                            face.families
+                        );
+                        assert_eq!(face.style, expected_style, "weight {weight}");
+                        assert!(
+                            face.monospaced,
+                            "weight {weight}: selected a proportional face"
+                        );
+                    }
+                }
             }
         }
     }

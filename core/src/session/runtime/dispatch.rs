@@ -9,12 +9,32 @@ use futures::SinkExt;
 
 use crate::models::ScriptLang;
 use crate::session::connection::Connection;
+use crate::session::ui_command::{PaneCommand, UiCommand};
 use crate::session::{BufferUpdate, SessionEvent, TaggedSessionEvent};
 
 use super::pane::{MAIN_PANE_KEY, PaneError, PaneKey, PaneKind, PaneNamespace};
 use super::trigger::{self, PushTriggerParams};
 use super::{ActionResult, Inner, IsolateId, RuntimeAction, ScriptAction};
 use crate::session::styled_line::StyledLine;
+
+/// Forward a lazy tooltip request while preserving a terminal failure path.
+/// A runtime's receiver is dropped just before its registry entry is removed,
+/// so a successful lookup does not guarantee that the send will succeed.
+fn send_link_tooltip(
+    tx: &tokio::sync::mpsc::UnboundedSender<RuntimeAction>,
+    action: RuntimeAction,
+) -> bool {
+    match tx.send(action) {
+        Ok(()) => true,
+        Err(error) => {
+            let RuntimeAction::ResolveLinkTooltip { state, .. } = error.0 else {
+                unreachable!("send_link_tooltip accepts only tooltip actions");
+            };
+            state.resolve(None);
+            false
+        }
+    }
+}
 
 fn prepare_pane_open(
     registry: &super::SharedPaneRegistry,
@@ -28,16 +48,21 @@ fn prepare_pane_open(
 
     let registry = registry.lock().unwrap();
     let def = registry.get(def.key)?.clone();
-    let placement = super::pane::PanePlacement {
-        reference: if registry.is_live(placement.reference) {
-            placement.reference
-        } else {
-            super::pane::MAIN_PANE_KEY
-        },
-        direction: placement.direction,
-        size_px: placement.size_px,
-    };
+    let reference = placement.reference();
+    let placement = placement.with_reference(if registry.is_live(reference) {
+        reference
+    } else {
+        super::pane::MAIN_PANE_KEY
+    });
     Some((def, placement))
+}
+
+fn pane_closed_event(key: PaneKey, ui_command_published: bool) -> SessionEvent {
+    if ui_command_published {
+        SessionEvent::PaneClosedOrdered(key)
+    } else {
+        SessionEvent::PaneClosed(key)
+    }
 }
 
 impl Inner<'_> {
@@ -180,9 +205,9 @@ impl Inner<'_> {
                 published,
                 writes,
             } => {
-                let (actions, bindings_changed) =
-                    self.script_engine
-                        .remote_store_flushed(source, &published, &writes);
+                let (actions, bindings_changed) = self
+                    .script_engine
+                    .remote_store_flushed(source, &published, &writes);
                 if bindings_changed
                     && let Err(error) = self.ui_tx.try_send(TaggedSessionEvent {
                         session_id: self.session_id,
@@ -202,9 +227,9 @@ impl Inner<'_> {
                 depth,
             } => {
                 let mut local = Vec::new();
-                for runtime in crate::session::registry::get_runtimes_for_server(
-                    self.server_name.as_str(),
-                ) {
+                for runtime in
+                    crate::session::registry::get_runtimes_for_server(self.server_name.as_str())
+                {
                     let action = RuntimeAction::InteropEvent {
                         canonical: Arc::clone(&canonical),
                         stamped: Arc::clone(&stamped),
@@ -310,11 +335,29 @@ impl Inner<'_> {
                 compression,
                 tls,
             } => {
-                let mut connection = Connection::new(
+                self.connection_generation = self.connection_generation.wrapping_add(1);
+                let connection_generation = self.connection_generation;
+                self.pending_send_on_connect = send_on_connect.map(|text| {
+                    // When the auto-login text carries secrets (a substituted
+                    // $PASSWORD), send it with redactions so it reaches the wire
+                    // but is masked in the client view + log; otherwise keep the
+                    // ordinary Send path (alias matching / separator splitting).
+                    if send_on_connect_redactions.is_empty() {
+                        RuntimeAction::Send(text)
+                    } else {
+                        RuntimeAction::SendWithRedactions {
+                            text,
+                            redactions: send_on_connect_redactions,
+                        }
+                    }
+                });
+
+                let mut connection = Connection::with_generation(
                     self.session_runtime_tx.clone(),
                     self.ui_tx.clone(),
                     self.trigger_manager.raw_wanted_flag(),
                     self.window_size.clone(),
+                    connection_generation,
                 );
 
                 // Resolve the configured encoding label; an unresolvable one falls back
@@ -335,26 +378,6 @@ impl Inner<'_> {
                     }
                     resolved
                 });
-
-                if let Some(send_on_connect) = send_on_connect {
-                    let local_tx = self.session_runtime_tx.clone();
-                    let redactions = send_on_connect_redactions;
-                    connection.on_connect(move || {
-                        // When the auto-login text carries secrets (a substituted
-                        // $PASSWORD), send it with redactions so it reaches the wire
-                        // but is masked in the client view + log; otherwise keep the
-                        // ordinary Send path (alias matching / separator splitting).
-                        let action = if redactions.is_empty() {
-                            RuntimeAction::Send(send_on_connect)
-                        } else {
-                            RuntimeAction::SendWithRedactions {
-                                text: send_on_connect,
-                                redactions,
-                            }
-                        };
-                        local_tx.send(action).ok();
-                    });
-                }
 
                 // Raw logging is decided per connection: load settings fresh
                 // so toggling `log_raw` applies to the next connect.
@@ -395,12 +418,14 @@ impl Inner<'_> {
                 if let Some(connection) = self.connection.as_mut() {
                     connection.disconnect();
                 }
+                self.pending_send_on_connect = None;
                 Ok(ActionResult::None)
             }
             RuntimeAction::HandleIncomingLine(line) => {
                 self.script_engine
                     .set_current_line(Some(Arc::downgrade(&line)));
                 if let Err(err) = self.trigger_manager.process_incoming_line(&line) {
+                    self.abort_incoming_line_sync();
                     return Ok(ActionResult::Echo(format!("Error processing line {err:?}")));
                 }
 
@@ -426,10 +451,18 @@ impl Inner<'_> {
                     .set_current_line(Some(Arc::downgrade(&line)));
                 match self.trigger_manager.process_partial_line(line) {
                     Ok(()) => Ok(ActionResult::None),
-                    Err(err) => Ok(ActionResult::Echo(format!(
-                        "Error processing partial line {err:?}"
-                    ))),
+                    Err(err) => {
+                        self.abort_incoming_line_sync();
+                        Ok(ActionResult::Echo(format!(
+                            "Error processing partial line {err:?}"
+                        )))
+                    }
                 }
+            }
+            RuntimeAction::PromptBoundary => {
+                self.pending_buffer_updates
+                    .push(BufferUpdate::PromptBoundary);
+                Ok(ActionResult::None)
             }
             RuntimeAction::RetractIncomingPartialLine => {
                 self.retract_incoming_open_line_sync();
@@ -439,6 +472,27 @@ impl Inner<'_> {
                 if let Some(fut) = self.flush_buffer_updates()? {
                     fut.await?;
                 }
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::IncomingPacketProcessed {
+                connection_generation,
+                has_displayable_text,
+            } => {
+                if connection_generation != self.connection_generation || !has_displayable_text {
+                    return Ok(ActionResult::None);
+                }
+                match self.pending_send_on_connect.take() {
+                    Some(action) => Ok(ActionResult::Run(vec![action])),
+                    None => Ok(ActionResult::None),
+                }
+            }
+            RuntimeAction::LinkTooltipChanged => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::LinkTooltipChanged,
+                    })
+                    .await?;
                 Ok(ActionResult::None)
             }
             // Echo arms append WITHOUT flushing: delivery rides the run loop's
@@ -724,6 +778,41 @@ impl Inner<'_> {
                             .ok();
                     } else {
                         warn!("Dropping link click for session {session}: no live runtime");
+                    }
+                    Ok(ActionResult::None)
+                }
+            }
+            RuntimeAction::ResolveLinkTooltip {
+                session,
+                isolate,
+                instance,
+                id,
+                state,
+            } => {
+                // Like click callbacks, tooltip callbacks execute in the isolate
+                // that created the fragment, even when another session displays it.
+                if session == self.session_id {
+                    self.script_engine
+                        .resolve_link_tooltip(&isolate, instance, id, state)
+                } else {
+                    if let Some(runtime) = crate::session::registry::get_runtime(session) {
+                        if !send_link_tooltip(
+                            &runtime.tx,
+                            RuntimeAction::ResolveLinkTooltip {
+                                session,
+                                isolate,
+                                instance,
+                                id,
+                                state,
+                            },
+                        ) {
+                            warn!(
+                                "Dropping link tooltip for session {session}: runtime channel closed"
+                            );
+                        }
+                    } else {
+                        state.resolve(None);
+                        warn!("Dropping link tooltip for session {session}: no live runtime");
                     }
                     Ok(ActionResult::None)
                 }
@@ -1039,7 +1128,16 @@ impl Inner<'_> {
                     .await?;
                 Ok(self.run_host_event("sys:connect", "{}"))
             }
-            RuntimeAction::Disconnected => {
+            RuntimeAction::Disconnected {
+                connection_generation,
+            } => {
+                // Only the live socket's own teardown may clear the deferred
+                // profile send: a replaced socket's late `Disconnected` would
+                // otherwise erase the NEW connection's pending send before its
+                // first displayable packet releases it.
+                if connection_generation == self.connection_generation {
+                    self.pending_send_on_connect = None;
+                }
                 if self
                     .connected
                     .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -1056,12 +1154,11 @@ impl Inner<'_> {
                 // The tail of the session log is what users read after a
                 // drop; don't leave it sitting in the BufWriter.
                 self.flush_log();
-                // Drop any unterminated whole-line accumulator: the next
-                // connection starts a fresh logical line, so a leftover prompt
-                // fragment must not glue onto the first pane-routed line after
-                // reconnect. The main open line is committed by the disconnect
-                // notice echo; this is the separate pane-delivery accumulator.
-                self.open_line = None;
+                // Drop any unterminated line pipeline: the next connection starts
+                // a fresh logical line, so neither pane-routing state nor a
+                // carriage-return replacement transaction may cross the boundary.
+                // The main open line is committed by the disconnect notice echo.
+                self.abort_incoming_line_sync();
                 self.ui_tx
                     .send(TaggedSessionEvent {
                         session_id: self.session_id,
@@ -1291,17 +1388,23 @@ impl Inner<'_> {
                     .await?;
                 Ok(ActionResult::None)
             }
+            RuntimeAction::AssociateCreatedAtlas(atlas_id) => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::MapAtlasCreated(atlas_id),
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
             RuntimeAction::PaneOpened {
                 def,
                 placement,
                 reconcile_registry,
             } => {
-                let Some((def, placement)) = prepare_pane_open(
-                    &self.pane_registry,
-                    def,
-                    placement,
-                    reconcile_registry,
-                ) else {
+                let Some((def, placement)) =
+                    prepare_pane_open(&self.pane_registry, def, placement, reconcile_registry)
+                else {
                     // A foreign split mutates this data-only registry on its
                     // caller thread before queueing the open. Reconcile at the
                     // owner queue: an intervening close retires the key (drop
@@ -1324,7 +1427,10 @@ impl Inner<'_> {
                     .await?;
                 Ok(ActionResult::None)
             }
-            RuntimeAction::PaneClosed { key } => {
+            RuntimeAction::PaneClosed {
+                key,
+                ui_command_published,
+            } => {
                 // Flush first: buffered updates may hold `AppendTo`s for this key, and the
                 // dangling-sink rule promises the UI that `PaneClosed` arrives behind them.
                 // The closed pane's mirrored size dies with it (keys are never reused).
@@ -1335,7 +1441,7 @@ impl Inner<'_> {
                 self.ui_tx
                     .send(TaggedSessionEvent {
                         session_id: self.session_id,
-                        event: SessionEvent::PaneClosed(key),
+                        event: pane_closed_event(key, ui_command_published),
                     })
                     .await?;
                 Ok(ActionResult::None)
@@ -1372,12 +1478,28 @@ impl Inner<'_> {
                 // behind the load's own actions, so a pane the reloading scripts
                 // echoed into before abandoning still shows those lines before it
                 // closes; the flush upholds the AppendTo-before-PaneClosed promise.
-                let swept = self.pane_registry.lock().unwrap().sweep_unclaimed();
+                let ui_command_producer = self.ui_command_producer.clone();
+                let swept = {
+                    let mut registry = self.pane_registry.lock().unwrap();
+                    registry
+                        .sweep_unclaimed()
+                        .into_iter()
+                        .map(|key| {
+                            let published = ui_command_producer.as_ref().is_some_and(|producer| {
+                                producer.send(UiCommand::Pane(PaneCommand::Close {
+                                    session_id: self.session_id,
+                                    key,
+                                }))
+                            });
+                            (key, published)
+                        })
+                        .collect::<Vec<_>>()
+                };
                 if !swept.is_empty() {
                     if let Some(fut) = self.flush_buffer_updates()? {
                         fut.await?;
                     }
-                    for key in swept {
+                    for (key, ui_command_published) in swept {
                         // The swept pane's input state dies with it, exactly
                         // as on an explicit close.
                         super::input::purge_pane_input_state(
@@ -1390,15 +1512,35 @@ impl Inner<'_> {
                         self.ui_tx
                             .send(TaggedSessionEvent {
                                 session_id: self.session_id,
-                                event: SessionEvent::PaneClosed(key),
+                                event: pane_closed_event(key, ui_command_published),
                             })
                             .await?;
                     }
                 }
                 Ok(ActionResult::None)
             }
-            RuntimeAction::PaneCloseRemote { namespace, name } => {
-                let closed = self.pane_registry.lock().unwrap().close(&namespace, &name);
+            RuntimeAction::PaneCloseRemote {
+                namespace,
+                name,
+                ui_command_published,
+            } => {
+                let (closed, ui_command_published) = {
+                    let mut registry = self.pane_registry.lock().unwrap();
+                    let closed = registry.close(&namespace, &name);
+                    let published = match &closed {
+                        Ok(key) if !ui_command_published => {
+                            self.ui_command_producer.as_ref().is_some_and(|producer| {
+                                producer.send(UiCommand::Pane(PaneCommand::Close {
+                                    session_id: self.session_id,
+                                    key: *key,
+                                }))
+                            })
+                        }
+                        Ok(_) => ui_command_published,
+                        Err(_) => false,
+                    };
+                    (closed, published)
+                };
                 match closed {
                     Ok(key) => {
                         // The closed pane's input state dies with it, like the
@@ -1416,7 +1558,7 @@ impl Inner<'_> {
                         self.ui_tx
                             .send(TaggedSessionEvent {
                                 session_id: self.session_id,
-                                event: SessionEvent::PaneClosed(key),
+                                event: pane_closed_event(key, ui_command_published),
                             })
                             .await?;
                     }
@@ -1542,6 +1684,36 @@ impl Inner<'_> {
                     .await?;
                 Ok(ActionResult::None)
             }
+            RuntimeAction::PaneGroupWith {
+                key,
+                reference_session,
+                reference,
+                position,
+                selected,
+            } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneGroupWith {
+                            key,
+                            reference_session,
+                            reference,
+                            position,
+                            selected,
+                        },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneSelect { key } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneSelect { key },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
             RuntimeAction::PaneTearOut { key, width, height } => {
                 self.ui_tx
                     .send(TaggedSessionEvent {
@@ -1663,11 +1835,13 @@ impl Inner<'_> {
                 let callback = self.pane_input_callbacks.lock().unwrap().get(key);
                 let Some(cb) = callback else {
                     if !retry {
-                        let _ = self.session_runtime_tx.send(RuntimeAction::PaneInputSubmit {
-                            key,
-                            text,
-                            retry: true,
-                        });
+                        let _ = self
+                            .session_runtime_tx
+                            .send(RuntimeAction::PaneInputSubmit {
+                                key,
+                                text,
+                                retry: true,
+                            });
                         return Ok(ActionResult::None);
                     }
                     warn!(
@@ -1680,10 +1854,9 @@ impl Inner<'_> {
                     if let Some(runtime) = crate::session::registry::get_runtime(cb.home_session)
                         && runtime.server_name.as_str() == self.server_name.as_str()
                     {
-                        let _ = runtime.tx.send(RuntimeAction::InvokePaneInputSubmit {
-                            callback: cb,
-                            text,
-                        });
+                        let _ = runtime
+                            .tx
+                            .send(RuntimeAction::InvokePaneInputSubmit { callback: cb, text });
                     } else {
                         warn!("Dropping pane-input submission: callback home session is gone");
                     }
@@ -1735,6 +1908,24 @@ impl Inner<'_> {
                     .send(TaggedSessionEvent {
                         session_id: self.session_id,
                         event: SessionEvent::PaneMirrorInterest,
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::LayoutSave { name } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::LayoutSave { name },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::LayoutApply { name } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::LayoutApply { name },
                     })
                     .await?;
                 Ok(ActionResult::None)
@@ -1882,7 +2073,10 @@ impl Inner<'_> {
                 // The UI's history update: write the mirror the history read op
                 // consults. Unconditional — history changes per submission, not
                 // per keystroke, so there is no interest gate to check.
-                self.input_mirror.lock().unwrap().apply_history(key, entries);
+                self.input_mirror
+                    .lock()
+                    .unwrap()
+                    .apply_history(key, entries);
                 Ok(ActionResult::None)
             }
             RuntimeAction::InputWordSetsChanged { key } => {
@@ -1934,11 +2128,35 @@ impl Inner<'_> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use super::prepare_pane_open;
+    use super::{prepare_pane_open, send_link_tooltip};
+    use crate::session::SessionId;
     use crate::session::runtime::pane::{
         DefStateSpec, MAIN_PANE_KEY, PaneKind, PaneNamespace, PanePlacement, PaneRegistry,
         SplitDirection,
     };
+    use crate::session::runtime::{IsolateId, RuntimeAction};
+    use crate::session::styled_line::LinkTooltipState;
+
+    #[test]
+    fn failed_tooltip_forward_resolves_the_loading_state() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let state = Arc::new(LinkTooltipState::default());
+        assert!(state.begin_request());
+
+        assert!(!send_link_tooltip(
+            &tx,
+            RuntimeAction::ResolveLinkTooltip {
+                session: SessionId::from(7),
+                isolate: IsolateId::Main,
+                instance: 1,
+                id: 2,
+                state: Arc::clone(&state),
+            },
+        ));
+        assert!(!state.is_loading());
+        assert!(state.text().is_none());
+    }
 
     #[test]
     fn retired_own_open_is_preserved_but_retired_foreign_open_is_dropped() {
@@ -1956,7 +2174,7 @@ mod tests {
             )
             .unwrap()
             .def;
-        let placement = PanePlacement {
+        let placement = PanePlacement::Split {
             reference: MAIN_PANE_KEY,
             direction: SplitDirection::Right,
             size_px: None,
@@ -2014,7 +2232,7 @@ mod tests {
         let prepared = prepare_pane_open(
             &registry,
             original,
-            PanePlacement {
+            PanePlacement::Split {
                 reference: reference.key,
                 direction: SplitDirection::Left,
                 size_px: Some(240.0),
@@ -2023,8 +2241,13 @@ mod tests {
         )
         .expect("the foreign target remains live");
         assert!(prepared.0.hidden);
-        assert_eq!(prepared.1.reference, MAIN_PANE_KEY);
-        assert_eq!(prepared.1.direction, SplitDirection::Left);
-        assert_eq!(prepared.1.size_px, Some(240.0));
+        assert_eq!(
+            prepared.1,
+            PanePlacement::Split {
+                reference: MAIN_PANE_KEY,
+                direction: SplitDirection::Left,
+                size_px: Some(240.0),
+            }
+        );
     }
 }

@@ -15,7 +15,7 @@ use crate::{
     models::hotkeys::HotkeyDefinition,
     session::runtime::input::InputOp,
     session::runtime::line_operation::LineOperation,
-    session::runtime::pane::{PaneDef, PaneKey, PanePlacement, SplitDirection},
+    session::runtime::pane::{PaneDef, PaneKey, PanePlacement, SplitDirection, TabPosition},
 };
 
 pub mod config;
@@ -23,6 +23,7 @@ pub mod connection;
 pub mod registry;
 pub mod runtime;
 pub mod styled_line;
+pub mod ui_command;
 
 #[derive(From, Into, Display, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Add)]
 #[repr(transparent)]
@@ -60,6 +61,9 @@ pub enum SessionEvent {
     /// A script created a non-ephemeral (cloud-tier) area; the daemon
     /// associates it with this session's server entry.
     MapAreaCreated(AreaId),
+    /// A script created or promoted a cloud atlas; the daemon associates it
+    /// with this session's server entry.
+    MapAtlasCreated(AtlasId),
     /// A pane was created in this session's registry. Travels the same
     /// ordered channel as buffer updates, so the UI always sees the open
     /// before the first `AppendTo` for the key. `placement` tells the hosting
@@ -72,6 +76,9 @@ pub enum SessionEvent {
     /// it arrives behind every `AppendTo` that preceded it — a UI-side
     /// `AppendTo` miss is therefore a bug (warn and drop), never a race.
     PaneClosed(PaneKey),
+    /// The ordered UI command already removed this pane from its layout. This
+    /// event trails every preceding `AppendTo` and retires display state.
+    PaneClosedOrdered(PaneKey),
     /// An existing pane's def changed in place — a def-state field
     /// (`title_bar`, `hidden`, `font_size`) via a `split()` naming an
     /// existing pane with an explicit field, the `hide`/`show`/`setFontSize`
@@ -102,6 +109,16 @@ pub enum SessionEvent {
         direction: SplitDirection,
         size_px: Option<f32>,
     },
+    PaneGroupWith {
+        key: PaneKey,
+        reference_session: SessionId,
+        reference: PaneKey,
+        position: TabPosition,
+        selected: bool,
+    },
+    PaneSelect {
+        key: PaneKey,
+    },
     /// A script asked to move a pane into a fresh dedicated window
     /// (`pane.tearOut`): the drag tear-out flow minus the drag. `width`/
     /// `height` size the new window (floored by the window minimum); omitted
@@ -123,10 +140,16 @@ pub enum SessionEvent {
     /// hold the new values and the widget render closures read them lock-free,
     /// so the UI needs no state change — processing the message redraws the view.
     StoreBindingsChanged,
+    /// A lazy script-link tooltip resolved into the shared cell held by the
+    /// rendered line. Pure repaint wake; no UI-owned state changes.
+    LinkTooltipChanged,
     /// Apply one scripted input mutation to the input of pane `key`
     /// (`docs/input.md` §3.4). Travels the ordered channel, so ops
     /// land in the order scripts issued them.
-    InputOp { key: PaneKey, op: InputOp },
+    InputOp {
+        key: PaneKey,
+        op: InputOp,
+    },
     /// The session thread has flagged input-mirror interest: start sending
     /// `RuntimeAction::InputStateChanged` on input changes, and push the
     /// current state immediately so the mirror warms up.
@@ -136,6 +159,19 @@ pub enum SessionEvent {
     /// `RuntimeAction::PaneDisplayChanged` on settled pane layout changes, and
     /// push every pane's current size immediately so the mirror warms up.
     PaneMirrorInterest,
+    /// A script asked for this session's window footprint to be saved as
+    /// the named layout (`layout.save`). The daemon owns the capture and
+    /// the per-server store; the name arrives already validated.
+    LayoutSave {
+        name: String,
+    },
+    /// A script asked for a named layout to be applied (`layout.apply`).
+    /// Layout-only: the daemon rebinds what exists, scoped to this
+    /// session's server, and never spawns, closes, prompts, or touches OS
+    /// windows.
+    LayoutApply {
+        name: String,
+    },
     /// The merged completion word sets for the input of pane `key`
     /// (`docs/input.md` §3.8): every creator's registered
     /// suggestions in merge order (creators in first-contribution order,
@@ -155,7 +191,9 @@ pub enum SessionEvent {
     /// with a script-set mask UI-side: the input stays masked while either
     /// is active (`docs/input.md` §3.10). Also sent with `false` on
     /// disconnect, since the option dies with the connection.
-    ServerEcho { enabled: bool },
+    ServerEcho {
+        enabled: bool,
+    },
 }
 #[derive(Debug, Clone)]
 pub struct TaggedSessionEvent {
@@ -251,16 +289,29 @@ pub enum BufferUpdate {
     /// arrive as several appends glued by the UI, terminated by
     /// [`BufferUpdate::EnsureNewLine`].
     Append(Arc<StyledLine>),
+    /// Begin a carriage-return replacement of the main buffer's open line.
+    /// The matching [`BufferUpdate::FinishOpenLineReplacement`] may arrive in
+    /// a later UI batch and may have unrelated trigger output before it.
+    BeginOpenLineReplacement,
+    /// Finish the carriage-return replacement started by
+    /// [`BufferUpdate::BeginOpenLineReplacement`]. `Some` supplies the exact
+    /// replacement frame after triggers/transforms; `None` means routing
+    /// gagged or redirected it away from main.
+    FinishOpenLineReplacement(Option<Arc<StyledLine>>),
     /// Commit the main buffer's open line.
     EnsureNewLine,
+    /// A telnet GA/EOR prompt boundary. Carries no text; terminal panes use it
+    /// to advance OSC 8 visibility expiry without conflating partial socket
+    /// flushes with real prompts.
+    PromptBoundary,
     /// One WHOLE line for a non-main pane. Routing is decided per logical
     /// line, so pane buffers never receive fragments — core assembles the
     /// full line before queuing this.
     AppendTo(PaneKey, Arc<StyledLine>),
-    /// Drop the main buffer's unterminated tail line. Emitted when routing
-    /// excludes main (gag/redirect) after a prefix of the line already
-    /// flushed as a partial; affects only the uncommitted line, so line
-    /// numbering parity holds.
+    /// Drop the main buffer's unterminated tail line. Emitted only when routing
+    /// excludes main (gag/redirect) after a prefix of the line already flushed
+    /// as a partial; affects only the uncommitted line, so line numbering
+    /// parity holds.
     RetractOpenLine,
     /// Clear a terminal pane's scrollback (`pane.clear()`); the main pane is
     /// addressed by [`runtime::pane::MAIN_PANE_KEY`]. Line numbering
@@ -269,7 +320,7 @@ pub enum BufferUpdate {
 }
 
 pub fn spawn(params: Arc<SessionParams>) -> impl Stream<Item = TaggedSessionEvent> {
-    spawn_inner(params, None)
+    spawn_inner(params, None, None)
 }
 
 /// Like [`spawn`], but resolves `smudgy://` packages through `package_provider` instead of
@@ -280,12 +331,24 @@ pub fn spawn_with_package_provider(
     params: Arc<SessionParams>,
     package_provider: PackageProviderFactory,
 ) -> impl Stream<Item = TaggedSessionEvent> {
-    spawn_inner(params, Some(package_provider))
+    spawn_inner(params, Some(package_provider), None)
+}
+
+/// Spawn a session attached to the UI daemon's ordered command bus.
+///
+/// Headless embedders and existing integration tests may keep using [`spawn`];
+/// their pane placement commands continue to arrive as `SessionEvent`s.
+pub fn spawn_with_ui_commands(
+    params: Arc<SessionParams>,
+    ui_commands: ui_command::UiCommandBus,
+) -> impl Stream<Item = TaggedSessionEvent> {
+    spawn_inner(params, None, Some(ui_commands))
 }
 
 fn spawn_inner(
     params: Arc<SessionParams>,
     package_provider_override: Option<PackageProviderFactory>,
+    ui_commands: Option<ui_command::UiCommandBus>,
 ) -> impl Stream<Item = TaggedSessionEvent> {
     let (mut ui_tx, ui_rx) = futures::channel::mpsc::channel::<TaggedSessionEvent>(1024);
 
@@ -309,6 +372,7 @@ fn spawn_inner(
         params.extra_script_extensions.clone(),
         params.on_engine_rebuild.clone(),
         ui_tx,
+        ui_commands,
     );
     let shutdown_tx = runtime.tx();
 

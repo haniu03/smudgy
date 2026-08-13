@@ -10,7 +10,7 @@ use iced::widget::{
     Column, button, column, container, markdown, pick_list, radio, rich_text, row, scrollable,
     span, text, text_input,
 };
-use iced::{Color, Font, Length, Padding};
+use iced::{Background, Border, Color, Font, Length, Padding};
 
 use smudgy_cloud::cloud_api::FriendView;
 use smudgy_cloud::package_api::{
@@ -22,7 +22,7 @@ use smudgy_core::models::local_packages::{self, LocalModule, LocalPackage};
 use smudgy_core::models::naming;
 use smudgy_core::models::shared_packages::{
     self, ImportPolicy, LockedPackage, PackageManifest, PackageParameter, PackagePermissions,
-    ParamKind, SmudgyCapabilities, UpdateMode,
+    ParamKind, SmudgyCapabilities, UpdateMode, is_any_host_net_entry,
 };
 
 use crate::assets::fonts;
@@ -31,6 +31,7 @@ use crate::theme::builtins::button as button_style;
 use crate::update::Update;
 
 use smudgy_core::session::runtime::{AutomationBody, AutomationKind};
+use smudgy_core::session::styled_line::{InvisiblePolicy, deceptive_invisible};
 
 use super::common;
 use super::editors::pane_scroll;
@@ -40,6 +41,14 @@ use super::model::{
 };
 use super::param_values::{self, ParamTarget, ParamValueEdit, ParamValueState, ScalarEdit};
 use super::{AutomationsWindow, DiscoverScope, Elem, Event, Message, Pane, Selection};
+
+/// Terminal-like output from the latest publish attempt, keyed to its package so navigating to a
+/// different owned package never shows the wrong command or diagnostics.
+#[derive(Debug, Clone)]
+pub(super) struct PublishOutput {
+    pub(super) package: String,
+    pub(super) text: String,
+}
 
 /// The install-time prompt for a package's required params that aren't yet set.
 #[derive(Debug, Clone)]
@@ -454,15 +463,8 @@ pub enum FilePreview {
 /// audit pane is the safe default. We *warn*, not strip: legitimate right-to-left source exists, so
 /// the auditor is told to look closely rather than having their text silently rewritten.
 fn has_deceptive_unicode(s: &str) -> bool {
-    s.chars().any(|c| {
-        matches!(c,
-            '\u{202A}'..='\u{202E}'   // LRE RLE PDF LRO RLO (embeddings + overrides)
-            | '\u{2066}'..='\u{2069}' // LRI RLI FSI PDI (isolates)
-            | '\u{200E}' | '\u{200F}' | '\u{061C}' // LRM RLM ALM (bidi marks)
-            | '\u{200B}'..='\u{200D}' // ZWSP ZWNJ ZWJ
-            | '\u{2060}' | '\u{FEFF}' | '\u{00AD}' // word joiner, ZWNBSP/BOM, soft hyphen
-        )
-    })
+    s.chars()
+        .any(|c| deceptive_invisible(c, InvisiblePolicy::ActionTarget))
 }
 
 /// Classify fetched module bytes for the source browser. The declared media type is
@@ -1008,8 +1010,9 @@ async fn closure_permission_union(
 enum PermissionRisk {
     /// A scoped grant that does what the line says and nothing more.
     Normal,
-    /// Elevated exposure (reading files outside the package's own data folder, downloading
-    /// arbitrary web code to run) — flagged amber, but still contained by the sandbox.
+    /// Elevated exposure (reading files outside the package's own data folder, connecting to any
+    /// host, downloading arbitrary web code to run) — flagged amber, but still contained by the
+    /// sandbox.
     Caution,
     /// Sandbox-escape-equivalent: subprocesses (`run`), native code (`ffi`), or writes outside
     /// `$DATA`. A subprocess or native library runs with the user's full privileges, and an
@@ -1052,7 +1055,13 @@ fn permission_can_lines(perms: &PackagePermissions) -> Vec<PermissionLine> {
             lines.push(PermissionLine {
                 head: crate::i18n::t!("permission-connect-to"),
                 detail: Some(host.clone()),
-                risk: PermissionRisk::Normal,
+                // `*` / `*:port` lets the package choose the peer rather than constraining it to
+                // a named host. Frame that at the same caution tier as arbitrary web-code imports.
+                risk: if is_any_host_net_entry(host) {
+                    PermissionRisk::Caution
+                } else {
+                    PermissionRisk::Normal
+                },
             });
         }
     }
@@ -2808,6 +2817,7 @@ impl AutomationsWindow {
         self.share_friends.clear();
         self.share_grants.clear();
         self.share_versions.clear();
+        self.share_busy = false;
         self.share_feedback = None;
         self.selection = Selection::OwnedPackage(name.clone());
         match local_packages::load_local_package(&self.server_name, &name) {
@@ -2843,10 +2853,18 @@ impl AutomationsWindow {
         if !self.signed_in() {
             return Update::none();
         }
+        Update::with_task(self.load_owned_share(name))
+    }
+
+    /// Reload all cloud-backed state shown in an owned package pane. Publishing uses the same load
+    /// as opening the pane so the new version, first-publish sharing controls, and visibility all
+    /// repaint from server truth as soon as the upload completes.
+    pub(super) fn load_owned_share(&mut self, name: String) -> Task<Message> {
         self.share_busy = true;
         let pkg_client = self.package_client();
         let cloud_client = self.cloud.client.clone();
-        Update::with_task(Task::perform(
+        let result_name = name.clone();
+        Task::perform(
             async move {
                 let mine = pkg_client.list_my_packages().await?;
                 let detail = mine
@@ -2860,13 +2878,17 @@ impl AutomationsWindow {
                 let versions = pkg_client.list_versions(id).await?;
                 Ok((id, is_public, friends, grants, versions))
             },
-            Message::OwnedShareLoaded,
-        ))
+            move |result| Message::OwnedShareLoaded {
+                name: result_name.clone(),
+                result,
+            },
+        )
     }
 
     #[allow(clippy::type_complexity)]
     pub(super) fn owned_share_loaded(
         &mut self,
+        name: &str,
         result: Result<
             (
                 Uuid,
@@ -2878,6 +2900,9 @@ impl AutomationsWindow {
             CloudError,
         >,
     ) -> Update<Message, Event> {
+        if !matches!(&self.selection, Selection::OwnedPackage(open) if open == name) {
+            return Update::none();
+        }
         self.share_busy = false;
         match result {
             Ok((id, is_public, friends, grants, versions)) => {
@@ -2952,21 +2977,29 @@ impl AutomationsWindow {
             return Update::none();
         };
         self.authoring_busy = true;
-        // Shown live while the (possibly slow) tsc declaration pass + upload run; the
-        // outcome — including any non-fatal tsc warnings — lands in `PublishFinished`.
-        self.authoring_feedback = Some(crate::i18n::t!(
-            "package-publishing-progress",
-            "name" => &name
-        ));
+        self.authoring_feedback = None;
+        // Shown live beside Publish while the (possibly slow) tsc declaration pass + upload run;
+        // the outcome — including any non-fatal tsc warnings — lands in `PublishFinished`.
+        self.publish_output = Some(PublishOutput {
+            package: name.clone(),
+            text: format!(
+                "smudgy> publish {name}\n{}",
+                crate::i18n::t!("package-publishing-progress", "name" => &name)
+            ),
+        });
         let client = self.package_client();
         let server = self.server_name.clone();
+        let result_name = name.clone();
         Update::with_task(Task::perform(
             async move {
                 local_packages::publish_local_package(&client, &server, &name)
                     .await
                     .map_err(|e| e.to_string())
             },
-            Message::PublishFinished,
+            move |result| Message::PublishFinished {
+                name: result_name.clone(),
+                result,
+            },
         ))
     }
 
@@ -5128,6 +5161,7 @@ impl AutomationsWindow {
         // Package names are owner-scoped on the server, so a fork always publishes under your own
         // handle and can never clobber another author's package — no client-side rename gate needed.
         let can_publish = !self.authoring_busy
+            && !self.share_busy
             && !self.manifest_dirty
             && matches!(verdict, PublishVerdict::Ready);
         body = body.push(
@@ -5173,6 +5207,20 @@ impl AutomationsWindow {
                 }
                 PublishVerdict::Ready => {}
             }
+        }
+
+        if let Some(output) = self
+            .publish_output
+            .as_ref()
+            .filter(|output| output.package == package.name)
+        {
+            body = body.push(
+                column![
+                    common::section_label(crate::i18n::ts!("package-publish-output")),
+                    publish_output_panel(&output.text),
+                ]
+                .spacing(6.0),
+            );
         }
 
         // Published versions.
@@ -6843,6 +6891,53 @@ fn code_block<'a>(content: &str) -> Elem<'a> {
         .into()
 }
 
+/// A bounded publish console using the user's actual terminal font and palette. Diagnostics can be
+/// arbitrarily long, so both axes scroll inside this surface instead of pushing the pane around.
+fn publish_output_panel<'a>(output: &str) -> Elem<'a> {
+    let prefs = crate::prefs::current();
+    let background = prefs.palette.background;
+    let foreground = prefs.palette.foreground;
+    let terminal_font = prefs.font;
+    let scrollbar = || {
+        scrollable::Scrollbar::new()
+            .width(6)
+            .scroller_width(6)
+            .margin(2)
+    };
+    let output = container(
+        text(output.to_string())
+            .size(12.0)
+            .font(terminal_font)
+            .color(foreground)
+            .wrapping(text::Wrapping::None),
+    )
+    .padding(10.0)
+    .width(Length::Shrink);
+
+    container(
+        scrollable(output)
+            .direction(scrollable::Direction::Both {
+                vertical: scrollbar(),
+                horizontal: scrollbar(),
+            })
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(132.0))
+    .style(move |_theme: &crate::theme::Theme| container::Style {
+        text_color: Some(foreground),
+        background: Some(Background::Color(background)),
+        border: Border {
+            color: foreground.scale_alpha(0.24),
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
 /// One "can do" row in the consent enumeration: a bullet, the capability label, and (when the line
 /// names one) the specific host/path/var in monospace.
 fn consent_can_row<'a>(line: &PermissionLine) -> Elem<'a> {
@@ -6939,6 +7034,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owned_share_result_refreshes_only_the_open_package() {
+        let mut window = AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "publish-refresh-test".to_string(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        window.selection = Selection::OwnedPackage("demo".to_string());
+        window.share_busy = true;
+        let version = VersionListItem {
+            version: "1.2.3".to_string(),
+            yanked: false,
+            deleted: false,
+            published_at: "2026-08-10T00:00:00Z".parse().unwrap(),
+        };
+
+        let _ = window.owned_share_loaded(
+            "demo",
+            Ok((Uuid::new_v4(), true, vec![], vec![], vec![version.clone()])),
+        );
+        assert!(!window.share_busy);
+        assert_eq!(window.share_versions, vec![version.clone()]);
+
+        window.selection = Selection::OwnedPackage("other".to_string());
+        window.share_busy = true;
+        let _ = window.owned_share_loaded(
+            "demo",
+            Ok((Uuid::new_v4(), false, vec![], vec![], Vec::new())),
+        );
+        assert!(window.share_busy, "a stale result must not finish the current load");
+        assert_eq!(window.share_versions, vec![version]);
+    }
+
+    #[test]
     fn fork_mirrors_source_enabled_state() {
         // Source disabled: the fork is an inspect-only copy.
         assert_eq!(fork_activation(false, false), ForkActivation::Inactive);
@@ -6988,6 +7117,7 @@ mod tests {
         ));
         // Zero-width space hidden in an identifier.
         assert!(has_deceptive_unicode("ad\u{200B}min"));
+        assert!(has_deceptive_unicode("admin\u{3164}"));
         // Plain Arabic (RTL letters, no control chars) is legitimate source/text — no warning.
         assert!(!has_deceptive_unicode(
             "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} = 1"
@@ -7004,5 +7134,33 @@ mod tests {
         assert_eq!(human_size(1536), "1.5 KB");
         assert_eq!(human_size(1024 * 1024), "1.0 MB");
         assert_eq!(human_size(1024 * 1024 * 3 / 2), "1.5 MB");
+    }
+
+    #[test]
+    fn any_host_network_grants_share_the_arbitrary_import_risk_tier() {
+        let wildcard = PackagePermissions {
+            net: vec!["*".into(), "*:443".into()],
+            ..Default::default()
+        };
+        let wildcard_lines = permission_can_lines(&wildcard);
+        assert_eq!(wildcard_lines.len(), 2);
+        assert!(
+            wildcard_lines
+                .iter()
+                .all(|line| line.risk == PermissionRisk::Caution)
+        );
+        assert_eq!(union_risk(&wildcard), PermissionRisk::Caution);
+
+        let arbitrary_import = PackagePermissions {
+            import: ImportPolicy::Any,
+            ..Default::default()
+        };
+        assert_eq!(union_risk(&arbitrary_import), PermissionRisk::Caution);
+
+        let named_host = PackagePermissions {
+            net: vec!["api.example.com:443".into()],
+            ..Default::default()
+        };
+        assert_eq!(union_risk(&named_host), PermissionRisk::Normal);
     }
 }

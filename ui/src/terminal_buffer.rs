@@ -1,19 +1,46 @@
 use iced::Background;
 use iced::widget::text::Span;
 use selection::Selection;
-use std::borrow::Cow;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    collections::{HashMap, HashSet, VecDeque},
+    num::NonZeroUsize,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use crate::prefs::TerminalPalette;
+use crate::prefs::TerminalPrefs;
 use smudgy_core::session::runtime::line_operation::LineOperation;
-use smudgy_core::session::styled_line::{Color, LinkAction, Style, StyledLine};
-use std::collections::{HashSet, VecDeque};
-use std::num::NonZeroUsize;
+use smudgy_core::session::styled_line::{
+    Blink, Color, LinkAction, LinkColor, LinkDecoration, LinkSpan, LinkStyle, LinkTextStyle,
+    LinkTooltip, LinkVisibility, LinkVisibilityAction, Style, StyledLine, Underline,
+};
+use unicode_segmentation::UnicodeSegmentation;
 
-type Link = ();
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SpanMetadata {
+    pub blink: Blink,
+    pub underline: LinkDecoration,
+    pub overline: LinkDecoration,
+    pub strikethrough: LinkDecoration,
+    pub decoration_color: Option<iced::Color>,
+}
+
+type Link = SpanMetadata;
 
 pub mod selection;
+
+pub(crate) fn authored_color(color: LinkColor) -> iced::Color {
+    iced::Color::from_rgba8(
+        color.red,
+        color.green,
+        color.blue,
+        f32::from(color.alpha) / 255.0,
+    )
+}
 
 /// A click on a link span, as delivered to the pane's `on_link` handler.
 #[derive(Debug, Clone)]
@@ -24,10 +51,1148 @@ pub struct LinkClickEvent {
     pub alt: bool,
 }
 
+/// Stable identity for one live link in a terminal buffer.
+///
+/// Byte offsets are deliberately not part of the identity: scripts and CR
+/// overprinting can move an otherwise unchanged link within its line. The
+/// buffer remaps this id when a line is replaced, so spoiler, visibility, and
+/// widget interaction state follow the link instead of being reset by an edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LinkKey(u64);
+
+#[cfg(test)]
+impl LinkKey {
+    pub(crate) const fn test(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LinkAddress {
+    line: usize,
+    begin: usize,
+    end: usize,
+}
+
+impl LinkAddress {
+    fn new(line: usize, link: &LinkSpan) -> Self {
+        Self {
+            line,
+            begin: link.begin_pos,
+            end: link.end_pos,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SelectionValueState {
+    selected: bool,
+    references: usize,
+}
+
+/// Session-scoped state shared by every terminal buffer and every widget that
+/// renders them. Link-instance visibility belongs to a buffer; selection
+/// groups and visited destinations describe the session-wide protocol.
+#[derive(Debug, Default)]
+pub(crate) struct LinkProtocolState {
+    selected_values: HashMap<(Arc<str>, Arc<str>), SelectionValueState>,
+    visited_actions: Vec<LinkAction>,
+    visual_generation: u64,
+}
+
+impl LinkProtocolState {
+    pub(crate) fn selected(
+        &self,
+        selection: &smudgy_core::session::styled_line::LinkSelection,
+    ) -> bool {
+        self.selected_values
+            .get(&(selection.group.clone(), selection.value.clone()))
+            .map_or(selection.selected, |state| state.selected)
+    }
+
+    pub(crate) fn visited(&self, action: &LinkAction) -> bool {
+        let target = action.disclosed_target().unwrap_or(action);
+        self.visited_actions.iter().any(|visited| visited == target)
+    }
+
+    pub(crate) fn mark_visited(&mut self, action: &LinkAction) {
+        if !self.visited(action) {
+            self.visited_actions
+                .push(action.disclosed_target().unwrap_or(action).clone());
+            self.visual_generation = self.visual_generation.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn toggle_link_selection(&mut self, action: &LinkAction) -> Option<bool> {
+        let selection = action.protocol()?.selection.as_ref()?;
+        let key = (selection.group.clone(), selection.value.clone());
+        let current = self.selected_values.get(&key)?.selected;
+        if selection.disabled {
+            return Some(current);
+        }
+        let next = if current { !selection.toggle } else { true };
+        if next && selection.exclusive {
+            for ((group, _), state) in &mut self.selected_values {
+                if group == &selection.group {
+                    state.selected = false;
+                }
+            }
+        }
+        if let Some(state) = self.selected_values.get_mut(&key) {
+            state.selected = next;
+        }
+        self.visual_generation = self.visual_generation.wrapping_add(1);
+        Some(next)
+    }
+
+    pub(crate) fn record_menu_choice(&mut self, source: &LinkAction) {
+        self.toggle_link_selection(source);
+        self.mark_visited(source);
+    }
+
+    pub(crate) fn visual_generation(&self) -> u64 {
+        self.visual_generation
+    }
+
+    fn retain_selection(&mut self, selection: &smudgy_core::session::styled_line::LinkSelection) {
+        let key = (selection.group.clone(), selection.value.clone());
+        if let Some(state) = self.selected_values.get_mut(&key) {
+            state.references += 1;
+            return;
+        }
+        let mut changed_existing = false;
+        if selection.selected && selection.exclusive {
+            for ((group, _), state) in &mut self.selected_values {
+                if group == &selection.group {
+                    changed_existing |= state.selected;
+                    state.selected = false;
+                }
+            }
+        }
+        self.selected_values.insert(
+            key,
+            SelectionValueState {
+                selected: selection.selected,
+                references: 1,
+            },
+        );
+        // The new line will shape because its source changed. Invalidate other
+        // cached lines only if this exclusive default changed their selection.
+        if changed_existing {
+            self.visual_generation = self.visual_generation.wrapping_add(1);
+        }
+    }
+
+    fn release_selection(&mut self, selection: &smudgy_core::session::styled_line::LinkSelection) {
+        let key = (selection.group.clone(), selection.value.clone());
+        let remove = self.selected_values.get_mut(&key).is_some_and(|state| {
+            state.references -= 1;
+            state.references == 0
+        });
+        if remove {
+            self.selected_values.remove(&key);
+        }
+    }
+
+    #[cfg(test)]
+    fn selection_references(
+        &self,
+        selection: &smudgy_core::session::styled_line::LinkSelection,
+    ) -> usize {
+        self.selected_values
+            .get(&(selection.group.clone(), selection.value.clone()))
+            .map_or(0, |state| state.references)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkRegistration {
+    action: LinkAction,
+    selection: Option<smudgy_core::session::styled_line::LinkSelection>,
+    spoiler: bool,
+    visibility: Option<LinkVisibility>,
+}
+
+impl LinkRegistration {
+    fn new(link: &LinkSpan) -> Self {
+        let protocol = link.action.protocol();
+        Self {
+            action: link.action.clone(),
+            selection: protocol.and_then(|protocol| protocol.selection.clone()),
+            spoiler: protocol.is_some_and(|protocol| protocol.spoiler),
+            visibility: protocol.and_then(|protocol| protocol.visibility.clone()),
+        }
+    }
+
+    fn matches(&self, link: &LinkSpan) -> bool {
+        let protocol = link.action.protocol();
+        self.action == link.action
+            && self.selection.as_ref() == protocol.and_then(|protocol| protocol.selection.as_ref())
+            && self.spoiler == protocol.is_some_and(|protocol| protocol.spoiler)
+            && self.visibility.as_ref()
+                == protocol.and_then(|protocol| protocol.visibility.as_ref())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LiveLink {
+    address: LinkAddress,
+    registration: LinkRegistration,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VisibilityState {
+    config: LinkVisibility,
+    pub(crate) concealed: bool,
+    created: Instant,
+    activated: Option<Instant>,
+    expiry_activated: bool,
+    skip_first_prompt: bool,
+    skip_first_output: bool,
+    pub(crate) revealed_phase: bool,
+}
+
+impl VisibilityState {
+    pub(crate) fn new(config: &LinkVisibility) -> Self {
+        let (concealed, revealed_phase) = match config.action {
+            LinkVisibilityAction::Conceal => (false, false),
+            LinkVisibilityAction::Reveal | LinkVisibilityAction::RevealThenConceal => (true, false),
+        };
+        Self {
+            config: config.clone(),
+            concealed,
+            created: Instant::now(),
+            activated: None,
+            expiry_activated: false,
+            skip_first_prompt: false,
+            skip_first_output: false,
+            revealed_phase,
+        }
+    }
+
+    fn has_expiry_trigger(&self) -> bool {
+        self.config.expire.input || self.config.expire.prompt || self.config.expire.output
+    }
+
+    fn activate_expiry(&mut self) {
+        self.expiry_activated = true;
+        self.skip_first_prompt = self.config.expire.prompt;
+        self.skip_first_output = self.config.expire.output;
+    }
+
+    pub(crate) fn apply_expiry(&mut self) -> bool {
+        let was_concealed = self.concealed;
+        let was_revealed_phase = self.revealed_phase;
+        match self.config.action {
+            LinkVisibilityAction::Conceal => self.concealed = true,
+            LinkVisibilityAction::Reveal => self.concealed = false,
+            LinkVisibilityAction::RevealThenConceal if !self.revealed_phase => {
+                self.concealed = false;
+                self.revealed_phase = true;
+            }
+            LinkVisibilityAction::RevealThenConceal => {}
+        }
+        self.activated = None;
+        self.expiry_activated = false;
+        self.skip_first_prompt = false;
+        self.skip_first_output = false;
+        self.concealed != was_concealed || self.revealed_phase != was_revealed_phase
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BufferLinkState {
+    shared: Rc<RefCell<LinkProtocolState>>,
+    live: HashMap<LinkKey, LiveLink>,
+    by_address: HashMap<LinkAddress, LinkKey>,
+    by_line: HashMap<usize, Vec<LinkKey>>,
+    next_key: u64,
+    revealed_spoilers: HashSet<LinkKey>,
+    visibility: HashMap<LinkKey, VisibilityState>,
+    /// Absolute logical lines removed by an irreversible `wholeline`
+    /// concealment. The source line remains in scrollback so absolute numbering
+    /// stays stable, but layout, copy, and link enumeration treat it as absent.
+    deleted_lines: HashSet<usize>,
+    pending_deleted_line_retirement: HashSet<usize>,
+    visual_generation: u64,
+    previous_output_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct DetachedLinks(Vec<(LinkKey, LiveLink)>);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MatchScore {
+    matches: usize,
+    distance: usize,
+}
+
+impl MatchScore {
+    fn with_match(self, distance: usize) -> Self {
+        Self {
+            matches: self.matches + 1,
+            distance: self.distance.saturating_add(distance),
+        }
+    }
+
+    fn better_than(self, other: Self) -> bool {
+        self.matches > other.matches
+            || (self.matches == other.matches && self.distance < other.distance)
+    }
+}
+
+impl BufferLinkState {
+    /// The exact matcher stores one score per pair of old/new links. Keep that
+    /// scratch space below a small, fixed budget and use the bounded fallback
+    /// for server-controlled lines that would exceed it.
+    const MAX_EXACT_MATCH_BYTES: usize = 4 * 1024 * 1024;
+    const FALLBACK_LOOKAHEAD: usize = 32;
+
+    pub(crate) fn new(shared: Rc<RefCell<LinkProtocolState>>) -> Self {
+        Self {
+            shared,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn replace_line(&mut self, line_number: usize, new: Option<&StyledLine>) {
+        if self.deleted_lines.contains(&line_number) {
+            let detached = self.detach_line(line_number);
+            self.discard_detached(detached);
+            return;
+        }
+        if self.line_matches(line_number, new) {
+            return;
+        }
+        let detached = self.detach_line(line_number);
+        self.install_line(line_number, detached, new);
+    }
+
+    fn line_matches(&self, line_number: usize, new: Option<&StyledLine>) -> bool {
+        let keys = self
+            .by_line
+            .get(&line_number)
+            .map_or(&[][..], Vec::as_slice);
+        let links = new.map_or(&[][..], |line| line.links.as_slice());
+        keys.len() == links.len()
+            && keys.iter().zip(links).all(|(key, link)| {
+                self.live.get(key).is_some_and(|live| {
+                    live.address == LinkAddress::new(line_number, link)
+                        && live.registration.matches(link)
+                })
+            })
+    }
+
+    fn detach_line(&mut self, line_number: usize) -> DetachedLinks {
+        let mut detached = self
+            .by_line
+            .remove(&line_number)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|key| {
+                let live = self.live.remove(&key)?;
+                self.by_address.remove(&live.address);
+                Some((key, live))
+            })
+            .collect::<Vec<_>>();
+        detached.sort_by_key(|(_, live)| live.address.begin);
+        DetachedLinks(detached)
+    }
+
+    fn install_line(
+        &mut self,
+        line_number: usize,
+        detached: DetachedLinks,
+        new: Option<&StyledLine>,
+    ) {
+        if self.deleted_lines.contains(&line_number) {
+            self.discard_detached(detached);
+            return;
+        }
+        let old = detached.0;
+        let new = new.map_or_else(Vec::new, |line| {
+            line.links
+                .iter()
+                .map(|link| LiveLink {
+                    address: LinkAddress::new(line_number, link),
+                    registration: LinkRegistration::new(link),
+                })
+                .collect()
+        });
+        let matches = Self::monotonic_matches(&old, &new);
+        let mut old_matched = vec![false; old.len()];
+        let mut new_to_old = vec![None; new.len()];
+        for (old_index, new_index) in matches {
+            old_matched[old_index] = true;
+            new_to_old[new_index] = Some(old_index);
+        }
+
+        let mut installed = Vec::with_capacity(new.len());
+        for (new_index, live) in new.into_iter().enumerate() {
+            if let Some(old_index) = new_to_old[new_index] {
+                installed.push((old[old_index].0, live, false));
+            } else {
+                let key = LinkKey(self.next_key);
+                self.next_key = self
+                    .next_key
+                    .checked_add(1)
+                    .expect("terminal link identity space exhausted");
+                installed.push((key, live, true));
+            }
+        }
+
+        // Retain replacements before releasing their predecessors so a streamed
+        // line extension cannot transiently retire and reinitialize a group.
+        {
+            let mut shared = self.shared.borrow_mut();
+            for (_, live, added) in &installed {
+                if !added {
+                    continue;
+                }
+                if let Some(selection) = &live.registration.selection {
+                    shared.retain_selection(selection);
+                }
+            }
+            for (index, (key, live)) in old.iter().enumerate() {
+                if old_matched[index] {
+                    continue;
+                }
+                if let Some(selection) = &live.registration.selection {
+                    shared.release_selection(selection);
+                }
+                self.revealed_spoilers.remove(key);
+                self.visibility.remove(key);
+            }
+        }
+
+        let mut keys = Vec::with_capacity(installed.len());
+        for (key, live, added) in installed {
+            if added && let Some(visibility) = &live.registration.visibility {
+                self.visibility
+                    .insert(key, VisibilityState::new(visibility));
+            }
+            self.by_address.insert(live.address, key);
+            self.live.insert(key, live);
+            keys.push(key);
+        }
+        if !keys.is_empty() {
+            self.by_line.insert(line_number, keys);
+        }
+    }
+
+    /// Monotonic matching keeps two identical links from crossing and swapping
+    /// state when edits move their byte ranges. Ordinary lines use an exact
+    /// maximum-cardinality, minimum-distance match. Pathological lines use a
+    /// bounded-lookahead fallback so remote input can never allocate an
+    /// old-links by new-links matrix.
+    fn monotonic_matches(old: &[(LinkKey, LiveLink)], new: &[LiveLink]) -> Vec<(usize, usize)> {
+        if old.is_empty() || new.is_empty() {
+            return Vec::new();
+        }
+
+        // Exact address/registration pairs at either edge are safe anchors and
+        // make the streaming append case linear regardless of line size.
+        let mut prefix = 0;
+        while prefix < old.len()
+            && prefix < new.len()
+            && old[prefix].1.address == new[prefix].address
+            && old[prefix].1.registration == new[prefix].registration
+        {
+            prefix += 1;
+        }
+
+        let mut suffix = 0;
+        while suffix < old.len() - prefix
+            && suffix < new.len() - prefix
+            && old[old.len() - 1 - suffix].1.address == new[new.len() - 1 - suffix].address
+            && old[old.len() - 1 - suffix].1.registration
+                == new[new.len() - 1 - suffix].registration
+        {
+            suffix += 1;
+        }
+
+        let old_middle = &old[prefix..old.len() - suffix];
+        let new_middle = &new[prefix..new.len() - suffix];
+        let mut matches = Vec::with_capacity(old.len().min(new.len()));
+        matches.extend((0..prefix).map(|index| (index, index)));
+
+        let middle = (old_middle.len() + 1)
+            .checked_mul(new_middle.len() + 1)
+            .filter(|cells| {
+                cells.saturating_mul(std::mem::size_of::<MatchScore>())
+                    <= Self::MAX_EXACT_MATCH_BYTES
+            })
+            .map_or_else(
+                || Self::bounded_monotonic_matches(old_middle, new_middle),
+                |_| Self::exact_monotonic_matches(old_middle, new_middle),
+            );
+        matches.extend(
+            middle
+                .into_iter()
+                .map(|(old_index, new_index)| (old_index + prefix, new_index + prefix)),
+        );
+        matches.extend(
+            (0..suffix).map(|offset| (old.len() - suffix + offset, new.len() - suffix + offset)),
+        );
+        matches
+    }
+
+    fn exact_monotonic_matches(
+        old: &[(LinkKey, LiveLink)],
+        new: &[LiveLink],
+    ) -> Vec<(usize, usize)> {
+        if old.is_empty() || new.is_empty() {
+            return Vec::new();
+        }
+        let width = new.len() + 1;
+        let mut scores = vec![MatchScore::default(); (old.len() + 1) * width];
+        let at = |i: usize, j: usize| i * width + j;
+
+        for i in (0..old.len()).rev() {
+            for j in (0..new.len()).rev() {
+                let mut best = scores[at(i + 1, j)];
+                let skip_new = scores[at(i, j + 1)];
+                if skip_new.better_than(best) {
+                    best = skip_new;
+                }
+                if old[i].1.registration == new[j].registration {
+                    let matched = scores[at(i + 1, j + 1)]
+                        .with_match(old[i].1.address.begin.abs_diff(new[j].address.begin));
+                    if matched.better_than(best) {
+                        best = matched;
+                    }
+                }
+                scores[at(i, j)] = best;
+            }
+        }
+
+        let mut matches = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        while i < old.len() && j < new.len() {
+            if old[i].1.registration == new[j].registration {
+                let matched = scores[at(i + 1, j + 1)]
+                    .with_match(old[i].1.address.begin.abs_diff(new[j].address.begin));
+                if matched == scores[at(i, j)] {
+                    matches.push((i, j));
+                    i += 1;
+                    j += 1;
+                    continue;
+                }
+            }
+            if scores[at(i + 1, j)] == scores[at(i, j)] {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        matches
+    }
+
+    /// Linear-memory fallback for lines too large for exact alignment. It
+    /// greedily preserves equal registrations, looking a short distance ahead
+    /// to recover from insertions/deletions without permitting quadratic work.
+    fn bounded_monotonic_matches(
+        old: &[(LinkKey, LiveLink)],
+        new: &[LiveLink],
+    ) -> Vec<(usize, usize)> {
+        let mut matches = Vec::with_capacity(old.len().min(new.len()));
+        let (mut old_index, mut new_index) = (0, 0);
+
+        while old_index < old.len() && new_index < new.len() {
+            if old[old_index].1.registration == new[new_index].registration {
+                matches.push((old_index, new_index));
+                old_index += 1;
+                new_index += 1;
+                continue;
+            }
+
+            let old_limit = (old_index + Self::FALLBACK_LOOKAHEAD + 1).min(old.len());
+            let new_limit = (new_index + Self::FALLBACK_LOOKAHEAD + 1).min(new.len());
+            let skip_old = (old_index + 1..old_limit)
+                .find(|&candidate| old[candidate].1.registration == new[new_index].registration);
+            let skip_new = (new_index + 1..new_limit)
+                .find(|&candidate| old[old_index].1.registration == new[candidate].registration);
+
+            match (skip_old, skip_new) {
+                (Some(candidate), Some(other)) => {
+                    let old_skip = candidate - old_index;
+                    let new_skip = other - new_index;
+                    if old_skip < new_skip
+                        || (old_skip == new_skip
+                            && old[candidate]
+                                .1
+                                .address
+                                .begin
+                                .abs_diff(new[new_index].address.begin)
+                                <= old[old_index]
+                                    .1
+                                    .address
+                                    .begin
+                                    .abs_diff(new[other].address.begin))
+                    {
+                        old_index = candidate;
+                    } else {
+                        new_index = other;
+                    }
+                }
+                (Some(candidate), None) => old_index = candidate,
+                (None, Some(candidate)) => new_index = candidate,
+                (None, None) => {
+                    // Neither current registration appears nearby. Retire both
+                    // candidates together; this bounds comparisons per link.
+                    old_index += 1;
+                    new_index += 1;
+                }
+            }
+        }
+
+        matches
+    }
+
+    fn remove_line(&mut self, line_number: usize) {
+        self.deleted_lines.remove(&line_number);
+        self.pending_deleted_line_retirement.remove(&line_number);
+        let detached = self.detach_line(line_number);
+        self.discard_detached(detached);
+    }
+
+    fn discard_detached(&mut self, detached: DetachedLinks) {
+        let mut shared = self.shared.borrow_mut();
+        for (key, live) in detached.0 {
+            if let Some(selection) = &live.registration.selection {
+                shared.release_selection(selection);
+            }
+            self.revealed_spoilers.remove(&key);
+            self.visibility.remove(&key);
+        }
+    }
+
+    fn retire_all(&mut self) {
+        if self.live.is_empty() {
+            return;
+        }
+        {
+            let mut shared = self.shared.borrow_mut();
+            for live in self.live.values() {
+                if let Some(selection) = &live.registration.selection {
+                    shared.release_selection(selection);
+                }
+            }
+        }
+        self.live.clear();
+        self.by_address.clear();
+        self.by_line.clear();
+        self.revealed_spoilers.clear();
+        self.visibility.clear();
+        self.deleted_lines.clear();
+        self.pending_deleted_line_retirement.clear();
+    }
+
+    pub(crate) fn shared(&self) -> Rc<RefCell<LinkProtocolState>> {
+        Rc::clone(&self.shared)
+    }
+
+    pub(crate) fn key_at(&self, line_number: usize, link: &LinkSpan) -> Option<LinkKey> {
+        self.by_address
+            .get(&LinkAddress::new(line_number, link))
+            .copied()
+    }
+
+    fn address(&self, key: LinkKey) -> Option<LinkAddress> {
+        self.live.get(&key).map(|live| live.address)
+    }
+
+    pub(crate) fn line(&self, key: LinkKey) -> Option<usize> {
+        self.address(key).map(|address| address.line)
+    }
+
+    pub(crate) fn position(&self, key: LinkKey) -> Option<(usize, usize, usize)> {
+        self.address(key)
+            .map(|address| (address.line, address.begin, address.end))
+    }
+
+    fn keys(&self) -> Vec<LinkKey> {
+        let mut links: Vec<_> = self
+            .live
+            .iter()
+            .filter(|(_, live)| !self.line_concealed(live.address.line))
+            .map(|(key, live)| (live.address, *key))
+            .collect();
+        links.sort_by_key(|(address, _)| (address.line, address.begin, address.end));
+        links.into_iter().map(|(_, key)| key).collect()
+    }
+
+    pub(crate) fn contains(&self, key: LinkKey) -> bool {
+        self.live.contains_key(&key)
+    }
+
+    pub(crate) fn spoiler_revealed(&self, key: LinkKey) -> bool {
+        self.revealed_spoilers.contains(&key)
+    }
+
+    pub(crate) fn reveal_spoiler(&mut self, key: LinkKey) -> bool {
+        if self
+            .live
+            .get(&key)
+            .is_some_and(|link| link.registration.spoiler)
+            && self.revealed_spoilers.insert(key)
+        {
+            self.visual_generation = self.visual_generation.wrapping_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn concealed(&self, key: LinkKey) -> bool {
+        self.visibility
+            .get(&key)
+            .is_some_and(|visibility| visibility.concealed)
+    }
+
+    pub(crate) fn line_concealed(&self, line_number: usize) -> bool {
+        self.deleted_lines.contains(&line_number)
+            || self
+                .by_line
+                .get(&line_number)
+                .into_iter()
+                .flatten()
+                .any(|key| {
+                    self.visibility.get(key).is_some_and(|visibility| {
+                        visibility.concealed && visibility.config.whole_line
+                    })
+                })
+    }
+
+    /// Release every registration on a line after an irreversible whole-line
+    /// concealment. The tombstone remains so the logical row cannot reappear or
+    /// expose co-located links during later interaction passes.
+    pub(crate) fn retire_deleted_line_registrations(&mut self) {
+        let lines: Vec<_> = self.pending_deleted_line_retirement.drain().collect();
+        for line_number in lines {
+            let detached = self.detach_line(line_number);
+            self.discard_detached(detached);
+        }
+    }
+
+    fn mark_line_deleted(&mut self, line_number: usize) {
+        self.deleted_lines.insert(line_number);
+        self.pending_deleted_line_retirement.insert(line_number);
+    }
+
+    pub(crate) fn activate_visibility(&mut self, key: LinkKey, now: Instant) -> Option<Instant> {
+        let state = self.visibility.get_mut(&key)?;
+        let deadline = match state.config.action {
+            LinkVisibilityAction::Conceal if !state.concealed => {
+                if let Some(delay_ms) = state.config.delay_ms.filter(|delay_ms| *delay_ms > 0) {
+                    state.activated = Some(now);
+                    Some(now + Duration::from_millis(delay_ms))
+                } else if state.has_expiry_trigger() {
+                    // Expiry is click-armed. Prompt/output skip the first response
+                    // event so a command link does not immediately expire on the
+                    // output and prompt caused by its own activation.
+                    state.activate_expiry();
+                    None
+                } else {
+                    state.concealed = true;
+                    state.activated = None;
+                    None
+                }
+            }
+            LinkVisibilityAction::RevealThenConceal if state.revealed_phase => {
+                state.concealed = true;
+                state.revealed_phase = false;
+                state.activated = None;
+                None
+            }
+            _ => None,
+        };
+        let delete_whole_line = state.concealed
+            && state.config.whole_line
+            && matches!(
+                state.config.action,
+                LinkVisibilityAction::Conceal | LinkVisibilityAction::RevealThenConceal
+            );
+        if delete_whole_line
+            && let Some(line_number) = self.live.get(&key).map(|live| live.address.line)
+        {
+            self.mark_line_deleted(line_number);
+        }
+        self.visual_generation = self.visual_generation.wrapping_add(1);
+        deadline
+    }
+
+    pub(crate) fn update_visibility_timers(&mut self, now: Instant) -> (Option<Instant>, bool) {
+        let mut changed = false;
+        let mut next = None;
+        let mut deleted_keys = Vec::new();
+        for (key, state) in &mut self.visibility {
+            let deadline = match state.config.action {
+                LinkVisibilityAction::Conceal => state
+                    .activated
+                    .zip(state.config.delay_ms)
+                    .map(|(at, delay_ms)| at + Duration::from_millis(delay_ms)),
+                LinkVisibilityAction::Reveal | LinkVisibilityAction::RevealThenConceal
+                    if state.concealed =>
+                {
+                    state
+                        .config
+                        .delay_ms
+                        .map(|delay_ms| state.created + Duration::from_millis(delay_ms))
+                }
+                _ => None,
+            };
+            if let Some(deadline) = deadline {
+                if now >= deadline {
+                    state.concealed = matches!(state.config.action, LinkVisibilityAction::Conceal);
+                    state.revealed_phase = !state.concealed;
+                    state.activated = None;
+                    changed = true;
+                    if state.concealed
+                        && state.config.whole_line
+                        && matches!(state.config.action, LinkVisibilityAction::Conceal)
+                    {
+                        deleted_keys.push(*key);
+                    }
+                } else {
+                    next = Some(next.map_or(deadline, |current: Instant| current.min(deadline)));
+                }
+            }
+        }
+        let deleted_lines: Vec<_> = deleted_keys
+            .into_iter()
+            .filter_map(|key| self.live.get(&key).map(|live| live.address.line))
+            .collect();
+        for line_number in deleted_lines {
+            self.mark_line_deleted(line_number);
+        }
+        if changed {
+            self.visual_generation = self.visual_generation.wrapping_add(1);
+        }
+        (next, changed)
+    }
+
+    fn note_input(&mut self) {
+        self.apply_expiry(|visibility| {
+            visibility.expiry_activated && visibility.config.expire.input
+        });
+    }
+
+    fn note_prompt(&mut self) {
+        self.apply_expiry(|visibility| {
+            if !visibility.expiry_activated || !visibility.config.expire.prompt {
+                return false;
+            }
+            if visibility.skip_first_prompt {
+                visibility.skip_first_prompt = false;
+                return false;
+            }
+            true
+        });
+    }
+
+    fn note_output(&mut self, now: Instant) {
+        let previous = self.previous_output_at.replace(now);
+        let Some(previous) = previous else {
+            return;
+        };
+        self.apply_expiry(|visibility| {
+            if !visibility.expiry_activated || !visibility.config.expire.output {
+                return false;
+            }
+            if now.saturating_duration_since(previous)
+                < Duration::from_millis(visibility.config.expire.output_delay_ms)
+            {
+                return false;
+            }
+            if visibility.skip_first_output {
+                visibility.skip_first_output = false;
+                return false;
+            }
+            true
+        });
+    }
+
+    fn apply_expiry(&mut self, mut trigger: impl FnMut(&mut VisibilityState) -> bool) {
+        if self.visibility.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        let mut deleted_keys = Vec::new();
+        for (key, visibility) in &mut self.visibility {
+            if trigger(visibility) {
+                let state_changed = visibility.apply_expiry();
+                changed |= state_changed;
+                if state_changed
+                    && visibility.concealed
+                    && visibility.config.whole_line
+                    && matches!(visibility.config.action, LinkVisibilityAction::Conceal)
+                {
+                    deleted_keys.push(*key);
+                }
+            }
+        }
+        let deleted_lines: Vec<_> = deleted_keys
+            .into_iter()
+            .filter_map(|key| self.live.get(&key).map(|live| live.address.line))
+            .collect();
+        for line_number in deleted_lines {
+            self.mark_line_deleted(line_number);
+        }
+        if changed {
+            self.visual_generation = self.visual_generation.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn visual_generation(&self) -> u64 {
+        self.visual_generation
+    }
+}
+
 /// The chip fill behind a link: a nearly-transparent wash of the text's own
 /// foreground. The alpha matches the Markdown widget's link chip, so a link whose
 /// foreground is the Markdown link color renders identically to a Markdown link.
 const LINK_WASH_ALPHA: f32 = 0.14;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkRenderStyle {
+    pub authored: bool,
+    pub style: LinkTextStyle,
+    pub spoiler_concealed: bool,
+    pub hidden: bool,
+}
+
+impl LinkRenderStyle {
+    fn base(link: &LinkSpan) -> Self {
+        Self {
+            authored: link.style.is_some(),
+            style: link
+                .style
+                .as_ref()
+                .map_or_else(LinkTextStyle::default, |style| style.base.clone()),
+            spoiler_concealed: false,
+            hidden: false,
+        }
+    }
+}
+
+/// Bidirectional byte-offset mapping between the immutable source line and the
+/// text actually shaped by the renderer. Most lines are identity-mapped;
+/// concealed link content needs a real map because one grapheme becomes one space.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum RenderedOffsets {
+    #[default]
+    Identity,
+    Mapped {
+        identity_prefix: usize,
+        source: Rc<[usize]>,
+        rendered: Rc<[usize]>,
+    },
+}
+
+impl RenderedOffsets {
+    fn map(offset: usize, from: &[usize], to: &[usize]) -> usize {
+        if offset == usize::MAX {
+            return usize::MAX;
+        }
+        match from.binary_search(&offset) {
+            Ok(index) => to[index],
+            Err(0) => 0,
+            Err(index) if index == from.len() => *to.last().unwrap_or(&0),
+            Err(index) => {
+                let from_start = from[index - 1];
+                let from_end = from[index];
+                let to_start = to[index - 1];
+                let to_end = to[index];
+                if from_end - from_start == to_end - to_start {
+                    to_start + offset - from_start
+                } else {
+                    // Selection/link offsets should land on grapheme boundaries.
+                    // If an external edit leaves one inside a concealed cluster,
+                    // snap to its beginning rather than exposing partial text.
+                    to_start
+                }
+            }
+        }
+    }
+
+    pub(crate) fn source_to_rendered(&self, offset: usize) -> usize {
+        match self {
+            Self::Identity => offset,
+            Self::Mapped {
+                identity_prefix,
+                source,
+                rendered,
+            } => {
+                if offset <= *identity_prefix {
+                    offset
+                } else {
+                    Self::map(offset, source, rendered)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn rendered_to_source(&self, offset: usize) -> usize {
+        match self {
+            Self::Identity => offset,
+            Self::Mapped {
+                identity_prefix,
+                source,
+                rendered,
+            } => {
+                if offset <= *identity_prefix {
+                    offset
+                } else {
+                    Self::map(offset, rendered, source)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn map_selection(
+        &self,
+        selection: Option<(usize, usize)>,
+    ) -> Option<(usize, usize)> {
+        selection.map(|(from, to)| (self.source_to_rendered(from), self.source_to_rendered(to)))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RenderedSpans {
+    pub(crate) spans: Rc<Vec<Span<'static, Link>>>,
+    pub(crate) offsets: RenderedOffsets,
+}
+
+#[derive(Debug)]
+enum RenderedOffsetsBuilder {
+    Identity {
+        end: usize,
+    },
+    Mapped {
+        identity_prefix: usize,
+        source: Vec<usize>,
+        rendered: Vec<usize>,
+        source_end: usize,
+        rendered_end: usize,
+    },
+}
+
+impl Default for RenderedOffsetsBuilder {
+    fn default() -> Self {
+        Self::Identity { end: 0 }
+    }
+}
+
+impl RenderedOffsetsBuilder {
+    fn push(&mut self, source: &str, rendered: &str, rewritten: bool) {
+        if let Self::Identity { end } = self {
+            if !rewritten {
+                debug_assert_eq!(source, rendered);
+                *end += source.len();
+                return;
+            }
+
+            let identity_prefix = *end;
+            *self = Self::Mapped {
+                identity_prefix,
+                source: vec![identity_prefix],
+                rendered: vec![identity_prefix],
+                source_end: identity_prefix,
+                rendered_end: identity_prefix,
+            };
+        }
+
+        let Self::Mapped {
+            source: source_offsets,
+            rendered: rendered_offsets,
+            source_end,
+            rendered_end,
+            ..
+        } = self
+        else {
+            unreachable!("identity spans return before offset mapping")
+        };
+
+        let mut rendered_graphemes = rendered.graphemes(true);
+        for source_grapheme in source.graphemes(true) {
+            let rendered_grapheme = rendered_graphemes
+                .next()
+                .expect("rendered terminal text preserves grapheme count");
+            *source_end += source_grapheme.len();
+            *rendered_end += rendered_grapheme.len();
+            source_offsets.push(*source_end);
+            rendered_offsets.push(*rendered_end);
+        }
+        debug_assert!(rendered_graphemes.next().is_none());
+    }
+
+    fn finish(self) -> RenderedOffsets {
+        match self {
+            Self::Identity { .. } => RenderedOffsets::Identity,
+            Self::Mapped {
+                identity_prefix,
+                source,
+                rendered,
+                ..
+            } => {
+                if source == rendered {
+                    RenderedOffsets::Identity
+                } else {
+                    RenderedOffsets::Mapped {
+                        identity_prefix,
+                        source: source.into(),
+                        rendered: rendered.into(),
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct RenderedSpansBuilder<'a> {
+    spans: Vec<Span<'static, Link>>,
+    offsets: RenderedOffsetsBuilder,
+    prefs: &'a TerminalPrefs,
+    line_hidden: bool,
+}
+
+impl<'a> RenderedSpansBuilder<'a> {
+    fn new(capacity: usize, prefs: &'a TerminalPrefs, line_hidden: bool) -> Self {
+        Self {
+            spans: Vec::with_capacity(capacity),
+            offsets: RenderedOffsetsBuilder::default(),
+            prefs,
+            line_hidden,
+        }
+    }
+
+    fn push(
+        &mut self,
+        text: &str,
+        style: Style,
+        linked: bool,
+        link_style: Option<&LinkRenderStyle>,
+    ) {
+        let (span, rewritten) = make_resolved_span_with_rewrite(
+            text,
+            style,
+            linked,
+            link_style,
+            self.line_hidden,
+            self.prefs,
+        );
+        self.offsets.push(text, span.text.as_ref(), rewritten);
+        self.spans.push(span);
+    }
+
+    fn finish(self) -> RenderedSpans {
+        RenderedSpans {
+            spans: Rc::new(self.spans),
+            offsets: self.offsets.finish(),
+        }
+    }
+}
 
 /// One renderable segment: underlined over the foreground wash when linked (unless
 /// the span sets an explicit background, which wins — the underline stays).
@@ -35,47 +1200,213 @@ const LINK_WASH_ALPHA: f32 = 0.14;
 /// `DefaultBackground` at the op boundary and so still washes, while a background
 /// literally painted the theme's background color counts as explicit and doesn't.
 #[inline]
-fn make_span(
+pub(crate) fn make_span(
     text: &str,
     style: Style,
     linked: bool,
-    palette: &TerminalPalette,
+    link_style: Option<&LinkStyle>,
+    prefs: &TerminalPrefs,
 ) -> Span<'static, Link> {
-    let fg = palette.resolve(style.fg);
-    let mut span = Span::<'static, Link>::new(Cow::Owned(text.to_string())).color(fg);
+    let resolved = link_style.map(|style| LinkRenderStyle {
+        authored: true,
+        style: style.base.clone(),
+        spoiler_concealed: false,
+        hidden: false,
+    });
+    make_resolved_span(text, style, linked, resolved.as_ref(), false, prefs)
+}
+
+#[inline]
+fn make_resolved_span(
+    text: &str,
+    style: Style,
+    linked: bool,
+    link_style: Option<&LinkRenderStyle>,
+    line_hidden: bool,
+    prefs: &TerminalPrefs,
+) -> Span<'static, Link> {
+    make_resolved_span_with_rewrite(text, style, linked, link_style, line_hidden, prefs).0
+}
+
+#[inline]
+fn make_resolved_span_with_rewrite(
+    text: &str,
+    style: Style,
+    linked: bool,
+    link_style: Option<&LinkRenderStyle>,
+    line_hidden: bool,
+    prefs: &TerminalPrefs,
+) -> (Span<'static, Link>, bool) {
+    let mut attributes = style.attributes;
+    let authored = link_style.map(|style| &style.style);
+    let sgr_bold = attributes.bold;
+    let authored_bold = authored.and_then(|style| style.bold);
+    // OSC-authored bold is literal styling. The preference only controls how
+    // an SGR bold attribute is presented, and an authored `bold: false`
+    // suppresses both of that SGR attribute's visual effects.
+    let bold_weight =
+        authored_bold.unwrap_or_else(|| sgr_bold && prefs.bold_mode.uses_bold_weight());
+    let bold_brightness =
+        sgr_bold && authored_bold != Some(false) && prefs.bold_mode.uses_bright_palette();
+    if let Some(value) = authored.and_then(|style| style.italic) {
+        attributes.italic = value;
+    }
+    let logical_fg = if bold_brightness {
+        match style.fg {
+            Color::Ansi { color, bold: false } => Color::Ansi { color, bold: true },
+            Color::DefaultForeground { bold: false } => Color::DefaultForeground { bold: true },
+            other => other,
+        }
+    } else {
+        style.fg
+    };
+    let terminal_color = |color| match color {
+        Color::DefaultBackground => prefs.palette.background,
+        other => prefs.resolve(other),
+    };
+    let logical_fg = authored
+        .and_then(|style| style.foreground)
+        .map_or_else(|| terminal_color(logical_fg), authored_color);
+    let logical_bg = authored
+        .and_then(|style| style.background)
+        .map(authored_color)
+        .or_else(|| (style.bg != Color::DefaultBackground).then(|| terminal_color(style.bg)));
+    let (mut fg, mut background) = if attributes.reverse {
+        (
+            logical_bg.unwrap_or(prefs.palette.background),
+            Some(logical_fg),
+        )
+    } else {
+        (logical_fg, logical_bg)
+    };
+    if attributes.faint {
+        fg.a *= 0.5;
+    }
+    let mut font = prefs.font;
+    if bold_weight {
+        font.weight = iced::font::Weight::Bold;
+    }
+    if attributes.italic {
+        font.style = iced::font::Style::Italic;
+    }
+    let sgr_underline = match attributes.underline {
+        Underline::None => LinkDecoration::None,
+        Underline::Single => LinkDecoration::Solid,
+        Underline::Double => LinkDecoration::Double,
+    };
+    let mut underline = authored
+        .and_then(|style| style.underline)
+        .unwrap_or(sgr_underline);
+    if linked
+        && !link_style.is_some_and(|style| style.authored)
+        && underline == LinkDecoration::None
+    {
+        underline = LinkDecoration::Solid;
+    }
+    let overline = authored
+        .and_then(|style| style.overline)
+        .unwrap_or(LinkDecoration::None);
+    let strikethrough =
+        authored
+            .and_then(|style| style.strikethrough)
+            .unwrap_or(if attributes.crossed_out {
+                LinkDecoration::Solid
+            } else {
+                LinkDecoration::None
+            });
+    let decoration_color = authored
+        .and_then(|style| style.decoration_color)
+        .map(authored_color);
+    let hidden = line_hidden || link_style.is_some_and(|style| style.hidden);
+    let spoiler_concealed = link_style.is_some_and(|style| style.spoiler_concealed);
+    if spoiler_concealed {
+        underline = LinkDecoration::None;
+    }
+    if hidden {
+        fg = iced::Color::TRANSPARENT;
+        background = None;
+        underline = LinkDecoration::None;
+    }
+    let overline = if hidden || spoiler_concealed {
+        LinkDecoration::None
+    } else {
+        overline
+    };
+    let strikethrough = if hidden || spoiler_concealed {
+        LinkDecoration::None
+    } else {
+        strikethrough
+    };
+    let decoration_color = (!hidden && !spoiler_concealed)
+        .then_some(decoration_color)
+        .flatten();
+    // Color emoji glyphs do not necessarily honor a span foreground, so
+    // painting foreground and background alike cannot reliably conceal them.
+    // Shape one ordinary space per grapheme instead; reveal re-bakes the
+    // original text, while the offset map keeps selection tied to the
+    // immutable source line.
+    let rewritten = hidden || spoiler_concealed;
+    let rendered_text = if rewritten {
+        text.graphemes(true).map(|_| ' ').collect()
+    } else {
+        text.to_string()
+    };
+    let mut span = Span::<'static, Link>::new(Cow::Owned(rendered_text))
+        .color(fg)
+        .font(font)
+        .underline(underline != LinkDecoration::None)
+        .strikethrough(strikethrough != LinkDecoration::None);
     // Only a meaningful background sets the span highlight: the widget draws a
     // quad per highlighted span region, so the (overwhelmingly common) default
     // background must stay decoration-free rather than painting a quad of the
     // pane's own color under every span.
-    if linked && style.bg == Color::DefaultBackground {
+    if linked
+        && !link_style.is_some_and(|style| style.authored)
+        && background.is_none()
+        && !hidden
+        && !spoiler_concealed
+    {
         span = span.background(Background::Color(iced::Color {
             a: LINK_WASH_ALPHA,
             ..fg
         }));
-    } else if style.bg != Color::DefaultBackground {
-        span = span.background(Background::Color(palette.resolve(style.bg)));
+    } else if let Some(bg) = background {
+        span = span.background(Background::Color(bg));
     }
-    if linked { span.underline(true) } else { span }
+    let metadata = SpanMetadata {
+        blink: attributes.blink,
+        underline,
+        overline,
+        strikethrough,
+        decoration_color,
+    };
+    let span = if metadata == SpanMetadata::default() {
+        span
+    } else {
+        span.link(metadata)
+    };
+    (span, rewritten)
 }
 
 /// Bakes a styled line's semantic colors into renderable spans using the
 /// given palette. Style spans are split at link boundaries so linked ranges get
 /// the link affordance without disturbing the line's own colors.
 #[inline]
-fn to_spans(
+fn to_spans(styled_line: &Arc<StyledLine>, prefs: &TerminalPrefs) -> Rc<Vec<Span<'static, Link>>> {
+    to_spans_with(styled_line, prefs, false, LinkRenderStyle::base).spans
+}
+
+fn to_spans_with(
     styled_line: &Arc<StyledLine>,
-    palette: &TerminalPalette,
-) -> Rc<Vec<Span<'static, Link>>> {
-    let mut spans = Vec::with_capacity(styled_line.spans.len());
+    prefs: &TerminalPrefs,
+    line_hidden: bool,
+    resolve: impl Fn(&LinkSpan) -> LinkRenderStyle,
+) -> RenderedSpans {
+    let mut rendered = RenderedSpansBuilder::new(styled_line.spans.len(), prefs, line_hidden);
     for span_info in &styled_line.spans {
         let (begin, end) = (span_info.begin_pos, span_info.end_pos);
         if styled_line.links.is_empty() || begin == end {
-            spans.push(make_span(
-                &styled_line.text[begin..end],
-                span_info.style,
-                false,
-                palette,
-            ));
+            rendered.push(&styled_line.text[begin..end], span_info.style, false, None);
             continue;
         }
         // Links are sorted and non-overlapping; walk the ones intersecting this span,
@@ -90,32 +1421,28 @@ fn to_spans(
             }
             let linked_begin = link.begin_pos.max(cursor);
             if linked_begin > cursor {
-                spans.push(make_span(
+                rendered.push(
                     &styled_line.text[cursor..linked_begin],
                     span_info.style,
                     false,
-                    palette,
-                ));
+                    None,
+                );
             }
             let linked_end = link.end_pos.min(end);
-            spans.push(make_span(
+            let resolved = resolve(link);
+            rendered.push(
                 &styled_line.text[linked_begin..linked_end],
                 span_info.style,
                 true,
-                palette,
-            ));
+                Some(&resolved),
+            );
             cursor = linked_end;
         }
         if cursor < end {
-            spans.push(make_span(
-                &styled_line.text[cursor..end],
-                span_info.style,
-                false,
-                palette,
-            ));
+            rendered.push(&styled_line.text[cursor..end], span_info.style, false, None);
         }
     }
-    Rc::new(spans)
+    rendered.finish()
 }
 
 /// Clamp a byte offset to `text`'s length and snap it down to the nearest char
@@ -146,8 +1473,8 @@ fn strip_possessive_suffix(word: &str) -> &str {
     }
 }
 
-impl AsRef<[Span<'static, ()>]> for BufferLine {
-    fn as_ref(&self) -> &[Span<'static, ()>] {
+impl AsRef<[Span<'static, SpanMetadata>]> for BufferLine {
+    fn as_ref(&self) -> &[Span<'static, SpanMetadata>] {
         self.spans().as_slice()
     }
 }
@@ -160,7 +1487,7 @@ pub struct BufferLine {
     /// window, scrollback eviction) never pays `to_spans` at all; only lines
     /// the pane actually lays out are baked. Cleared — not eagerly rebaked —
     /// on palette changes and line edits.
-    spans: std::cell::OnceCell<Rc<Vec<Span<'static, ()>>>>,
+    spans: std::cell::OnceCell<Rc<Vec<Span<'static, SpanMetadata>>>>,
 }
 
 impl PartialEq for BufferLine {
@@ -183,9 +1510,27 @@ impl BufferLine {
     /// first access. The returned `Rc` is pointer-stable until the spans are
     /// invalidated (palette change, line edit) — the pane's paragraph cache
     /// keys on that identity.
-    pub fn spans(&self) -> &Rc<Vec<Span<'static, ()>>> {
-        self.spans
-            .get_or_init(|| to_spans(&self.styled_line, &crate::prefs::current().palette))
+    pub fn spans(&self) -> &Rc<Vec<Span<'static, SpanMetadata>>> {
+        self.spans.get_or_init(|| {
+            let prefs = crate::prefs::current();
+            to_spans(&self.styled_line, &prefs)
+        })
+    }
+
+    pub(crate) fn spans_with_link_state(
+        &self,
+        prefs: &TerminalPrefs,
+        line_hidden: bool,
+        resolve: impl Fn(&LinkSpan) -> LinkRenderStyle,
+    ) -> RenderedSpans {
+        to_spans_with(&self.styled_line, prefs, line_hidden, resolve)
+    }
+
+    pub(crate) fn rendered_spans(&self) -> RenderedSpans {
+        RenderedSpans {
+            spans: self.spans().clone(),
+            offsets: RenderedOffsets::Identity,
+        }
     }
 
     /// Drop the baked spans so the next access re-bakes them (and downstream
@@ -208,6 +1553,15 @@ pub struct TerminalBuffer {
     /// mutation — so the per-frame hover path can skip hit testing entirely on
     /// the (overwhelmingly common) linkless buffer via [`Self::has_links`].
     lines_with_links: usize,
+    /// Bumped whenever keyboard focus returns to this pane's command editor.
+    /// Terminal widget instances observe the epoch and drop their independent
+    /// link-navigation focus before processing further keyboard input.
+    link_navigation_reset_epoch: u64,
+    link_state: Rc<RefCell<BufferLinkState>>,
+    /// Link-instance state detached by an explicit core-authored carriage-
+    /// return replacement. It survives UI batch boundaries and unrelated
+    /// trigger output until the matching finish update arrives.
+    open_line_replacement: Option<DetachedLinks>,
 }
 
 impl Default for TerminalBuffer {
@@ -233,6 +1587,16 @@ impl TerminalBuffer {
     /// * `max_lines`: The maximum number of lines the buffer can hold. Must be non-zero.
     ///   The internal `VecDeque` will be initialized with this capacity.
     pub fn new_with_max_lines(max_lines: NonZeroUsize) -> Self {
+        Self::new_with_protocol_state(
+            max_lines,
+            Rc::new(RefCell::new(LinkProtocolState::default())),
+        )
+    }
+
+    pub(crate) fn new_with_protocol_state(
+        max_lines: NonZeroUsize,
+        protocol_state: Rc<RefCell<LinkProtocolState>>,
+    ) -> Self {
         Self {
             lines: VecDeque::with_capacity(max_lines.get()),
             max_lines,
@@ -240,7 +1604,38 @@ impl TerminalBuffer {
             last_line_number: 0,
             span_generation: crate::prefs::current().generation,
             lines_with_links: 0,
+            link_navigation_reset_epoch: 0,
+            link_state: Rc::new(RefCell::new(BufferLinkState::new(protocol_state))),
+            open_line_replacement: None,
         }
+    }
+
+    pub fn note_visibility_input(&self) {
+        self.link_state.borrow_mut().note_input();
+    }
+
+    pub fn note_command_input_focus(&mut self) {
+        self.link_navigation_reset_epoch = self.link_navigation_reset_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn link_navigation_reset_epoch(&self) -> u64 {
+        self.link_navigation_reset_epoch
+    }
+
+    pub fn note_visibility_prompt(&self) {
+        self.link_state.borrow_mut().note_prompt();
+    }
+
+    pub fn note_visibility_output(&self) {
+        self.link_state.borrow_mut().note_output(Instant::now());
+    }
+
+    pub(crate) fn link_state(&self) -> Rc<RefCell<BufferLinkState>> {
+        Rc::clone(&self.link_state)
+    }
+
+    pub(crate) fn link_protocol_state(&self) -> Rc<RefCell<LinkProtocolState>> {
+        self.link_state.borrow().shared()
     }
 
     /// Whether any held line carries a link span. O(1); the per-frame hover
@@ -250,23 +1645,30 @@ impl TerminalBuffer {
     }
 
     /// Account for `line` entering the buffer (call beside every push).
-    fn note_added(&mut self, line: &BufferLine) {
-        if !line.styled_line.links.is_empty() {
-            self.lines_with_links += 1;
+    fn note_added(&mut self, line_number: usize, line: &BufferLine) {
+        if line.styled_line.links.is_empty() {
+            return;
         }
+        self.lines_with_links += 1;
+        self.link_state
+            .borrow_mut()
+            .replace_line(line_number, Some(&line.styled_line));
     }
 
     /// Account for `line` leaving the buffer (call on every pop).
-    fn note_removed(&mut self, line: &BufferLine) {
-        if !line.styled_line.links.is_empty() {
-            self.lines_with_links -= 1;
+    fn note_removed(&mut self, line_number: usize, line: &BufferLine) {
+        if line.styled_line.links.is_empty() {
+            return;
         }
+        self.lines_with_links -= 1;
+        self.link_state.borrow_mut().remove_line(line_number);
     }
 
     /// Pop the oldest line, keeping the link accounting straight.
     fn evict_front(&mut self) {
+        let line_number = self.last_line_number - self.lines.len() + 1;
         if let Some(line) = self.lines.pop_front() {
-            self.note_removed(&line);
+            self.note_removed(line_number, &line);
         }
     }
 
@@ -303,32 +1705,104 @@ impl TerminalBuffer {
 
     pub fn extend_line(&mut self, line_in: Arc<StyledLine>) {
         if self.line_terminated {
-            self.last_line_number += 1;
             self.line_terminated = false;
 
             while self.lines.len() > (self.max_lines.get() - 1) {
                 self.evict_front();
             }
 
+            self.last_line_number += 1;
             let line: BufferLine = line_in.into();
-            self.note_added(&line);
+            self.note_added(self.last_line_number, &line);
             self.lines.push_back(line);
         } else {
             match self.lines.pop_back() {
                 Some(line) => {
-                    self.note_removed(&line);
                     let joined: BufferLine = Arc::new(line.styled_line.append(&line_in)).into();
-                    self.note_added(&joined);
+                    let had_links = !line.styled_line.links.is_empty();
+                    let has_links = !joined.styled_line.links.is_empty();
+                    if has_links && !had_links {
+                        self.lines_with_links += 1;
+                    } else if !has_links && had_links {
+                        self.lines_with_links -= 1;
+                    }
+                    if had_links || has_links {
+                        self.link_state
+                            .borrow_mut()
+                            .replace_line(self.last_line_number, Some(&joined.styled_line));
+                    }
                     self.lines.push_back(joined);
                 }
                 None => {
                     self.last_line_number += 1;
                     let line: BufferLine = line_in.into();
-                    self.note_added(&line);
+                    self.note_added(self.last_line_number, &line);
                     self.lines.push_back(line);
                 }
             }
         }
+    }
+
+    /// Start a producer-identified carriage-return replacement. The retired
+    /// line's link state is detached rather than released, so the matching
+    /// finish update can restore it even after a UI flush or intervening output.
+    pub fn begin_open_line_replacement(&mut self) {
+        if self.open_line_replacement.is_some() {
+            return;
+        }
+        if self.line_terminated {
+            self.open_line_replacement = Some(DetachedLinks::default());
+            return;
+        }
+        let Some(old) = self.lines.pop_back() else {
+            self.open_line_replacement = Some(DetachedLinks::default());
+            return;
+        };
+
+        let detached = if old.styled_line.links.is_empty() {
+            DetachedLinks::default()
+        } else {
+            self.lines_with_links -= 1;
+            self.link_state
+                .borrow_mut()
+                .detach_line(self.last_line_number)
+        };
+        self.last_line_number -= 1;
+        self.line_terminated = true;
+        self.open_line_replacement = Some(detached);
+    }
+
+    /// Finish a producer-identified carriage-return replacement. `None`
+    /// retires the preserved state because routing removed the replacement
+    /// from main; `Some` installs a fresh open line and order-preservingly
+    /// remaps matching link instances onto it.
+    pub fn finish_open_line_replacement(&mut self, replacement: Option<Arc<StyledLine>>) {
+        let Some(detached) = self.open_line_replacement.take() else {
+            if let Some(replacement) = replacement {
+                self.extend_line(replacement);
+            }
+            return;
+        };
+        let Some(replacement) = replacement else {
+            self.link_state.borrow_mut().discard_detached(detached);
+            return;
+        };
+
+        while self.lines.len() > (self.max_lines.get() - 1) {
+            self.evict_front();
+        }
+        self.last_line_number += 1;
+        let replacement: BufferLine = replacement.into();
+        if !replacement.styled_line.links.is_empty() {
+            self.lines_with_links += 1;
+        }
+        self.link_state.borrow_mut().install_line(
+            self.last_line_number,
+            detached,
+            Some(&replacement.styled_line),
+        );
+        self.lines.push_back(replacement);
+        self.line_terminated = false;
     }
 
     /// Adds a line to the buffer.
@@ -337,8 +1811,6 @@ impl TerminalBuffer {
     // buffer's coherent line API (the live path uses `extend_line`).
     #[allow(dead_code)]
     pub fn push_line(&mut self, line: Arc<StyledLine>) {
-        self.last_line_number += 1;
-
         let limit = self.max_lines.get();
 
         // Remove oldest lines if the buffer is at or would exceed the limit.
@@ -347,8 +1819,9 @@ impl TerminalBuffer {
         while self.lines.len() >= limit {
             self.evict_front();
         }
+        self.last_line_number += 1;
         let line: BufferLine = line.into();
-        self.note_added(&line);
+        self.note_added(self.last_line_number, &line);
         self.lines.push_back(line);
         self.line_terminated = true;
     }
@@ -431,10 +1904,15 @@ impl TerminalBuffer {
                 // that survived the clamp; a clamped-in edge starts/ends whole.
                 let use_from_column = first_line == from.line;
                 let use_to_column = last_line == to.line;
+                let link_state = self.link_state.borrow();
 
                 (start_line_index..=to_line_index)
-                    .map(|i| {
+                    .filter_map(|i| {
                         let line = &self.lines[i];
+                        let line_number = offset + i + 1;
+                        if link_state.line_concealed(line_number) {
+                            return None;
+                        }
                         let text = line.styled_line.text.as_str();
                         let start_column = if i == start_line_index && use_from_column {
                             from.column
@@ -453,9 +1931,41 @@ impl TerminalBuffer {
                         let start_column = clamp_to_char_boundary(text, start_column);
                         let end_column = clamp_to_char_boundary(text, end_column).max(start_column);
 
-                        &text[start_column..end_column]
+                        let concealed = link_state
+                            .by_line
+                            .get(&line_number)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|key| {
+                                let visibility = link_state.visibility.get(key)?;
+                                if !visibility.concealed {
+                                    return None;
+                                }
+                                let live = link_state.live.get(key)?;
+                                Some((live.address.begin, live.address.end))
+                            })
+                            .collect::<Vec<_>>();
+                        if concealed.is_empty() {
+                            return Some(text[start_column..end_column].to_string());
+                        }
+
+                        let copied = text[start_column..end_column]
+                            .grapheme_indices(true)
+                            .map(|(relative, grapheme)| {
+                                let begin = start_column + relative;
+                                let end = begin + grapheme.len();
+                                if concealed.iter().any(|(hidden_begin, hidden_end)| {
+                                    begin < *hidden_end && end > *hidden_begin
+                                }) {
+                                    " "
+                                } else {
+                                    grapheme
+                                }
+                            })
+                            .collect::<String>();
+                        Some(copied)
                     })
-                    .collect::<Vec<&str>>()
+                    .collect::<Vec<_>>()
                     .join("\n")
             }
         }
@@ -527,11 +2037,11 @@ impl TerminalBuffer {
             None
         };
 
-        self.lines
-            .iter()
-            .rev()
+        let link_state = self.link_state.borrow();
+        self.iter_rev_with_line_number(None)
+            .filter(|(line_number, _)| !link_state.line_concealed(*line_number))
             .take(n_recent_lines)
-            .find_map(|line| {
+            .find_map(|(_, line)| {
                 // Split line by whitespace to get words
                 for raw_word in line.styled_line.text.split_whitespace() {
                     // Clean the word by trimming non-alphanumeric chars from start/end
@@ -577,6 +2087,14 @@ impl TerminalBuffer {
     /// The link action under byte `column` of absolute line `line_number`, if any.
     /// Backs the pane's hover cursor and click dispatch.
     pub fn link_at(&self, line_number: usize, column: usize) -> Option<LinkAction> {
+        self.link_span_at(line_number, column)
+            .map(|link| link.action.clone())
+    }
+
+    pub(crate) fn link_span_at(&self, line_number: usize, column: usize) -> Option<&LinkSpan> {
+        if self.link_state.borrow().line_concealed(line_number) {
+            return None;
+        }
         let offset = self.last_line_number - self.lines.len();
         if line_number <= offset || line_number > self.last_line_number {
             return None;
@@ -586,7 +2104,36 @@ impl TerminalBuffer {
             .links
             .iter()
             .find(|link| link.begin_pos <= column && column < link.end_pos)
-            .map(|link| link.action.clone())
+    }
+
+    pub(crate) fn link_key(&self, line_number: usize, link: &LinkSpan) -> Option<LinkKey> {
+        self.link_state.borrow().key_at(line_number, link)
+    }
+
+    pub(crate) fn link_keys(&self) -> std::vec::IntoIter<LinkKey> {
+        self.link_state.borrow().keys().into_iter()
+    }
+
+    pub(crate) fn link_span(&self, key: LinkKey) -> Option<&LinkSpan> {
+        let address = self.link_state.borrow().address(key)?;
+        let offset = self.last_line_number - self.lines.len();
+        if address.line <= offset || address.line > self.last_line_number {
+            return None;
+        }
+        self.lines
+            .get(address.line - offset - 1)?
+            .styled_line
+            .links
+            .iter()
+            .find(|link| link.begin_pos == address.begin && link.end_pos == address.end)
+    }
+
+    /// The tooltip metadata under byte `column` of absolute line `line_number`.
+    /// Kept separate from click lookup so hover can resolve lazy script copy
+    /// without manufacturing a click event.
+    pub fn link_tooltip_at(&self, line_number: usize, column: usize) -> Option<LinkTooltip> {
+        self.link_span_at(line_number, column)
+            .and_then(|link| link.tooltip.clone())
     }
 
     pub fn perform_line_operation(&mut self, line_number: usize, operation: LineOperation) {
@@ -599,8 +2146,10 @@ impl TerminalBuffer {
         }
         let line_number = line_number - offset - 1;
         if let Some(line) = self.lines.get_mut(line_number) {
+            let absolute_line_number = offset + line_number + 1;
             let had_links = !line.styled_line.links.is_empty();
-            line.styled_line = operation.apply(&line.styled_line);
+            let old = Arc::clone(&line.styled_line);
+            line.styled_line = operation.apply(&old);
             line.invalidate_spans();
             // An edit can add or drop a line's links; keep the O(1) count true.
             let has_links = !line.styled_line.links.is_empty();
@@ -608,6 +2157,11 @@ impl TerminalBuffer {
                 self.lines_with_links += 1;
             } else if !has_links && had_links {
                 self.lines_with_links -= 1;
+            }
+            if had_links || has_links {
+                self.link_state
+                    .borrow_mut()
+                    .replace_line(absolute_line_number, Some(&line.styled_line));
             }
         }
     }
@@ -621,7 +2175,7 @@ impl TerminalBuffer {
         if !self.line_terminated
             && let Some(line) = self.lines.pop_back()
         {
-            self.note_removed(&line);
+            self.note_removed(self.last_line_number, &line);
             self.last_line_number -= 1;
             self.line_terminated = true;
         }
@@ -630,16 +2184,30 @@ impl TerminalBuffer {
     /// Clear the scrollback (`pane.clear()`), keeping the line numbering —
     /// numbers keep increasing across a clear so core/UI parity is untouched.
     pub fn clear_lines(&mut self) {
+        if let Some(detached) = self.open_line_replacement.take() {
+            self.link_state.borrow_mut().discard_detached(detached);
+        }
+        self.link_state.borrow_mut().retire_all();
         self.lines.clear();
         self.lines_with_links = 0;
         self.line_terminated = true;
     }
 }
 
+impl Drop for TerminalBuffer {
+    fn drop(&mut self) {
+        if let Some(detached) = self.open_line_replacement.take() {
+            self.link_state.borrow_mut().discard_detached(detached);
+        }
+        self.link_state.borrow_mut().retire_all();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smudgy_core::session::styled_line::{StyledLine, VtSpan};
+    use smudgy_core::session::connection::vt_processor::AnsiColor;
+    use smudgy_core::session::styled_line::{Blink, StyledLine, TextAttributes, Underline, VtSpan};
     use std::num::NonZeroUsize; // Assuming VtSpan is needed for StyledLine::new
 
     // Helper to create Arc<StyledLine> for tests
@@ -839,6 +2407,7 @@ mod tests {
                 b: 10,
             },
             bg: Color::DefaultBackground,
+            ..Style::DEFAULT
         };
         let mut line = StyledLine::new(
             text,
@@ -852,15 +2421,140 @@ mod tests {
             begin_pos: begin,
             end_pos: end,
             action: LinkAction::Send(Arc::from("north")),
+            tooltip: None,
+            style: None,
         });
         Arc::new(line)
     }
 
     #[test]
+    fn sgr_bold_modes_preserve_the_regular_font_and_choose_weight_and_color() {
+        use smudgy_core::models::settings::TerminalBoldMode;
+
+        let mut prefs = (*crate::prefs::current()).clone();
+        let regular_font = prefs.font;
+        let style = Style {
+            fg: Color::Ansi {
+                color: AnsiColor::Red,
+                bold: false,
+            },
+            attributes: TextAttributes {
+                bold: true,
+                ..TextAttributes::DEFAULT
+            },
+            ..Style::DEFAULT
+        };
+
+        prefs.bold_mode = TerminalBoldMode::Bold;
+        let bold = make_span("bold", style, false, None, &prefs);
+        assert_eq!(
+            bold.font,
+            Some(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..regular_font
+            })
+        );
+        assert_eq!(
+            bold.color,
+            Some(prefs.resolve(Color::Ansi {
+                color: AnsiColor::Red,
+                bold: false,
+            }))
+        );
+
+        prefs.bold_mode = TerminalBoldMode::Bright;
+        let bright = make_span("bold", style, false, None, &prefs);
+        assert_eq!(bright.font, Some(regular_font));
+        assert_eq!(
+            bright.color,
+            Some(prefs.resolve(Color::Ansi {
+                color: AnsiColor::Red,
+                bold: true,
+            }))
+        );
+
+        prefs.bold_mode = TerminalBoldMode::BoldAndBright;
+        let both = make_span("bold", style, false, None, &prefs);
+        assert_eq!(
+            both.font,
+            Some(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..regular_font
+            })
+        );
+        assert_eq!(both.color, bright.color);
+
+        prefs.bold_mode = TerminalBoldMode::Bold;
+        let explicit_bright = make_span(
+            "bright",
+            Style {
+                fg: Color::Ansi {
+                    color: AnsiColor::Red,
+                    bold: true,
+                },
+                ..style
+            },
+            false,
+            None,
+            &prefs,
+        );
+        assert_eq!(explicit_bright.color, bright.color);
+    }
+
+    #[test]
+    fn make_span_renders_sgr_attributes_and_reverse_colors() {
+        let prefs = crate::prefs::current();
+        let style = Style {
+            fg: Color::Rgb {
+                r: 10,
+                g: 20,
+                b: 30,
+            },
+            bg: Color::Rgb {
+                r: 40,
+                g: 50,
+                b: 60,
+            },
+            attributes: TextAttributes {
+                faint: true,
+                italic: true,
+                underline: Underline::Double,
+                blink: Blink::Fast,
+                crossed_out: true,
+                reverse: true,
+                ..TextAttributes::DEFAULT
+            },
+        };
+        let span = make_span("styled", style, false, None, &prefs);
+        let mut reversed_fg = prefs.resolve(style.bg);
+        reversed_fg.a *= 0.5;
+        assert_eq!(span.color, Some(reversed_fg));
+        assert_eq!(
+            span.highlight.map(|highlight| highlight.background),
+            Some(Background::Color(prefs.resolve(style.fg)))
+        );
+        assert_eq!(
+            span.font.map(|font| font.style),
+            Some(iced::font::Style::Italic)
+        );
+        assert!(span.underline);
+        assert!(span.strikethrough);
+        assert_eq!(
+            span.link,
+            Some(SpanMetadata {
+                blink: Blink::Fast,
+                underline: LinkDecoration::Double,
+                strikethrough: LinkDecoration::Solid,
+                ..SpanMetadata::default()
+            })
+        );
+    }
+
+    #[test]
     fn to_spans_splits_at_link_boundaries_with_chip() {
         let line = linked_line("go north now", 3, 8);
-        let palette = &crate::prefs::current().palette;
-        let spans = to_spans(&line, palette);
+        let prefs = crate::prefs::current();
+        let spans = to_spans(&line, &prefs);
 
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[0].text, "go ");
@@ -871,7 +2565,7 @@ mod tests {
         // the segments around it keep the plain background.
         assert!(!spans[0].underline && !spans[2].underline);
         assert!(spans[1].underline);
-        let fg = palette.resolve(Color::Rgb {
+        let fg = prefs.resolve(Color::Rgb {
             r: 200,
             g: 10,
             b: 10,
@@ -890,6 +2584,210 @@ mod tests {
     }
 
     #[test]
+    fn authored_osc_style_suppresses_fallback_link_affordance() {
+        let prefs = crate::prefs::current();
+        let authored = LinkStyle::default();
+        let span = make_span("link", Style::DEFAULT, true, Some(&authored), &prefs);
+        assert!(
+            !span.underline,
+            "an empty authored style is not auto-underlined"
+        );
+        assert!(
+            span.highlight.is_none(),
+            "an authored style gets no fallback wash"
+        );
+    }
+
+    #[test]
+    fn protocol_concealment_suppresses_every_visual_affordance() {
+        let prefs = crate::prefs::current();
+        let resolved = LinkRenderStyle {
+            authored: false,
+            style: LinkTextStyle::default(),
+            spoiler_concealed: false,
+            hidden: true,
+        };
+        let span = make_resolved_span(
+            "hidden",
+            Style::DEFAULT,
+            true,
+            Some(&resolved),
+            false,
+            &prefs,
+        );
+        assert_eq!(span.text, "      ");
+        assert_eq!(span.color, Some(iced::Color::TRANSPARENT));
+        assert!(span.highlight.is_none());
+        assert!(!span.underline);
+        assert!(!span.strikethrough);
+    }
+
+    #[test]
+    fn concealed_spoiler_replaces_each_grapheme_with_a_space() {
+        let prefs = crate::prefs::current();
+        let resolved = LinkRenderStyle {
+            authored: false,
+            style: LinkTextStyle::default(),
+            spoiler_concealed: true,
+            hidden: false,
+        };
+        let span = make_resolved_span(
+            "🔮💀🗝️",
+            Style::DEFAULT,
+            true,
+            Some(&resolved),
+            false,
+            &prefs,
+        );
+        assert_eq!(span.text, "   ");
+        assert!(span.highlight.is_none());
+        assert!(!span.underline);
+    }
+
+    #[test]
+    fn concealed_spoiler_offsets_map_back_to_the_source_line() {
+        let prefs = crate::prefs::current();
+        let line = linked_line("A🗝️B", 1, 8);
+        let rendered = to_spans_with(&line, &prefs, false, |_| LinkRenderStyle {
+            authored: false,
+            style: LinkTextStyle::default(),
+            spoiler_concealed: true,
+            hidden: false,
+        });
+        let text: String = rendered
+            .spans
+            .iter()
+            .flat_map(|span| span.text.chars())
+            .collect();
+
+        assert_eq!(text, "A B");
+        assert_eq!(rendered.offsets.source_to_rendered(1), 1);
+        assert_eq!(rendered.offsets.source_to_rendered(8), 2);
+        assert_eq!(rendered.offsets.rendered_to_source(1), 1);
+        assert_eq!(rendered.offsets.rendered_to_source(2), 8);
+        assert_eq!(rendered.offsets.rendered_to_source(3), 9);
+    }
+
+    #[test]
+    fn unchanged_spans_keep_the_offset_builder_in_identity_mode() {
+        let mut offsets = RenderedOffsetsBuilder::default();
+        let first = "plain text 🔮";
+        let second = " and more";
+
+        offsets.push(first, first, false);
+        offsets.push(second, second, false);
+
+        assert!(matches!(
+            &offsets,
+            RenderedOffsetsBuilder::Identity { end }
+                if *end == first.len() + second.len()
+        ));
+        assert!(matches!(offsets.finish(), RenderedOffsets::Identity));
+    }
+
+    #[test]
+    fn mapped_offsets_preserve_an_identity_prefix_and_suffix() {
+        let prefix = "pré🔮";
+        let spoiler = "🗝️";
+        let concealed = " ";
+        let suffix = "尾x";
+        let mut offsets = RenderedOffsetsBuilder::default();
+
+        offsets.push(prefix, prefix, false);
+        offsets.push(spoiler, concealed, true);
+        offsets.push(suffix, suffix, false);
+        match &offsets {
+            RenderedOffsetsBuilder::Mapped {
+                identity_prefix,
+                source,
+                rendered,
+                ..
+            } => {
+                assert_eq!(*identity_prefix, prefix.len());
+                assert_eq!(source.first(), Some(&prefix.len()));
+                assert_eq!(rendered.first(), Some(&prefix.len()));
+            }
+            RenderedOffsetsBuilder::Identity { .. } => {
+                panic!("rewritten text should initialize offset mapping")
+            }
+        }
+        let offsets = offsets.finish();
+
+        let source_spoiler_end = prefix.len() + spoiler.len();
+        let rendered_spoiler_end = prefix.len() + concealed.len();
+        for offset in 0..=prefix.len() {
+            assert_eq!(offsets.source_to_rendered(offset), offset);
+            assert_eq!(offsets.rendered_to_source(offset), offset);
+        }
+        assert_eq!(offsets.source_to_rendered(prefix.len() + 1), prefix.len());
+        assert_eq!(
+            offsets.source_to_rendered(source_spoiler_end),
+            rendered_spoiler_end
+        );
+        assert_eq!(
+            offsets.rendered_to_source(rendered_spoiler_end),
+            source_spoiler_end
+        );
+        assert_eq!(
+            offsets.source_to_rendered(source_spoiler_end + 1),
+            rendered_spoiler_end + 1
+        );
+        assert_eq!(
+            offsets.rendered_to_source(rendered_spoiler_end + 1),
+            source_spoiler_end + 1
+        );
+        assert_eq!(
+            offsets.source_to_rendered(source_spoiler_end + suffix.len()),
+            rendered_spoiler_end + suffix.len()
+        );
+        assert_eq!(offsets.source_to_rendered(usize::MAX), usize::MAX);
+        assert_eq!(offsets.rendered_to_source(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn authored_osc_false_values_override_active_sgr_attributes() {
+        use smudgy_core::session::styled_line::{LinkTextStyle, TextAttributes};
+
+        let prefs = crate::prefs::current();
+        let authored = LinkStyle {
+            base: LinkTextStyle {
+                bold: Some(false),
+                italic: Some(false),
+                underline: Some(LinkDecoration::None),
+                strikethrough: Some(LinkDecoration::None),
+                ..LinkTextStyle::default()
+            },
+            ..LinkStyle::default()
+        };
+        let span = make_span(
+            "link",
+            Style {
+                attributes: TextAttributes {
+                    bold: true,
+                    italic: true,
+                    underline: Underline::Single,
+                    crossed_out: true,
+                    ..TextAttributes::DEFAULT
+                },
+                ..Style::DEFAULT
+            },
+            true,
+            Some(&authored),
+            &prefs,
+        );
+        assert_ne!(
+            span.font.map(|font| font.weight),
+            Some(iced::font::Weight::Bold)
+        );
+        assert_ne!(
+            span.font.map(|font| font.style),
+            Some(iced::font::Style::Italic)
+        );
+        assert!(!span.underline);
+        assert!(!span.strikethrough);
+    }
+
+    #[test]
     fn to_spans_keeps_explicit_background_under_a_link() {
         use smudgy_core::session::styled_line::{LinkSpan, VtSpan};
         let style = Style {
@@ -899,6 +2797,7 @@ mod tests {
                 b: 10,
             },
             bg: Color::Rgb { r: 1, g: 2, b: 3 },
+            ..Style::DEFAULT
         };
         let mut line = StyledLine::new(
             "north",
@@ -912,15 +2811,17 @@ mod tests {
             begin_pos: 0,
             end_pos: 5,
             action: LinkAction::Send(Arc::from("north")),
+            tooltip: None,
+            style: None,
         });
-        let palette = &crate::prefs::current().palette;
-        let spans = to_spans(&Arc::new(line), palette);
+        let prefs = crate::prefs::current();
+        let spans = to_spans(&Arc::new(line), &prefs);
         assert_eq!(spans.len(), 1);
         // The author's background wins over the wash; the underline stays.
         assert!(spans[0].underline);
         assert_eq!(
             spans[0].highlight.map(|h| h.background),
-            Some(Background::Color(palette.resolve(Color::Rgb {
+            Some(Background::Color(prefs.resolve(Color::Rgb {
                 r: 1,
                 g: 2,
                 b: 3
@@ -950,6 +2851,13 @@ mod tests {
         assert_eq!(buffer.link_at(1, 5), None);
         assert_eq!(buffer.link_at(0, 5), None);
         assert_eq!(buffer.link_at(99, 5), None);
+
+        let keys: Vec<_> = buffer.link_keys().collect();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            buffer.link_span(keys[0]).map(|link| link.action.clone()),
+            Some(LinkAction::Send(Arc::from("north")))
+        );
     }
 
     #[test]
@@ -1053,5 +2961,604 @@ mod tests {
             buffer.find_recent_word_by_prefix("scr", None, &[], 5),
             Some("scratch".to_string())
         );
+    }
+
+    fn protocol_line(
+        selection: Option<smudgy_core::session::styled_line::LinkSelection>,
+        visibility: Option<LinkVisibility>,
+        spoiler: bool,
+    ) -> (Arc<StyledLine>, LinkAction) {
+        use smudgy_core::session::styled_line::LinkProtocol;
+
+        let action = LinkAction::Configured {
+            primary: Some(Box::new(LinkAction::ServerSend(Arc::from("look")))),
+            disabled: false,
+            primary_enabled: true,
+            menu: None,
+            menu_on_left_click: false,
+            protocol: Some(LinkProtocol {
+                selection,
+                visibility,
+                spoiler,
+            }),
+        };
+        let mut line = StyledLine::new("link", Vec::new());
+        line.links.push(LinkSpan {
+            begin_pos: 0,
+            end_pos: 4,
+            action: action.clone(),
+            tooltip: None,
+            style: None,
+        });
+        (Arc::new(line), action)
+    }
+
+    fn matcher_link(action: LinkAction, begin: usize) -> LiveLink {
+        LiveLink {
+            address: LinkAddress {
+                line: 1,
+                begin,
+                end: begin + 1,
+            },
+            registration: LinkRegistration {
+                action,
+                selection: None,
+                spoiler: false,
+                visibility: None,
+            },
+        }
+    }
+
+    #[test]
+    fn exact_link_matcher_prefers_the_closest_duplicate() {
+        let action = LinkAction::Send(Arc::from("look"));
+        let old = vec![(LinkKey::test(0), matcher_link(action.clone(), 10))];
+        let new = vec![matcher_link(action.clone(), 0), matcher_link(action, 10)];
+
+        assert_eq!(BufferLinkState::monotonic_matches(&old, &new), [(0, 1)]);
+    }
+
+    #[test]
+    fn huge_shifted_link_line_uses_bounded_matching() {
+        const LINK_COUNT: usize = 50_000;
+
+        let action = LinkAction::Send(Arc::from("look"));
+        let old = (0..LINK_COUNT)
+            .map(|index| {
+                (
+                    LinkKey::test(u64::try_from(index).expect("test index fits u64")),
+                    matcher_link(action.clone(), index * 2),
+                )
+            })
+            .collect::<Vec<_>>();
+        let new = (0..LINK_COUNT)
+            .map(|index| matcher_link(action.clone(), index * 2 + 1))
+            .collect::<Vec<_>>();
+
+        let matches = BufferLinkState::monotonic_matches(&old, &new);
+        assert_eq!(matches.len(), LINK_COUNT);
+        assert_eq!(matches.first(), Some(&(0, 0)));
+        assert_eq!(matches.last(), Some(&(LINK_COUNT - 1, LINK_COUNT - 1)));
+    }
+
+    #[test]
+    fn huge_unrelated_link_lines_do_not_do_quadratic_work() {
+        const LINK_COUNT: usize = 20_000;
+
+        let old_action = LinkAction::Send(Arc::from("old"));
+        let new_action = LinkAction::Send(Arc::from("new"));
+        let old = (0..LINK_COUNT)
+            .map(|index| {
+                (
+                    LinkKey::test(u64::try_from(index).expect("test index fits u64")),
+                    matcher_link(old_action.clone(), index * 2),
+                )
+            })
+            .collect::<Vec<_>>();
+        let new = (0..LINK_COUNT)
+            .map(|index| matcher_link(new_action.clone(), index * 2 + 1))
+            .collect::<Vec<_>>();
+
+        assert!(BufferLinkState::monotonic_matches(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn selection_and_visited_state_is_shared_across_routed_buffers() {
+        use smudgy_core::session::styled_line::LinkSelection;
+
+        let shared = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let mut main =
+            TerminalBuffer::new_with_protocol_state(NonZeroUsize::new(10).unwrap(), shared.clone());
+        let mut routed =
+            TerminalBuffer::new_with_protocol_state(NonZeroUsize::new(10).unwrap(), shared.clone());
+        let first = LinkSelection {
+            group: Arc::from("stance"),
+            value: Arc::from("attack"),
+            toggle: false,
+            selected: false,
+            exclusive: true,
+            disabled: false,
+        };
+        let second = LinkSelection {
+            value: Arc::from("defend"),
+            ..first.clone()
+        };
+        let (main_line, main_action) = protocol_line(Some(first.clone()), None, false);
+        let (routed_line, routed_action) = protocol_line(Some(second.clone()), None, false);
+        main.push_line(main_line);
+        routed.push_line(routed_line);
+
+        assert_eq!(
+            shared.borrow_mut().toggle_link_selection(&main_action),
+            Some(true)
+        );
+        assert!(shared.borrow().selected(&first));
+        assert!(!shared.borrow().selected(&second));
+        assert_eq!(
+            shared.borrow_mut().toggle_link_selection(&routed_action),
+            Some(true)
+        );
+        assert!(!shared.borrow().selected(&first));
+        assert!(shared.borrow().selected(&second));
+
+        shared.borrow_mut().mark_visited(&main_action);
+        assert!(shared.borrow().visited(&main_action));
+    }
+
+    #[test]
+    fn selection_lifecycle_refcounts_retire_and_reinitialize_groups() {
+        use smudgy_core::session::styled_line::LinkSelection;
+
+        let shared = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let mut first_buffer =
+            TerminalBuffer::new_with_protocol_state(NonZeroUsize::new(2).unwrap(), shared.clone());
+        let mut second_buffer =
+            TerminalBuffer::new_with_protocol_state(NonZeroUsize::new(2).unwrap(), shared.clone());
+        let selection = LinkSelection {
+            group: Arc::from("answer"),
+            value: Arc::from("yes"),
+            toggle: true,
+            selected: false,
+            exclusive: true,
+            disabled: false,
+        };
+        let (line, action) = protocol_line(Some(selection.clone()), None, false);
+        first_buffer.push_line(line.clone());
+        second_buffer.push_line(line);
+        assert_eq!(shared.borrow().selection_references(&selection), 2);
+        assert_eq!(
+            shared.borrow_mut().toggle_link_selection(&action),
+            Some(true)
+        );
+
+        first_buffer.clear_lines();
+        assert_eq!(shared.borrow().selection_references(&selection), 1);
+        drop(second_buffer);
+        assert_eq!(shared.borrow().selection_references(&selection), 0);
+
+        let selected = LinkSelection {
+            selected: true,
+            ..selection.clone()
+        };
+        let (line, _) = protocol_line(Some(selected.clone()), None, false);
+        first_buffer.push_line(line);
+        assert_eq!(shared.borrow().selection_references(&selected), 1);
+        assert!(shared.borrow().selected(&selected));
+
+        first_buffer.push_line(sl("plain"));
+        first_buffer.push_line(sl("evicts the linked line"));
+        assert_eq!(shared.borrow().selection_references(&selected), 0);
+    }
+
+    #[test]
+    fn byte_shifting_edit_preserves_link_identity_and_instance_state() {
+        use smudgy_core::session::styled_line::{LinkVisibility, LinkVisibilityExpire};
+
+        let visibility = LinkVisibility {
+            action: LinkVisibilityAction::Conceal,
+            delay_ms: Some(5_000),
+            expire: LinkVisibilityExpire {
+                input: false,
+                prompt: false,
+                output: false,
+                output_delay_ms: 0,
+            },
+            whole_line: false,
+        };
+        let (line, _) = protocol_line(None, Some(visibility), true);
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.push_line(line);
+        let key = buffer.link_keys().next().expect("link key");
+        let link_state = buffer.link_state();
+        assert!(link_state.borrow_mut().reveal_spoiler(key));
+        let activated = Instant::now();
+        link_state.borrow_mut().activate_visibility(key, activated);
+        let generation = link_state.borrow().visual_generation();
+
+        buffer.perform_line_operation(
+            1,
+            LineOperation::Insert {
+                str: Arc::new("prefix ".to_string()),
+                begin: 0,
+                end: 0,
+                style: Style::DEFAULT,
+            },
+        );
+
+        let moved = buffer.link_keys().next().expect("moved link key");
+        assert_eq!(moved, key);
+        assert!(link_state.borrow().spoiler_revealed(moved));
+        assert_eq!(
+            link_state
+                .borrow()
+                .visibility
+                .get(&moved)
+                .and_then(|state| state.activated),
+            Some(activated)
+        );
+        assert_eq!(
+            link_state.borrow().visual_generation(),
+            generation,
+            "moving a link must not invalidate every dynamic-link paragraph"
+        );
+    }
+
+    #[test]
+    fn carriage_return_replacement_preserves_semantic_link_state() {
+        let (line, _) = protocol_line(None, None, true);
+        let replacement = Arc::new(line.insert("shifted ", 0, 0, Style::DEFAULT));
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.extend_line(line);
+        let key = buffer.link_keys().next().expect("link key");
+        let link_state = buffer.link_state();
+        assert!(link_state.borrow_mut().reveal_spoiler(key));
+
+        buffer.begin_open_line_replacement();
+        buffer.finish_open_line_replacement(Some(replacement));
+
+        let moved = buffer.link_keys().next().expect("replacement link key");
+        assert_eq!(moved, key);
+        assert!(link_state.borrow().spoiler_revealed(moved));
+        assert_eq!(buffer.last_line_number(), 1);
+        assert_eq!(buffer.len(), 1);
+    }
+
+    #[test]
+    fn carriage_return_identity_survives_intervening_committed_output() {
+        let (line, _) = protocol_line(None, None, true);
+        let replacement = Arc::new(line.insert("shifted ", 0, 0, Style::DEFAULT));
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.extend_line(line);
+        let key = buffer.link_keys().next().expect("link key");
+        let link_state = buffer.link_state();
+        assert!(link_state.borrow_mut().reveal_spoiler(key));
+
+        buffer.begin_open_line_replacement();
+        buffer.push_line(sl("trigger output"));
+        buffer.finish_open_line_replacement(Some(replacement));
+
+        let moved = buffer.link_keys().next().expect("replacement link key");
+        assert_eq!(moved, key);
+        assert!(link_state.borrow().spoiler_revealed(moved));
+        assert_eq!(buffer.last_line_number(), 2);
+        assert_eq!(buffer.len(), 2);
+    }
+
+    #[test]
+    fn ordinary_retraction_does_not_transfer_link_instance_state() {
+        let (line, _) = protocol_line(None, None, true);
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.extend_line(line.clone());
+        let retired = buffer.link_keys().next().expect("link key");
+        let link_state = buffer.link_state();
+        assert!(link_state.borrow_mut().reveal_spoiler(retired));
+
+        buffer.retract_open_line();
+        buffer.extend_line(line);
+
+        let fresh = buffer.link_keys().next().expect("fresh link key");
+        assert_ne!(fresh, retired);
+        assert!(!link_state.borrow().spoiler_revealed(fresh));
+    }
+
+    #[test]
+    fn identical_links_keep_ordered_identity_after_prefix_insert() {
+        let (_, action) = protocol_line(None, None, true);
+        let mut line = StyledLine::new("link------link", Vec::new());
+        for (begin_pos, end_pos) in [(0, 4), (10, 14)] {
+            line.links.push(LinkSpan {
+                begin_pos,
+                end_pos,
+                action: action.clone(),
+                tooltip: None,
+                style: None,
+            });
+        }
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.push_line(Arc::new(line));
+        let original: Vec<_> = buffer.link_keys().collect();
+        let link_state = buffer.link_state();
+        assert!(link_state.borrow_mut().reveal_spoiler(original[1]));
+
+        buffer.perform_line_operation(
+            1,
+            LineOperation::Insert {
+                str: Arc::new("fifteen bytes--".to_string()),
+                begin: 0,
+                end: 0,
+                style: Style::DEFAULT,
+            },
+        );
+
+        let shifted: Vec<_> = buffer.link_keys().collect();
+        assert_eq!(shifted, original);
+        assert!(!link_state.borrow().spoiler_revealed(shifted[0]));
+        assert!(link_state.borrow().spoiler_revealed(shifted[1]));
+    }
+
+    #[test]
+    fn retired_selection_cannot_be_toggled_by_a_stale_menu_source() {
+        use smudgy_core::session::styled_line::LinkSelection;
+
+        let shared = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let selection = LinkSelection {
+            group: Arc::from("answer"),
+            value: Arc::from("yes"),
+            toggle: true,
+            selected: false,
+            exclusive: true,
+            disabled: false,
+        };
+        let (line, action) = protocol_line(Some(selection.clone()), None, false);
+        let mut buffer =
+            TerminalBuffer::new_with_protocol_state(NonZeroUsize::new(1).unwrap(), shared.clone());
+        buffer.push_line(line);
+        buffer.push_line(sl("evicts the menu source"));
+
+        let generation = shared.borrow().visual_generation();
+        assert_eq!(shared.borrow().selection_references(&selection), 0);
+        assert_eq!(shared.borrow_mut().toggle_link_selection(&action), None);
+        assert_eq!(shared.borrow().visual_generation(), generation);
+    }
+
+    #[test]
+    fn spoiler_disclosure_is_buffer_shared_but_not_session_global() {
+        let shared = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let mut first =
+            TerminalBuffer::new_with_protocol_state(NonZeroUsize::new(10).unwrap(), shared.clone());
+        let mut routed =
+            TerminalBuffer::new_with_protocol_state(NonZeroUsize::new(10).unwrap(), shared);
+        let (line, _) = protocol_line(None, None, true);
+        first.push_line(line.clone());
+        routed.push_line(line);
+        let first_state = first.link_state();
+        let split_half_state = first.link_state();
+        let routed_state = routed.link_state();
+        let key = first.link_keys().next().expect("first link key");
+        let routed_key = routed.link_keys().next().expect("routed link key");
+
+        assert!(Rc::ptr_eq(&first_state, &split_half_state));
+        assert!(first_state.borrow_mut().reveal_spoiler(key));
+        assert!(split_half_state.borrow().spoiler_revealed(key));
+        assert!(!routed_state.borrow().spoiler_revealed(routed_key));
+    }
+
+    #[test]
+    fn visibility_initial_state_and_expiry_live_on_the_buffer() {
+        use smudgy_core::session::styled_line::LinkVisibilityExpire;
+
+        let expire = LinkVisibilityExpire {
+            input: true,
+            prompt: false,
+            output: false,
+            output_delay_ms: 500,
+        };
+        let conceal_config = LinkVisibility {
+            action: LinkVisibilityAction::Conceal,
+            delay_ms: None,
+            expire: expire.clone(),
+            whole_line: false,
+        };
+        let mut conceal = VisibilityState::new(&conceal_config);
+        assert!(!conceal.concealed);
+        assert!(conceal.apply_expiry());
+        assert!(conceal.concealed);
+
+        let reveal_config = LinkVisibility {
+            action: LinkVisibilityAction::Reveal,
+            delay_ms: None,
+            expire,
+            whole_line: false,
+        };
+        let mut reveal = VisibilityState::new(&reveal_config);
+        assert!(reveal.concealed);
+        assert!(reveal.apply_expiry());
+        assert!(!reveal.concealed);
+
+        let cycle = VisibilityState::new(&LinkVisibility {
+            action: LinkVisibilityAction::RevealThenConceal,
+            delay_ms: Some(0),
+            expire: LinkVisibilityExpire {
+                input: false,
+                prompt: false,
+                output: false,
+                output_delay_ms: 0,
+            },
+            whole_line: false,
+        });
+        assert!(cycle.concealed);
+        assert!(!cycle.revealed_phase);
+    }
+
+    #[test]
+    fn visibility_expiry_is_click_armed_and_skips_the_first_response() {
+        use smudgy_core::session::styled_line::LinkVisibilityExpire;
+
+        let visibility = LinkVisibility {
+            action: LinkVisibilityAction::Conceal,
+            delay_ms: None,
+            expire: LinkVisibilityExpire {
+                input: false,
+                prompt: true,
+                output: true,
+                output_delay_ms: 10,
+            },
+            whole_line: false,
+        };
+        let (line, _) = protocol_line(None, Some(visibility), false);
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.push_line(line);
+        let key = buffer.link_keys().next().expect("link key");
+        let link_state = buffer.link_state();
+        let created = Instant::now();
+
+        link_state.borrow_mut().note_prompt();
+        link_state.borrow_mut().note_output(created);
+        link_state
+            .borrow_mut()
+            .note_output(created + Duration::from_millis(20));
+        assert!(!link_state.borrow().concealed(key));
+
+        link_state.borrow_mut().activate_visibility(key, created);
+        link_state.borrow_mut().note_prompt();
+        assert!(!link_state.borrow().concealed(key));
+        link_state
+            .borrow_mut()
+            .note_output(created + Duration::from_millis(40));
+        assert!(!link_state.borrow().concealed(key));
+
+        link_state.borrow_mut().note_prompt();
+        assert!(link_state.borrow().concealed(key));
+    }
+
+    #[test]
+    fn copied_text_masks_concealed_link_content() {
+        use super::selection::{BufferPosition, Selection};
+        use smudgy_core::session::styled_line::LinkVisibilityExpire;
+
+        let visibility = LinkVisibility {
+            action: LinkVisibilityAction::Conceal,
+            delay_ms: None,
+            expire: LinkVisibilityExpire {
+                input: false,
+                prompt: false,
+                output: false,
+                output_delay_ms: 0,
+            },
+            whole_line: false,
+        };
+        let (line, _) = protocol_line(None, Some(visibility), false);
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.push_line(line);
+        let key = buffer.link_keys().next().expect("link key");
+        buffer
+            .link_state()
+            .borrow_mut()
+            .activate_visibility(key, Instant::now());
+
+        let selection = Selection::Selected {
+            from: BufferPosition { line: 1, column: 0 },
+            to: BufferPosition {
+                line: 1,
+                column: usize::MAX,
+            },
+        };
+        assert_eq!(buffer.selected_text(&selection), "    ");
+    }
+
+    #[test]
+    fn whole_line_concealment_tombstones_content_and_retires_colocated_state() {
+        use super::selection::{BufferPosition, Selection};
+        use smudgy_core::session::styled_line::{LinkSelection, LinkVisibilityExpire};
+
+        let selection_state = LinkSelection {
+            group: Arc::from("poll"),
+            value: Arc::from("yes"),
+            toggle: false,
+            selected: true,
+            exclusive: false,
+            disabled: false,
+        };
+        let visibility = LinkVisibility {
+            action: LinkVisibilityAction::Conceal,
+            delay_ms: None,
+            expire: LinkVisibilityExpire {
+                input: false,
+                prompt: false,
+                output: false,
+                output_delay_ms: 0,
+            },
+            whole_line: true,
+        };
+        let shared = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let (line, _) = protocol_line(Some(selection_state.clone()), Some(visibility), false);
+        let mut buffer =
+            TerminalBuffer::new_with_protocol_state(NonZeroUsize::new(10).unwrap(), shared.clone());
+        buffer.push_line(line);
+        let key = buffer.link_keys().next().expect("link key");
+        let link_state = buffer.link_state();
+
+        link_state
+            .borrow_mut()
+            .activate_visibility(key, Instant::now());
+        assert!(link_state.borrow().line_concealed(1));
+        assert!(buffer.link_keys().next().is_none());
+        assert_eq!(shared.borrow().selection_references(&selection_state), 1);
+
+        let selection = Selection::Selected {
+            from: BufferPosition { line: 1, column: 0 },
+            to: BufferPosition {
+                line: 1,
+                column: usize::MAX,
+            },
+        };
+        assert!(buffer.selected_text(&selection).is_empty());
+
+        link_state.borrow_mut().retire_deleted_line_registrations();
+        assert!(!link_state.borrow().contains(key));
+        assert!(link_state.borrow().line_concealed(1));
+        assert_eq!(shared.borrow().selection_references(&selection_state), 0);
+
+        buffer.perform_line_operation(
+            1,
+            LineOperation::Insert {
+                str: Arc::new("edited ".to_string()),
+                begin: 0,
+                end: 0,
+                style: Style::DEFAULT,
+            },
+        );
+        assert!(buffer.link_keys().next().is_none());
+        assert_eq!(shared.borrow().selection_references(&selection_state), 0);
+        assert_eq!(buffer.find_recent_word_by_prefix("edit", None, &[], 10), None);
+    }
+
+    #[test]
+    fn temporarily_hidden_whole_line_can_reveal() {
+        use smudgy_core::session::styled_line::LinkVisibilityExpire;
+
+        let visibility = LinkVisibility {
+            action: LinkVisibilityAction::Reveal,
+            delay_ms: Some(0),
+            expire: LinkVisibilityExpire {
+                input: false,
+                prompt: false,
+                output: false,
+                output_delay_ms: 0,
+            },
+            whole_line: true,
+        };
+        let (line, _) = protocol_line(None, Some(visibility), false);
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.push_line(line);
+        let link_state = buffer.link_state();
+        let key = link_state.borrow().by_line[&1][0];
+        assert!(link_state.borrow().line_concealed(1));
+
+        link_state
+            .borrow_mut()
+            .update_visibility_timers(Instant::now() + Duration::from_millis(1));
+        assert!(!link_state.borrow().line_concealed(1));
+        assert!(link_state.borrow().contains(key));
     }
 }

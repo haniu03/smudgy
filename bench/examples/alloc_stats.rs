@@ -138,6 +138,7 @@ const DEFAULT_SCROLLBACK: usize = 10_000;
 const DEFAULT_STYLE: Style = Style {
     fg: Color::DefaultForeground { bold: false },
     bg: Color::DefaultBackground,
+    ..Style::DEFAULT
 };
 
 /// Feature-gated trigger action observation handle.

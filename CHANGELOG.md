@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Panes stack into tabs.** Drop a pane onto another pane's header and
+  they share that spot as a tabbed group — one region, a tab per pane.
+  Tabs carry their controls (connect/reconnect on a session's main tab,
+  close, the hide eye), scroll when the strip fills, and
+  Ctrl+Tab / Ctrl+Shift+Tab cycles a group's visible tabs from the
+  keyboard. Hidden tabs stay reachable in the strip — dimmed, eye and
+  all — so a hidden pane can always be brought back.
+- **One drag for everything.** Rearranging panes is a single gesture
+  wherever it ends: reorder tabs within a strip, merge into another
+  group at an exact insertion point, split against any pane's edge, dock
+  at a window edge, swap with the pane under the cursor, drop into
+  another smudgy window, or release over empty desktop to tear out a new
+  window. A live highlight — with an insertion caret in tab strips —
+  shows exactly what the release will do (the preview and the drop share
+  one geometry, so they can never disagree), and Escape cancels any drag
+  with nothing moved.
+- **Pick up where you left off.** Every server remembers the last
+  arrangement you played it in — windows and panes, positions, sizes,
+  splits, tab groups and selections, hidden panes, and which sessions
+  were open. Smudgy still starts clean; the offer waits in the Connect
+  dialog, where each server shows "Restore last session" with the
+  profiles it will bring back. Restoring fills the window you are in
+  rather than opening another. Sessions that were connected reconnect
+  exactly as if you had clicked Connect (your connect commands
+  included); sessions you opened offline stay offline. Script panes hold
+  their exact places as empty frames while scripts load, then fill in
+  without reshuffling. The record is continuous and crash-tolerant: even
+  a forced shutdown (an installer closing smudgy, Windows restarting)
+  keeps a snapshot at most a minute old, and an unreadable file means
+  the offer simply does not appear — never a deleted one. Credentials,
+  terminal contents, and script state are never written.
+- **Named layouts.** The new Layouts button saves the current
+  arrangement of the active session's server under a name and brings it
+  back on demand. Applying runs the full flow: missing sessions spawn
+  per their saved online/offline state, and extra live sessions get an
+  explicit keep-or-close choice (keeping is the default; closing is
+  never silent). Overwrite, rename, and delete sit behind
+  confirmations, and Reset lets a session's script layout win again
+  over remembered geometry. Layouts are stored per server as plain JSON
+  files beside your profiles.
+- **Scripts can switch layouts.** `session.layout` saves, applies, and
+  lists the server's named layouts — `layout.apply("combat")` from a
+  trigger, alias, or keybinding. A script apply only rearranges panes:
+  it never opens or closes sessions, never prompts, and never touches
+  other servers' windows, and it is safe to call at gameplay rates.
+  Requires the `panes` and `session: reach-others` permissions.
  - **The client speaks your language.** Smudgy's interface is now
    localizable, and ships its first translation: 繁體中文（臺灣）
   (Traditional Chinese, Taiwan). Preferences gains a Language picker —
@@ -139,9 +185,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   number into an exit's destination with no map picked selects the map
   you're editing automatically — the dropdown shows its name dimmed as
   the placeholder, so the default is visible before you type.
+- **Maps choose where they live.** Every map and map folder (atlas) now
+  has an explicit storage tier: session (this session only, discarded
+  when it closes), on this device, or cloud. The New area and New folder
+  dialogs gain a "Save in" choice — folders can now live on this device,
+  not only in the cloud — and signed out, new maps and folders save on
+  this device. Scripts choose the same way:
+  `mapper.createArea(name, { storage: "session" | "local" | "cloud" })`,
+  optionally with an `atlas` to create into, and `listAtlases` /
+  `createAtlas` cover folders.
+- **Maps and atlases move and copy between tiers.** A map's Move… dialog
+  now lists every destination in one place — each of your folders with
+  its tier, plus loose maps on this device or in the cloud — so filing a
+  map into a folder and moving it to another tier are the same gesture,
+  and a folder's own Move… relocates it with every map inside. Maps
+  relocated together keep their links to each other, across tiers
+  included. Scripts get the same operations — `copyArea`/`moveArea`,
+  the multi-area `copyAreas`/`moveAreas`, and `copyAtlas`/`moveAtlas` —
+  each taking a destination of tier plus optional folder. A cross-tier
+  move copies everything to the destination before deleting the source,
+  so a failure partway can leave the complete copy alongside the
+  original — a duplicate to clean up, never lost work — and the editor
+  then points at the existing copy instead of inviting a retry. A map
+  with an unresolved sync conflict refuses to move until the conflict is
+  settled.
+- **Batched map edits for scripts.** `mapper.mutateArea(area, callback)`
+  collects a run of related writes — creating rooms and exits, updating
+  fields, linking — and submits them together when the callback
+  finishes, in as few operations as the batch allows. Room numbers
+  drafted inside the batch are reserved, so a room created meanwhile by
+  a trigger or the map editor can't collide with them. If the callback
+  throws, nothing is submitted; if a submission fails partway, the
+  error reports the operations that had already committed.
+- **Scripts style the map view.** `MapView` gains view-local
+  presentation: a `styles` palette names each look once (room fill,
+  stroke, and corner radius; connection color and width; door color),
+  `apply` associates palette entries with rooms and exits — later
+  entries win field-by-field over earlier ones and over `defaultStyle` —
+  and `doors` overrides an exit's closed or locked state on screen.
+  Top-level knobs set room spacing, the player marker's color, and
+  whether doors draw at all. Exits are named by room and direction, and
+  one reference styles both halves of a cross-level connection. All of
+  it stays in the view: the shared map is never modified, nothing syncs,
+  and a style update keeps the view's zoom and pan.
 
 ### Changed
 
+- **The window wears its platform's frame.** On macOS the main window
+  now keeps its native frame — the system's rounded corners, hairline
+  border, and traffic-light buttons — with smudgy's toolbar drawn up in
+  the titlebar area. On Linux under Wayland, the window draws the same
+  finish itself, the way GNOME apps do: rounded top corners and a
+  hairline border while floating, squared off while maximized. X11
+  sessions keep the sharp rectangle, and `SMUDGY_SQUARE_CORNERS=1`
+  turns the rounding off anywhere it fights a tiling layout. (Windows
+  already had this look from the OS.)
 - **Map links meet rooms the way the exit reads.** Compass exits keep
   their short wall stubs, and diagonal exits' stubs now leave the corner
   diagonally — but up/down, in/out, and portal links drop the stub
@@ -204,9 +302,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wide), with the line's own color and dash redrawn inside it; cross-
   level links highlight their drawn triangle or fading stub — which are
   now also clickable exactly as drawn.
+- Release builds now default the log level to `info` when `SMUDGY_LOG` is
+  unset, so a production `smudgy.log` carries operational events rather
+  than the debug stream; debug builds keep their `debug` default, and an
+  explicit `SMUDGY_LOG` still overrides either.
+- **On-connect text waits for the server to speak.** A profile's
+  auto-send text now goes out when the first real server output arrives
+  instead of the moment the connection opens, so triggers matching the
+  greeting run before it and login commands no longer race the banner. A
+  server that never prints anything does not receive the text.
+
+### Deprecated
+
+- Creating a map with the `ephemeral` flag is deprecated in favor of an
+  explicit `storage: "session"`, as is the `isEphemeral` read (use
+  `storage === "session"`). Both keep working through 0.5.x and are
+  removed in 0.6.0. Creating a map with no storage choice at all remains
+  fully supported: it saves to the cloud when signed in and to this
+  device when not.
 
 ### Fixed
 
+- Emoji variation selectors, joiners, and tag characters in OSC link labels now
+  reach the text shaper instead of appearing as literal `\u{...}` escapes;
+  invisible characters in disclosed link destinations remain escaped.
+- Concealed OSC spoilers now render one space per Unicode grapheme instead of
+  relying on foreground color, which could not hide color emoji glyphs. Click
+  and selection offsets remain aligned with the original text after concealment.
+- Clicking a terminal command link no longer panics when it tries to update
+  scrollback during event dispatch; script send links and OSC `send:` links now
+  defer their session work through the ordinary UI update path.
+- Dragging a pane divider immediately after the layout changed under it
+  (a pane opened, closed, or moved in the same moment) could apply the
+  resize to the wrong edge; stale divider targets are now rejected and
+  re-derived from the current layout.
 - Connections attached near a room's corner no longer float in the gap
   left by the rounded outline: ports follow the drawn edge around the
   corner, meeting the adjacent wall at the corner's diagonal. Dragging an
@@ -242,6 +371,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route's line converts it (only handle drags and Ctrl+click do), Stub
   routing explains why there's nothing to edit, and a selected port
   advertises its arrow-key wall slide.
+- **One command input holds focus at a time.** Keyboard focus over
+  command inputs is now reconciled across every smudgy window: exactly
+  one input is focused, and switching to another application and back
+  counts as a real focus loss and return. Previously the loss went
+  unnoticed — an input in a background window still counted as focused —
+  so focus-driven behavior, from hotkey routing to scripts' input focus
+  events, could follow an input in a window you had left.
 
 ## [0.4.1] - 2026-07-14
 
@@ -304,16 +440,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   you-are-here resolution on MUDs that announce room ids. A session map
   worth keeping can be exported with `mapper.exportArea`.
 - **Clickable server links (OSC 8 hyperlinks).** MUDs that send OSC 8
-  hyperlinks now render as clickable links in the terminal. `http`/`https`
+  hyperlinks now render as clickable links in the terminal. `http`/`https`/`ftp`
   links open in your browser; a MUD-specific `send:` link sends a command as
   you. Because these come from the server, the first click to a given site
   (or the first command link) opens a confirmation showing the exact
   destination — nothing the server sends can disguise it — where you can also
   choose to always allow that site or always trust every link from that
-  server. Other URI schemes are ignored.
+  server. Mudlet-compatible OSC styling now controls link colors, bold,
+  italic, underline/overline/strikethrough forms, and decoration color;
+  unstyled links retain Smudgy's underline and subtle wash, while an authored
+  style (including `underline: false`) takes precedence. Stateful hover,
+  press, focus, visited, selected, disabled, link, and any-link styles follow
+  Mudlet's priority order. Tooltips, styled menu titles, context menus,
+  disabled links, spoilers, timed/input/prompt/output visibility, radio and
+  checkbox selection groups, compact keys, and session presets are supported;
+  styled tooltip text is announced through Smudgy's
+  `OSC_HYPERLINKS_TOOLTIP_SGR` capability extension; links can be traversed and
+  activated from the keyboard. Selection and visited state agree across split
+  views and routed panes. Incoming OSC 8 URIs are capped at 4096 bytes, while
+  the parser bounds every OSC and APC string at 8192 bytes; deceptive invisible
+  controls are rendered visibly, and unapproved URI schemes are ignored.
+  Script-authored links retain their existing unrestricted payload size.
+- **Configurable SGR bold presentation.** Terminal preferences now offer
+  weight-only, bright-color-only, and combined bold modes. Weight-only bold
+  preserves the selected regular font family and changes only its weight;
+  existing boolean settings migrate without changing their appearance. The
+  three choices use the selected interface language.
+- **Scripts can round-trip terminal styling.** `line.styles` now reports every
+  text attribute plus the exact ANSI palette-bright bit, and styled echo and
+  line edits accept those attributes without losing double underline, fast
+  blink, reverse video, or the distinction between bold weight and bright
+  color. The legacy color `bold` readback remains available for compatibility.
 
 ### Fixed
 
+- **Bold variable terminal fonts stay in their selected family.** Requesting
+  bold from a variable font such as Geist Mono no longer falls through to a
+  proportional face just because the font file registers one default weight;
+  Smudgy now recognizes every weight covered by the font's `wght` axis.
+- **Async link tooltips show progress.** A script tooltip whose callback is
+  still resolving now opens with an animated loading indicator (and the honest
+  target disclosure, when available) instead of appearing empty or finished.
+  Tooltips also stay open when a link is reached from the keyboard.
+- **Link clicks no longer hijack later command submissions.** Enter and Space
+  activate a terminal link only while its keyboard focus ring is visible, and
+  returning focus to a command editor clears the terminal's link-navigation
+  focus instead of replaying the last mouse-clicked OSC or script link.
+- **OSC 8 raw JSON and reserved query fields parse without URI ambiguity.**
+  Literal JSON may contain `#` colors and `&` text, encoded `config%3D` and
+  `preset%3D` fields are stripped like their literal forms, and real URL
+  fragments and ordinary query parameters remain intact. Presets are capped at
+  1024 names per connection; existing names remain replaceable at the cap.
+- **OSC control strings cannot desynchronize terminal output.** Bare ESC bytes
+  and UTF-8 continuation bytes no longer confuse a shadow OSC scanner and
+  swallow all later output. Unterminated OSC and APC strings are also bounded,
+  including non-hyperlink selectors.
+- **OSC link state follows the session and the rendered buffer.** Selection and
+  visited styles stay synchronized across scrollback splits and routed panes;
+  spoilers survive widget rebuilds; input and prompt expiry reach links in
+  routed panes; evicted selection values are retired.
+- **Empty OSC actions are handled safely.** Empty `send:` and hostless web URLs
+  are ignored, while empty `prompt:` remains a valid way to clear the command
+  editor.
+- **JSR packages can load slash-normalized dependencies.** Smudgy now accepts
+  both `jsr:@scope/package` and the `jsr:/@scope/package` form emitted by Deno
+  and found in published JSR packages, instead of rejecting the latter as an
+  unscoped package.
 - **Map preferences stop retrying maps that can't sync.** A map disabled
   locally that the cloud can't store a preference for (a local-only map, or
   one you no longer have access to) was re-pushed on every 90-second sync
@@ -326,11 +518,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at both ends — the codes were dropped during ingest, and the terminal
   never painted span backgrounds (which also kept link chips and underlines
   from rendering).
-- **One unsupported ANSI code no longer discards a whole style sequence.**
-  Codes smudgy doesn't render (underline, italic, blink, …) used to poison
-  every color that shared their sequence — `ESC[1;4;31m` displayed as plain
-  text instead of bright red. Each code now applies independently, the
-  bare-reset form `ESC[m` resets, colon-form extended colors
+- **ANSI text attributes display.** Bold is now real font weight, and faint,
+  italic, underline, double underline, slow/fast blink, reverse video, and
+  crossed-out text render instead of being discarded. A new preference,
+  enabled by default for compatibility, controls whether bold text also uses
+  the bright ANSI palette; explicit bright-color codes stay bright either
+  way. Attribute set/reset codes apply independently, unknown codes no longer
+  poison colors beside them, bare `ESC[m` resets, colon-form extended colors
   (`38:2::r:g:b`) parse, and out-of-range color components clamp instead of
   wrapping around.
 - **Progress bars that redraw with a bare carriage return display as one

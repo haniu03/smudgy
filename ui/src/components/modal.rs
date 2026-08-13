@@ -12,23 +12,30 @@ use crate::theme;
 use crate::theme::Element;
 // Import modal implementation modules
 pub mod connect;
+pub mod layouts;
 
 /// Enum representing the currently active modal.
+// At most one modal exists per window, so the size spread between the
+// connect form and the smaller modals costs nothing worth boxing for.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Modal {
     Connect(connect::State),
+    Layouts(layouts::State),
 }
 
 /// Messages that can be sent to the active modal.
 #[derive(Debug, Clone)]
 pub enum Message {
     Connect(ConnectMessage),
+    Layouts(layouts::Message),
 }
 
 /// Events that can be emitted by the active modal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Connect(ConnectEvent),
+    Layouts(layouts::Event),
 }
 
 impl Modal {
@@ -42,16 +49,34 @@ impl Modal {
                 // Map the task's message type and the event type
                 (task.map(Message::Connect), event.map(Event::Connect))
             }
+            (Modal::Layouts(state), Message::Layouts(msg)) => {
+                let (task, event) = layouts::update(state, msg);
+                (task.map(Message::Layouts), event.map(Event::Layouts))
+            }
+            // A message for a modal that is no longer the active one (a
+            // task settling after the modal switched): dropped.
+            _ => (Task::none(), None),
         }
     }
 
     /// Get the view for the active modal.
     pub fn view(&self) -> Element<'_, Message> {
-        let inner = match self {
-            Modal::Connect(state) => connect::view(state).map(Message::Connect),
+        let (title, width, height, inner) = match self {
+            Modal::Connect(state) => (
+                crate::i18n::t!("toolbar-connect"),
+                800.0,
+                600.0,
+                connect::view(state).map(Message::Connect),
+            ),
+            Modal::Layouts(state) => (
+                crate::i18n::t!("toolbar-layouts"),
+                560.0,
+                480.0,
+                layouts::view(state).map(Message::Layouts),
+            ),
         };
 
-        let title_bar_text = text(crate::i18n::t!("toolbar-connect"))
+        let title_bar_text = text(title)
             .center()
             .width(Length::Fill)
             .height(Length::Fixed(34.0));
@@ -61,10 +86,12 @@ impl Modal {
                 .style(theme::builtins::container::modal_title_bar)
                 .width(Length::Fill)
                 .height(Length::Fixed(34.0)),
-            container(inner).style(theme::builtins::container::modal_body),
+            container(inner)
+                .style(theme::builtins::container::modal_body)
+                .height(Length::Fill),
         ])
-        .width(Length::Fixed(800.0))
-        .height(Length::Fixed(600.0))
+        .width(Length::Fixed(width))
+        .height(Length::Fixed(height))
         .style(theme::builtins::container::modal_container)
         .into()
     }
@@ -77,6 +104,8 @@ impl Modal {
             // synchronously in `connect::State::opening`, so it opens fully
             // populated and needs no initial async task.
             Modal::Connect(_) => Task::none(),
+            // The layouts modal lists its store synchronously too.
+            Modal::Layouts(_) => Task::none(),
         }
     }
 }

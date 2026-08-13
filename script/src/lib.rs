@@ -41,8 +41,8 @@ use sys_traits::impls::RealSys;
 
 pub use module_loader::{ImportProvider, ScriptModuleLoader};
 pub use package_resolver::{
-    canonical_url, params_module_url, parse_canonical, parse_params_url, platform_event_catalog,
-    platform_state_producer,
+    canonical_url, is_any_host_net_entry, params_module_url, parse_canonical, parse_params_url,
+    platform_event_catalog, platform_state_producer,
     CanonicalCoords,
     ImportPolicy, InMemoryPackageProvider, PackageDependency, PackageError, PackageKey,
     PackageManifest, PackageModuleSource, PackageParameter, PackagePermissions, PackageProvider,
@@ -493,7 +493,6 @@ fn generic_loader_error(message: impl Into<String>) -> deno_core::error::ModuleL
     JsErrorBox::generic(message.into())
 }
 
-// npm is NOT routed through the (sync) ImportProvider: deno's npm stack is async
-// + !Send, so it's handled in ScriptModuleLoader::load via ModuleLoadResponse::Async
-// (driven by deno_core's event loop on the session runtime). The loader keeps the
-// JsrImportProvider for jsr and holds the npm services as a separate field.
+// npm and jsr are NOT routed through the (sync) ImportProvider. Both are handled in
+// ScriptModuleLoader::load via ModuleLoadResponse::Async (driven by deno_core's event loop on
+// the session runtime); npm keeps its native services and jsr keeps async metadata state.

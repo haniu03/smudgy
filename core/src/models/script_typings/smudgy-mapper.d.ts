@@ -20,17 +20,38 @@
 /**
  * An area's identifier. Treat it as **opaque**: take it from one mapper call and
  * pass it back to another, unchanged. **Careful:** this is not the same as the
- * UUID **string** the `map:room` event delivers; the two are not
- * interchangeable.
+ * UUID **string** the `map:room` event delivers; mapper calls accept only the
+ * pair. Real ids carry `BigInt` halves (see {@link ConnectionId}),
+ * which `JSON.stringify` rejects — so mapper-issued ids cannot travel
+ * session-store writes or store bindings. Where an area scope must ride JSON —
+ * store-bound MapView `apply` arrays — use the UUID string spelling instead:
+ * `MapStyleApplication.area` in `smudgy:widgets` accepts either form.
  */
 type AreaId = readonly [number, number];
+
+/** An atlas (map folder) identifier, opaque like {@link AreaId}. */
+type AtlasId = readonly [number, number];
+
+/** Where a map is stored. Session maps disappear when the session closes. */
+type MapStorage = "session" | "local" | "cloud";
 
 /** A room number within an area (a 32-bit integer). */
 type RoomNumber = number;
 
 /** An exit's identifier: a 2-element `[hi, lo]` pair, like {@link AreaId}. Opaque. */
 type ExitId = readonly [number, number];
-/** A Connection's identifier, opaque like {@link ExitId}. */
+/**
+ * A Connection's identifier, opaque like {@link ExitId}.
+ *
+ * **Careful:** the `[hi, lo]` halves are 64-bit UUID halves. Values beyond
+ * `Number.MAX_SAFE_INTEGER` (essentially always for real ids) are delivered
+ * as `BigInt`, so despite this type's spelling the halves are `bigint` at
+ * runtime. `JSON.stringify` throws on `BigInt`, which means these ids cannot
+ * travel session-store writes or store bindings, and coercing a half with
+ * `Number()` rounds it and will silently never match. Pass ids straight back
+ * to mapper calls; for widget-facing selection use room + direction exit
+ * refs instead (see `MapExitRef` in `smudgy:widgets`).
+ */
 type ConnectionId = readonly [number, number];
 /** A queued mapper mutation's identifier, opaque like {@link ExitId}. */
 type OperationId = readonly [number, number];
@@ -215,6 +236,11 @@ interface CreateRoomParams {
  *  set as creation. Any omitted field is left unchanged. */
 type UpdateRoomParams = CreateRoomParams;
 
+interface MutateAreaOptions {
+    /** Description shown by save/conflict diagnostics. */
+    description?: string;
+}
+
 /**
  * One exit read back from a room (`room.exits`). Optional links are present but `null`
  * when unset (not omitted).
@@ -338,6 +364,40 @@ interface LinkCreateArgs extends ConnectionUpdates {
     traversals: LinkTraversalArgs[];
 }
 
+/** Callback-scoped collector used by {@link Mapper.mutateArea}. Calls update a
+ * callback-local draft and are submitted only after the callback completes. */
+interface AreaMutator {
+    /**
+     * Draft a room under a number reserved from the live allocator: ambient
+     * creators in this client (`mapper.createRoom`, the map editor, other
+     * open mutators) skip reserved numbers, so a create landing while the
+     * callback is open cannot collide with the draft. The number is
+     * provisional (the room exists only once the mutation commits), and the
+     * reservation is released when the callback finishes or aborts, so an
+     * aborted draft's numbers become available again.
+     */
+    createRoom(params: CreateRoomParams): Promise<RoomNumber>;
+    updateRoom(room: Room | RoomNumber, fields: UpdateRoomParams): Promise<void>;
+    updateRooms(updates: [RoomNumber, UpdateRoomParams][]): Promise<void>;
+    setRoomTitle(room: Room | RoomNumber, title: string): Promise<void>;
+    setRoomDescription(room: Room | RoomNumber, description: string): Promise<void>;
+    setRoomColor(room: Room | RoomNumber, color: string): Promise<void>;
+    setRoomLevel(room: Room | RoomNumber, level: number): Promise<void>;
+    setRoomX(room: Room | RoomNumber, x: number): Promise<void>;
+    setRoomY(room: Room | RoomNumber, y: number): Promise<void>;
+    setRoomExternalId(room: Room | RoomNumber, externalId: string): Promise<void>;
+    setRoomProperty(room: Room | RoomNumber, name: string, value: string): Promise<void>;
+    setAreaProperty(name: string, value: string): Promise<void>;
+    addRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
+    removeRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
+    createRoomExit(room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId>;
+    setRoomExit(room: Room | RoomNumber, exitId: ExitId, exit: ExitUpdates): Promise<void>;
+    deleteRoom(room: Room | RoomNumber): Promise<void>;
+    deleteRoomExit(room: Room | RoomNumber, exitId: ExitId): Promise<void>;
+    createLink(link: LinkCreateArgs): Promise<ConnectionId>;
+    setConnection(connectionId: ConnectionId, updates: ConnectionUpdates): Promise<void>;
+}
+
 /** A room read from the map. Obtain one via `area.room(n)` or the `listRooms*` helpers. */
 interface Room {
     readonly room_number: RoomNumber;
@@ -380,10 +440,13 @@ interface Area {
     readonly room_numbers: RoomNumber[];
     /**
      * Whether this is a session map: it lives only for this session and is
-     * discarded when the session closes. Save it with `mapper.exportArea` +
-     * `mapper.importAreas` to keep it.
+     * discarded when the session closes.
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+     * Use `storage === "session"` instead.
      */
     readonly isEphemeral: boolean;
+    /** The area's actual storage tier. */
+    readonly storage: MapStorage;
     /** The next unused room number in this area. */
     readonly next_room_number: RoomNumber;
     /** The room with this number, or `undefined`. */
@@ -403,12 +466,44 @@ interface Area {
 
 /** Options for {@link Mapper.createArea}. */
 interface CreateAreaOptions {
+    /** Select the authoritative storage tier explicitly. */
+    storage: MapStorage;
+    /** Optionally create the area inside this atlas. Its storage must match. */
+    atlas?: Atlas | AtlasId;
+    ephemeral?: never;
+}
+
+/** Options accepted only for the pre-storage-model creation API. */
+interface LegacyCreateAreaOptions {
+    storage?: never;
+    atlas?: never;
     /**
      * Create a session map: it lives only for this session, is never saved
      * or synced, and is discarded when the session closes. Use this for maps
      * built automatically from server data.
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+     * Use `storage: "session"` instead.
      */
     ephemeral?: boolean;
+}
+
+/** An atlas (map folder). Session storage does not support atlases. */
+interface Atlas {
+    readonly id: AtlasId;
+    readonly name: string;
+    readonly storage: MapStorage;
+    toString(): string;
+}
+
+/** A destination used by map copy and move operations. */
+interface MapDestination {
+    storage: MapStorage;
+    /** Omit to leave the area loose (outside an atlas). */
+    atlas?: Atlas | AtlasId;
+}
+
+interface CreateAtlasOptions {
+    storage: "local" | "cloud";
 }
 
 /**
@@ -416,8 +511,28 @@ interface CreateAreaOptions {
  * location; changes to persistent areas sync to the cloud in the background.
  */
 interface Mapper {
-    /** Create a new area and return its handle. */
-    createArea(name: string, options?: CreateAreaOptions): Promise<Area>;
+    /** Create a new area in an explicit storage tier and return its handle. */
+    createArea(name: string, options: CreateAreaOptions): Promise<Area>;
+    /**
+     * Create using the old implicit default tier or `ephemeral` flag.
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+     * Pass a {@link CreateAreaOptions} object with explicit `storage` instead.
+     */
+    createArea(name: string, options?: LegacyCreateAreaOptions): Promise<Area>;
+    /** List local and cloud atlases. */
+    listAtlases(): Promise<Atlas[]>;
+    /** Create a durable atlas in an explicit storage tier. */
+    createAtlas(name: string, options: CreateAtlasOptions): Promise<Atlas>;
+    /** Copy areas together, preserving links between members of the set. */
+    copyAreas(areas: (Area | AreaId)[], destination: MapDestination): Promise<Area[]>;
+    /** Move areas together. Cross-tier moves copy completely before deleting sources. */
+    moveAreas(areas: (Area | AreaId)[], destination: MapDestination): Promise<Area[]>;
+    copyArea(area: Area | AreaId, destination: MapDestination): Promise<Area>;
+    moveArea(area: Area | AreaId, destination: MapDestination): Promise<Area>;
+    /** Copy an atlas and all of its areas to another durable storage tier. */
+    copyAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas>;
+    /** Move an atlas and all of its areas to another durable storage tier. */
+    moveAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas>;
     /** Set the current map location (the per-session "you are here" marker). */
     setCurrentLocation(areaId: AreaId, roomNumber?: RoomNumber): void;
     /** The current map location, or `undefined` if none is set. `room` is absent when the
@@ -426,6 +541,21 @@ interface Mapper {
     /** All active areas (areas marked inactive are excluded). */
     readonly areas: Area[];
     getAreaById(id: AreaId): Area;
+    /**
+     * Collect related writes to one area and submit them in the fewest practical ordered
+     * envelopes. The whole callback is validated and durably staged before anything is
+     * published, so a locally invalid batch submits nothing, even when oversized work is
+     * split into several envelopes. Each envelope is atomic at the backend; acknowledged
+     * envelopes are never rolled back, so if a later envelope fails after earlier ones
+     * were accepted, the thrown `Error` carries the acknowledged prefix on its
+     * `committedOperations` property (an `OperationId[]`). If the callback throws,
+     * nothing is submitted.
+     */
+    mutateArea(
+        area: Area | AreaId,
+        callback: (mutation: AreaMutator) => void | Promise<void>,
+        options?: MutateAreaOptions,
+    ): Promise<OperationId[]>;
     /** The cheapest route between two rooms, as a list of `[areaId, roomNumber]`
      *  steps (each exit's `weight` is its cost). */
     getPathBetweenRooms(

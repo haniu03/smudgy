@@ -138,6 +138,72 @@ pub const DEFAULT_API_BASE_URL: &str = if is_dev_build() {
     "https://api.smudgy.org"
 };
 
+/// Largest link-tooltip delay accepted by the preferences UI and renderer.
+/// Keeps a hand-edited settings file from scheduling an effectively unbounded
+/// redraw deadline.
+pub const MAX_LINK_TOOLTIP_DELAY_MS: u64 = 60_000;
+
+/// How an SGR bold attribute is presented in terminal output.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", from = "TerminalBoldModeCompat")]
+pub enum TerminalBoldMode {
+    /// Increase the selected terminal font's weight without changing color.
+    Bold,
+    /// Use the bright ANSI palette without changing font weight.
+    Bright,
+    /// Increase font weight and use the bright ANSI palette.
+    BoldAndBright,
+}
+
+impl TerminalBoldMode {
+    pub const ALL: [Self; 3] = [Self::Bold, Self::Bright, Self::BoldAndBright];
+
+    #[must_use]
+    pub const fn uses_bold_weight(self) -> bool {
+        matches!(self, Self::Bold | Self::BoldAndBright)
+    }
+
+    #[must_use]
+    pub const fn uses_bright_palette(self) -> bool {
+        matches!(self, Self::Bright | Self::BoldAndBright)
+    }
+}
+
+impl Default for TerminalBoldMode {
+    fn default() -> Self {
+        Self::BoldAndBright
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalBoldModeName {
+    Bold,
+    Bright,
+    BoldAndBright,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TerminalBoldModeCompat {
+    Name(TerminalBoldModeName),
+    LegacyBool(bool),
+}
+
+impl From<TerminalBoldModeCompat> for TerminalBoldMode {
+    fn from(value: TerminalBoldModeCompat) -> Self {
+        match value {
+            TerminalBoldModeCompat::Name(TerminalBoldModeName::Bold) => Self::Bold,
+            TerminalBoldModeCompat::Name(TerminalBoldModeName::Bright) => Self::Bright,
+            TerminalBoldModeCompat::Name(TerminalBoldModeName::BoldAndBright) => {
+                Self::BoldAndBright
+            }
+            TerminalBoldModeCompat::LegacyBool(true) => Self::BoldAndBright,
+            TerminalBoldModeCompat::LegacyBool(false) => Self::Bold,
+        }
+    }
+}
+
 /// Represents the global application settings.
 ///
 /// Loaded from / saved to `settings.json` in the main smudgy config directory.
@@ -207,13 +273,28 @@ pub struct Settings {
     /// merging `=>` or `fi` into one glyph break column alignment.
     #[serde(default)]
     pub terminal_font_ligatures: bool,
+    /// Choose whether SGR bold changes the selected font's weight, promotes
+    /// ordinary ANSI foregrounds to the bright palette, or does both. The alias
+    /// migrates the former boolean (`false` = bold, `true` = both).
+    #[serde(default, alias = "terminal_bold_is_bright")]
+    pub terminal_bold_mode: TerminalBoldMode,
     /// Maximum terminal line length in columns; `None` wraps to the pane
     /// width. This is client-side wrapping only (no NAWS negotiation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_line_length: Option<u16>,
+    /// Time the pointer must remain over a terminal link before its tooltip is
+    /// shown, in milliseconds. Zero shows tooltips immediately.
+    #[serde(default)]
+    pub link_tooltip_delay_ms: u64,
     /// Named theme: terminal color scheme plus app background/accent.
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Map server-supplied 256-color and truecolor values through the
+    /// selected theme's perceptual color cube. Off renders those RGB values
+    /// literally; the 16 named ANSI colors remain theme-controlled either
+    /// way.
+    #[serde(default = "default_true")]
+    pub theme_extended_colors: bool,
     /// Non-destructive per-theme adjustments, keyed by theme name. The base
     /// schemes are never modified; tweaks survive switching themes and back.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -534,8 +615,11 @@ impl Default for Settings {
             terminal_font_family: default_terminal_font_family(),
             terminal_font_size: default_terminal_font_size(),
             terminal_font_ligatures: false,
+            terminal_bold_mode: TerminalBoldMode::default(),
             terminal_line_length: None,
+            link_tooltip_delay_ms: 0,
             theme: default_theme(),
+            theme_extended_colors: true,
             theme_tweaks: std::collections::HashMap::new(),
             image_cache_max_mb: default_image_cache_max_mb(),
             command_separator: default_command_separator(),
@@ -839,12 +923,77 @@ mod tests {
     }
 
     #[test]
+    fn link_tooltip_delay_defaults_to_zero_and_roundtrips() {
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("existing settings parse");
+        assert_eq!(settings.link_tooltip_delay_ms, 0);
+
+        let configured = Settings {
+            link_tooltip_delay_ms: 375,
+            ..Settings::default()
+        };
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
+        assert_eq!(parsed.link_tooltip_delay_ms, 375);
+    }
+
+    #[test]
+    fn terminal_bold_mode_defaults_to_bold_and_bright_and_roundtrips() {
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("existing settings parse");
+        assert_eq!(settings.terminal_bold_mode, TerminalBoldMode::BoldAndBright);
+
+        for mode in TerminalBoldMode::ALL {
+            let configured = Settings {
+                terminal_bold_mode: mode,
+                ..Settings::default()
+            };
+            let json = serde_json::to_string(&configured).unwrap();
+            assert!(json.contains("terminal_bold_mode"));
+            assert!(!json.contains("terminal_bold_is_bright"));
+            let parsed: Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.terminal_bold_mode, mode);
+        }
+    }
+
+    #[test]
+    fn legacy_bold_is_bright_boolean_migrates_without_changing_rendering() {
+        let enabled: Settings =
+            serde_json::from_str(r#"{"terminal_bold_is_bright":true}"#).unwrap();
+        assert_eq!(enabled.terminal_bold_mode, TerminalBoldMode::BoldAndBright);
+
+        let disabled: Settings =
+            serde_json::from_str(r#"{"terminal_bold_is_bright":false}"#).unwrap();
+        assert_eq!(disabled.terminal_bold_mode, TerminalBoldMode::Bold);
+    }
+
+    #[test]
+    fn terminal_bold_mode_rejects_unreleased_kebab_case_alias() {
+        assert!(serde_json::from_str::<TerminalBoldMode>(r#""bold-and-bright""#).is_err());
+    }
+
+    #[test]
     fn locale_preference_roundtrips_without_changing_legacy_defaults() {
         let mut settings = Settings::default();
         settings.locale = "zh-TW".to_string();
         let json = serde_json::to_string(&settings).expect("settings serialize");
         let parsed: Settings = serde_json::from_str(&json).expect("settings parse");
         assert_eq!(parsed.locale, "zh-TW");
+    }
+
+    #[test]
+    fn themed_extended_colors_default_on_and_round_trip_off() {
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("existing settings parse");
+        assert!(settings.theme_extended_colors);
+
+        let literal = Settings {
+            theme_extended_colors: false,
+            ..Settings::default()
+        };
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&literal).unwrap()).unwrap();
+        assert!(!parsed.theme_extended_colors);
     }
 
     #[test]
@@ -898,14 +1047,16 @@ mod tests {
         // An existing settings file without the field deserializes with the feature OFF.
         let existing = r#"{ "scrollback_length": 5000 }"#;
         let settings: Settings = serde_json::from_str(existing).expect("parse");
-        assert!(!settings.advanced_scripting_features, "advanced features default off");
+        assert!(
+            !settings.advanced_scripting_features,
+            "advanced features default off"
+        );
 
         let on = Settings {
             advanced_scripting_features: true,
             ..Settings::default()
         };
-        let parsed: Settings =
-            serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        let parsed: Settings = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
         assert!(parsed.advanced_scripting_features);
     }
 
@@ -935,8 +1086,7 @@ mod tests {
             auto_check_for_updates: false,
             ..Settings::default()
         };
-        let parsed: Settings =
-            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        let parsed: Settings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!parsed.auto_check_for_updates);
     }
 
@@ -952,8 +1102,7 @@ mod tests {
             discord_rich_presence: false,
             ..Settings::default()
         };
-        let parsed: Settings =
-            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        let parsed: Settings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!parsed.discord_rich_presence);
     }
 
@@ -969,7 +1118,10 @@ mod tests {
         };
         let parsed: Settings =
             serde_json::from_str(&serde_json::to_string(&dismissed).unwrap()).unwrap();
-        assert_eq!(parsed.dismissed_signin_banner_version.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            parsed.dismissed_signin_banner_version.as_deref(),
+            Some("1.2.3")
+        );
 
         // Unset stays out of settings.json entirely.
         let json = serde_json::to_string(&Settings::default()).expect("serialize");

@@ -54,6 +54,7 @@ const {
     op_smudgy_session_reload,
     op_smudgy_session_send,
     op_smudgy_session_send_raw,
+    op_smudgy_resolve_link_tooltip,
     op_smudgy_insert,
     op_smudgy_replace,
     op_smudgy_highlight,
@@ -62,12 +63,15 @@ const {
     op_smudgy_redirect,
     op_smudgy_copy,
     op_smudgy_pane_split,
+    op_smudgy_pane_add_tab,
     op_smudgy_pane_close,
     op_smudgy_pane_set_hidden,
     op_smudgy_pane_set_font_size,
     op_smudgy_pane_def_state,
     op_smudgy_pane_resize,
     op_smudgy_pane_relocate,
+    op_smudgy_pane_group_with,
+    op_smudgy_pane_select,
     op_smudgy_pane_tear_out,
     op_smudgy_pane_swap,
     op_smudgy_pane_size,
@@ -76,6 +80,9 @@ const {
     op_smudgy_pane_clear,
     op_smudgy_pane_list,
     op_smudgy_pane_resolve,
+    op_smudgy_layout_save,
+    op_smudgy_layout_apply,
+    op_smudgy_layout_list,
     op_smudgy_input_get,
     op_smudgy_input_apply,
     op_smudgy_input_submission_generation,
@@ -215,11 +222,24 @@ interface Settings {
 type Color =
     | string
     | { r: number; g: number; b: number }
-    | { color: string; bold: boolean };
+    | { color: string; bold: boolean; paletteBright?: boolean };
+
+interface TextAttributes {
+    bold: boolean;
+    faint: boolean;
+    italic: boolean;
+    underline: "none" | "single" | "double";
+    blink: "none" | "slow" | "fast";
+    crossedOut: boolean;
+    reverse: boolean;
+}
 
 interface ColorOptions {
     fg?: Color;
     bg?: Color;
+    attributes?: TextAttributes;
+    /** Lossless raw palette bit for a read-back `fg: "default"` span. */
+    foregroundPaletteBright?: boolean;
 }
 
 // ---- Styled text (the `style` tagged-template surface) ------------------------
@@ -235,9 +255,38 @@ interface LinkClick {
     alt: boolean;
 }
 
-/** A run's click action: a command to send, or a handler function (extracted into a
- *  side array before the payload crosses the op boundary -- functions don't serialize). */
-type LinkSpec = { send: string } | { fn: (click: LinkClick) => void };
+type LinkTooltip = string | (() => unknown | PromiseLike<unknown>);
+type LinkHandler = (click: LinkClick) => void;
+type LinkActionSpec = { send: string } | { fn: LinkHandler };
+
+interface LinkMenuItem {
+    label: string;
+    action: string | LinkHandler;
+}
+
+interface LinkOptions {
+    tooltip?: LinkTooltip;
+    enabled?: boolean;
+    menu?: readonly ("-" | LinkMenuItem)[];
+    title?: string;
+}
+
+type TooltipSpec = { text: string } | { fn: (requestId: string) => void };
+
+/** A run's click action plus optional hover copy. Functions are extracted into a
+ *  side array before the payload crosses the op boundary. */
+interface LinkSpec {
+    action: LinkActionSpec | null;
+    tooltip: TooltipSpec | null;
+    enabled: boolean;
+    menu: readonly (LinkMenuItemSpec | null)[] | null;
+    title: string | null;
+}
+
+interface LinkMenuItemSpec {
+    label: string;
+    action: LinkActionSpec;
+}
 
 /** One flattened run of a fragment: its text plus the colors it has resolved so far.
  *  `null` means unset -- filled by an enclosing fragment's style, or by the delivery
@@ -246,6 +295,7 @@ interface StyledRun {
     text: string;
     fg: Color | null;
     bg: Color | null;
+    attributes: TextAttributes | null;
     link: LinkSpec | null;
 }
 
@@ -313,15 +363,49 @@ function __styled_check_color(value: Color): Color {
             return { r: __styled_u8(v.r), g: __styled_u8(v.g), b: __styled_u8(v.b) };
         }
         if (typeof v.color === "string") {
-            if (__STYLED_ANSI_NAMES.indexOf(v.color) === -1) {
-                throw new TypeError(`Unknown ANSI color "${v.color}" in { color, bold }`);
+            if (__STYLED_ANSI_NAMES.indexOf(v.color) === -1 && v.color !== "default") {
+                throw new TypeError(`Unknown palette color "${v.color}" in { color, bold }`);
             }
-            return { color: v.color, bold: Boolean(v.bold) };
+            if (v.paletteBright !== undefined && typeof v.paletteBright !== "boolean") {
+                throw new TypeError("paletteBright must be a boolean");
+            }
+            return {
+                color: v.color,
+                bold: Boolean(v.bold),
+                ...(v.paletteBright === undefined ? {} : { paletteBright: v.paletteBright }),
+            };
         }
     }
     throw new TypeError(
         "Expected a color: an ANSI/theme name, { r, g, b }, or { color, bold }",
     );
+}
+
+function __styled_check_attributes(value: TextAttributes): TextAttributes {
+    if (typeof value !== "object" || value === null) {
+        throw new TypeError("attributes must be an object");
+    }
+    const v = value as any;
+    for (const name of ["bold", "faint", "italic", "crossedOut", "reverse"]) {
+        if (typeof v[name] !== "boolean") {
+            throw new TypeError(`attributes.${name} must be a boolean`);
+        }
+    }
+    if (v.underline !== "none" && v.underline !== "single" && v.underline !== "double") {
+        throw new TypeError('attributes.underline must be "none", "single", or "double"');
+    }
+    if (v.blink !== "none" && v.blink !== "slow" && v.blink !== "fast") {
+        throw new TypeError('attributes.blink must be "none", "slow", or "fast"');
+    }
+    return {
+        bold: v.bold,
+        faint: v.faint,
+        italic: v.italic,
+        underline: v.underline,
+        blink: v.blink,
+        crossedOut: v.crossedOut,
+        reverse: v.reverse,
+    };
 }
 
 /** Build a fragment from one tagged-template invocation under the enclosing style
@@ -332,6 +416,7 @@ function __styled_check_color(value: Color): Color {
 function __styled_from_template(
     fg: Color | null,
     bg: Color | null,
+    attributes: TextAttributes | null,
     link: LinkSpec | null,
     strings: TemplateStringsArray,
     values: unknown[],
@@ -341,20 +426,28 @@ function __styled_from_template(
         text: string,
         runFg: Color | null,
         runBg: Color | null,
+        runAttributes: TextAttributes | null,
         runLink: LinkSpec | null,
     ): void => {
         if (text === "") return;
         const last = runs.length > 0 ? runs[runs.length - 1] : undefined;
-        if (last !== undefined && last.fg === runFg && last.bg === runBg && last.link === runLink) {
+        if (last !== undefined && last.fg === runFg && last.bg === runBg
+            && last.attributes === runAttributes && last.link === runLink) {
             last.text += text;
             return;
         }
-        runs.push({ text, fg: runFg, bg: runBg, link: runLink });
+        runs.push({ text, fg: runFg, bg: runBg, attributes: runAttributes, link: runLink });
     };
     for (let i = 0; i < strings.length; i++) {
         // An illegal escape in a tagged template yields an undefined cooked entry
         // (legal ES for tags); fall back to the raw text, like String.raw.
-        push(strings[i] !== undefined ? strings[i] : (strings.raw[i] ?? ""), fg, bg, link);
+        push(
+            strings[i] !== undefined ? strings[i] : (strings.raw[i] ?? ""),
+            fg,
+            bg,
+            attributes,
+            link,
+        );
         if (i < values.length) {
             const value = values[i];
             if (__is_styled_text(value)) {
@@ -363,12 +456,13 @@ function __styled_from_template(
                         run.text,
                         run.fg === null ? fg : run.fg,
                         run.bg === null ? bg : run.bg,
+                        run.attributes === null ? attributes : run.attributes,
                         run.link === null ? link : run.link,
                     );
                 }
             } else {
                 // Plain-template semantics: every other value stringifies.
-                push(String(value), fg, bg, link);
+                push(String(value), fg, bg, attributes, link);
             }
         }
     }
@@ -415,22 +509,29 @@ const __STYLED_BG_PROPS: [string, Color][] = __STYLED_ANSI_NAMES.map((name) => [
  *  a template tag and (called with options) a refinement. Shorthand properties are
  *  memoizing getters: the derived builder is built on first touch and cached as a data
  *  property, so a chain echoed per incoming line pays its allocations once. */
-function __styled_make_builder(fg: Color | null, bg: Color | null): StyleBuilder {
+function __styled_make_builder(
+    fg: Color | null,
+    bg: Color | null,
+    attributes: TextAttributes | null,
+): StyleBuilder {
     const builder = ((first: TemplateStringsArray | ColorOptions, ...values: unknown[]): any => {
         if (__is_template_strings(first)) {
-            return __styled_from_template(fg, bg, null, first, values);
+            return __styled_from_template(fg, bg, attributes, null, first, values);
         }
         if (typeof first !== "object" || first === null) {
             throw new TypeError("style(...) expects { fg?, bg? }, or use it as a template tag");
         }
         // `!= null` so an explicit null means unset, like the plain color options.
         return __styled_make_builder(
-            first.fg != null ? __styled_check_color(first.fg) : fg,
+            first.fg != null ? __styled_check_color(__line_fg(first)!) : fg,
             first.bg != null ? __styled_check_color(first.bg) : bg,
+            first.attributes != null ? __styled_check_attributes(first.attributes) : attributes,
         );
     }) as any;
-    builder.fg = (color: Color) => __styled_make_builder(__styled_check_color(color), bg);
-    builder.bg = (color: Color) => __styled_make_builder(fg, __styled_check_color(color));
+    builder.fg = (color: Color) =>
+        __styled_make_builder(__styled_check_color(color), bg, attributes);
+    builder.bg = (color: Color) =>
+        __styled_make_builder(fg, __styled_check_color(color), attributes);
     const memoize = (prop: string, derive: () => StyleBuilder): void => {
         Object.defineProperty(builder, prop, {
             configurable: true,
@@ -442,44 +543,161 @@ function __styled_make_builder(fg: Color | null, bg: Color | null): StyleBuilder
         });
     };
     for (const [prop, color] of __STYLED_FG_PROPS) {
-        memoize(prop, () => __styled_make_builder(color, bg));
+        memoize(prop, () => __styled_make_builder(color, bg, attributes));
     }
     for (const [prop, color] of __STYLED_BG_PROPS) {
-        memoize(prop, () => __styled_make_builder(fg, color));
+        memoize(prop, () => __styled_make_builder(fg, color, attributes));
     }
     return builder as StyleBuilder;
 }
 
 /** The root style builder (`style.red`, `style.bgBlue`, `style({ fg, bg })`, ...). */
-const style: StyleBuilder = __styled_make_builder(null, null);
+const style: StyleBuilder = __styled_make_builder(null, null, null);
 
 /** The impl-side twin of the contract's `StyleTag` (see smudgy-core.d.ts). */
 interface StyleTag {
     (text: TemplateStringsArray, ...values: unknown[]): StyledTextImpl;
 }
 
+/** Normalize optional hover copy. A function is wrapped so its sync result or
+ *  promise completion reports back through one native completion op. */
+function __styled_tooltip(options: LinkOptions | undefined): TooltipSpec | null {
+    if (options === undefined) return null;
+    if (typeof options !== "object" || options === null) {
+        throw new TypeError("link() options must be an object");
+    }
+    if (options.tooltip === undefined) return null;
+    const tooltip = options.tooltip;
+    if (typeof tooltip === "string") return { text: tooltip };
+    if (typeof tooltip !== "function") {
+        throw new TypeError("link() tooltip must be a string or function");
+    }
+    return {
+        fn: (requestId: string): void => {
+            Promise.resolve()
+                .then(() => tooltip())
+                .then(
+                    (value) => op_smudgy_resolve_link_tooltip(requestId, String(value)),
+                    (error) => {
+                        op_smudgy_resolve_link_tooltip(requestId, null);
+                        console.error(error);
+                    },
+                );
+        },
+    };
+}
+
+function __styled_menu(options: LinkOptions | undefined): readonly (LinkMenuItemSpec | null)[] | null {
+    if (options === undefined || options.menu === undefined) return null;
+    if (!Array.isArray(options.menu) || options.menu.length === 0) {
+        throw new TypeError("link() menu must be a non-empty array");
+    }
+    return options.menu.map((item, index) => {
+        if (item === "-") return null;
+        if (typeof item !== "object" || item === null) {
+            throw new TypeError(`link() menu item ${index} must be "-" or { label, action }`);
+        }
+        if (typeof item.label !== "string" || item.label.trim() === "") {
+            throw new TypeError(`link() menu item ${index} label must be a non-empty string`);
+        }
+        const action = item.action;
+        if (typeof action === "string") {
+            if (action === "") {
+                throw new TypeError(`link() menu item ${index} command must not be empty`);
+            }
+            return { label: item.label, action: { send: action } };
+        }
+        if (typeof action === "function") {
+            return { label: item.label, action: { fn: action } };
+        }
+        throw new TypeError(`link() menu item ${index} action must be a command or function`);
+    });
+}
+
 /** Makes text clickable: `link("north")` sends the command when clicked (as if
  *  typed); `link(fn)` runs the handler. Returns a template tag, so it composes with
  *  `style` by nesting -- the innermost link wins on overlap. */
-function link(action: string | ((click: LinkClick) => void)): StyleTag {
-    let spec: LinkSpec;
+function link(
+    action: string | LinkHandler | null,
+    options?: LinkOptions,
+): StyleTag {
+    const tooltip = __styled_tooltip(options);
+    const menu = __styled_menu(options);
+    if (options?.enabled !== undefined && typeof options.enabled !== "boolean") {
+        throw new TypeError("link() enabled must be a boolean");
+    }
+    if (options?.title !== undefined && typeof options.title !== "string") {
+        throw new TypeError("link() title must be a string");
+    }
+    let primary: LinkActionSpec | null;
     if (typeof action === "string") {
         if (action === "") {
             throw new TypeError("link() command must not be empty");
         }
-        spec = { send: action };
+        primary = { send: action };
     } else if (typeof action === "function") {
-        spec = { fn: action };
+        primary = { fn: action };
+    } else if (action === null) {
+        primary = null;
     } else {
-        throw new TypeError("link() expects a command string or a click handler function");
+        throw new TypeError("link() expects a command string, click handler function, or null");
     }
+    const spec: LinkSpec = {
+        action: primary,
+        tooltip,
+        enabled: options?.enabled ?? true,
+        menu,
+        title: options?.title ?? null,
+    };
     return ((strings: TemplateStringsArray, ...values: unknown[]) =>
-        __styled_from_template(null, null, spec, strings, values)) as StyleTag;
+        __styled_from_template(null, null, null, spec, strings, values)) as StyleTag;
 }
 
 /** A run's link in wire form: a command, or an index into the callbacks array the op
  *  receives beside the payload. */
-type WireLink = { send: string } | { cb: number } | null;
+type WireTooltip = { text: string } | { cb: number };
+type WireAction = { send: string } | { cb: number };
+type WireMenuItem = { separator: true } | { label: string; action: WireAction };
+interface WireMenu {
+    title?: string;
+    items: WireMenuItem[];
+}
+interface WireLinkValue {
+    action: WireAction | null;
+    tooltip?: WireTooltip;
+    enabled?: boolean;
+    menu?: WireMenu;
+}
+type WireLink = WireLinkValue | null;
+
+function __styled_callback_index(callbacks: Function[], fn: Function): number {
+    let index = callbacks.indexOf(fn);
+    if (index === -1) {
+        index = callbacks.length;
+        callbacks.push(fn);
+    }
+    return index;
+}
+
+/** One exhaustive decision per LinkSpec field. Adding a link option therefore
+ *  fails type-checking until the packed fast path declares whether that field
+ *  requires the complete wire form. */
+const __STYLED_LINK_REQUIRES_WIRE: {
+    [K in keyof LinkSpec]: (value: LinkSpec[K], spec: LinkSpec) => boolean;
+} = {
+    action: (value) => value === null,
+    tooltip: () => false,
+    enabled: (value) => !value,
+    menu: (value) => value !== null,
+    // A title is serialized only as part of a menu; `menu` already selects
+    // the wire form. A title without a menu has no rendering effect.
+    title: () => false,
+};
+
+function __styled_link_requires_wire(spec: LinkSpec): boolean {
+    return (Object.keys(__STYLED_LINK_REQUIRES_WIRE) as (keyof LinkSpec)[])
+        .some((field) => __STYLED_LINK_REQUIRES_WIRE[field](spec[field] as never, spec));
+}
 
 /** The wire shape of one SPLICE run (see ops.rs `StyledRunWire`; the echo path
  *  crosses packed instead -- see `__styled_echo_packed`). */
@@ -487,22 +705,40 @@ interface WireRun {
     text: string;
     fg: Color | null;
     bg: Color | null;
+    attributes: TextAttributes | null;
     link: WireLink;
 }
 
 /** Build the link converter one flatten pass uses: `{ fn }` specs are deduplicated
  *  into `callbacks` and become `{ cb }` indexes; command links pass through. */
-function __styled_make_wire_link(
-    callbacks: ((click: LinkClick) => void)[],
-): (spec: LinkSpec | null) => WireLink {
+function __styled_make_wire_link(callbacks: Function[]): (spec: LinkSpec | null) => WireLink {
+    const tooltipWire = (tooltip: TooltipSpec | null): WireTooltip | undefined => {
+        if (tooltip === null) return undefined;
+        return "text" in tooltip
+            ? tooltip
+            : { cb: __styled_callback_index(callbacks, tooltip.fn) };
+    };
+    const actionWire = (action: LinkActionSpec): WireAction =>
+        "send" in action
+            ? { send: action.send }
+            : { cb: __styled_callback_index(callbacks, action.fn) };
     return (spec) => {
-        if (spec === null || "send" in spec) return spec;
-        let index = callbacks.indexOf(spec.fn);
-        if (index === -1) {
-            index = callbacks.length;
-            callbacks.push(spec.fn);
-        }
-        return { cb: index };
+        if (spec === null) return null;
+        const tooltip = tooltipWire(spec.tooltip);
+        const menu = spec.menu === null
+            ? undefined
+            : {
+                ...(spec.title === null ? {} : { title: spec.title }),
+                items: spec.menu.map((item): WireMenuItem => item === null
+                    ? { separator: true }
+                    : { label: item.label, action: actionWire(item.action) }),
+            };
+        return {
+            action: spec.action === null ? null : actionWire(spec.action),
+            ...(tooltip === undefined ? {} : { tooltip }),
+            ...(spec.enabled ? {} : { enabled: false }),
+            ...(menu === undefined ? {} : { menu }),
+        };
     };
 }
 
@@ -540,7 +776,42 @@ function __styled_encode_color(value: Color | null): number {
     if (typeof v.r === "number") {
         return 0x01000000 | (v.r << 16) | (v.g << 8) | v.b;
     }
-    return 0x02000000 | (v.bold ? 8 : 0) | __STYLED_ANSI_NAMES.indexOf(v.color);
+    const bright = v.paletteBright ?? v.bold;
+    if (v.color === "default") return 0x03000000 | (bright ? 4 : 0);
+    return 0x02000000 | (bright ? 8 : 0) | __STYLED_ANSI_NAMES.indexOf(v.color);
+}
+
+/** Encode a complete attribute object. Zero stays reserved for unset/inherit;
+ *  bit 31 marks even an explicit all-default object as present. */
+function __styled_encode_attributes(value: TextAttributes | null): number {
+    if (value === null) return 0;
+    if (typeof value.bold !== "boolean" || typeof value.faint !== "boolean"
+        || typeof value.italic !== "boolean" || typeof value.crossedOut !== "boolean"
+        || typeof value.reverse !== "boolean") {
+        return 0x80000200; // reserved bit: Rust rejects the forged run
+    }
+    const underline = value.underline === "none"
+        ? 0
+        : value.underline === "single"
+        ? 1
+        : value.underline === "double"
+        ? 2
+        : 3;
+    const blink = value.blink === "none"
+        ? 0
+        : value.blink === "slow"
+        ? 1
+        : value.blink === "fast"
+        ? 2
+        : 3;
+    return 0x80000000
+        | (value.bold ? 1 << 0 : 0)
+        | (value.faint ? 1 << 1 : 0)
+        | (value.italic ? 1 << 2 : 0)
+        | (underline << 3)
+        | (blink << 5)
+        | (value.crossedOut ? 1 << 7 : 0)
+        | (value.reverse ? 1 << 8 : 0);
 }
 
 /** A flattened fragment ready for a styled echo op call. `records` is a view of
@@ -548,7 +819,8 @@ function __styled_encode_color(value: Color | null): number {
 interface PackedStyled {
     text: string;
     records: Uint32Array;
-    callbacks: ((click: LinkClick) => void)[];
+    advancedLinks: string;
+    callbacks: Function[];
 }
 
 /** Flatten a fragment into the packed payload: whole lines, split on `\n` (a run
@@ -556,11 +828,14 @@ interface PackedStyled {
  *  links dedupe into `callbacks` by identity; send links collect at the FRONT of
  *  `text` with their lengths at the TAIL of `records`. */
 function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
-    const callbacks: ((click: LinkClick) => void)[] = [];
+    const callbacks: Function[] = [];
+    const advancedLinks: WireLinkValue[] = [];
     const sendLengths: number[] = [];
+    const tooltipLengths: number[] = [];
     let sendText = "";
+    let tooltipText = "";
     let runText = "";
-    let w = 2; // records cursor; slots 0/1 (line/send counts) patch at the end
+    let w = 3; // records cursor; slots 0..2 (line/send/tooltip counts) patch at the end
     let lineCount = 0;
     let runCountSlot = 0;
     let runCount = 0;
@@ -574,39 +849,65 @@ function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
         __packedScratch[runCountSlot] = runCount;
         lineCount++;
     };
-    const pushRun = (piece: string, fg: number, bg: number, link: number): void => {
+    const pushRun = (
+        piece: string,
+        fg: number,
+        bg: number,
+        attributes: number,
+        link: number,
+        tooltip: number,
+    ): void => {
         if (piece === "") return;
-        if (__packedScratch.length < w + 4) __packed_grow(w + 4);
+        if (__packedScratch.length < w + 6) __packed_grow(w + 6);
         __packedScratch[w++] = piece.length;
         __packedScratch[w++] = fg;
         __packedScratch[w++] = bg;
+        __packedScratch[w++] = attributes;
         __packedScratch[w++] = link;
+        __packedScratch[w++] = tooltip;
         runText += piece;
         runCount++;
     };
-    const encodeLink = (spec: LinkSpec | null): number => {
-        if (spec === null) return 0;
-        if ("send" in spec) {
-            sendText += spec.send;
-            sendLengths.push(spec.send.length);
-            return 0x40000000 | (sendLengths.length - 1);
+    const encodeTooltip = (tooltip: TooltipSpec | null): number => {
+        if (tooltip === null) return 0;
+        if ("text" in tooltip) {
+            tooltipText += tooltip.text;
+            tooltipLengths.push(tooltip.text.length);
+            return 0x40000000 | (tooltipLengths.length - 1);
         }
-        let index = callbacks.indexOf(spec.fn);
-        if (index === -1) {
-            index = callbacks.length;
-            callbacks.push(spec.fn);
+        return 0x80000000 | __styled_callback_index(callbacks, tooltip.fn);
+    };
+    const wireLink = __styled_make_wire_link(callbacks);
+    const encodeLink = (spec: LinkSpec | null): [number, number] => {
+        if (spec === null) return [0, 0];
+        const action = spec.action;
+        if (__styled_link_requires_wire(spec)) {
+            const wire = wireLink(spec);
+            if (wire === null) throw new TypeError("internal advanced link encoding failure");
+            advancedLinks.push(wire);
+            return [0xC0000000 | (advancedLinks.length - 1), 0];
         }
-        return 0x80000000 | index;
+        if (action === null) {
+            throw new TypeError("internal packed link classification failure");
+        }
+        const tooltip = encodeTooltip(spec.tooltip);
+        if ("send" in action) {
+            sendText += action.send;
+            sendLengths.push(action.send.length);
+            return [0x40000000 | (sendLengths.length - 1), tooltip];
+        }
+        return [0x80000000 | __styled_callback_index(callbacks, action.fn), tooltip];
     };
 
     beginLine();
     for (const run of frag._runs) {
         const fg = __styled_encode_color(run.fg);
         const bg = __styled_encode_color(run.bg);
-        const link = encodeLink(run.link);
+        const attributes = __styled_encode_attributes(run.attributes);
+        const [link, tooltip] = encodeLink(run.link);
         // Common case: no newline in the run.
         if (run.text.indexOf("\n") === -1) {
-            pushRun(run.text, fg, bg, link);
+            pushRun(run.text, fg, bg, attributes, link, tooltip);
             continue;
         }
         const parts = run.text.split("\n");
@@ -615,18 +916,23 @@ function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
                 endLine();
                 beginLine();
             }
-            pushRun(parts[i], fg, bg, link);
+            pushRun(parts[i], fg, bg, attributes, link, tooltip);
         }
     }
     endLine();
 
-    if (__packedScratch.length < w + sendLengths.length) __packed_grow(w + sendLengths.length);
+    if (__packedScratch.length < w + sendLengths.length + tooltipLengths.length) {
+        __packed_grow(w + sendLengths.length + tooltipLengths.length);
+    }
     for (const length of sendLengths) __packedScratch[w++] = length;
+    for (const length of tooltipLengths) __packedScratch[w++] = length;
     __packedScratch[0] = lineCount;
     __packedScratch[1] = sendLengths.length;
+    __packedScratch[2] = tooltipLengths.length;
     return {
-        text: sendText + runText,
+        text: sendText + tooltipText + runText,
         records: __packedScratch.subarray(0, w),
+        advancedLinks: JSON.stringify(advancedLinks),
         callbacks,
     };
 }
@@ -638,12 +944,16 @@ function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
 function __styled_splice_args(
     text: StyledTextImpl,
     options: ColorOptions,
-): { runs: WireRun[]; callbacks: ((click: LinkClick) => void)[] } {
-    const callbacks: ((click: LinkClick) => void)[] = [];
+): { runs: WireRun[]; callbacks: Function[] } {
+    const callbacks: Function[] = [];
     const wireLink = __styled_make_wire_link(callbacks);
     // Match the plain path's tolerance: a null color option means unset.
-    const baseFg = options.fg != null ? __styled_check_color(options.fg) : null;
+    const lineFg = __line_fg(options);
+    const baseFg = lineFg !== null ? __styled_check_color(lineFg) : null;
     const baseBg = options.bg != null ? __styled_check_color(options.bg) : null;
+    const baseAttributes = options.attributes != null
+        ? __styled_check_attributes(options.attributes)
+        : null;
     const runs: WireRun[] = [];
     for (const run of text._runs) {
         if (run.text.indexOf("\n") !== -1) {
@@ -654,6 +964,7 @@ function __styled_splice_args(
             text: run.text,
             fg: run.fg === null ? baseFg : run.fg,
             bg: run.bg === null ? baseBg : run.bg,
+            attributes: run.attributes === null ? baseAttributes : run.attributes,
             link: wireLink(run.link),
         });
     }
@@ -667,7 +978,7 @@ function __styled_echo_arg(
     values: unknown[],
 ): string | StyledTextImpl {
     if (__is_template_strings(first)) {
-        return __styled_from_template(null, null, null, first, values);
+        return __styled_from_template(null, null, null, null, first, values);
     }
     return first as string | StyledTextImpl;
 }
@@ -872,6 +1183,22 @@ interface StyleSpan {
     end: number;
     fg: Color;
     bg: Color;
+    attributes: TextAttributes;
+    /** Present when `fg` is the compatibility string `"default"` but its
+     *  terminal palette slot is the bright default. */
+    foregroundPaletteBright?: boolean;
+}
+
+function __line_fg(options: ColorOptions): Color | null {
+    const fg = options.fg ?? null;
+    if (fg === "default" && options.foregroundPaletteBright !== undefined) {
+        return {
+            color: "default",
+            bold: options.attributes?.bold ?? false,
+            paletteBright: options.foregroundPaletteBright,
+        };
+    }
+    return fg;
 }
 
 // ---- Panes --------------------------------------------------------------
@@ -924,6 +1251,21 @@ type PaneSpec<D extends SplitDirection> = PaneSpecBase &
         ? { width?: number; height?: never }
         : { height?: number; width?: never });
 
+/** The spec for `pane.addTab()`. Tab creation has no spatial dimensions;
+ *  `selected` is a creation-only default. */
+type TabPaneSpec = PaneSpecBase & {
+    selected?: boolean;
+    width?: never;
+    height?: never;
+};
+
+type TabPosition = "before" | "after" | "end";
+
+interface GroupWithOptions {
+    position?: TabPosition;
+    selected?: boolean;
+}
+
 /** The wire shape a pane op returns for one pane. */
 interface PaneInfoWire {
     name: string;
@@ -938,9 +1280,9 @@ interface PaneInfoWire {
 }
 
 /**
- * A handle to one session pane. Get-or-create via `split()` (an existing name
- * returns the existing pane); a pane is removed by `close()`, session end, or
- * the reload sweep (a reload closes panes no script re-claimed via `split()`).
+ * A handle to one session pane. Get-or-create via `split()` or `addTab()` (an
+ * existing name returns the existing pane); a pane is removed by `close()`,
+ * session end, or the reload sweep (which closes unclaimed panes).
  * Handles carry their owning session id -- passing another session's `Pane` to
  * a line-routing op throws.
  */
@@ -990,7 +1332,14 @@ class Pane {
         const arg = __styled_echo_arg(text, values);
         if (__is_styled_text(arg)) {
             const packed = __styled_echo_packed(arg);
-            op_smudgy_pane_echo_styled(this._sessionId, this._name, packed.text, packed.records, packed.callbacks);
+            op_smudgy_pane_echo_styled(
+                this._sessionId,
+                this._name,
+                packed.text,
+                packed.records,
+                packed.advancedLinks,
+                packed.callbacks,
+            );
         } else {
             op_smudgy_pane_echo(this._sessionId, this._name, String(arg));
         }
@@ -1018,6 +1367,12 @@ class Pane {
      *  updates an existing pane (`titleBar`/`fontSize` incl. main). */
     split<D extends SplitDirection>(direction: D, spec: PaneSpec<D>): Pane {
         return __smudgy_pane_split(this._sessionId, this._name, direction, spec, this.#creatorId);
+    }
+
+    /** Create a pane as a tab immediately after this pane. Existing panes are
+     *  returned without moving or selecting them. */
+    addTab(spec: TabPaneSpec): Pane {
+        return __smudgy_pane_add_tab(this._sessionId, this._name, spec, this.#creatorId);
     }
 
     /** Hide this pane -- the title-bar eyeball's script spelling. A soft
@@ -1120,6 +1475,33 @@ class Pane {
         op_smudgy_pane_relocate(this._sessionId, this._name, direction, refName, sizePx);
     }
 
+    /** Move or reorder this pane in the group currently hosting `reference`. */
+    groupWith(reference: Pane, options?: GroupWithOptions): void {
+        if (!(reference instanceof Pane)) {
+            throw new TypeError("groupWith expects a Pane reference");
+        }
+        if (options !== undefined && (typeof options !== "object" || options === null)) {
+            throw new TypeError("groupWith options must be an object of the form { position?, selected? }");
+        }
+        const position = options?.position ?? "after";
+        if (position !== "before" && position !== "after" && position !== "end") {
+            throw new TypeError('position must be one of "before" | "after" | "end"');
+        }
+        op_smudgy_pane_group_with(
+            this._sessionId,
+            this._name,
+            reference._sessionId,
+            reference._name,
+            position,
+            options?.selected === true,
+        );
+    }
+
+    /** Select this pane and activate its session without requesting focus. */
+    select(): void {
+        op_smudgy_pane_select(this._sessionId, this._name);
+    }
+
     /** Move this pane into a fresh dedicated window -- the drag tear-out
      *  minus the drag. Windows stay anonymous: there is no window handle,
      *  the window closes when its last pane leaves, and re-docking is a
@@ -1204,6 +1586,55 @@ function __smudgy_pane_split(
                                   : null,
                       }
                     : null,
+        },
+        spec.input?.onSubmit ?? null,
+    );
+    return new Pane(sessionId, info, creatorId);
+}
+
+function __smudgy_pane_add_tab(
+    sessionId: number,
+    refName: string,
+    spec: TabPaneSpec,
+    creatorId: number | null = null,
+): Pane {
+    if (typeof spec !== "object" || spec === null || typeof spec.name !== "string") {
+        throw new TypeError(
+            "spec must be an object of the form { name, terminal?, titleBar?, hidden?, fontSize?, input?, selected? }",
+        );
+    }
+    if (spec.input !== undefined) {
+        if (
+            typeof spec.input !== "object" ||
+            spec.input === null ||
+            typeof spec.input.onSubmit !== "function"
+        ) {
+            throw new TypeError(
+                "input must be an object of the form { onSubmit: (text) => void, placeholder? }",
+            );
+        }
+    }
+    const info = op_smudgy_pane_add_tab(
+        sessionId,
+        refName,
+        {
+            name: spec.name,
+            width: null,
+            height: null,
+            terminal: spec.terminal !== undefined ? Boolean(spec.terminal) : null,
+            titleBar: typeof spec.titleBar === "string" ? spec.titleBar : null,
+            hidden: typeof spec.hidden === "boolean" ? spec.hidden : null,
+            fontSize: typeof spec.fontSize === "number" ? spec.fontSize : null,
+            input:
+                spec.input !== undefined
+                    ? {
+                          placeholder:
+                              typeof spec.input.placeholder === "string"
+                                  ? spec.input.placeholder
+                                  : null,
+                      }
+                    : null,
+            selected: typeof spec.selected === "boolean" ? spec.selected : null,
         },
         spec.input?.onSubmit ?? null,
     );
@@ -1674,8 +2105,8 @@ class Session {
     echo(line: string | StyledTextLike | TemplateStringsArray, ...values: unknown[]): void {
         const arg = __styled_echo_arg(line, values);
         if (__is_styled_text(arg)) {
-            const { text, records, callbacks } = __styled_echo_packed(arg);
-            op_smudgy_session_echo_styled(this.id, text, records, callbacks);
+            const { text, records, advancedLinks, callbacks } = __styled_echo_packed(arg);
+            op_smudgy_session_echo_styled(this.id, text, records, advancedLinks, callbacks);
         } else {
             op_smudgy_session_echo(this.id, String(arg));
         }
@@ -2622,9 +3053,24 @@ class Line {
             return;
         }
         if (this._isCurrent) {
-            op_smudgy_insert(text as string, begin, end, options.fg || null, options.bg || null);
+            op_smudgy_insert(
+                text as string,
+                begin,
+                end,
+                __line_fg(options),
+                options.bg || null,
+                options.attributes ?? null,
+            );
         } else {
-            op_smudgy_line_insert(this._lineNumber, text as string, begin, end, options.fg || null, options.bg || null);
+            op_smudgy_line_insert(
+                this._lineNumber,
+                text as string,
+                begin,
+                end,
+                __line_fg(options),
+                options.bg || null,
+                options.attributes ?? null,
+            );
         }
     }
 
@@ -2645,9 +3091,22 @@ class Line {
     /** Highlights text in the specified byte range with the given colors. */
     highlightAt(begin: number, end: number, options: ColorOptions = {}): void {
         if (this._isCurrent) {
-            op_smudgy_highlight(begin, end, options.fg || null, options.bg || null);
+            op_smudgy_highlight(
+                begin,
+                end,
+                __line_fg(options),
+                options.bg || null,
+                options.attributes ?? null,
+            );
         } else {
-            op_smudgy_line_highlight(this._lineNumber, begin, end, options.fg || null, options.bg || null);
+            op_smudgy_line_highlight(
+                this._lineNumber,
+                begin,
+                end,
+                __line_fg(options),
+                options.bg || null,
+                options.attributes ?? null,
+            );
         }
     }
 
@@ -4190,6 +4649,22 @@ function __smudgy_make_api(creator: { kind: string }) {
             },
             mergeKeys(...names: string[]): void {
                 op_smudgy_gmcp_merge_keys(names.map((n) => String(n)));
+            },
+        }),
+        // Named workspace layouts. This shim only coerces names to strings:
+        // scope, validation, gating, and routing (save/apply queue to the
+        // UI daemon, list reads the store directly) live op-side -- see the
+        // named-layouts banner in script_engine/ops.rs. The author-facing
+        // contract is `layout` in smudgy-core.d.ts.
+        layout: Object.freeze({
+            save(name: string): void {
+                op_smudgy_layout_save(String(name));
+            },
+            apply(name: string): void {
+                op_smudgy_layout_apply(String(name));
+            },
+            list(): string[] {
+                return op_smudgy_layout_list() as string[];
             },
         }),
     };

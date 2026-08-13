@@ -130,6 +130,7 @@ export const IsometricZMoveCoordinates = {
 };
 
 export enum ZMode {
+    Auto,
     Normal,
     Isometric,
 }
@@ -171,13 +172,16 @@ function configuredMode(): State {
     return MODE_BY_PARAM[paramString("mode") ?? ""] ?? State.Active;
 }
 
-/** The `zMode` param (normal/isometric) -> how up/down movement is projected. */
+/** The `zMode` param is a creation preference; existing links encode their own style. */
 const ZMODE_BY_PARAM: Record<string, ZMode> = {
+    auto: ZMode.Auto,
     normal: ZMode.Normal,
+    levels: ZMode.Normal,
     isometric: ZMode.Isometric,
+    projected: ZMode.Isometric,
 };
 function configuredZMode(): ZMode {
-    return ZMODE_BY_PARAM[paramString("zMode") ?? ""] ?? ZMode.Normal;
+    return ZMODE_BY_PARAM[paramString("zMode") ?? ""] ?? ZMode.Auto;
 }
 
 /**
@@ -425,7 +429,7 @@ export class MapState {
 export class MapOptions {
     debug: boolean = false;
     debugRaw: boolean = false;
-    /** How up/down movement is projected onto the map (the `zMode` param). */
+    /** Creation preference for new U/D links; Auto infers the nearby section. */
     zMode: ZMode = configuredZMode();
     /** Base text size (px) for the map panel's text/button/markdown widgets (the `textSize` param). */
     textSize: number = configuredTextSize();
@@ -433,6 +437,8 @@ export class MapOptions {
     widgetSize: number = configuredWidgetSize();
 
     get moveCoordinates() {
+        // Coordinate-only legacy operations have no topology to infer from.
+        // Auto therefore uses levels; room creation goes through map-layout.
         return this.zMode === ZMode.Isometric ? IsometricZMoveCoordinates : MoveCoordinates;
     }
 }
@@ -496,17 +502,48 @@ export async function linkRooms(from: Room, to: Room, direction: Direction, crea
         e.to_room_number !== from.room_number
     );
 
+    const fromExit = from.exits.find((e) =>
+        e.from_direction === direction &&
+        e.to_room_number === to.room_number
+    );
+
+    if (idsMatch(from.area_id, to.area_id)) {
+        const ids: ExitId[] = [];
+        await mapper.mutateArea(from.area_id, async (mutation) => {
+            for (const exit of toRemoveFrom) {
+                await mutation.deleteRoomExit(from.room_number, exit.id);
+            }
+            for (const exit of toRemoveTo) {
+                await mutation.deleteRoomExit(to.room_number, exit.id);
+            }
+            ids.push(fromExit?.id ?? await mutation.createRoomExit(from.room_number, {
+                from_direction: direction,
+                to_direction: oppositeDirection,
+                to_area_id: to.area_id,
+                to_room_number: to.room_number,
+            }));
+            if (createReturnExit) {
+                const toExit = to.exits.find((e) =>
+                    e.from_direction === oppositeDirection &&
+                    e.to_room_number === from.room_number
+                );
+                ids.push(toExit?.id ?? await mutation.createRoomExit(to.room_number, {
+                    from_direction: oppositeDirection,
+                    to_direction: direction,
+                    to_area_id: from.area_id,
+                    to_room_number: from.room_number,
+                }));
+            }
+        }, { description: "Link Arctic rooms" });
+        return ids;
+    }
+
     for (const exit of toRemoveFrom) {
         await mapper.deleteRoomExit(from.area_id, from.room_number, exit.id);
     }
     for (const exit of toRemoveTo) {
         await mapper.deleteRoomExit(to.area_id, to.room_number, exit.id);
     }
-
-    const fromExit = from.exits.find((e) =>
-        e.from_direction === direction &&
-        e.to_room_number === to.room_number
-    );
 
     const fromExitPromise = fromExit ? Promise.resolve(fromExit.id) :
         mapper.createRoomExit(from.area_id, from.room_number, {

@@ -76,7 +76,10 @@ pub(super) fn endpoint_updates(
             endpoint.side,
         );
         let (old_tip, other_tip) = if endpoint_b {
-            (render.geometry.stub_tip_b?, Some(render.geometry.stub_tip_a))
+            (
+                render.geometry.stub_tip_b?,
+                Some(render.geometry.stub_tip_a),
+            )
         } else {
             (render.geometry.stub_tip_a, render.geometry.stub_tip_b)
         };
@@ -993,9 +996,10 @@ impl MapEditorWindow {
                 // Re-anchoring an Automatic route's endpoint leaves its
                 // stored route stale exactly like an inspector port edit.
                 if atlas.get_area(&room_key.area_id).is_some_and(|area| {
-                    area.get_connection(*connection_id).is_some_and(|connection| {
-                        connection.routing == ConnectionRouting::Automatic
-                    })
+                    area.get_connection(*connection_id)
+                        .is_some_and(|connection| {
+                            connection.routing == ConnectionRouting::Automatic
+                        })
                 }) {
                     self.automatic_routes_maybe_stale.insert(*connection_id);
                 }
@@ -1006,13 +1010,16 @@ impl MapEditorWindow {
                 // the enum is positionless, so the selection stays valid
                 // at the new anchor.)
                 let becomes_triangle = atlas.get_area(&room_key.area_id).is_some_and(|area| {
-                    area.get_connection(*connection_id).is_some_and(|connection| {
-                        smudgy_cloud::connection_geometry::renders_as_level_triangle(
-                            connection.kind,
-                            connection.routing,
-                            smudgy_cloud::connection_geometry::StubAxis::for_direction(direction),
-                        )
-                    })
+                    area.get_connection(*connection_id)
+                        .is_some_and(|connection| {
+                            smudgy_cloud::connection_geometry::renders_as_level_triangle(
+                                connection.kind,
+                                connection.routing,
+                                smudgy_cloud::connection_geometry::StubAxis::for_direction(
+                                    direction,
+                                ),
+                            )
+                        })
                 });
                 if becomes_triangle {
                     self.editor.clear_selected_connection_handle();
@@ -2704,10 +2711,13 @@ fn properties_section<'a>(
             text(property_row.name.clone())
                 .size(13)
                 .width(Length::FillPortion(2)),
-            text_input(crate::i18n::ts!("inspector-value-placeholder"), &property_row.value)
-                .size(13)
-                .on_input(move |value| { super::Message::Inspector(on_value_change(index, value)) })
-                .width(Length::FillPortion(3)),
+            text_input(
+                crate::i18n::ts!("inspector-value-placeholder"),
+                &property_row.value
+            )
+            .size(13)
+            .on_input(move |value| { super::Message::Inspector(on_value_change(index, value)) })
+            .width(Length::FillPortion(3)),
         ]
         .spacing(4)
         .align_y(Vertical::Center);
@@ -2934,7 +2944,7 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
 
     // Session (ephemeral) areas are excluded as destinations: an exit from a
     // persistent map into an area that vanishes with the session would dangle.
-    let ephemeral = window.mapper.ephemeral_area_ids();
+    let ephemeral = window.mapper.session_area_ids();
     let mut area_choices: Vec<AreaChoice> = atlas
         .areas()
         .filter(|area| !ephemeral.contains(area.get_id()))
@@ -3064,12 +3074,15 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
 
             section = section.push(
                 row![
-                    text_input(crate::i18n::ts!("inspector-room-number-placeholder"), &exit.to_room)
-                        .size(12)
-                        .on_input(move |value| {
-                            super::Message::Inspector(Message::ExitToRoomChanged(index, value))
-                        })
-                        .width(Length::FillPortion(1)),
+                    text_input(
+                        crate::i18n::ts!("inspector-room-number-placeholder"),
+                        &exit.to_room
+                    )
+                    .size(12)
+                    .on_input(move |value| {
+                        super::Message::Inspector(Message::ExitToRoomChanged(index, value))
+                    })
+                    .width(Length::FillPortion(1)),
                     pick_list(&ExitDirection::ALL[..], exit.to_direction, move |d| {
                         super::Message::Inspector(Message::ExitToDirectionChanged(index, d))
                     })
@@ -3125,12 +3138,15 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
         // Connection appearance moves to the Connection inspector.
         section = section.push(
             row![
-                text_input(crate::i18n::ts!("inspector-weight-placeholder"), &exit.weight)
-                    .size(12)
-                    .on_input(move |value| {
-                        super::Message::Inspector(Message::ExitWeightChanged(index, value))
-                    })
-                    .width(Length::FillPortion(1)),
+                text_input(
+                    crate::i18n::ts!("inspector-weight-placeholder"),
+                    &exit.weight
+                )
+                .size(12)
+                .on_input(move |value| {
+                    super::Message::Inspector(Message::ExitWeightChanged(index, value))
+                })
+                .width(Length::FillPortion(1)),
             ]
             .spacing(4)
             .align_y(Vertical::Center),
@@ -3138,12 +3154,15 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
 
         section = section.push(
             row![
-                text_input(crate::i18n::ts!("inspector-command-placeholder"), &exit.command)
-                    .size(12)
-                    .on_input(move |value| {
-                        super::Message::Inspector(Message::ExitCommandChanged(index, value))
-                    })
-                    .width(Length::FillPortion(1)),
+                text_input(
+                    crate::i18n::ts!("inspector-command-placeholder"),
+                    &exit.command
+                )
+                .size(12)
+                .on_input(move |value| {
+                    super::Message::Inspector(Message::ExitCommandChanged(index, value))
+                })
+                .width(Length::FillPortion(1)),
                 text_input(crate::i18n::ts!("inspector-path-placeholder"), &exit.path)
                     .size(12)
                     .on_input(move |value| {
@@ -3303,86 +3322,91 @@ fn connection_view(
 
     // One labeled endpoint editor; `role` is the perspective label the
     // anchor ordering assigns ("From"/"To").
-    let endpoint_editor = |endpoint_b: bool, role: &'static str| -> ThemedElement<'_, super::Message> {
-        let endpoint = if endpoint_b {
-            connection.endpoint_b.unwrap_or(connection.endpoint_a)
-        } else {
-            connection.endpoint_a
-        };
-        let mut col = Column::new().spacing(4);
-        col = col.push(
-            text(format!("{role} · {}", room_label(endpoint.room_number)))
-                .size(11)
-                .style(muted_text),
-        );
-        if level_endpoint(endpoint_b) {
+    let endpoint_editor =
+        |endpoint_b: bool, role: &'static str| -> ThemedElement<'_, super::Message> {
+            let endpoint = if endpoint_b {
+                connection.endpoint_b.unwrap_or(connection.endpoint_a)
+            } else {
+                connection.endpoint_a
+            };
+            let mut col = Column::new().spacing(4);
             col = col.push(
-                text(crate::i18n::t!("inspector-connection-level-anchored"))
-                    .size(12)
+                text(format!("{role} · {}", room_label(endpoint.room_number)))
+                    .size(11)
                     .style(muted_text),
             );
-            return col.into();
-        }
-        let (side, offset_buffer) = if endpoint_b {
-            (
-                state.connection.endpoint_b_side,
-                &state.connection.endpoint_b_offset,
-            )
-        } else {
-            (
-                state.connection.endpoint_a_side,
-                &state.connection.endpoint_a_offset,
-            )
-        };
-        col = col.push(
-            row![
-                pick_list(&SIDE_CHOICES[..], Some(SideChoice(side)), move |choice| {
-                    super::Message::Inspector(Message::ConnectionEndpointSideChanged(
-                        endpoint_b, choice.0,
-                    ))
-                })
-                .text_size(12)
-                .width(Length::FillPortion(2)),
-                text_input(
-                    crate::i18n::ts!("inspector-connection-port-placeholder"),
-                    offset_buffer
+            if level_endpoint(endpoint_b) {
+                col = col.push(
+                    text(crate::i18n::t!("inspector-connection-level-anchored"))
+                        .size(12)
+                        .style(muted_text),
+                );
+                return col.into();
+            }
+            let (side, offset_buffer) = if endpoint_b {
+                (
+                    state.connection.endpoint_b_side,
+                    &state.connection.endpoint_b_offset,
                 )
+            } else {
+                (
+                    state.connection.endpoint_a_side,
+                    &state.connection.endpoint_a_offset,
+                )
+            };
+            col = col.push(
+                row![
+                    pick_list(&SIDE_CHOICES[..], Some(SideChoice(side)), move |choice| {
+                        super::Message::Inspector(Message::ConnectionEndpointSideChanged(
+                            endpoint_b, choice.0,
+                        ))
+                    })
+                    .text_size(12)
+                    .width(Length::FillPortion(2)),
+                    text_input(
+                        crate::i18n::ts!("inspector-connection-port-placeholder"),
+                        offset_buffer
+                    )
                     .on_input(move |value| super::Message::Inspector(
                         Message::ConnectionEndpointOffsetChanged(endpoint_b, value),
                     ))
                     .size(12)
                     .width(Length::FillPortion(1)),
-                button(text(crate::i18n::t!("inspector-connection-auto")).size(11))
-                    .style(builtins::button::secondary)
-                    .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
-                        endpoint_b,
-                    ))),
-                button(text(crate::i18n::t!("inspector-connection-redistribute")).size(11))
-                    .style(builtins::button::secondary)
-                    .on_press(super::Message::Inspector(
-                        Message::ConnectionRedistributePorts(endpoint_b)
-                    )),
-            ]
-            .spacing(6),
-        );
-        let offset_valid = offset_buffer
-            .parse::<f32>()
-            .is_ok_and(|offset| (0.0..=1.0).contains(&offset));
-        if !offset_valid {
-            col = col.push(
-                text(crate::i18n::t!("inspector-connection-port-invalid"))
-                    .size(11)
-                    .style(builtins::text::danger),
+                    button(text(crate::i18n::t!("inspector-connection-auto")).size(11))
+                        .style(builtins::button::secondary)
+                        .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
+                            endpoint_b,
+                        ))),
+                    button(text(crate::i18n::t!("inspector-connection-redistribute")).size(11))
+                        .style(builtins::button::secondary)
+                        .on_press(super::Message::Inspector(
+                            Message::ConnectionRedistributePorts(endpoint_b)
+                        )),
+                ]
+                .spacing(6),
             );
-        }
-        col.into()
-    };
+            let offset_valid = offset_buffer
+                .parse::<f32>()
+                .is_ok_and(|offset| (0.0..=1.0).contains(&offset));
+            if !offset_valid {
+                col = col.push(
+                    text(crate::i18n::t!("inspector-connection-port-invalid"))
+                        .size(11)
+                        .style(builtins::text::danger),
+                );
+            }
+            col.into()
+        };
 
     // Link
     content = content.push(field_label(crate::i18n::t!("inspector-link")));
     content = content.push(text(format!("{} · {endpoints}", kind_name(connection.kind))).size(12));
     if state.connection.has_endpoint_b {
-        let (first, second) = if flipped { (true, false) } else { (false, true) };
+        let (first, second) = if flipped {
+            (true, false)
+        } else {
+            (false, true)
+        };
         content = content.push(endpoint_editor(
             first,
             crate::i18n::ts!("inspector-endpoint-from"),
@@ -3434,9 +3458,7 @@ fn connection_view(
             if reciprocal {
                 has_reciprocal_candidate = true;
                 content = content.push(
-                    button(
-                        text(crate::i18n::t!("inspector-connection-pair-reciprocal")).size(12)
-                    )
+                    button(text(crate::i18n::t!("inspector-connection-pair-reciprocal")).size(12))
                         .style(builtins::button::secondary)
                         .on_press(super::Message::Inspector(Message::ConnectionPair(
                             candidate.id,
@@ -3450,7 +3472,12 @@ fn connection_view(
         // this link. Only for same-area, non-redacted, non-loop
         // destinations whose return direction is still free.
         let return_free = || {
-            let to_room = selected.to_room.trim().parse::<i32>().ok().map(RoomNumber)?;
+            let to_room = selected
+                .to_room
+                .trim()
+                .parse::<i32>()
+                .ok()
+                .map(RoomNumber)?;
             let destination = area.get_room(&to_room)?;
             let return_direction = selected
                 .to_direction
@@ -3570,9 +3597,8 @@ fn connection_view(
             ConnectionRouting::Stub | ConnectionRouting::Simple
         )
     {
-        content = content.push(
-            text(crate::i18n::t!("inspector-connection-route-inactive")).size(12)
-        );
+        content =
+            content.push(text(crate::i18n::t!("inspector-connection-route-inactive")).size(12));
     }
     content = content.push(
         button(text(crate::i18n::t!("inspector-connection-clear-route")).size(12))
@@ -3660,9 +3686,9 @@ fn connection_view(
             })
             .padding(3)
             .width(Length::Fill)
-            .on_press(super::Message::Inspector(Message::ConnectionThicknessPicked(
-                thickness,
-            )))
+            .on_press(super::Message::Inspector(
+                Message::ConnectionThicknessPicked(thickness),
+            ))
         };
         // A stored width outside the offered list stays visible and
         // reselectable rather than silently vanishing.
@@ -3696,9 +3722,9 @@ fn connection_view(
                 })
                 .padding(3)
                 .width(Length::Fill)
-                .on_press(super::Message::Inspector(Message::ConnectionDashChanged(
-                    dash,
-                ))),
+                .on_press(super::Message::Inspector(
+                    Message::ConnectionDashChanged(dash),
+                )),
             );
         }
         content = content.push(panel);
@@ -3751,8 +3777,16 @@ fn bounds_fields<'a>(
         ]
         .spacing(8),
         row![
-            bound_input(crate::i18n::t!("inspector-width"), width, BoundsField::Width),
-            bound_input(crate::i18n::t!("inspector-height"), height, BoundsField::Height),
+            bound_input(
+                crate::i18n::t!("inspector-width"),
+                width,
+                BoundsField::Width
+            ),
+            bound_input(
+                crate::i18n::t!("inspector-height"),
+                height,
+                BoundsField::Height
+            ),
         ]
         .spacing(8),
     ]
@@ -4100,14 +4134,16 @@ fn identification_toggle<'a>(
         muted_text
     };
     let status_line = row![
-        text(crate::i18n::t!("inspector-this-map")).size(12).style(muted_text),
+        text(crate::i18n::t!("inspector-this-map"))
+            .size(12)
+            .style(muted_text),
         text(if enabled {
             crate::i18n::t!("inspector-active")
         } else {
             crate::i18n::t!("inspector-inactive")
         })
-            .size(12)
-            .style(status_style),
+        .size(12)
+        .style(status_style),
         space::horizontal(),
         tooltip(
             button(text(icon).font(fonts::BOOTSTRAP_ICONS).size(16.0),)
@@ -4200,8 +4236,8 @@ fn copies_section<'a>(
 
     section = section.push(
         text(crate::i18n::t!("inspector-multiple-copies-warning"))
-        .size(11)
-        .style(muted_text),
+            .size(11)
+            .style(muted_text),
     );
 
     Some(section.into())
@@ -4358,12 +4394,10 @@ fn exit_summary(atlas: &AtlasCache, area: &AreaCache, exit: &ExitCache) -> Strin
     let target = if exit.to_unknown {
         crate::i18n::t!("inspector-unknown-map")
     } else if let Some(to_area) = exit.to_area_id.filter(|to| to != area.get_id()) {
-        let name = atlas
-            .get_area(&to_area)
-            .map_or_else(
-                || crate::i18n::t!("inspector-another-area"),
-                |a| a.get_name().to_string(),
-            );
+        let name = atlas.get_area(&to_area).map_or_else(
+            || crate::i18n::t!("inspector-another-area"),
+            |a| a.get_name().to_string(),
+        );
         match exit.to_room_number {
             Some(number) => crate::i18n::t!(
                 "inspector-exit-target-area-room",
@@ -4408,8 +4442,8 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
             "inspector-view-only",
             "attribution" => attribution
         ))
-            .size(12)
-            .style(muted_text),
+        .size(12)
+        .style(muted_text),
     );
     content = content.push(rule::horizontal(1));
 
@@ -4418,7 +4452,8 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
         match entity {
             EntityId::Connection(connection_id) => {
                 if let Some(connection) = area.get_connection(connection_id) {
-                    content = content.push(heading(crate::i18n::t!("inspector-connection-heading")));
+                    content =
+                        content.push(heading(crate::i18n::t!("inspector-connection-heading")));
                     let span = connection.endpoint_b.map_or_else(
                         || {
                             crate::i18n::t!(
@@ -4482,7 +4517,8 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
                         .collect();
                     if !properties.is_empty() {
                         properties.sort();
-                        content = content.push(field_label(crate::i18n::t!("inspector-properties")));
+                        content =
+                            content.push(field_label(crate::i18n::t!("inspector-properties")));
                         for (name, value) in properties {
                             content = content.push(text(format!("{name}: {value}")).size(12));
                         }
@@ -4528,8 +4564,8 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
                 "inspector-room-count",
                 "count" => area.room_count()
             ))
-                .size(12)
-                .style(muted_text),
+            .size(12)
+            .style(muted_text),
         );
         let mut properties: Vec<(String, String)> = area
             .properties()

@@ -20,8 +20,9 @@ use smudgy_cloud::cloud_api::{
 use smudgy_cloud::mapper::area_cache::AreaCache;
 use smudgy_cloud::{
     AreaId, AreaWithDetails, AtlasId, CloudError, ConnectionDash, ConnectionId, ConnectionRouting,
-    DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS, ExitDirection, ExitId, LabelId, Mapper,
-    RoomNumber, RoomSide, ShapeId, Uuid, canonicalize_css_color,
+    DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS, ExitDirection, ExitId, LabelId,
+    MapDestination, MapStorage, Mapper, RoomNumber, RoomSide, ShapeId, Uuid,
+    canonicalize_css_color,
 };
 
 use crate::components::cloud_errors::display_error;
@@ -93,6 +94,11 @@ pub enum Modal {
         /// The folder the new area should be filed into (`None` = loose). Set
         /// when opened from a folder's "new map" affordance.
         atlas_id: Option<AtlasId>,
+        /// Explicit durable storage tier. Folder-targeted creation inherits
+        /// its folder's tier and disables this choice.
+        storage: MapStorage,
+        storage_selectable: bool,
+        cloud_available: bool,
     },
     ConfirmDeleteArea {
         area_id: AreaId,
@@ -133,12 +139,20 @@ pub enum Modal {
     CreateAtlas {
         name: String,
         error: Option<String>,
-        /// Chosen tier: `true` = local (on this device), `false` = cloud
-        /// (synced, shareable).
-        local: bool,
+        /// Chosen durable storage tier.
+        storage: MapStorage,
         /// Whether the cloud tier is selectable (i.e. signed in). When false
         /// the folder is forced local.
         cloud_available: bool,
+    },
+    /// Confirm copying a complete atlas to the other durable tier and only
+    /// deleting the source after the destination is acknowledged.
+    MoveAtlasStorage {
+        atlas_id: AtlasId,
+        name: String,
+        area_count: i64,
+        source: MapStorage,
+        destination: MapStorage,
     },
     /// Gentle-delete confirmation for a folder: its maps survive as Loose.
     ConfirmDeleteAtlas {
@@ -150,9 +164,9 @@ pub enum Modal {
     MoveArea {
         area_id: AreaId,
         area_name: String,
-        current_atlas: Option<AtlasId>,
-        /// Available folders (id, name), name-sorted, built at open time.
-        folders: Vec<(AtlasId, String)>,
+        current: MapDestination,
+        /// Available explicit destinations and labels, name-sorted.
+        targets: Vec<(MapDestination, String)>,
     },
     /// The "Share folder…" dialog: atlas-scope grants in one step.
     ShareAtlas(ShareAtlasDialog),
@@ -584,11 +598,13 @@ fn transfer_error_message(error: &CloudError) -> String {
 
 fn transfer_offer_view(dialog: &TransferDialog) -> ThemedElement<'_, Message> {
     if dialog.sent {
-        return column![text(crate::i18n::t!(
-            "mapper-transfer-offer-sent",
-            "subject" => dialog.subject.name()
-        ))
-        .size(13),]
+        return column![
+            text(crate::i18n::t!(
+                "mapper-transfer-offer-sent",
+                "subject" => dialog.subject.name()
+            ))
+            .size(13),
+        ]
         .spacing(10)
         .into();
     }
@@ -601,8 +617,8 @@ fn transfer_offer_view(dialog: &TransferDialog) -> ThemedElement<'_, Message> {
         ))
         .size(13),
         text(crate::i18n::t!("mapper-transfer-warning"))
-        .size(12)
-        .style(builtins::text::danger),
+            .size(12)
+            .style(builtins::text::danger),
     ]
     .spacing(8);
 
@@ -616,11 +632,13 @@ fn transfer_offer_view(dialog: &TransferDialog) -> ThemedElement<'_, Message> {
 
     body = body.push(section_label(crate::i18n::t!("mapper-transfer-to")));
     match &dialog.friends {
-        None => body = body.push(
-            text(crate::i18n::t!("mapper-loading-friends"))
-                .size(12)
-                .style(muted),
-        ),
+        None => {
+            body = body.push(
+                text(crate::i18n::t!("mapper-loading-friends"))
+                    .size(12)
+                    .style(muted),
+            )
+        }
         Some(Err(error)) => {
             body = body.push(text(error.clone()).size(12).style(builtins::text::danger));
         }
@@ -633,9 +651,12 @@ fn transfer_offer_view(dialog: &TransferDialog) -> ThemedElement<'_, Message> {
         }
         Some(Ok(friends)) => {
             body = body.push(
-                text_input(crate::i18n::ts!("mapper-filter-placeholder"), &dialog.filter)
-                    .size(13)
-                    .on_input(|value| transfer(TransferMessage::FilterChanged(value))),
+                text_input(
+                    crate::i18n::ts!("mapper-filter-placeholder"),
+                    &dialog.filter,
+                )
+                .size(13)
+                .on_input(|value| transfer(TransferMessage::FilterChanged(value))),
             );
             let filter = dialog.filter.trim().to_lowercase();
             let mut list = column![].spacing(4);
@@ -1547,8 +1568,14 @@ const KIND_GROUPS: [(SecretEntityKind, &str); 6] = [
     (SecretEntityKind::Exit, "mapper-secret-exits"),
     (SecretEntityKind::Label, "mapper-secret-labels"),
     (SecretEntityKind::Shape, "mapper-secret-shapes"),
-    (SecretEntityKind::RoomProperty, "mapper-secret-room-properties"),
-    (SecretEntityKind::AreaProperty, "mapper-secret-area-properties"),
+    (
+        SecretEntityKind::RoomProperty,
+        "mapper-secret-room-properties",
+    ),
+    (
+        SecretEntityKind::AreaProperty,
+        "mapper-secret-area-properties",
+    ),
 ];
 
 fn muted(theme: &crate::Theme) -> iced::widget::text::Style {
@@ -1627,14 +1654,14 @@ impl Modal {
                             crate::i18n::ts!("mapper-link-source-command-placeholder"),
                             &draft.from_command
                         )
-                            .on_input(Message::LinkFromCommandChanged)
-                            .size(12),
+                        .on_input(Message::LinkFromCommandChanged)
+                        .size(12),
                         text_input(
                             crate::i18n::ts!("mapper-link-return-command-placeholder"),
                             &draft.to_command
                         )
-                            .on_input(Message::LinkToCommandChanged)
-                            .size(12),
+                        .on_input(Message::LinkToCommandChanged)
+                        .size(12),
                     ]
                     .spacing(8),
                     row![
@@ -1653,12 +1680,18 @@ impl Modal {
                     ]
                     .spacing(8),
                     row![
-                        text_input(crate::i18n::ts!("inspector-css-color-placeholder"), &draft.color)
-                            .on_input(Message::LinkColorChanged)
-                            .size(12),
-                        text_input(crate::i18n::ts!("inspector-width-placeholder"), &draft.thickness)
-                            .on_input(Message::LinkThicknessChanged)
-                            .size(12),
+                        text_input(
+                            crate::i18n::ts!("inspector-css-color-placeholder"),
+                            &draft.color
+                        )
+                        .on_input(Message::LinkColorChanged)
+                        .size(12),
+                        text_input(
+                            crate::i18n::ts!("inspector-width-placeholder"),
+                            &draft.thickness
+                        )
+                        .on_input(Message::LinkThicknessChanged)
+                        .size(12),
                     ]
                     .spacing(8),
                 ]
@@ -1696,7 +1729,14 @@ impl Modal {
                 );
                 (crate::i18n::t!("mapper-link-create-title"), body.into())
             }
-            Modal::CreateArea { name, error, .. } => {
+            Modal::CreateArea {
+                name,
+                error,
+                storage,
+                storage_selectable,
+                cloud_available,
+                ..
+            } => {
                 let mut body = column![
                     text(crate::i18n::t!("mapper-name-new-area")).size(13),
                     text_input(crate::i18n::ts!("mapper-area-name-placeholder"), name)
@@ -1705,6 +1745,39 @@ impl Modal {
                         .on_submit(Message::CreateAreaConfirmed),
                 ]
                 .spacing(10);
+
+                if *storage_selectable {
+                    if *cloud_available {
+                        body = body.push(
+                            column![
+                                section_label(crate::i18n::t!("mapper-save-in")),
+                                radio(
+                                    crate::i18n::t!("mapper-save-cloud"),
+                                    MapStorage::Cloud,
+                                    Some(*storage),
+                                    Message::CreateAreaStorageChanged,
+                                )
+                                .size(14)
+                                .text_size(13),
+                                radio(
+                                    crate::i18n::t!("mapper-save-local"),
+                                    MapStorage::Local,
+                                    Some(*storage),
+                                    Message::CreateAreaStorageChanged,
+                                )
+                                .size(14)
+                                .text_size(13),
+                            ]
+                            .spacing(4),
+                        );
+                    } else {
+                        body = body.push(
+                            text(crate::i18n::t!("mapper-save-local-signed-out"))
+                                .size(11)
+                                .style(muted),
+                        );
+                    }
+                }
 
                 if let Some(error) = error {
                     body = body.push(text(error.clone()).size(12).style(builtins::text::danger));
@@ -1800,7 +1873,7 @@ impl Modal {
                         "mapper-route-preview-link",
                         "id" => connection_id.to_string()
                     ))
-                        .size(13),
+                    .size(13),
                     text(crate::i18n::t!(
                         "mapper-route-preview-stats",
                         "points" => point_count.to_string(),
@@ -1808,8 +1881,7 @@ impl Modal {
                     ))
                     .size(12)
                     .style(muted),
-                    text(crate::i18n::t!("mapper-route-preview-accept-help"))
-                        .size(12),
+                    text(crate::i18n::t!("mapper-route-preview-accept-help")).size(12),
                     text(crate::i18n::t!("mapper-route-preview-public-help"))
                         .size(12)
                         .style(muted),
@@ -1858,10 +1930,9 @@ impl Modal {
                         "mapper-redistribute-offsets",
                         "offsets" => offsets.join(", ")
                     ))
-                        .size(12)
-                        .style(muted),
-                    text(crate::i18n::t!("mapper-redistribute-help"))
-                        .size(12),
+                    .size(12)
+                    .style(muted),
+                    text(crate::i18n::t!("mapper-redistribute-help")).size(12),
                     row![
                         space::horizontal(),
                         button(text(crate::i18n::t!("action-cancel")).size(13))
@@ -1900,8 +1971,7 @@ impl Modal {
                 };
                 let body = column![
                     text(boundary).size(13),
-                    text(crate::i18n::t!("mapper-copy-boundary-help"))
-                        .size(12),
+                    text(crate::i18n::t!("mapper-copy-boundary-help")).size(12),
                     checkbox(*include_boundary_links)
                         .label(crate::i18n::t!("mapper-copy-include-boundary"))
                         .size(14)
@@ -1931,7 +2001,7 @@ impl Modal {
             Modal::CreateAtlas {
                 name,
                 error,
-                local,
+                storage,
                 cloud_available,
             } => {
                 let mut body = column![
@@ -1951,16 +2021,16 @@ impl Modal {
                             section_label(crate::i18n::t!("mapper-save-in")),
                             radio(
                                 crate::i18n::t!("mapper-save-cloud"),
-                                false,
-                                Some(*local),
+                                MapStorage::Cloud,
+                                Some(*storage),
                                 Message::CreateAtlasTierChanged,
                             )
                             .size(14)
                             .text_size(13),
                             radio(
                                 crate::i18n::t!("mapper-save-local"),
-                                true,
-                                Some(*local),
+                                MapStorage::Local,
+                                Some(*storage),
                                 Message::CreateAtlasTierChanged,
                             )
                             .size(14)
@@ -1971,8 +2041,8 @@ impl Modal {
                 } else {
                     body = body.push(
                         text(crate::i18n::t!("mapper-save-local-signed-out"))
-                        .size(11)
-                        .style(muted),
+                            .size(11)
+                            .style(muted),
                     );
                 }
 
@@ -2007,8 +2077,7 @@ impl Modal {
                     n => crate::i18n::t!("mapper-folder-maps-move", "count" => n),
                 };
                 let body = column![
-                    text(crate::i18n::t!("mapper-delete-folder-question", "name" => name))
-                        .size(13),
+                    text(crate::i18n::t!("mapper-delete-folder-question", "name" => name)).size(13),
                     text(detail).size(12).style(muted),
                     row![
                         space::horizontal(),
@@ -2026,34 +2095,69 @@ impl Modal {
 
                 (crate::i18n::t!("mapper-delete-folder"), body.into())
             }
+            Modal::MoveAtlasStorage {
+                name,
+                area_count,
+                source,
+                destination,
+                ..
+            } => {
+                let storage_label = |storage| match storage {
+                    MapStorage::Local => crate::i18n::t!("mapper-save-local"),
+                    MapStorage::Cloud => crate::i18n::t!("mapper-save-cloud"),
+                    MapStorage::Session => unreachable!("atlases are durable"),
+                };
+                let detail = match area_count {
+                    0 => crate::i18n::t!("mapper-folder-empty"),
+                    1 => crate::i18n::t!("mapper-folder-one-map-moves"),
+                    n => crate::i18n::t!("mapper-folder-maps-move", "count" => n),
+                };
+                let body = column![
+                    text(name.clone()).size(13),
+                    text(format!(
+                        "{} → {}",
+                        storage_label(*source),
+                        storage_label(*destination)
+                    ))
+                    .size(12),
+                    text(detail).size(12).style(muted),
+                    row![
+                        space::horizontal(),
+                        button(text(crate::i18n::t!("action-cancel")).size(13))
+                            .style(builtins::button::secondary)
+                            .on_press(Message::ModalDismissed),
+                        button(text(crate::i18n::t!("area-list-move-action")).size(13))
+                            .style(builtins::button::primary)
+                            .on_press(Message::MoveAtlasStorageConfirmed),
+                    ]
+                    .spacing(10)
+                    .align_y(Vertical::Center),
+                ]
+                .spacing(10);
+                (crate::i18n::t!("area-list-move-action"), body.into())
+            }
             Modal::MoveArea {
                 area_id,
                 area_name,
-                current_atlas,
-                folders,
+                current,
+                targets,
             } => {
-                let mut list = column![text(crate::i18n::t!(
-                    "mapper-move-area-to",
-                    "name" => area_name
-                ))
-                .size(13)]
+                let mut list = column![
+                    text(crate::i18n::t!(
+                        "mapper-move-area-to",
+                        "name" => area_name
+                    ))
+                    .size(13)
+                ]
                 .spacing(6);
 
-                list = list.push(move_target_button(
-                    crate::i18n::t!("mapper-loose-maps"),
-                    current_atlas.is_none(),
-                    Message::MoveAreaToAtlas {
-                        area: *area_id,
-                        atlas: None,
-                    },
-                ));
-                for (atlas_id, atlas_name) in folders {
+                for (destination, label) in targets {
                     list = list.push(move_target_button(
-                        atlas_name.clone(),
-                        *current_atlas == Some(*atlas_id),
-                        Message::MoveAreaToAtlas {
+                        label.clone(),
+                        *current == *destination,
+                        Message::MoveAreaTo {
                             area: *area_id,
-                            atlas: Some(*atlas_id),
+                            destination: *destination,
                         },
                     ));
                 }
@@ -2107,9 +2211,8 @@ impl Modal {
                             if group_entries.peek().is_none() {
                                 continue;
                             }
-                            list = list.push(
-                                text(crate::i18n::translate(header)).size(11).style(muted),
-                            );
+                            list = list
+                                .push(text(crate::i18n::translate(header)).size(11).style(muted));
                             for entity in group_entries {
                                 list = list.push(
                                     row![
@@ -2161,10 +2264,13 @@ impl Modal {
                 };
                 let mut body = column![
                     text(intro).size(12),
-                    text_input(crate::i18n::ts!("mapper-copy-name-placeholder"), &dialog.name)
-                        .size(14)
-                        .on_input(Message::CopyAreaNameChanged)
-                        .on_submit(Message::CopyAreaConfirmed),
+                    text_input(
+                        crate::i18n::ts!("mapper-copy-name-placeholder"),
+                        &dialog.name
+                    )
+                    .size(14)
+                    .on_input(Message::CopyAreaNameChanged)
+                    .on_submit(Message::CopyAreaConfirmed),
                 ]
                 .spacing(10);
 
@@ -2172,8 +2278,8 @@ impl Modal {
                 if dialog.duplicate {
                     body = body.push(
                         text(crate::i18n::t!("mapper-copy-duplicate-inactive"))
-                        .size(11)
-                        .style(muted),
+                            .size(11)
+                            .style(muted),
                     );
                 }
 
@@ -2192,8 +2298,8 @@ impl Modal {
                         column![
                             iced::widget::rule::horizontal(1),
                             text(crate::i18n::t!("mapper-copy-atlas-offer"))
-                            .size(11)
-                            .style(muted),
+                                .size(11)
+                                .style(muted),
                             button(text(crate::i18n::t!("mapper-copy-whole-atlas")).size(12))
                                 .style(builtins::button::secondary)
                                 .on_press_maybe(
@@ -2294,8 +2400,8 @@ fn servers_checklist_view<'a>(
     servers: &'a [String],
     checked: &'a std::collections::BTreeSet<String>,
 ) -> ThemedElement<'a, Message> {
-    let mut list = column![text(crate::i18n::t!("mapper-show-name-on", "name" => name)).size(13)]
-        .spacing(6);
+    let mut list =
+        column![text(crate::i18n::t!("mapper-show-name-on", "name" => name)).size(13)].spacing(6);
 
     if servers.is_empty() {
         list = list.push(
@@ -2362,9 +2468,8 @@ fn share_view(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
             .text_size(13),
         );
     }
-    content = content.push(
-        column![section_label(crate::i18n::t!("mapper-scope")), scope].spacing(4),
-    );
+    content =
+        content.push(column![section_label(crate::i18n::t!("mapper-scope")), scope].spacing(4));
 
     // ===== recipients =====================================================
     let mut recipients = column![
@@ -2373,8 +2478,8 @@ fn share_view(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
             crate::i18n::ts!("mapper-filter-handle-placeholder"),
             &dialog.filter,
         )
-            .size(13)
-            .on_input(|value| share(ShareMessage::FilterChanged(value))),
+        .size(13)
+        .on_input(|value| share(ShareMessage::FilterChanged(value))),
     ]
     .spacing(4);
 
@@ -2419,12 +2524,11 @@ fn share_view(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
                 );
             }
             if !any {
-                friend_list =
-                    friend_list.push(
-                        text(crate::i18n::t!("mapper-no-friends-filter"))
-                            .size(12)
-                            .style(muted),
-                    );
+                friend_list = friend_list.push(
+                    text(crate::i18n::t!("mapper-no-friends-filter"))
+                        .size(12)
+                        .style(muted),
+                );
             }
         }
     }
@@ -2493,8 +2597,8 @@ fn share_view(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
         let mut section = column![
             section_label(crate::i18n::t!("mapper-disclose-servers")),
             text(crate::i18n::t!("mapper-disclose-servers-help"))
-            .size(11)
-            .style(muted),
+                .size(11)
+                .style(muted),
         ]
         .spacing(4);
         for (host, checked) in &dialog.host_hints {
@@ -2641,10 +2745,7 @@ fn share_view(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
 }
 
 fn preview_block(summary: &PreviewSummary) -> ThemedElement<'_, Message> {
-    fn count_row<'a>(
-        label: String,
-        value: usize,
-    ) -> iced::widget::Row<'a, Message, crate::Theme> {
+    fn count_row<'a>(label: String, value: usize) -> iced::widget::Row<'a, Message, crate::Theme> {
         row![
             text(label).size(12).style(muted).width(120.0),
             text(value.to_string()).size(12),
@@ -2695,8 +2796,7 @@ fn preview_block(summary: &PreviewSummary) -> ThemedElement<'_, Message> {
 
 #[allow(clippy::too_many_lines)]
 fn manage_section(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
-    let mut section = column![text(crate::i18n::t!("mapper-who-has-access")).size(13)]
-        .spacing(6);
+    let mut section = column![text(crate::i18n::t!("mapper-who-has-access")).size(13)].spacing(6);
 
     if let Some(error) = &dialog.manage_error {
         section = section.push(text(error.clone()).size(12).style(builtins::text::danger));
@@ -2704,7 +2804,11 @@ fn manage_section(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
 
     match &dialog.tree {
         None => {
-            section = section.push(text(crate::i18n::t!("mapper-loading")).size(12).style(muted));
+            section = section.push(
+                text(crate::i18n::t!("mapper-loading"))
+                    .size(12)
+                    .style(muted),
+            );
         }
         Some(Err(error)) => {
             section = section.push(text(error.clone()).size(12).style(builtins::text::danger));
@@ -2783,10 +2887,7 @@ fn grant_row<'a>(
         badges.join(" \u{00b7} ")
     };
     if grant.atlas_id.is_some() {
-        badge_text.push_str(&format!(
-            " ({})",
-            crate::i18n::t!("mapper-badge-atlas")
-        ));
+        badge_text.push_str(&format!(" ({})", crate::i18n::t!("mapper-badge-atlas")));
     }
 
     let shared_by = if dialog.viewer_id == Some(grant.grantor_id) {
@@ -2935,8 +3036,8 @@ fn revoke_confirm_row<'a>(
 ) -> ThemedElement<'a, Message> {
     let mut block = column![
         text(crate::i18n::t!("mapper-revoke-warning"))
-        .size(11)
-        .style(builtins::text::danger),
+            .size(11)
+            .style(builtins::text::danger),
     ]
     .spacing(6)
     .padding([4, 0]);
@@ -3020,8 +3121,8 @@ fn share_atlas_view(dialog: &ShareAtlasDialog) -> ThemedElement<'_, Message> {
             crate::i18n::ts!("mapper-filter-handle-placeholder"),
             &dialog.filter,
         )
-            .size(13)
-            .on_input(|value| share_atlas(ShareAtlasMessage::FilterChanged(value))),
+        .size(13)
+        .on_input(|value| share_atlas(ShareAtlasMessage::FilterChanged(value))),
     ]
     .spacing(4);
 
@@ -3066,12 +3167,11 @@ fn share_atlas_view(dialog: &ShareAtlasDialog) -> ThemedElement<'_, Message> {
                 );
             }
             if !any {
-                friend_list =
-                    friend_list.push(
-                        text(crate::i18n::t!("mapper-no-friends-filter"))
-                            .size(12)
-                            .style(muted),
-                    );
+                friend_list = friend_list.push(
+                    text(crate::i18n::t!("mapper-no-friends-filter"))
+                        .size(12)
+                        .style(muted),
+                );
             }
         }
     }
@@ -3135,8 +3235,8 @@ fn share_atlas_view(dialog: &ShareAtlasDialog) -> ThemedElement<'_, Message> {
         let mut section = column![
             section_label(crate::i18n::t!("mapper-disclose-servers")),
             text(crate::i18n::t!("mapper-disclose-servers-help"))
-            .size(11)
-            .style(muted),
+                .size(11)
+                .style(muted),
         ]
         .spacing(4);
         for (host, checked) in &dialog.host_hints {
@@ -3209,8 +3309,7 @@ fn share_atlas_view(dialog: &ShareAtlasDialog) -> ThemedElement<'_, Message> {
 }
 
 fn atlas_manage_section(dialog: &ShareAtlasDialog) -> ThemedElement<'_, Message> {
-    let mut section = column![text(crate::i18n::t!("mapper-who-has-access")).size(13)]
-        .spacing(6);
+    let mut section = column![text(crate::i18n::t!("mapper-who-has-access")).size(13)].spacing(6);
 
     if let Some(error) = &dialog.manage_error {
         section = section.push(text(error.clone()).size(12).style(builtins::text::danger));
@@ -3232,7 +3331,11 @@ fn atlas_manage_section(dialog: &ShareAtlasDialog) -> ThemedElement<'_, Message>
 
     match &dialog.grants {
         None => {
-            section = section.push(text(crate::i18n::t!("mapper-loading")).size(12).style(muted));
+            section = section.push(
+                text(crate::i18n::t!("mapper-loading"))
+                    .size(12)
+                    .style(muted),
+            );
         }
         Some(Err(error)) => {
             section = section.push(text(error.clone()).size(12).style(builtins::text::danger));
@@ -3301,8 +3404,8 @@ fn atlas_grant_row<'a>(
 fn atlas_revoke_confirm_row(dialog: &ShareAtlasDialog) -> ThemedElement<'_, Message> {
     let block = column![
         text(crate::i18n::t!("mapper-revoke-folder-warning"))
-        .size(11)
-        .style(builtins::text::danger),
+            .size(11)
+            .style(builtins::text::danger),
         row![
             space::horizontal(),
             button(text(crate::i18n::t!("action-cancel")).size(11))
@@ -3342,11 +3445,13 @@ fn entity_label(area: Option<&Arc<AreaCache>>, entity: &SecretEntity) -> String 
                 .filter(|title| !title.is_empty())
                 .map_or_else(
                     || crate::i18n::t!("mapper-room-fallback", "number" => number),
-                    |title| crate::i18n::t!(
-                        "mapper-room-title",
-                        "number" => number,
-                        "title" => title
-                    ),
+                    |title| {
+                        crate::i18n::t!(
+                            "mapper-room-title",
+                            "number" => number,
+                            "title" => title
+                        )
+                    },
                 )
         }
         SecretEntityKind::Exit => entity
@@ -3378,10 +3483,12 @@ fn entity_label(area: Option<&Arc<AreaCache>>, entity: &SecretEntity) -> String 
             .and_then(|id| area.and_then(|area| area.get_label(&id).cloned()))
             .map_or_else(
                 || crate::i18n::t!("mapper-label-fallback"),
-                |label| crate::i18n::t!(
-                    "mapper-label-named",
-                    "text" => snippet(&label.text)
-                ),
+                |label| {
+                    crate::i18n::t!(
+                        "mapper-label-named",
+                        "text" => snippet(&label.text)
+                    )
+                },
             ),
         SecretEntityKind::Shape => entity
             .id
@@ -3389,11 +3496,13 @@ fn entity_label(area: Option<&Arc<AreaCache>>, entity: &SecretEntity) -> String 
             .and_then(|id| area.and_then(|area| area.get_shape(&id).cloned()))
             .map_or_else(
                 || crate::i18n::t!("mapper-shape-fallback"),
-                |shape| crate::i18n::t!(
-                    "mapper-shape-at",
-                    "x" => format!("{:.0}", shape.x),
-                    "y" => format!("{:.0}", shape.y)
-                ),
+                |shape| {
+                    crate::i18n::t!(
+                        "mapper-shape-at",
+                        "x" => format!("{:.0}", shape.x),
+                        "y" => format!("{:.0}", shape.y)
+                    )
+                },
             ),
         SecretEntityKind::RoomProperty => {
             let number = entity.room_number.unwrap_or_default();

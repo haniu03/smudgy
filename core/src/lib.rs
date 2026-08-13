@@ -79,6 +79,11 @@ pub fn get_smudgy_home() -> Result<PathBuf> {
 /// In release builds, logs to a file named "smudgy.log" in the smudgy home directory
 /// with timestamp information.
 ///
+/// Default level (when `SMUDGY_LOG` is unset): `debug` in debug builds,
+/// `info` in release builds — a production smudgy.log carries operational
+/// events, never the debug stream. Set `SMUDGY_LOG` explicitly to override
+/// either default.
+///
 /// # Errors
 ///
 /// Returns an error if logging initialization fails or if the log file cannot be created
@@ -89,7 +94,14 @@ fn init_logging() -> Result<()> {
         // This only needs to be wrapped with unsafe because it isn't thread-safe;
         // this is ok because we're only going to use this once, on the current thread
         unsafe {
-            std::env::set_var("SMUDGY_LOG", "debug");
+            std::env::set_var(
+                "SMUDGY_LOG",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "info"
+                },
+            );
         }
     }
 
@@ -171,6 +183,7 @@ pub fn init() {
     );
 }
 
+pub(crate) mod json;
 pub mod models;
 pub mod session;
 

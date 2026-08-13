@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use smudgy_cloud::{
-    CloudMapper, CompositeBackend, Credential, CredentialSource, LocalBackend, Mapper,
-    MapperBackend, PackageApiClient, RoomNumber, RoomUpdates, mapper::RoomKey,
+    CloudMapper, CompositeBackend, Credential, CredentialSource, LocalBackend, MapDestination,
+    MapStorage, Mapper, MapperBackend, PackageApiClient, RoomNumber, RoomUpdates, mapper::RoomKey,
 };
 use smudgy_core::models::local_packages::packages_dir;
 use smudgy_core::models::shared_packages::{self, UpdateMode};
@@ -182,7 +182,7 @@ async fn auto_mapper_maps_follows_and_promotes() {
     assert_eq!(key100.area_id, key101.area_id, "one area per zone");
     assert_eq!(key100.area_id, key103.area_id, "one area per zone");
     assert!(
-        mapper.is_ephemeral(&key100.area_id),
+        mapper.area_storage(&key100.area_id) == MapStorage::Session,
         "auto-mapped rooms land in the ephemeral tier"
     );
     let area = atlas.get_area(&key100.area_id).expect("zone area");
@@ -301,7 +301,7 @@ async fn auto_mapper_maps_follows_and_promotes() {
         "a fresh (imported) area"
     );
     assert!(
-        !mapper.is_ephemeral(&promoted_key.area_id),
+        mapper.area_storage(&promoted_key.area_id) != MapStorage::Session,
         "the promoted area is no longer ephemeral"
     );
     assert_eq!(promoted_room.get_title(), "Temple Square");
@@ -438,11 +438,11 @@ async fn auto_mapper_maps_follows_and_promotes() {
         "the new room joins the SAVED midgaard map (adopted by name).\n{transcript}"
     );
     assert!(
-        !mapper.is_ephemeral(&key105.area_id),
+        mapper.area_storage(&key105.area_id) != MapStorage::Session,
         "the adopted area is the saved local map, not a session copy.\n{transcript}"
     );
     assert_eq!(
-        mapper.ephemeral_area_ids().len(),
+        mapper.session_area_ids().len(),
         0,
         "no duplicate session area is minted for a saved zone.\n{transcript}"
     );
@@ -607,7 +607,7 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         "a new room discovered after returning joins the original zone area.\n{transcript}"
     );
     assert_eq!(
-        mapper.ephemeral_area_ids().len(),
+        mapper.session_area_ids().len(),
         2,
         "exactly two session areas: old-town and wildwood.\n{transcript}"
     );
@@ -680,7 +680,7 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         "the -1 sentinel must not be minted as a room.\n{transcript}"
     );
     assert_eq!(
-        mapper.ephemeral_area_ids().len(),
+        mapper.session_area_ids().len(),
         2,
         "an unmappable fix opens no area.\n{transcript}"
     );
@@ -776,7 +776,7 @@ async fn auto_mapper_maps_ire_dialect_with_server_coords() {
     let (key, room) = atlas
         .find_room_by_external_id("4711")
         .unwrap_or_else(|| panic!("IRE room was auto-created.\n{transcript}"));
-    assert!(mapper.is_ephemeral(&key.area_id));
+    assert_eq!(mapper.area_storage(&key.area_id), MapStorage::Session);
     assert_eq!(
         atlas.get_area(&key.area_id).expect("area").get_name(),
         "the village of Tasur'ke",
@@ -985,7 +985,7 @@ async fn auto_mapper_maps_msdp_composite_room() {
     let (key, room) = atlas
         .find_room_by_external_id("14100")
         .unwrap_or_else(|| panic!("MSDP room was auto-created.\n{transcript}"));
-    assert!(mapper.is_ephemeral(&key.area_id));
+    assert_eq!(mapper.area_storage(&key.area_id), MapStorage::Session);
     let area = atlas.get_area(&key.area_id).expect("zone area");
     assert_eq!(area.get_name(), "Training Halls");
     assert_eq!(room.get_title(), "A Small Island Beach");
@@ -1179,8 +1179,10 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
     // A refused north move produces no room report, then east reaches a new room. With
     // two unresolved commands and no destination ids, attribution is ambiguous: the
     // mapper may create/follow room 903, but must not invent 900 --north--> 903.
-    tx.send(RuntimeAction::Send(Arc::new("n".to_string()))).unwrap();
-    tx.send(RuntimeAction::Send(Arc::new("e".to_string()))).unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("n".to_string())))
+        .unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("e".to_string())))
+        .unwrap();
     tx.send(gmcp(
         "Room.Info",
         r#"{ "num": 903, "name": "Ambiguous Trail", "zone": "trailfields", "exits": {} }"#,
@@ -1300,7 +1302,10 @@ async fn auto_mapper_follows_continent_rooms_without_drawing() {
 
     // Stand in for an imported overland map: one continent room bound to its id.
     let mesolar = mapper
-        .create_area_ephemeral("Mesolar".to_string())
+        .create_area_at(
+            "Mesolar".to_string(),
+            MapDestination::loose(MapStorage::Session),
+        )
         .await
         .expect("create the overland area");
     mapper
@@ -1386,7 +1391,7 @@ async fn auto_mapper_follows_continent_rooms_without_drawing() {
         "the overland map gained no rooms.\n{transcript}"
     );
     assert_eq!(
-        mapper.ephemeral_area_ids().len(),
+        mapper.session_area_ids().len(),
         1,
         "no zone area was opened for continent fixes.\n{transcript}"
     );
@@ -1433,7 +1438,10 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
     // longer resolve "9500" (it is another entry's map), but the rescue index
     // still holds it.
     let elsewhere = mapper
-        .create_area_ephemeral("Other Server Map".to_string())
+        .create_area_at(
+            "Other Server Map".to_string(),
+            MapDestination::loose(MapStorage::Session),
+        )
         .await
         .expect("create the stand-in area");
     mapper
@@ -1454,7 +1462,7 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
             .is_none(),
         "the scope-excluded room is absent from normal identification"
     );
-    let ephemeral_before = mapper.ephemeral_area_ids().len();
+    let ephemeral_before = mapper.session_area_ids().len();
 
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(9335_u32),
@@ -1510,7 +1518,7 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
     // No duplicate was minted: no new ephemeral zone area appeared, and "9500"
     // still resolves nowhere in normal identification.
     assert_eq!(
-        mapper.ephemeral_area_ids().len(),
+        mapper.session_area_ids().len(),
         ephemeral_before,
         "the rescue path must not auto-create a duplicate zone area.\n{transcript}"
     );
@@ -1521,6 +1529,160 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
             .is_none(),
         "no duplicate room 9500 was minted into a participating area.\n{transcript}"
     );
+
+    tx.send(RuntimeAction::Shutdown).ok();
+}
+
+/// The unwritable-map fallback: an adopted durable zone map whose backend
+/// refuses the write must be detached and the SAME fix retried into a fresh
+/// session area. The mutator's draft room number resolves before submission,
+/// so a failed submit must not leave the retry loop believing a room exists —
+/// that phantom would end the loop early and links/current-location would
+/// bind a room number the fallback area never held.
+#[tokio::test]
+async fn auto_mapper_retries_into_a_session_area_when_the_bound_map_refuses_writes() {
+    const RETRY_SERVER: &str = "AutoMapperRetry";
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    std::fs::create_dir_all(smudgy_home.join(RETRY_SERVER).join("modules")).unwrap();
+    std::fs::create_dir_all(smudgy_home.join(RETRY_SERVER).join("logs")).unwrap();
+    copy_package_source(RETRY_SERVER);
+    shared_packages::install_package(
+        RETRY_SERVER,
+        "smudgy://local/auto-mapper",
+        UpdateMode::Auto,
+        true,
+    )
+    .unwrap();
+
+    let map_root = smudgy_home.join("map-test-retry");
+    let local = Arc::new(LocalBackend::new(map_root.join("local")));
+    let cloud = Arc::new(CloudMapper::new(
+        "http://127.0.0.1:0".to_string(),
+        "test-key".to_string(),
+    ));
+    let backend: Arc<dyn MapperBackend + Send + Sync> =
+        Arc::new(CompositeBackend::new(local, cloud));
+    let mapper = Mapper::new(backend, map_root.join("cache"));
+
+    // A saved local map the package will adopt by folded name.
+    let bound = mapper
+        .create_area_at(
+            "walledgarden".to_string(),
+            MapDestination::loose(MapStorage::Local),
+        )
+        .await
+        .expect("create the bound local area");
+    let seed = mapper
+        .upsert_room(
+            RoomKey::new(bound, RoomNumber(1)),
+            RoomUpdates {
+                title: Some("Garden Gate".to_string()),
+                external_id: Some(Some("700".to_string())),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("seed room should enqueue");
+    if let Some(operation_id) = seed.operation_id() {
+        mapper
+            .wait_for_mutation(operation_id)
+            .await
+            .expect("seed room acknowledged");
+    }
+
+    // Make the local tier refuse further writes to the area document: the
+    // atomic rewrite cannot replace a read-only file (Windows) or create its
+    // temp in a read-only directory (Unix).
+    let areas_dir = map_root.join("local").join("areas-v2");
+    for entry in std::fs::read_dir(&areas_dir).expect("list local area files") {
+        let path = entry.expect("area file entry").path();
+        if path.extension().is_some_and(|extension| extension == "json") {
+            let mut permissions = std::fs::metadata(&path).expect("area file metadata").permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&path, permissions).expect("set area file read-only");
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&areas_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("set areas dir read-only");
+    }
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(9341_u32),
+        server_name: Arc::new(RETRY_SERVER.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: Some(mapper.clone()),
+        package_client: Some(PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        )),
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+
+    // A NEW room in the adopted zone: the first attempt drafts into the bound
+    // local map and fails at submit; the retry must land a REAL room in a
+    // fresh session area.
+    tx.send(RuntimeAction::GmcpEnabled).unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 701, "name": "Overgrown Path", "zone": "walledgarden", "terrain": "field",
+             "exits": {} }"#,
+    ))
+    .unwrap();
+
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+
+    assert!(
+        lines.iter().any(|line| line.contains("not writable")),
+        "the unwritable adoption is announced once.\n{transcript}"
+    );
+    let session_areas = mapper.session_area_ids();
+    assert_eq!(
+        session_areas.len(),
+        1,
+        "the fallback opens exactly one session area.\n{transcript}"
+    );
+    let fallback = *session_areas.iter().next().expect("fallback area id");
+    let atlas = mapper.get_current_atlas();
+    let fallback_area = atlas.get_area(&fallback).expect("fallback area");
+    assert_eq!(
+        fallback_area.room_count(),
+        1,
+        "the retry created a real room in the fallback area — a phantom draft \
+         number would have left it empty.\n{transcript}"
+    );
+    let fallback_room = fallback_area
+        .get_rooms()
+        .first()
+        .expect("the retried room exists");
+    assert_eq!(fallback_room.get_external_id(), Some("701"));
+    assert_eq!(fallback_room.get_title(), "Overgrown Path");
 
     tx.send(RuntimeAction::Shutdown).ok();
 }

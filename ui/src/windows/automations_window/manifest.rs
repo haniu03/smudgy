@@ -259,7 +259,7 @@ pub enum ManifestTab {
     Settings,
     /// The `permissions.smudgy` op-capability toggles.
     Capabilities,
-    /// `permissions.net` — outbound hosts.
+    /// `permissions.net` — hosts for outgoing connections and incoming listeners.
     Network,
     /// `permissions.read` + `permissions.write` — filesystem paths.
     Files,

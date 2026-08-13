@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_core"
-version = "0.5.2"
+version = "0.5.3-rc"
 edition = "2024"
 
 [dependencies]
@@ -74,6 +74,9 @@ include_dir = "0.7"
 # Write replacement files beside their destination so persisting them is an
 # atomic same-filesystem operation on Unix and Windows.
 tempfile = "3"
+# Parse browser links with WHATWG-compatible authority and host semantics. The
+# canonical host is also the unit of per-host OSC 8 trust grants.
+url = "2"
 
 # Linux credential store. The base `keyring` dep enables only `windows-native`;
 # with no Linux backend feature, keyring silently falls back to an in-memory

@@ -2897,8 +2897,6 @@ dependencies = [
 [[package]]
 name = "deno_permissions"
 version = "0.101.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e8c4f4413ae8b9e2ae87e5241f6d1db7108997792eb80d380f962b4d9000b77"
 dependencies = [
  "capacity_builder",
  "chrono",
@@ -10471,7 +10469,7 @@ dependencies = [
 
 [[package]]
 name = "smudgy_bench"
-version = "0.5.2"
+version = "0.5.3-rc"
 dependencies = [
  "aho-corasick",
  "criterion",
@@ -10492,7 +10490,7 @@ dependencies = [
 
 [[package]]
 name = "smudgy_cloud"
-version = "0.5.2"
+version = "0.5.3-rc"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -10526,7 +10524,7 @@ dependencies = [
 
 [[package]]
 name = "smudgy_core"
-version = "0.5.2"
+version = "0.5.3-rc"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -10565,6 +10563,7 @@ dependencies = [
  "thiserror 2.0.12",
  "tokio",
  "tokio-rustls",
+ "url",
  "validator",
  "vtparse",
  "winapi",
@@ -10582,7 +10581,7 @@ dependencies = [
 
 [[package]]
 name = "smudgy_inspector"
-version = "0.5.2"
+version = "0.5.3-rc"
 dependencies = [
  "anyhow",
  "http 1.3.1",
@@ -10594,10 +10593,11 @@ dependencies = [
 
 [[package]]
 name = "smudgy_map_widget"
-version = "0.5.2"
+version = "0.5.3-rc"
 dependencies = [
  "iced",
  "iced_anim",
+ "log",
  "smudgy_cloud",
  "smudgy_theme",
  "tokio",
@@ -10605,7 +10605,7 @@ dependencies = [
 
 [[package]]
 name = "smudgy_script"
-version = "0.5.2"
+version = "0.5.3-rc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10639,7 +10639,7 @@ dependencies = [
 
 [[package]]
 name = "smudgy_theme"
-version = "0.5.2"
+version = "0.5.3-rc"
 dependencies = [
  "arc-swap",
  "iced",
@@ -10647,7 +10647,7 @@ dependencies = [
 
 [[package]]
 name = "smudgy_ui"
-version = "0.5.2"
+version = "0.5.3-rc"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -10669,10 +10669,12 @@ dependencies = [
  "open",
  "regex",
  "reqwest",
+ "rustc-hash 2.1.1",
  "semver",
  "serde",
  "serde_json",
  "sha2",
+ "smallvec",
  "smudgy_cloud",
  "smudgy_core",
  "smudgy_i18n",
@@ -10680,6 +10682,7 @@ dependencies = [
  "smudgy_theme",
  "smudgy_widgets",
  "sys-locale",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "unicode-segmentation",
@@ -10691,7 +10694,7 @@ dependencies = [
 
 [[package]]
 name = "smudgy_widgets"
-version = "0.5.2"
+version = "0.5.3-rc"
 dependencies = [
  "arc-swap",
  "deno_core",
@@ -12636,8 +12639,6 @@ dependencies = [
 [[package]]
 name = "vtparse"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1726b5dabcf18909219a11c1ae3b85fff931b6e5ccf7321d998fc7665f52661b"
 dependencies = [
  "utf8parse",
 ]

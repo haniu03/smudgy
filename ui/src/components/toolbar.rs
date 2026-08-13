@@ -1,5 +1,9 @@
 use iced::alignment::Vertical;
-use iced::widget::{Row, Space, button, mouse_area, row, svg, text};
+use iced::widget::{Row, Space, button, mouse_area, svg, text};
+// The `row!` macro only builds the custom window controls, which macOS
+// (native traffic lights) never renders.
+#[cfg(not(target_os = "macos"))]
+use iced::widget::row;
 use iced::{Color, Length};
 use smudgy_theme::builtins;
 
@@ -12,6 +16,7 @@ pub enum Message {
     SettingsPressed,
     AutomationsPressed,
     MapEditorPressed,
+    LayoutsPressed,
     ToggleExpand,
     // Window controls: the toolbar doubles as the titlebar of the borderless
     // main window.
@@ -41,12 +46,24 @@ const TITLE_COLOR_HOVER: Color = Color::from_rgb8(128, 128, 128);
 /// explicit height the row would become fluid and grab half the window.
 const TOOLBAR_HEIGHT: f32 = 42.0;
 
+/// Width reserved at the toolbar's left edge for the native traffic lights.
+/// The main window keeps its macOS frame with a transparent titlebar and a
+/// full-size content view, so the buttons float above the toolbar and
+/// nothing else keeps them clear. The buttons end ~60pt from the window
+/// edge; with the row's 5px padding this puts the first control at ~71px,
+/// in line with other custom-titlebar apps.
+#[cfg(target_os = "macos")]
+const TRAFFIC_LIGHT_INSET: f32 = 62.0;
+
 fn svg_style(_: &crate::Theme, _: iced::widget::svg::Status) -> iced::widget::svg::Style {
     iced::widget::svg::Style {
         color: Some(TITLE_COLOR),
     }
 }
 
+// On macOS the window keeps its native frame, so the traffic lights replace
+// these custom controls.
+#[cfg(not(target_os = "macos"))]
 fn window_control_button(
     handle: iced::widget::svg::Handle,
     message: Message,
@@ -91,6 +108,7 @@ fn menu_button() -> Element<'static, Message> {
     .into()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn window_controls(maximized: bool) -> Element<'static, Message> {
     let maximize_icon = if maximized {
         assets::hero_icons::SQUARE_2_STACK.clone()
@@ -108,17 +126,49 @@ fn window_controls(maximized: bool) -> Element<'static, Message> {
     .into()
 }
 
+/// The space the native traffic lights occupy, as a toolbar row item. The
+/// buttons themselves hit-test above the content view, so this surface only
+/// sees clicks on the empty area around them — give those the same drag/zoom
+/// behavior as the rest of the titlebar.
+#[cfg(target_os = "macos")]
+fn traffic_light_inset() -> Element<'static, Message> {
+    mouse_area(
+        Space::new()
+            .width(TRAFFIC_LIGHT_INSET)
+            .height(Length::Fill),
+    )
+    .on_press(Message::DragWindow)
+    .on_double_click(Message::ToggleMaximizePressed)
+    .into()
+}
+
 pub fn view(
     expanded: bool,
     maximized: bool,
+    fullscreen: bool,
     session_context: &SessionContext,
 ) -> Element<'static, Message> {
+    // The maximize state only styles the custom window controls, which macOS
+    // doesn't render; the fullscreen state only drops the traffic-light
+    // inset, which exists nowhere else.
+    #[cfg(target_os = "macos")]
+    let _ = maximized;
+    #[cfg(not(target_os = "macos"))]
+    let _ = fullscreen;
     if expanded {
         // Expanded view: quiet menu-bar items
-        let mut buttons = vec![
-            menu_button(),
-            toolbar_button(crate::i18n::t!("toolbar-connect"), Message::ConnectPressed),
-        ];
+        let mut buttons = Vec::new();
+        // Native fullscreen auto-hides the traffic lights, so their reserved
+        // corner goes too.
+        #[cfg(target_os = "macos")]
+        if !fullscreen {
+            buttons.push(traffic_light_inset());
+        }
+        buttons.push(menu_button());
+        buttons.push(toolbar_button(
+            crate::i18n::t!("toolbar-connect"),
+            Message::ConnectPressed,
+        ));
 
         // Only show automations button if there's an active session
         if session_context.has_active_session {
@@ -130,6 +180,10 @@ pub fn view(
                 crate::i18n::t!("toolbar-map-editor"),
                 Message::MapEditorPressed,
             ));
+            buttons.push(toolbar_button(
+                crate::i18n::t!("toolbar-layouts"),
+                Message::LayoutsPressed,
+            ));
         }
 
         buttons.push(toolbar_button(
@@ -138,6 +192,7 @@ pub fn view(
         ));
 
         buttons.push(drag_area());
+        #[cfg(not(target_os = "macos"))]
         buttons.push(window_controls(maximized));
 
         Row::with_children(buttons)
@@ -151,23 +206,29 @@ pub fn view(
     } else {
         // Collapsed view: Hamburger + Text. This bar doubles as the window's
         // title bar, so it mirrors the OS title (incl. the dev-build marker).
-        let title = text(crate::main_window_title())
-            .size(14)
-            .color(TITLE_COLOR);
+        let title = text(crate::main_window_title()).size(14).color(TITLE_COLOR);
 
-        row![
-            menu_button(),
-            title,
-            drag_area(),
-            window_controls(maximized)
-        ]
-        .padding(5)
-        .spacing(10)
-        // The collapsed toolbar still spans the window so the drag area
-        // and window controls stay reachable
-        .width(Length::Fill)
-        .height(TOOLBAR_HEIGHT)
-        .align_y(Vertical::Center)
-        .into()
+        let mut items: Vec<Element<'static, Message>> = Vec::new();
+        // Native fullscreen auto-hides the traffic lights, so their reserved
+        // corner goes too.
+        #[cfg(target_os = "macos")]
+        if !fullscreen {
+            items.push(traffic_light_inset());
+        }
+        items.push(menu_button());
+        items.push(title.into());
+        items.push(drag_area());
+        #[cfg(not(target_os = "macos"))]
+        items.push(window_controls(maximized));
+
+        Row::with_children(items)
+            .padding(5)
+            .spacing(10)
+            // The collapsed toolbar still spans the window so the drag area
+            // and window controls stay reachable
+            .width(Length::Fill)
+            .height(TOOLBAR_HEIGHT)
+            .align_y(Vertical::Center)
+            .into()
     }
 }

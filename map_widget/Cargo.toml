@@ -1,11 +1,12 @@
 [package]
 name = "smudgy_map_widget"
-version = "0.5.2"
+version = "0.5.3-rc"
 edition = "2024"
 
 [dependencies]
 iced = { workspace = true }
 iced_anim = { workspace = true }
+log = { workspace = true }
 smudgy_cloud = { workspace = true }
 smudgy_theme = { workspace = true }
 

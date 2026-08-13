@@ -2,15 +2,23 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use iced::{
-    Length, Point, Rectangle, Size, Vector,
-    keyboard, mouse,
+    Length, Point, Rectangle, Size, Vector, keyboard, mouse,
     widget::{Canvas, canvas, container},
 };
-use smudgy_cloud::{AreaId, Mapper, RoomNumber, mapper::RoomKey};
+use smudgy_cloud::{
+    AreaId, ExitDirection, Mapper, RoomNumber,
+    mapper::{
+        RoomKey,
+        room_connection::{RoomConnection, RoomConnectionEnd},
+    },
+};
 
 use iced_anim::{Animated, spring::Motion, transition::Easing};
 
-use crate::{Update, render, viewport::Viewport};
+use crate::{
+    MapExitRef, MapViewPresentation, ResolvedPresentation, Update, presentation::DEFAULT_DOOR_COLOR,
+    render, viewport::Viewport,
+};
 use iced::event::Event as IcedEvent;
 use std::time::{Duration, Instant};
 pub type Renderer = iced::Renderer;
@@ -28,6 +36,11 @@ pub struct MapView {
     area_opacity: Animated<f32>,
     fade_phase: FadePhase,
     pending_area_change: Option<PendingAreaChange>,
+    presentation: MapViewPresentation,
+    /// The draw-ready form of `presentation` for the active area: colors
+    /// parsed, apply entries folded into lookup tables. Rebuilt whenever the
+    /// presentation or the active area changes, never per frame.
+    resolved: ResolvedPresentation,
 
     hovered_room: Option<RoomKey>,
 }
@@ -109,18 +122,47 @@ impl MapView {
             ),
             fade_phase: FadePhase::Idle,
             pending_area_change: None,
+            presentation: MapViewPresentation::default(),
+            resolved: ResolvedPresentation::default(),
         }
+    }
+
+    /// Replace the view-local appearance and per-item style associations.
+    /// Changing room spacing preserves the map's current visual center;
+    /// nothing here touches zoom or pan otherwise.
+    pub fn set_presentation(&mut self, presentation: MapViewPresentation) {
+        let presentation = presentation.normalized();
+        if self.presentation == presentation {
+            return;
+        }
+        let old_spacing = self.presentation.room_spacing;
+        let new_spacing = presentation.room_spacing;
+        if (old_spacing - new_spacing).abs() > f32::EPSILON {
+            let ratio = new_spacing / old_spacing;
+            let value = *self.translation.value() * ratio;
+            let target = *self.translation.target() * ratio;
+            self.translation.settle_at(value);
+            self.translation.set_target(target);
+            if let Some(pending) = &mut self.pending_area_change {
+                pending.translation = pending.translation * ratio;
+            }
+        }
+        self.resolved = presentation.resolve(self.active_area_id);
+        self.presentation = presentation;
     }
 
     fn rooms_at_point(&self, point: &Point, bounds: &Size) -> Box<[RoomKey]> {
         let atlas = self.mapper.get_current_atlas();
 
         let point = self.viewport().project(*point, *bounds);
+        let spacing = self.resolved.room_spacing;
+        let lookup = Point::new(point.x / spacing, point.y / spacing);
         let half_size = render::MAP_ROOM_SIZE / 2.0;
-        let min_x = point.x - half_size;
-        let min_y = point.y - half_size;
-        let max_x = point.x + half_size;
-        let max_y = point.y + half_size;
+        let lookup_half = half_size / spacing;
+        let min_x = lookup.x - lookup_half;
+        let min_y = lookup.y - lookup_half;
+        let max_x = lookup.x + lookup_half;
+        let max_y = lookup.y + lookup_half;
 
         atlas
             .get_area(&self.active_area_id)
@@ -128,10 +170,10 @@ impl MapView {
                 let mut hits: Vec<RoomKey> = Vec::new();
                 area.with_rooms_in(min_x, min_y, max_x, max_y, |room| {
                     if room.get_level() == self.level
-                        && room.get_x() - half_size < point.x
-                        && room.get_x() + half_size > point.x
-                        && room.get_y() - half_size < point.y
-                        && room.get_y() + half_size > point.y
+                        && room.get_x() * spacing - half_size < point.x
+                        && room.get_x() * spacing + half_size > point.x
+                        && room.get_y() * spacing - half_size < point.y
+                        && room.get_y() * spacing + half_size > point.y
                     {
                         hits.push(RoomKey {
                             area_id: self.active_area_id,
@@ -181,8 +223,10 @@ impl MapView {
 
                         if let Some(room) = self.mapper.get_current_atlas().get_room(&room_key) {
                             pending.player_location = Some(room_key);
-                            pending.translation =
-                                Vector::new(-room.get_x() , -room.get_y() );
+                            pending.translation = Vector::new(
+                                -room.get_x() * self.resolved.room_spacing,
+                                -room.get_y() * self.resolved.room_spacing,
+                            );
                             pending.level = room.get_level();
                         }
                     } else {
@@ -204,10 +248,13 @@ impl MapView {
 
                     if let Some(room) = self.mapper.get_current_atlas().get_room(&room_key) {
                         self.player_location = Some(room_key);
-                        let target = Vector::new(-room.get_x() , -room.get_y() );
+                        let target = Vector::new(
+                            -room.get_x() * self.resolved.room_spacing,
+                            -room.get_y() * self.resolved.room_spacing,
+                        );
                         let visible = self.is_point_visible(Point {
-                            x: room.get_x(),
-                            y: room.get_y(),
+                            x: room.get_x() * self.resolved.room_spacing,
+                            y: room.get_y() * self.resolved.room_spacing,
                         });
                         if std::env::var_os("SMUDGY_MAP_DEBUG").is_some() {
                             eprintln!(
@@ -327,6 +374,9 @@ impl MapView {
             self.level = pending.level;
             self.translation.settle_at(pending.translation);
             self.translation.set_target(pending.translation);
+            // Apply entries can be area-scoped, so the lookup tables are
+            // per-area facts and must follow the area.
+            self.resolved = self.presentation.resolve(self.active_area_id);
         }
     }
 }
@@ -353,12 +403,7 @@ impl MapView {
     /// Zoom by a wheel step (±1 ≈ one notch), anchored at the cursor when
     /// possible. Captures the event even at the zoom limits so scrolling
     /// over the map never leaks to widgets beneath it.
-    fn zoom(
-        &self,
-        step: f32,
-        cursor: mouse::Cursor,
-        bounds: Rectangle,
-    ) -> canvas::Action<Message> {
+    fn zoom(&self, step: f32, cursor: mouse::Cursor, bounds: Rectangle) -> canvas::Action<Message> {
         if step < 0.0 && self.scaling > Self::MIN_SCALING
             || step > 0.0 && self.scaling < Self::MAX_SCALING
         {
@@ -367,8 +412,7 @@ impl MapView {
             let scaling =
                 (self.scaling * (1.0 + step / 10.0)).clamp(Self::MIN_SCALING, Self::MAX_SCALING);
 
-            let translation = if let Some(cursor_to_center) =
-                cursor.position_from(bounds.center())
+            let translation = if let Some(cursor_to_center) = cursor.position_from(bounds.center())
             {
                 let factor = scaling - old_scaling;
 
@@ -484,6 +528,8 @@ impl MapView {
         self.last_viewport_size.set(Some(bounds.size()));
         let atlas = self.mapper.get_current_atlas();
         let opacity = self.area_opacity.value().clamp(0.0, 1.0);
+        let resolved = &self.resolved;
+        let spacing = resolved.room_spacing;
 
         let player_room_number = self.player_location.as_ref().and_then(|room_key| {
             (room_key.area_id == self.active_area_id).then_some(room_key.room_number)
@@ -500,10 +546,10 @@ impl MapView {
                 frame.scale(1.0_f32);
 
                 let region = self.viewport().visible_region(bounds.size());
-                let min_x = region.x - Self::SPATIAL_QUERY_PADDING;
-                let min_y = region.y - Self::SPATIAL_QUERY_PADDING;
-                let max_x = region.x + region.width + Self::SPATIAL_QUERY_PADDING;
-                let max_y = region.y + region.height + Self::SPATIAL_QUERY_PADDING;
+                let min_x = (region.x - Self::SPATIAL_QUERY_PADDING) / spacing;
+                let min_y = (region.y - Self::SPATIAL_QUERY_PADDING) / spacing;
+                let max_x = (region.x + region.width + Self::SPATIAL_QUERY_PADDING) / spacing;
+                let max_y = (region.y + region.height + Self::SPATIAL_QUERY_PADDING) / spacing;
 
                 // Ghosts of the levels above and below: just rooms and their
                 // connections (labels and shapes stay on their own level),
@@ -533,10 +579,11 @@ impl MapView {
                                 max_y,
                                 |connection| {
                                     if connection.from_level == ghost_level {
+                                        let connection = connection.with_room_spacing(spacing);
                                         render::draw_connection(
                                             frame,
                                             &atlas,
-                                            connection,
+                                            &connection,
                                             ghost_opacity,
                                             false,
                                             true,
@@ -546,7 +593,18 @@ impl MapView {
                             );
                             area.with_rooms_in(min_x, min_y, max_x, max_y, |room| {
                                 if room.get_level() == ghost_level {
-                                    render::draw_room(frame, room, ghost_opacity, false);
+                                    render::draw_room_styled(
+                                        frame,
+                                        room,
+                                        room.get_x() * spacing,
+                                        room.get_y() * spacing,
+                                        ghost_opacity,
+                                        false,
+                                        // Ghost floors take the defaultStyle
+                                        // base only; per-room apply entries
+                                        // accent the current floor.
+                                        &resolved.base_room,
+                                    );
                                 }
                             });
                         });
@@ -555,20 +613,54 @@ impl MapView {
 
                 for shape in area.get_shapes() {
                     if shape.level == self.level {
-                        render::draw_shape(frame, shape, opacity, false);
+                        let mut shape = shape.clone();
+                        shape.x *= spacing;
+                        shape.y *= spacing;
+                        render::draw_shape(frame, &shape, opacity, false);
                     }
                 }
 
                 for label in area.get_labels() {
                     if label.level == self.level {
-                        render::draw_label(frame, label, opacity, false);
+                        let mut label = label.clone();
+                        label.x *= spacing;
+                        label.y *= spacing;
+                        render::draw_label(frame, &label, opacity, false);
                     }
                 }
 
+                // Connections draw in spatial-query order; a style accent
+                // changes a connection's paint, not its z-order, so a
+                // later-drawn unaccented neighbor can still cross over an
+                // accented stroke. Accepted: rooms (and their accents) draw
+                // on top of all connections, and route accents read fine in
+                // practice; a second accent-only pass would fix full
+                // stacking if it ever matters.
                 let connections_drawn = Cell::new(0_usize);
                 area.with_room_connections_in(min_x, min_y, max_x, max_y, |connection| {
                     if connection.from_level == self.level {
-                        render::draw_connection(frame, &atlas, connection, opacity, false, false);
+                        let connection = connection.with_room_spacing(spacing);
+                        let (anchor, far) = connection_exit_keys(&connection);
+                        let paint = resolved.conn_paint(anchor, far);
+                        let door = resolved.show_doors.then(|| {
+                            let state = resolved.door_override(anchor, far);
+                            (
+                                state.closed.unwrap_or(connection.is_closed),
+                                state.locked.unwrap_or(connection.is_locked),
+                                paint.door_color.unwrap_or(DEFAULT_DOOR_COLOR),
+                            )
+                        });
+                        render::draw_connection_styled(
+                            frame,
+                            &atlas,
+                            &connection,
+                            opacity,
+                            false,
+                            false,
+                            paint.color,
+                            paint.width,
+                            door,
+                        );
                         connections_drawn.set(connections_drawn.get() + 1);
                     }
                 });
@@ -576,7 +668,16 @@ impl MapView {
                 let rooms_drawn = Cell::new(0_usize);
                 area.with_rooms_in(min_x, min_y, max_x, max_y, |room| {
                     if room.get_level() == self.level {
-                        render::draw_room(frame, room, opacity, false);
+                        let paint = resolved.room_paint(room.get_room_number());
+                        render::draw_room_styled(
+                            frame,
+                            room,
+                            room.get_x() * spacing,
+                            room.get_y() * spacing,
+                            opacity,
+                            false,
+                            &paint,
+                        );
                         rooms_drawn.set(rooms_drawn.get() + 1);
                     }
                 });
@@ -584,11 +685,12 @@ impl MapView {
                 if let Some(player_room_number) = player_room_number
                     && let Some(room) = area.get_room(&player_room_number)
                         && room.get_level() == self.level {
-                            render::draw_player_indicator(
+                            render::draw_player_indicator_styled(
                                 frame,
-                                room.get_x(),
-                                room.get_y(),
+                                room.get_x() * spacing,
+                                room.get_y() * spacing,
                                 opacity,
+                                resolved.player_color,
                             );
                         }
 
@@ -618,6 +720,95 @@ impl MapView {
 
         vec![frame.into_geometry()]
     }
+}
+
+/// The far-endpoint summary of a connection half, reduced to what exit-ref
+/// matching needs.
+#[derive(Debug, Clone, Copy)]
+enum FarEnd {
+    Normal {
+        room: RoomNumber,
+        direction: ExitDirection,
+    },
+    /// Cross-level half; `direction` is this half's rendered exit direction.
+    ToLevel {
+        room: RoomNumber,
+        direction: ExitDirection,
+    },
+    SelfLoop,
+    /// Dangling, external-area, or redacted: no second selectable endpoint,
+    /// so the in-area anchor endpoint alone selects the connection.
+    Terminal,
+}
+
+/// The exit refs under which one drawn connection half is selectable: its
+/// anchor endpoint's ref, plus (when one exists) the far endpoint's.
+fn connection_exit_keys(connection: &RoomConnection) -> (MapExitRef, Option<MapExitRef>) {
+    let far = match &connection.to {
+        RoomConnectionEnd::Normal {
+            room, direction, ..
+        } => FarEnd::Normal {
+            room: room.get_room_number(),
+            direction: *direction,
+        },
+        RoomConnectionEnd::ToLevel {
+            room, direction, ..
+        } => FarEnd::ToLevel {
+            room: room.get_room_number(),
+            direction: *direction,
+        },
+        RoomConnectionEnd::SelfLoop => FarEnd::SelfLoop,
+        RoomConnectionEnd::None
+        | RoomConnectionEnd::External { .. }
+        | RoomConnectionEnd::Unknown { .. } => FarEnd::Terminal,
+    };
+    exit_keys(
+        connection.room.get_room_number(),
+        far,
+        connection.direction_a,
+        connection.direction_b,
+    )
+}
+
+/// Pure form of [`connection_exit_keys`] over the fields it actually reads.
+fn exit_keys(
+    anchor_room: RoomNumber,
+    far: FarEnd,
+    direction_a: ExitDirection,
+    direction_b: Option<ExitDirection>,
+) -> (MapExitRef, Option<MapExitRef>) {
+    let anchor_direction = match far {
+        FarEnd::ToLevel { direction, .. } => direction,
+        _ => direction_a,
+    };
+    let anchor = MapExitRef {
+        room: anchor_room,
+        direction: anchor_direction,
+    };
+    let other = match far {
+        FarEnd::Normal { room, direction } => Some(MapExitRef { room, direction }),
+        FarEnd::ToLevel { room, .. } => {
+            // Cross-level Connections render once per endpoint level. Offer
+            // the opposite endpoint's ref too so one (room, direction) entry
+            // accents both involved Up/Down markers, regardless of which
+            // half is currently drawn.
+            let other_direction = if anchor_direction == direction_a {
+                direction_b.unwrap_or(direction_a)
+            } else {
+                direction_a
+            };
+            Some(MapExitRef {
+                room,
+                direction: other_direction,
+            })
+        }
+        FarEnd::SelfLoop => direction_b.map(|direction| MapExitRef {
+            room: anchor_room,
+            direction,
+        }),
+        FarEnd::Terminal => None,
+    };
+    (anchor, other)
 }
 
 /// A cheaply cloneable, owning handle to a [`MapView`] — the canvas program
@@ -739,6 +930,131 @@ mod tests {
         assert!(
             weak.upgrade().is_none(),
             "dropping the element must free the view"
+        );
+    }
+
+    fn exit(room: i32, direction: ExitDirection) -> MapExitRef {
+        MapExitRef {
+            room: RoomNumber(room),
+            direction,
+        }
+    }
+
+    /// One `(room, direction)` entry must select **both halves** of a
+    /// cross-level Connection: each half renders on its own level, and the
+    /// entry may name either endpoint.
+    #[test]
+    fn one_exit_ref_selects_both_halves_of_a_cross_level_connection() {
+        // Room 1 (below) connects Up to room 2 (above); the widget draws
+        // one half anchored on each room.
+        let lower_half = exit_keys(
+            RoomNumber(1),
+            FarEnd::ToLevel {
+                room: RoomNumber(2),
+                direction: ExitDirection::Up,
+            },
+            ExitDirection::Up,
+            Some(ExitDirection::Down),
+        );
+        let upper_half = exit_keys(
+            RoomNumber(2),
+            FarEnd::ToLevel {
+                room: RoomNumber(1),
+                direction: ExitDirection::Down,
+            },
+            ExitDirection::Up,
+            Some(ExitDirection::Down),
+        );
+
+        let selects = |keys: &(MapExitRef, Option<MapExitRef>), entry: MapExitRef| {
+            keys.0 == entry || keys.1 == Some(entry)
+        };
+        // An entry naming the lower endpoint reaches both halves...
+        assert!(selects(&lower_half, exit(1, ExitDirection::Up)));
+        assert!(selects(&upper_half, exit(1, ExitDirection::Up)));
+        // ...and so does one naming the upper endpoint.
+        assert!(selects(&lower_half, exit(2, ExitDirection::Down)));
+        assert!(selects(&upper_half, exit(2, ExitDirection::Down)));
+    }
+
+    /// Outbound cross-area, redacted, and dangling connections have no
+    /// second selectable endpoint: the in-area anchor endpoint alone
+    /// selects them.
+    #[test]
+    fn terminal_connections_select_via_the_anchor_endpoint_alone() {
+        let keys = exit_keys(
+            RoomNumber(5),
+            FarEnd::Terminal,
+            ExitDirection::East,
+            None,
+        );
+        assert_eq!(keys.0, exit(5, ExitDirection::East));
+        assert_eq!(keys.1, None);
+    }
+
+    /// A normal in-area connection is selectable from either endpoint's
+    /// exit ref; a self-loop from either of its two directions.
+    #[test]
+    fn normal_and_self_loop_connections_offer_both_refs() {
+        let normal = exit_keys(
+            RoomNumber(1),
+            FarEnd::Normal {
+                room: RoomNumber(2),
+                direction: ExitDirection::South,
+            },
+            ExitDirection::North,
+            Some(ExitDirection::South),
+        );
+        assert_eq!(normal.0, exit(1, ExitDirection::North));
+        assert_eq!(normal.1, Some(exit(2, ExitDirection::South)));
+
+        let self_loop = exit_keys(
+            RoomNumber(3),
+            FarEnd::SelfLoop,
+            ExitDirection::In,
+            Some(ExitDirection::Out),
+        );
+        assert_eq!(self_loop.0, exit(3, ExitDirection::In));
+        assert_eq!(self_loop.1, Some(exit(3, ExitDirection::Out)));
+    }
+
+    /// Apply/doors updates travel through `set_presentation`; they must not
+    /// disturb the user's zoom or pan (only a room-spacing change rescales
+    /// the translation, preserving the visual center).
+    #[tokio::test]
+    async fn presentation_updates_keep_zoom_and_pan() {
+        let cache_dir = std::env::temp_dir()
+            .join("smudgy-map-widget-test")
+            .join(format!("pan-{}", std::process::id()));
+        let mapper = Mapper::new(
+            Arc::new(LocalBackend::new(cache_dir.join("local"))),
+            cache_dir,
+        );
+        let mut view = MapView::new(mapper, AreaId(Uuid::nil()));
+        let _ = view.update(Message::Translated(Vector::new(-3.0, 7.5)));
+        let _ = view.update(Message::Scaled(80.0, None));
+
+        let mut presentation = MapViewPresentation::default();
+        presentation.styles.insert(
+            "route".to_string(),
+            crate::MapStyle {
+                connection_color: Some("#00ff00".to_string()),
+                ..crate::MapStyle::default()
+            },
+        );
+        presentation.apply = vec![crate::MapStyleApplication {
+            style: "route".to_string(),
+            rooms: vec![RoomNumber(1)],
+            exits: vec![exit(1, ExitDirection::North)],
+            area: None,
+        }];
+        view.set_presentation(presentation);
+
+        assert_eq!(*view.translation.value(), Vector::new(-3.0, 7.5));
+        assert_eq!(view.scaling, 80.0);
+        assert_eq!(
+            view.resolved.conns[&exit(1, ExitDirection::North)].color,
+            smudgy_cloud::parse_css_color("#00ff00")
         );
     }
 }

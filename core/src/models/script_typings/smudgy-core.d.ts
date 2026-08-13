@@ -402,6 +402,7 @@ declare module "smudgy:core" {
     readonly __smudgyProcedure?: (args: A) => R;
   }
 
+  /** A terminal procedure consumer directed at one session. */
   export interface BoundProcedureConsumer<A = unknown, R = void> {
     post(args: A): void;
     readonly __smudgyProcedure?: (args: A) => R;
@@ -758,6 +759,59 @@ declare module "smudgy:core" {
     mergeKeys(...names: string[]): void;
   };
 
+  /**
+   * Named workspace layouts for the current session's server. A layout is a
+   * saved snapshot of the windows that hold at least one of this server's
+   * panes -- their splits, tab groups, sizes, and pane positions -- stored
+   * under the server and addressed by name. Names are case-insensitive:
+   * `"Combat"` and `"combat"` are the same layout.
+   *
+   * `apply` rearranges only what already exists: live panes of this
+   * session's server move into the saved arrangement, panes the layout
+   * doesn't mention keep riding with their groups, and slots for panes or
+   * sessions that aren't open are held open for them to fill later. It
+   * never opens or closes sessions, never prompts, and never creates,
+   * closes, moves, or resizes app windows -- those are user actions,
+   * available through the Layouts toolbar menu.
+   *
+   * Layouts exist so users' saved arrangements win. `split()` sizes and
+   * placements are creation defaults, while an explicit `pane.resize()`
+   * is imperative intent that overrides the user's saved geometry -- exactly
+   * as a user divider drag would. So resizing panes at load time is an
+   * anti-pattern: it permanently defeats the sizes users saved. Use split
+   * defaults at creation and reserve `resize` for genuine runtime
+   * reactions; switch whole arrangements with `layout.apply`.
+   *
+   * Every `layout` method requires both the `panes` and
+   * `session: ["reach-others"]` capabilities: rearranging the workspace reaches
+   * every window showing this server, not just the panes this script made.
+   */
+  export const layout: {
+    /**
+     * Saves the current arrangement of this server's windows as `name`,
+     * replacing any layout the name (case-insensitively) already refers
+     * to. Only open panes are captured; a slot whose session is closed is
+     * not part of the snapshot.
+     *
+     * The snapshot is taken immediately, but the disk write is deferred
+     * and best-effort: rapid saves of the same name coalesce into one
+     * write (the latest snapshot wins), and a crash can lose a save made
+     * moments before. Cheap to call at gameplay rates.
+     */
+    save(name: string): void;
+    /**
+     * Applies the saved layout `name` to this server's live windows.
+     * Throws when no such layout exists. The apply itself is asynchronous
+     * and best-effort: a layout that no longer exists by the time it
+     * runs, or one that does not reference this server, does nothing.
+     * Safe to call at gameplay rates -- switching layouts writes nothing
+     * to disk.
+     */
+    apply(name: string): void;
+    /** The saved layout names for this server, sorted. */
+    list(): string[];
+  };
+
   // ---- Sessions -----------------------------------------------------------
 
   /** The name and subtext (caption) associated with a session. */
@@ -979,8 +1033,8 @@ declare module "smudgy:core" {
     /** Default `true`. Pass `false` for a widgets-only pane with no terminal;
      *  `echo`/`clear` throw on it. Every pane can host widgets either way. */
     terminal?: boolean;
-    /** Default `'normal'`. Also applies to an **existing** pane: `split()`
-     *  naming an existing pane (including `'main'`) with an explicit
+    /** Default `'normal'`. Also applies to an **existing** pane: either
+     *  creation call naming it (including `'main'`) with an explicit
      *  `titleBar` updates its policy. */
     titleBar?: TitleBarSpec;
     /** Start the pane hidden — the title-bar eyeball's toggle, pre-set — so
@@ -996,10 +1050,10 @@ declare module "smudgy:core" {
      *  setting. */
     fontSize?: number;
     /** Give the pane its own input line (see {@link PaneInputSpec}). Part of
-     *  what the pane is, like `terminal`: `split()` naming an existing pane
+     *  what the pane is, like `terminal`: a creation call naming an existing pane
      *  that has no input while asking for one throws (close it first). Works
      *  on either pane kind, including a same-server session reached through
-     *  `sessions`. Re-splitting with the same spec re-registers `onSubmit`,
+     *  `sessions`. Re-claiming with the same spec re-registers `onSubmit`,
      *  which is also how a handler comes back after your script reloads. */
     input?: PaneInputSpec;
   }
@@ -1014,6 +1068,22 @@ declare module "smudgy:core" {
       ? { width?: number; height?: never }
       : { height?: number; width?: never });
 
+  /** The spec for {@link Pane.addTab}. */
+  export type TabPaneSpec = PaneSpecBase & {
+    selected?: boolean;
+    width?: never;
+    height?: never;
+  };
+
+  export type TabPosition = "before" | "after" | "end";
+
+  export interface GroupWithOptions {
+    /** Default `"after"`. `"end"` appends to the reference's group. */
+    position?: TabPosition;
+    /** Default `false`. Select the moved pane after grouping it. */
+    selected?: boolean;
+  }
+
   /** The optional extent for {@link Pane.relocate}, keyed to the split axis
    *  exactly like a split's initial size. */
   export type RelocateSize<D extends SplitDirection> = D extends "left" | "right"
@@ -1021,16 +1091,17 @@ declare module "smudgy:core" {
     : { height?: number; width?: never };
 
   /**
-   * A handle to one session pane. Panes are keyed by name: `split()` with an
-   * existing name returns that pane. Most of the spec is then ignored, with
+   * A handle to one session pane. Panes are keyed by name: `split()` or
+   * `addTab()` with an existing name returns that pane. Most of the spec is
+   * then ignored, with
    * two exceptions. An explicit `titleBar` updates the pane's policy. And
    * `input` is part of what the pane is: asking for one on an existing pane
    * that has none throws (close it first), while re-splitting a pane that
    * has one re-registers its `onSubmit` (placeholder changes are ignored).
    * A pane closes when `close()` is called, when the session ends, or when no
-   * script re-claims it during a reload; any `split()` naming it during the
-   * reload keeps it, placement untouched. A later `split()` with the same
-   * name recreates the pane and re-attaches its widgets.
+   * script re-claims it during a reload; either creation call naming it during
+   * the reload keeps it, placement untouched. A later creation call with the
+   * same name recreates the pane and re-attaches its widgets.
    *
    * ```ts
    * import { session, createTrigger, line } from "smudgy:core";
@@ -1068,6 +1139,10 @@ declare module "smudgy:core" {
      *  def-state field — `titleBar`, `hidden`, `fontSize` — also updates an
      *  existing pane, `titleBar`/`fontSize` including main's). */
     split<D extends SplitDirection>(direction: D, spec: PaneSpec<D>): Pane;
+    /** Create a pane as a tab in this pane's current group (get-or-create by
+     *  name). New panes are inserted immediately after this pane and start
+     *  unselected by default. Existing panes keep their placement. */
+    addTab(spec: TabPaneSpec): Pane;
     /** Hide this pane — the title-bar eyeball, scripted. A soft display
      *  state: the pane keeps running, widgets stay mounted, and routed lines
      *  keep landing in its scrollback. Throws on main (the user's eyeball
@@ -1110,6 +1185,12 @@ declare module "smudgy:core" {
       reference?: Pane | string,
       size?: RelocateSize<D>,
     ): void;
+    /** Move or reorder this pane as a tab in `reference`'s group. Main panes
+     *  and same-server foreign-session references are allowed. */
+    groupWith(reference: Pane, options?: GroupWithOptions): void;
+    /** Select this pane's tab and make its session active without requesting
+     *  keyboard focus. Selecting a hidden pane does not reveal it. */
+    select(): void;
     /** Move this pane into a fresh window of its own — the drag tear-out,
      *  scripted. Windows stay anonymous: there is no window handle, the
      *  window closes when its last pane leaves it, and re-docking is a
@@ -1439,7 +1520,7 @@ declare module "smudgy:core" {
    * echo color when echoed, the surrounding style when spliced into a line.
    */
   export interface StyleBuilder extends StyleTag {
-    /** Both colors at once, in the same shape `highlight` takes. */
+    /** Colors and/or complete text attributes, in the same shape `highlight` takes. */
     (options: LineColorOptions): StyleBuilder;
     fg(color: Color): StyleBuilder;
     bg(color: Color): StyleBuilder;
@@ -1476,6 +1557,29 @@ declare module "smudgy:core" {
     alt: boolean;
   }
 
+  /** Hover text for a link. A function is evaluated lazily on first hover and
+   *  may return its text immediately or through a promise. Its result is cached. */
+  export type LinkTooltip = string | (() => string | PromiseLike<string>);
+
+  /** One action row in a link's right-click menu. A string sends a command;
+   *  a function receives the same modifier snapshot as a primary callback. */
+  export interface LinkMenuItem {
+    label: string;
+    action: string | ((click: LinkClick) => void);
+  }
+
+  export interface LinkOptions {
+    tooltip?: LinkTooltip;
+    /** Whether a normal left click may activate the link. Defaults to `true`.
+     *  A menu remains available from right-click when this is `false`. For a
+     *  null-action menu, `true` also lets an ordinary left click open it. */
+    enabled?: boolean;
+    /** Right-click rows. Use `"-"` for a separator. */
+    menu?: readonly (LinkMenuItem | "-")[];
+    /** Optional plain-text heading shown above the menu rows. */
+    title?: string;
+  }
+
   /**
    * Makes text clickable. Pass a command, and clicking the text sends it exactly as
    * if you typed it into the clicked window's session. Pass a function instead, and
@@ -1493,9 +1597,24 @@ declare module "smudgy:core" {
    * keeps up:
    *
    * ```ts
-   * import { line, link, style } from "smudgy:core";
+   * import { echo, line, link, send, style } from "smudgy:core";
    *
    * line.replace("north", link("north")`${style.cyan`north`}`);
+   * line.replace("foo bar", link("https://www.google.com", {
+   *   tooltip: async () => "hello",
+   * })`foo bar`);
+   * line.replace("status", link(null, { tooltip: "Nothing to do yet" })`status`);
+   * line.replace("actions", link(null, {
+   *   enabled: false,
+   *   menu: [{ label: "Look", action: "look" }],
+   * })`actions`); // right-click only
+   * echo`${link("look", {
+   *   title: "Actions",
+   *   menu: [{ label: "Look", action: "look" }, "-", {
+   *     label: "Wave",
+   *     action: () => send("wave"),
+   *   }],
+   * })`room actions`}`;
    * ```
    *
    * A command link works forever, even on old lines. A function link lives with the
@@ -1503,8 +1622,12 @@ declare module "smudgy:core" {
    * nothing, and only the most recent function links are kept, so a very old one can
    * expire early. Prefer command links for anything long-lived.
    */
-  export function link(command: string): StyleTag;
-  export function link(onClick: (click: LinkClick) => void): StyleTag;
+  export function link(command: string, options?: LinkOptions): StyleTag;
+  export function link(onClick: (click: LinkClick) => void, options?: LinkOptions): StyleTag;
+  /** Produces link-styled text with no primary action. A supplied menu opens
+   *  from either left or right click by default; pass `{ enabled: false }` to
+   *  make that menu right-click-only. */
+  export function link(action: null, options?: LinkOptions): StyleTag;
 
   /**
    * Print a line in your session's output window; nothing is sent to the MUD.
@@ -1654,12 +1777,107 @@ declare module "smudgy:core" {
     fireLimit?: number;
   };
 
+  /** A modifier accepted by {@link createHotkey}. */
+  export type HotkeyModifier = "ctrl" | "alt" | "shift" | "super";
+
+  /** A decimal digit used as a logical character key. */
+  export type HotkeyDigitKey = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9";
+
+  /** A Latin letter used as a logical character key. */
+  export type HotkeyLetterKey =
+    | "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m"
+    | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z";
+
+  /**
+   * A logical character key. Common keyboard characters can be written directly;
+   * use `Character(...)` for any other Unicode character or grapheme.
+   */
+  export type HotkeyCharacterKey =
+    | HotkeyDigitKey | HotkeyLetterKey | Uppercase<HotkeyLetterKey>
+    | " " | "!" | "\"" | "#" | "$" | "%" | "&" | "'" | "(" | ")" | "*" | "+" | "," | "-" | "." | "/"
+    | ":" | ";" | "<" | "=" | ">" | "?" | "@" | "[" | "\\" | "]" | "^" | "_" | "`" | "{" | "|" | "}" | "~"
+    | `Character(${string})`;
+
+  /** Every physical key code understood by Smudgy/iced 0.14. */
+  export type HotkeyPhysicalCode =
+    | "Backquote" | "Backslash" | "BracketLeft" | "BracketRight" | "Comma" | "Digit0" | "Digit1" | "Digit2"
+    | "Digit3" | "Digit4" | "Digit5" | "Digit6" | "Digit7" | "Digit8" | "Digit9" | "Equal"
+    | "IntlBackslash" | "IntlRo" | "IntlYen" | "KeyA" | "KeyB" | "KeyC" | "KeyD" | "KeyE"
+    | "KeyF" | "KeyG" | "KeyH" | "KeyI" | "KeyJ" | "KeyK" | "KeyL" | "KeyM"
+    | "KeyN" | "KeyO" | "KeyP" | "KeyQ" | "KeyR" | "KeyS" | "KeyT" | "KeyU"
+    | "KeyV" | "KeyW" | "KeyX" | "KeyY" | "KeyZ" | "Minus" | "Period" | "Quote"
+    | "Semicolon" | "Slash" | "AltLeft" | "AltRight" | "Backspace" | "CapsLock" | "ContextMenu" | "ControlLeft"
+    | "ControlRight" | "Enter" | "SuperLeft" | "SuperRight" | "ShiftLeft" | "ShiftRight" | "Space" | "Tab"
+    | "Convert" | "KanaMode" | "Lang1" | "Lang2" | "Lang3" | "Lang4" | "Lang5" | "NonConvert"
+    | "Delete" | "End" | "Help" | "Home" | "Insert" | "PageDown" | "PageUp" | "ArrowDown"
+    | "ArrowLeft" | "ArrowRight" | "ArrowUp" | "NumLock" | "Numpad0" | "Numpad1" | "Numpad2" | "Numpad3"
+    | "Numpad4" | "Numpad5" | "Numpad6" | "Numpad7" | "Numpad8" | "Numpad9" | "NumpadAdd" | "NumpadBackspace"
+    | "NumpadClear" | "NumpadClearEntry" | "NumpadComma" | "NumpadDecimal" | "NumpadDivide" | "NumpadEnter" | "NumpadEqual" | "NumpadHash"
+    | "NumpadMemoryAdd" | "NumpadMemoryClear" | "NumpadMemoryRecall" | "NumpadMemoryStore" | "NumpadMemorySubtract" | "NumpadMultiply" | "NumpadParenLeft" | "NumpadParenRight"
+    | "NumpadStar" | "NumpadSubtract" | "Escape" | "Fn" | "FnLock" | "PrintScreen" | "ScrollLock" | "Pause"
+    | "BrowserBack" | "BrowserFavorites" | "BrowserForward" | "BrowserHome" | "BrowserRefresh" | "BrowserSearch" | "BrowserStop" | "Eject"
+    | "LaunchApp1" | "LaunchApp2" | "LaunchMail" | "MediaPlayPause" | "MediaSelect" | "MediaStop" | "MediaTrackNext" | "MediaTrackPrevious"
+    | "Power" | "Sleep" | "AudioVolumeDown" | "AudioVolumeMute" | "AudioVolumeUp" | "WakeUp" | "Meta" | "Hyper"
+    | "Turbo" | "Abort" | "Resume" | "Suspend" | "Again" | "Copy" | "Cut" | "Find"
+    | "Open" | "Paste" | "Props" | "Select" | "Undo" | "Hiragana" | "Katakana"
+    | "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10"
+    | "F11" | "F12" | "F13" | "F14" | "F15" | "F16" | "F17" | "F18" | "F19" | "F20"
+    | "F21" | "F22" | "F23" | "F24" | "F25" | "F26" | "F27" | "F28" | "F29" | "F30"
+    | "F31" | "F32" | "F33" | "F34" | "F35";
+
+  /** A layout-independent physical key such as `Code(KeyT)`. */
+  export type HotkeyPhysicalKey = `Code(${HotkeyPhysicalCode})`;
+
+  /** Every named logical key understood by Smudgy/iced 0.14. */
+  export type HotkeyNamedKey =
+    | "Alt" | "AltGraph" | "CapsLock" | "Control" | "Fn" | "FnLock" | "NumLock" | "ScrollLock"
+    | "Shift" | "Symbol" | "SymbolLock" | "Meta" | "Hyper" | "Super" | "Enter" | "Tab"
+    | "Space" | "ArrowDown" | "ArrowLeft" | "ArrowRight" | "ArrowUp" | "End" | "Home" | "PageDown"
+    | "PageUp" | "Backspace" | "Clear" | "Copy" | "CrSel" | "Cut" | "Delete" | "EraseEof"
+    | "ExSel" | "Insert" | "Paste" | "Redo" | "Undo" | "Accept" | "Again" | "Attn"
+    | "Cancel" | "ContextMenu" | "Escape" | "Execute" | "Find" | "Help" | "Pause" | "Play"
+    | "Props" | "Select" | "ZoomIn" | "ZoomOut" | "BrightnessDown" | "BrightnessUp" | "Eject" | "LogOff"
+    | "Power" | "PowerOff" | "PrintScreen" | "Hibernate" | "Standby" | "WakeUp" | "AllCandidates" | "Alphanumeric"
+    | "CodeInput" | "Compose" | "Convert" | "FinalMode" | "GroupFirst" | "GroupLast" | "GroupNext" | "GroupPrevious"
+    | "ModeChange" | "NextCandidate" | "NonConvert" | "PreviousCandidate" | "Process" | "SingleCandidate" | "HangulMode" | "HanjaMode"
+    | "JunjaMode" | "Eisu" | "Hankaku" | "Hiragana" | "HiraganaKatakana" | "KanaMode" | "KanjiMode" | "Katakana"
+    | "Romaji" | "Zenkaku" | "ZenkakuHankaku" | "Soft1" | "Soft2" | "Soft3" | "Soft4" | "ChannelDown"
+    | "ChannelUp" | "Close" | "MailForward" | "MailReply" | "MailSend" | "MediaClose" | "MediaFastForward" | "MediaPause"
+    | "MediaPlay" | "MediaPlayPause" | "MediaRecord" | "MediaRewind" | "MediaStop" | "MediaTrackNext" | "MediaTrackPrevious" | "New"
+    | "Open" | "Print" | "Save" | "SpellCheck" | "Key11" | "Key12" | "AudioBalanceLeft" | "AudioBalanceRight"
+    | "AudioBassBoostDown" | "AudioBassBoostToggle" | "AudioBassBoostUp" | "AudioFaderFront" | "AudioFaderRear" | "AudioSurroundModeNext" | "AudioTrebleDown" | "AudioTrebleUp"
+    | "AudioVolumeDown" | "AudioVolumeUp" | "AudioVolumeMute" | "MicrophoneToggle" | "MicrophoneVolumeDown" | "MicrophoneVolumeUp" | "MicrophoneVolumeMute" | "SpeechCorrectionList"
+    | "SpeechInputToggle" | "LaunchApplication1" | "LaunchApplication2" | "LaunchCalendar" | "LaunchContacts" | "LaunchMail" | "LaunchMediaPlayer" | "LaunchMusicPlayer"
+    | "LaunchPhone" | "LaunchScreenSaver" | "LaunchSpreadsheet" | "LaunchWebBrowser" | "LaunchWebCam" | "LaunchWordProcessor" | "BrowserBack" | "BrowserFavorites"
+    | "BrowserForward" | "BrowserHome" | "BrowserRefresh" | "BrowserSearch" | "BrowserStop" | "AppSwitch" | "Call" | "Camera"
+    | "CameraFocus" | "EndCall" | "GoBack" | "GoHome" | "HeadsetHook" | "LastNumberRedial" | "Notification" | "MannerMode"
+    | "VoiceDial" | "TV" | "TV3DMode" | "TVAntennaCable" | "TVAudioDescription" | "TVAudioDescriptionMixDown" | "TVAudioDescriptionMixUp" | "TVContentsMenu"
+    | "TVDataService" | "TVInput" | "TVInputComponent1" | "TVInputComponent2" | "TVInputComposite1" | "TVInputComposite2" | "TVInputHDMI1" | "TVInputHDMI2"
+    | "TVInputHDMI3" | "TVInputHDMI4" | "TVInputVGA1" | "TVMediaContext" | "TVNetwork" | "TVNumberEntry" | "TVPower" | "TVRadioService"
+    | "TVSatellite" | "TVSatelliteBS" | "TVSatelliteCS" | "TVSatelliteToggle" | "TVTerrestrialAnalog" | "TVTerrestrialDigital" | "TVTimer" | "AVRInput"
+    | "AVRPower" | "ColorF0Red" | "ColorF1Green" | "ColorF2Yellow" | "ColorF3Blue" | "ColorF4Grey" | "ColorF5Brown" | "ClosedCaptionToggle"
+    | "Dimmer" | "DisplaySwap" | "DVR" | "Exit" | "FavoriteClear0" | "FavoriteClear1" | "FavoriteClear2" | "FavoriteClear3"
+    | "FavoriteRecall0" | "FavoriteRecall1" | "FavoriteRecall2" | "FavoriteRecall3" | "FavoriteStore0" | "FavoriteStore1" | "FavoriteStore2" | "FavoriteStore3"
+    | "Guide" | "GuideNextDay" | "GuidePreviousDay" | "Info" | "InstantReplay" | "Link" | "ListProgram" | "LiveContent"
+    | "Lock" | "MediaApps" | "MediaAudioTrack" | "MediaLast" | "MediaSkipBackward" | "MediaSkipForward" | "MediaStepBackward" | "MediaStepForward"
+    | "MediaTopMenu" | "NavigateIn" | "NavigateNext" | "NavigateOut" | "NavigatePrevious" | "NextFavoriteChannel" | "NextUserProfile" | "OnDemand"
+    | "Pairing" | "PinPDown" | "PinPMove" | "PinPToggle" | "PinPUp" | "PlaySpeedDown" | "PlaySpeedReset" | "PlaySpeedUp"
+    | "RandomToggle" | "RcLowBattery" | "RecordSpeedNext" | "RfBypass" | "ScanChannelsToggle" | "ScreenModeNext" | "Settings" | "SplitScreenToggle"
+    | "STBInput" | "STBPower" | "Subtitle" | "Teletext" | "VideoModeNext" | "Wink" | "ZoomToggle"
+    | "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10"
+    | "F11" | "F12" | "F13" | "F14" | "F15" | "F16" | "F17" | "F18" | "F19" | "F20"
+    | "F21" | "F22" | "F23" | "F24" | "F25" | "F26" | "F27" | "F28" | "F29" | "F30"
+    | "F31" | "F32" | "F33" | "F34" | "F35";
+
+  /** A logical character, named logical key, or layout-independent physical key. */
+  export type HotkeyKey = HotkeyCharacterKey | HotkeyNamedKey | HotkeyPhysicalKey;
+
   /** The key combination for {@link createHotkey}. */
   export type KeySpec = {
-    /** The main key (e.g. `"F1"`, `"a"`). */
-    key: string;
-    /** Modifier keys that must be held with it (e.g. `["ctrl", "shift"]`). */
-    modifiers?: string[];
+    /** The main key (e.g. `"F1"`, `"a"`, or `"Code(KeyA)"`). */
+    key: HotkeyKey;
+    /** Modifier keys that must be held with it. */
+    modifiers?: HotkeyModifier[];
   };
 
   /** Options for {@link createHotkey}. */
@@ -1863,13 +2081,37 @@ declare module "smudgy:core" {
    *   `"magenta"`, `"cyan"`, `"white"`, meaning the bright variant), or a
    *   theme role: `"default"`, `"echo"`, `"output"`, `"warn"`
    * - `{ r, g, b }` with each component 0-255, for an exact color
-   * - `{ color, bold }`: an ANSI color name plus an explicit bright/bold flag
-   *   (`bold: false` selects the normal, dimmer variant)
+   * - `{ color, bold, paletteBright? }`: an ANSI color name or `"default"`
+   *   plus its palette slot (`bold: false` selects the normal, dimmer variant).
+   *   `paletteBright` is normally only needed when re-emitting style readback.
    */
   export type Color =
     | string
     | { r: number; g: number; b: number }
-    | { color: string; bold: boolean };
+    | {
+        color: string;
+        /** On input, selects the palette's bright slot unless `paletteBright`
+         *  is supplied. On ANSI style readback this is the deprecated legacy
+         *  palette-bright-or-font-bold value; use `attributes.bold` for weight. */
+        bold: boolean;
+        /** An explicit palette-slot override. Style readback supplies this for
+         *  ANSI colors so a span round-trips even when legacy `bold` is conflated.
+         *  Default foreground readback remains the string `"default"` for
+         *  compatibility and carries its raw slot in
+         *  `StyleSpan.foregroundPaletteBright`. */
+        paletteBright?: boolean;
+      };
+
+  /** The lossless non-color attributes carried by a terminal text run. */
+  export interface TextAttributes {
+    bold: boolean;
+    faint: boolean;
+    italic: boolean;
+    underline: "none" | "single" | "double";
+    blink: "none" | "slow" | "fast";
+    crossedOut: boolean;
+    reverse: boolean;
+  }
 
   /** One styled run read back from a line. `begin`/`end` are byte offsets into
    *  the line's text (not character counts; multi-byte characters span
@@ -1879,12 +2121,21 @@ declare module "smudgy:core" {
     end: number;
     fg: Color;
     bg: Color;
+    attributes: TextAttributes;
+    /** Present when `fg` is the compatibility string `"default"` but its
+     * terminal palette slot is the bright default. Passing this span back to a
+     * line styling method preserves that raw palette bit. */
+    foregroundPaletteBright?: boolean;
   }
 
-  /** Foreground and/or background color for a line write. */
+  /** Foreground, background, and/or complete text attributes for a line write.
+   *  A {@link StyleSpan} is accepted directly, making readback lossless. */
   export interface LineColorOptions {
     fg?: Color;
     bg?: Color;
+    attributes?: TextAttributes;
+    /** Lossless raw palette bit for a read-back `fg: "default"` span. */
+    foregroundPaletteBright?: boolean;
   }
 
   /**
@@ -2051,6 +2302,7 @@ declare module "smudgy:core" {
     createDerived: typeof createDerived;
     readonly events: typeof events;
     readonly gmcp: typeof gmcp;
+    readonly layout: typeof layout;
     createAlias: typeof createAlias;
     createTrigger: typeof createTrigger;
     createTriggers: typeof createTriggers;

@@ -1,0 +1,6 @@
+{
+  "version": "0.1.2",
+  "description": "Reusable integral-grid map layout, reflow, and Smudgy area snapshot planning.",
+  "entry": "index.ts",
+  "min_smudgy_version": "0.5.1"
+}

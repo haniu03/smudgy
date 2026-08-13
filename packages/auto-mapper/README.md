@@ -8,8 +8,11 @@ Maps as you explore, from the room data your game already sends. Works with GMCP
   work over everything you've explored.
 - **Rooms you haven't are drawn for you**, in *session maps*: one per game zone, kept only
   for this session, never written into your saved maps.
-- **`savemap`** keeps what you've mapped (or `savemap <zone>` for one zone): the session
-  map becomes a normal local map and mapping continues into it.
+- **`savemap`** keeps what you've mapped on this device. Use `savemap cloud` to sync it,
+  and append a zone name to keep only one zone (`savemap cloud Midgaard`). Mapping continues
+  into the acknowledged durable copies. The word right after `savemap` is read as a tier
+  first, so a zone actually named "cloud" or "local" needs the two-word form
+  (`savemap local cloud` keeps the zone named cloud on this device).
 - **Saved zones stay saved.** On later sessions, a zone whose map you kept is picked up
   by name and mapping continues into it — no duplicate session copy. Rename a map if you
   want the auto-mapper to leave it alone.

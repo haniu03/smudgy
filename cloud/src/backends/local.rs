@@ -57,7 +57,7 @@ use uuid::Uuid;
 use super::{MapperBackend, area_edits, local_migration};
 use crate::{
     Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CloudError, CloudResult, CreateAreaRequest,
+    CloudError, CloudResult, CreateAreaRequest, MapStorage,
     mutation::{MutationEnvelope, MutationResult},
 };
 
@@ -623,6 +623,19 @@ impl MapperBackend for LocalBackend {
         Ok(area)
     }
 
+    async fn create_area_at(
+        &self,
+        request: CreateAreaRequest,
+        storage: MapStorage,
+    ) -> CloudResult<Area> {
+        if storage != MapStorage::Local {
+            return Err(CloudError::InvalidInput(format!(
+                "the local backend cannot create a {storage} map"
+            )));
+        }
+        self.create_area(request).await
+    }
+
     async fn import_local_area(&self, details: AreaWithDetails) -> CloudResult<()> {
         self.ensure_loaded().await;
         self.store_area(details).await
@@ -753,6 +766,15 @@ impl MapperBackend for LocalBackend {
         Ok(atlas)
     }
 
+    async fn create_atlas_at(&self, name: &str, storage: MapStorage) -> CloudResult<Atlas> {
+        if storage != MapStorage::Local {
+            return Err(CloudError::InvalidInput(format!(
+                "the local backend cannot create a {storage} atlas"
+            )));
+        }
+        self.create_atlas(name).await
+    }
+
     async fn rename_atlas(&self, atlas_id: &AtlasId, name: &str) -> CloudResult<Atlas> {
         self.reload().await;
         let mut atlas = self
@@ -799,6 +821,14 @@ impl MapperBackend for LocalBackend {
         self.atlases.write().remove(atlas_id);
         Ok(())
     }
+
+    fn local_atlas_ids(&self) -> HashSet<AtlasId> {
+        self.atlases.read().keys().copied().collect()
+    }
+
+    fn local_area_ids(&self) -> HashSet<AreaId> {
+        self.areas.read().keys().copied().collect()
+    }
 }
 
 #[cfg(test)]
@@ -838,6 +868,20 @@ mod tests {
             }],
             payload,
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_creation_rejects_a_foreign_tier() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        assert!(matches!(
+            backend
+                .create_area_at(new_area_request("Wrong tier", None), MapStorage::Cloud)
+                .await,
+            Err(CloudError::InvalidInput(_))
+        ));
+        assert!(backend.list_areas().await.expect("list").is_empty());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

@@ -1,7 +1,14 @@
 import { createAlias, createHotkey, createTrigger, Matches, echo, send, sendRaw, capture, line, mapper} from "smudgy:core";
 import { extractMarkdownLinks } from "smudgy:widgets";
-import { debugLog, distanceBetweenRooms, findRoomsAt, idsMatch, linkRooms, options, parseRoomExits, parseRoomExitsDetailed, RoomFlags, roomsImpactedByPush, speedwalk, State, state } from "./mapper.ts";
+import {
+    planAreaChange,
+    type AreaChangePlan,
+    type ElevationPreference,
+    type LayoutDirection,
+} from "smudgy://kapusniak/map-layout";
+import { debugLog, distanceBetweenRooms, findRoomsAt, idsMatch, linkRooms, options, parseRoomExits, parseRoomExitsDetailed, RoomFlags, roomsImpactedByPush, speedwalk, State, state, ZMode } from "./mapper.ts";
 import { mapEvent, RoomEvent } from "./events.ts";
+import { requestExistingRoomConnection } from "./widget.tsx";
 
 import promptEvent from 'smudgy:events/kapusniak/arctic-prompt/prompt';
 
@@ -311,8 +318,10 @@ async function areaCommand([subcommand, ...args]: string[]) {
                 echo("Usage: area create <name>");
                 return;
             }
-            await mapper.createArea(name);
-            echo(`Created area ${name}`);
+            // The default durable destination is cloud when signed in and local
+            // otherwise. An explicit `storage: "cloud"` would not fall back.
+            const area = await mapper.createArea(name);
+            echo(`Created ${area.storage} area ${name}`);
             break;
         }
         default:
@@ -402,15 +411,15 @@ async function roomCommand([subcommand, ...args]: string[]) {
                 return;
             }
             const offset = options.moveCoordinates[intent];
-            if (offset[0] !== 0) {
-                await mapper.setRoomX(state.area.id, state.room.room_number, state.room.x + offset[0]);
-            }
-            if (offset[1] !== 0) {
-                await mapper.setRoomY(state.area.id, state.room.room_number, state.room.y + offset[1]);
-            }
-            if (offset[2] !== 0) {
-                await mapper.setRoomLevel(state.area.id, state.room.room_number, state.room.level + offset[2]);
-            }
+            const selectedRoom = state.room;
+            await mapper.mutateArea(state.area.id, (mutation) => mutation.updateRoom(
+                selectedRoom,
+                {
+                    ...(offset[0] !== 0 ? { x: selectedRoom.x + offset[0] } : {}),
+                    ...(offset[1] !== 0 ? { y: selectedRoom.y + offset[1] } : {}),
+                    ...(offset[2] !== 0 ? { level: selectedRoom.level + offset[2] } : {}),
+                },
+            ), { description: "Shift Arctic room" });
             state.refreshRoomAndArea();
             break;
         }
@@ -662,6 +671,8 @@ const commands = {
         echo("  move <direction> - Move the selection along an existing exit");
         echo("  path <from> <to> - Show the path between two rooms (tags: <number> or <area>#<number>)");
         echo("  push <direction> - Shift the selected room and connected rooms in a direction");
+        echo("  reflow - Recompute the complete current-area layout");
+        echo("  z [auto|levels|projected] - Show or set new U/D room placement style");
         echo("  refresh - Refresh the current room (will send a `look` command)");
         echo("  send_link [n] - Run the nth link in the current room's notes (default 1; same as CTRL+ENTER)");
         echo("  room move|color|link|shift|unlink|delete|show|flag|automerge - Edit the selected room");
@@ -717,20 +728,61 @@ const commands = {
 
         const offset = options.moveCoordinates[intent as Direction];
 
+        const updates: [RoomNumber, UpdateRoomParams][] = [];
         for (const roomNumber of rooms) {
             const room = state.area.room(roomNumber);
             echo(`Pushing room ${room.title} to ${intent}`);
 
-            if (offset[0] !== 0) {
-                await mapper.setRoomX(state.area.id, roomNumber, room.x + offset[0]);
-            }
-
-            if (offset[1] !== 0) {
-                await mapper.setRoomY(state.area.id, roomNumber, room.y + offset[1]);
-            }
+            const fields: UpdateRoomParams = {
+                ...(offset[0] !== 0 ? { x: room.x + offset[0] } : {}),
+                ...(offset[1] !== 0 ? { y: room.y + offset[1] } : {}),
+            };
+            if (Object.keys(fields).length > 0) updates.push([roomNumber, fields]);
+        }
+        if (updates.length > 0) {
+            await mapper.mutateArea(state.area.id, (mutation) => mutation.updateRooms(updates), {
+                description: "Push Arctic rooms",
+            });
         }
 
         state.refreshRoomAndArea();
+    },
+    reflow: async () => {
+        if (!state.area) {
+            echo("No area selected");
+            return;
+        }
+        const result = await planAreaChange(state.area.id, {
+            type: "reflow",
+            anchor: state.room?.room_number,
+        });
+        await applyLayoutMoves(state.area.id, result);
+        state.refreshRoomAndArea();
+        echo(`Reflowed ${result.patch.moves.length} room${result.patch.moves.length === 1 ? "" : "s"}; ` +
+            `${result.quality.cardinalRayViolations} directional violation${result.quality.cardinalRayViolations === 1 ? "" : "s"} remain.`);
+    },
+    z: (mode?: string) => {
+        const normalized = mode?.toLowerCase();
+        if (!normalized) {
+            const current = options.zMode === ZMode.Auto
+                ? "auto"
+                : options.zMode === ZMode.Normal ? "levels" : "projected";
+            echo(`New U/D room placement: ${current}`);
+            return;
+        }
+        const selected = normalized === "auto"
+            ? ZMode.Auto
+            : normalized === "levels" || normalized === "normal"
+                ? ZMode.Normal
+                : normalized === "projected" || normalized === "isometric"
+                    ? ZMode.Isometric
+                    : undefined;
+        if (selected === undefined) {
+            echo("Usage: map z [auto|levels|projected]");
+            return;
+        }
+        options.zMode = selected;
+        echo(`New U/D room placement: ${normalized}`);
     },
     select: (area: string, room?: string) => {
         if (!area) {
@@ -839,46 +891,45 @@ const commands = {
         send("look");
         mapEvent.once("room", (room: RoomEvent) => {
             void (async () => {
-            echo(`Room: ${room.title}`);
-            echo(`Description: ${room.description}`);
-            echo(`Exits: ${room.exits}`);
+                echo(`Room: ${room.title}`);
+                echo(`Description: ${room.description}`);
+                echo(`Exits: ${room.exits}`);
 
-            if (!state.room) {
+                const currentExits = new Set([
+                    ...(state.room?.exits ?? []).map((e) => e.from_direction),
+                ]);
+                const createdExits: [Direction, ExitId][] = [];
+                await mapper.mutateArea(areaId, async (mutation) => {
+                    if (!state.room) {
+                        roomNumber = await mutation.createRoom({
+                            title: room.title,
+                            description: room.description.join("\n"),
+                        });
+                    } else if (roomNumber !== undefined) {
+                        await mutation.updateRoom(roomNumber, {
+                            title: room.title,
+                            description: room.description.join("\n"),
+                        });
+                    }
 
-                roomNumber = await mapper.createRoom(areaId, {
-                    title: room.title,
-                    description: room.description.join("\n"),
-                });
-
+                    for (const exit of parseRoomExitsDetailed(room.exits)) {
+                        if (!currentExits.has(exit.direction) && roomNumber !== undefined) {
+                            const id = await mutation.createRoomExit(roomNumber, {
+                                from_direction: exit.direction,
+                                is_closed: exit.closed,
+                            });
+                            createdExits.push([exit.direction, id]);
+                        }
+                    }
+                }, { description: "Refresh Arctic room" });
+                if (roomNumber === undefined) {
+                    throw new Error("map refresh did not resolve a room number");
+                }
                 state.area = mapper.getAreaById(areaId);
                 state.room = state.area.room(roomNumber);
-            } else {
-                await mapper.setRoomTitle(areaId, roomNumber, room.title);
-                await mapper.setRoomDescription(
-                    areaId,
-                    roomNumber,
-                    room.description.join("\n"),
-                );
-            }
-
-            const currentExits = new Set([
-                ...state.room.exits.map((e) => e.from_direction),
-            ]);
-
-            for (
-                const exit of parseRoomExitsDetailed(room.exits)
-            ) {
-                if (!currentExits.has(exit.direction)) {
-                    const id = await mapper.createRoomExit(areaId, roomNumber, {
-                        from_direction: exit.direction,
-                        is_closed: exit.closed,
-                    });
-                    echo(
-                        `Created exit ${exit.direction} (${id.map((c) => c.toString(16)).join("")
-                        })`,
-                    );
+                for (const [direction, id] of createdExits) {
+                    echo(`Created exit ${direction} (${id.map((c) => c.toString(16)).join("")})`);
                 }
-            }
             })().catch((error) => {
                 echo(`Map refresh failed: ${error instanceof Error ? error.message : String(error)}`);
             });
@@ -1052,6 +1103,78 @@ function offsetDirection(room: Room, direction: Direction) {
     };
 }
 
+const PROPOSED_ROOM_ID = "$arctic:new-room";
+
+function elevationPreference(): ElevationPreference {
+    return options.zMode === ZMode.Auto
+        ? "auto"
+        : options.zMode === ZMode.Normal ? "levels" : "projected";
+}
+
+async function applyLayoutMoves(
+    areaId: AreaId,
+    result: AreaChangePlan,
+    mutation?: AreaMutator,
+): Promise<void> {
+    const updates: [RoomNumber, UpdateRoomParams][] = result.patch.moves.map((move) => {
+        if (move.roomNumber === undefined) {
+            throw new Error(`layout move ${move.id} has no Smudgy room number`);
+        }
+        return [move.roomNumber, {
+            x: move.to.x,
+            y: move.to.y,
+            level: move.to.level,
+        }];
+    });
+    if (updates.length > 0) {
+        if (mutation) await mutation.updateRooms(updates);
+        else await mapper.updateRooms(areaId, updates);
+    }
+}
+
+function matchingRoomsWithReciprocalStub(
+    source: Room,
+    title: string,
+    description: string,
+    direction: Direction,
+): Room[] {
+    const reciprocalDirection = OppositeDirection[direction];
+    return mapper.listRoomsByTitleAndDescription(title, description)
+        .filter((room): room is Room => !!room)
+        .filter((room) => room.area_id[0] === source.area_id[0] && room.area_id[1] === source.area_id[1] &&
+            room.room_number !== source.room_number)
+        .filter((room) => room.exits.some((exit) =>
+            exit.from_direction === reciprocalDirection && exit.to_room_number === null
+        ))
+        .sort((a, b) => a.room_number - b.room_number);
+}
+
+async function reflowAndConnectExistingRoom(
+    source: Room,
+    destinationRoomNumber: RoomNumber,
+    direction: Direction,
+): Promise<void> {
+    const result = await planAreaChange(source.area_id, {
+        type: "connect-rooms",
+        from: source.room_number,
+        to: destinationRoomNumber,
+        direction: direction as LayoutDirection,
+        elevation: elevationPreference(),
+    });
+    await applyLayoutMoves(source.area_id, result);
+
+    const reflowedArea = mapper.getAreaById(source.area_id);
+    const reflowedSource = reflowedArea.room(source.room_number);
+    const reflowedDestination = reflowedArea.room(destinationRoomNumber);
+    if (!reflowedSource || !reflowedDestination) {
+        throw new Error("a room disappeared while reflowing an existing connection");
+    }
+
+    await linkRooms(reflowedSource, reflowedDestination, direction);
+    state.setCurrentRoom(reflowedDestination);
+    echo(`Reflowed and connected ${direction} to ${reflowedDestination.title} (#${reflowedDestination.room_number}).`);
+}
+
 async function createNewRoomInDirection(roomEvent: RoomEvent, direction: Direction): Promise<ExitId[]> {
     const prevRoom = state.room;
     let areaId = prevRoom?.area_id;
@@ -1061,28 +1184,57 @@ async function createNewRoomInDirection(roomEvent: RoomEvent, direction: Directi
         return [];
     }
 
-    let newRoomNumber = await mapper.createRoom(areaId, {
-        ...offsetDirection(prevRoom, direction),
-        title: roomEvent.title,
-        description: roomEvent.description.join("\n"),
+    const layout = await planAreaChange(areaId, {
+        type: "add-room",
+        from: prevRoom.room_number,
+        direction: direction as LayoutDirection,
+        temporaryId: PROPOSED_ROOM_ID,
+        elevation: elevationPreference(),
     });
+    const placement = layout.patch.placements.find((value) => value.id === PROPOSED_ROOM_ID);
+    if (!placement) throw new Error("layout did not place the new Arctic room");
+    // Definitely assigned inside the mutateArea callback before any later use.
+    let newRoomNumber!: RoomNumber;
+    const exitIds: ExitId[] = [];
+    await mapper.mutateArea(areaId, async (mutation) => {
+        await applyLayoutMoves(areaId, layout, mutation);
+        newRoomNumber = await mutation.createRoom({
+            ...placement.position,
+            title: roomEvent.title,
+            description: roomEvent.description.join("\n"),
+        });
+
+        for (const exit of prevRoom.exits.filter((candidate) =>
+            candidate.from_direction === direction && candidate.to_room_number !== newRoomNumber
+        )) {
+            await mutation.deleteRoomExit(prevRoom.room_number, exit.id);
+        }
+        exitIds.push(await mutation.createRoomExit(prevRoom.room_number, {
+            from_direction: direction,
+            to_direction: OppositeDirection[direction],
+            to_area_id: areaId,
+            to_room_number: newRoomNumber,
+        }));
+        exitIds.push(await mutation.createRoomExit(newRoomNumber, {
+            from_direction: OppositeDirection[direction],
+            to_direction: direction,
+            to_area_id: areaId,
+            to_room_number: prevRoom.room_number,
+        }));
+        for (const exit of parseRoomExitsDetailed(roomEvent.exits)) {
+            if (exit.direction !== OppositeDirection[direction]) {
+                exitIds.push(await mutation.createRoomExit(newRoomNumber, {
+                    from_direction: exit.direction,
+                    is_closed: exit.closed,
+                }));
+            }
+        }
+    }, { description: "Map Arctic room and exits" });
 
 
     state.area = mapper.getAreaById(areaId);
     state.room = state.area.room(newRoomNumber)!;
-
-    // Link the previous room with the newly-created one, and create stub exits for all other exits in the new room
-    const newLinkExits = linkRooms(prevRoom, state.room, direction);
-    const stubExitDirections = parseRoomExitsDetailed(roomEvent.exits)
-        .filter((exit) => exit.direction !== OppositeDirection[direction])
-        .map((exit) =>
-            mapper.createRoomExit(areaId, newRoomNumber, {
-                from_direction: exit.direction,
-                is_closed: exit.closed,
-            })
-        );
-
-    return [...await newLinkExits, ...await Promise.all(stubExitDirections)];
+    return exitIds;
 }
 
 async function handleRoomEvent(roomEvent: RoomEvent) {
@@ -1129,19 +1281,47 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
 
         const roomsAtTarget = findRoomsAt(movedToCoordinates.x, movedToCoordinates.y, movedToCoordinates.level);
 
-        for (const room of roomsAtTarget) {
-            if (room.title === roomEvent.title && room.description === eventRoomDescription) {
-                echo(`Found not-yet-linked room ${room.title} at ${movedToCoordinates.x}, ${movedToCoordinates.y}, ${movedToCoordinates.level}, linking...`);
-                await linkRooms(state.room, room, direction);
-                state.room = room;
-                state.refreshRoomAndArea();
-                mapper.setCurrentLocation(room.area_id, room.room_number);
-                return;
-            } else {
-                echo(`Found room ${room.title} at ${movedToCoordinates.x}, ${movedToCoordinates.y}, ${movedToCoordinates.level}, but it's not a match, doing nothing.`);
+        const matchingRoom = roomsAtTarget.find((room) =>
+            room.title === roomEvent.title && room.description === eventRoomDescription
+        );
+
+        if (matchingRoom) {
+            echo(`Found not-yet-linked room ${matchingRoom.title} at ${movedToCoordinates.x}, ${movedToCoordinates.y}, ${movedToCoordinates.level}, linking...`);
+            await linkRooms(state.room, matchingRoom, direction);
+            state.room = matchingRoom;
+            state.refreshRoomAndArea();
+            mapper.setCurrentLocation(matchingRoom.area_id, matchingRoom.room_number);
+            return;
+        }
+
+        if (roomsAtTarget.length > 0) {
+            const occupants = roomsAtTarget.map((room) => room.title).join(", ");
+            echo(`Target cell ${movedToCoordinates.x}, ${movedToCoordinates.y}, ${movedToCoordinates.level} is occupied by ${occupants}; layout reflow will be required.`);
+        }
+
+        const sourceRoom = state.room;
+        const existingCandidates = matchingRoomsWithReciprocalStub(
+            sourceRoom,
+            roomEvent.title,
+            eventRoomDescription,
+            direction,
+        );
+        if (existingCandidates.length > 0) {
+            const decision = await requestExistingRoomConnection(
+                roomEvent.title,
+                existingCandidates.map((room) => ({
+                    roomNumber: room.room_number,
+                    x: room.x,
+                    y: room.y,
+                    level: room.level,
+                })),
+            );
+            if (decision.type === "connect") {
+                await reflowAndConnectExistingRoom(sourceRoom, decision.roomNumber, direction);
                 return;
             }
         }
+
         echo(`Creating new room in direction ${direction}`);
 
         await createNewRoomInDirection(roomEvent, direction);
@@ -1243,8 +1423,9 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
     }
 }
 
+let mapUpdateQueue = Promise.resolve();
 mapEvent.on("room", (roomEvent: RoomEvent) => {
-    void handleRoomEvent(roomEvent).catch((error) => {
+    mapUpdateQueue = mapUpdateQueue.then(() => handleRoomEvent(roomEvent)).catch((error) => {
         echo(`Automatic map update failed: ${error instanceof Error ? error.message : String(error)}`);
     });
 });

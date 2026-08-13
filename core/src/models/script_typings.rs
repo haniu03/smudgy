@@ -55,12 +55,14 @@ const SMUDGY_WIDGETS_DTS: &str = include_str!("script_typings/smudgy-widgets.d.t
 /// with the `/// <reference>` directives stripped so they're plain ambient declarations.
 /// Materialized to `<server>/.smudgy/types/deno/` (covered by the user tsconfig's
 /// `.smudgy/types/**` include).
-static DENO_LIB: Dir = include_dir!("$CARGO_MANIFEST_DIR/src/models/script_typings/vendor/deno-lib");
+static DENO_LIB: Dir =
+    include_dir!("$CARGO_MANIFEST_DIR/src/models/script_typings/vendor/deno-lib");
 
 /// The vendored `@types/node` tree (types `node:events`, `node:path`, … + Node globals),
 /// resolved by the base tsconfig's `types`/`typeRoots`. Materialized to
 /// `<server>/.smudgy/node-types/@types/node/`.
-static NODE_TYPES: Dir = include_dir!("$CARGO_MANIFEST_DIR/src/models/script_typings/vendor/node-types");
+static NODE_TYPES: Dir =
+    include_dir!("$CARGO_MANIFEST_DIR/src/models/script_typings/vendor/node-types");
 
 /// Bumped whenever the vendored Deno lib / `@types/node` change, so the runtime typings are
 /// (re)written only on first run or after a re-vendor — not on every session start.
@@ -339,7 +341,11 @@ fn interop_handles_dts(packages: &[InstalledPackageTypes]) -> String {
                     quote_ts(&module),
                     quote_ts(&handle.name)
                 );
-                let _ = writeln!(out, "  export {{ __handle as {} }};", export_name(&handle.name));
+                let _ = writeln!(
+                    out,
+                    "  export {{ __handle as {} }};",
+                    export_name(&handle.name)
+                );
                 let _ = writeln!(out, "  export default __handle;");
                 let _ = writeln!(
                     out,
@@ -374,7 +380,9 @@ fn consumer_type_for(
         None => match handle.kind {
             InteropKind::State => "import(\"smudgy:core\").StateConsumer<unknown>".to_string(),
             InteropKind::Event => "import(\"smudgy:core\").EventConsumer<unknown>".to_string(),
-            InteropKind::Procedure => "import(\"smudgy:core\").ProcedureConsumer<unknown>".to_string(),
+            InteropKind::Procedure => {
+                "import(\"smudgy:core\").ProcedureConsumer<unknown>".to_string()
+            }
         },
     }
 }
@@ -393,15 +401,64 @@ fn is_ts_ident(name: &str) -> bool {
 fn is_type_alias_name(name: &str) -> bool {
     const UNSPELLABLE: &[&str] = &[
         // Reserved words (parse errors as type-alias names).
-        "break", "case", "catch", "class", "const", "continue", "debugger", "default",
-        "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for",
-        "function", "if", "import", "in", "instanceof", "new", "null", "return", "super",
-        "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with",
-        "implements", "interface", "let", "package", "private", "protected", "public",
-        "static", "yield", "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "new",
+        "null",
+        "return",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "implements",
+        "interface",
+        "let",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "static",
+        "yield",
+        "await",
         // Built-in type names tsc refuses as alias names.
-        "any", "unknown", "never", "object", "string", "number", "boolean", "symbol",
-        "bigint", "undefined", "intrinsic",
+        "any",
+        "unknown",
+        "never",
+        "object",
+        "string",
+        "number",
+        "boolean",
+        "symbol",
+        "bigint",
+        "undefined",
+        "intrinsic",
     ];
     is_ts_ident(name) && !UNSPELLABLE.contains(&name)
 }
@@ -498,7 +555,10 @@ fn ensure_script_tsconfig_in(server_dir: &Path, packages: &[InstalledPackageType
     fs::create_dir_all(&types_dir).with_context(|| format!("create {}", types_dir.display()))?;
 
     write_if_changed(&managed_dir.join("README.md"), MANAGED_README)?;
-    write_if_changed(&managed_dir.join("tsconfig.base.json"), &tsconfig_base(packages)?)?;
+    write_if_changed(
+        &managed_dir.join("tsconfig.base.json"),
+        &tsconfig_base(packages)?,
+    )?;
     write_if_changed(&types_dir.join("smudgy-core.d.ts"), SMUDGY_CORE_DTS)?;
     write_if_changed(&types_dir.join("smudgy-params.d.ts"), SMUDGY_PARAMS_DTS)?;
     write_if_changed(&types_dir.join("smudgy-mapper.d.ts"), SMUDGY_MAPPER_DTS)?;
@@ -545,7 +605,8 @@ fn ensure_script_tsconfig_in(server_dir: &Path, packages: &[InstalledPackageType
 /// stub is replaced by this pointer rather than the pointer being mistaken for the stale stub.
 fn ensure_modules_tsconfig(server_dir: &Path) -> Result<()> {
     let modules_dir = server_dir.join("modules");
-    fs::create_dir_all(&modules_dir).with_context(|| format!("create {}", modules_dir.display()))?;
+    fs::create_dir_all(&modules_dir)
+        .with_context(|| format!("create {}", modules_dir.display()))?;
     let tsconfig = modules_dir.join("tsconfig.json");
     if !tsconfig.exists() {
         fs::write(&tsconfig, TSCONFIG_MODULES)
@@ -670,7 +731,10 @@ mod tests {
         // The base tsconfig wires the automatic JSX runtime for `.tsx` widget authoring.
         let base = fs::read_to_string(dir.join(".smudgy/tsconfig.base.json")).unwrap();
         assert!(base.contains("react-jsx"), "jsx setting missing:\n{base}");
-        assert!(base.contains("smudgy:widgets"), "jsxImportSource missing:\n{base}");
+        assert!(
+            base.contains("smudgy:widgets"),
+            "jsxImportSource missing:\n{base}"
+        );
 
         // The installed-events barrel is always written (header-only when no packages).
         assert!(dir.join(".smudgy/types/installed-events.d.ts").is_file());
@@ -683,7 +747,10 @@ mod tests {
 
         // The `modules/` subtree is seeded as its own thin project pointing one level up.
         let modules_ts = fs::read_to_string(dir.join("modules/tsconfig.json")).unwrap();
-        assert!(modules_ts.contains("../tsconfig.json"), "modules tsconfig extends the server project:\n{modules_ts}");
+        assert!(
+            modules_ts.contains("../tsconfig.json"),
+            "modules tsconfig extends the server project:\n{modules_ts}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -734,7 +801,10 @@ mod tests {
         // With no packages, the base carries no `paths`.
         ensure_script_tsconfig_in(&dir, &[]).expect("ensure empty");
         let bare = fs::read_to_string(dir.join(".smudgy/tsconfig.base.json")).unwrap();
-        assert!(!bare.contains("\"paths\""), "unexpected paths block:\n{bare}");
+        assert!(
+            !bare.contains("\"paths\""),
+            "unexpected paths block:\n{bare}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -792,8 +862,9 @@ mod tests {
 
         let barrel = fs::read_to_string(dir.join(".smudgy/types/installed-events.d.ts")).unwrap();
         assert!(
-            barrel
-                .contains("/// <reference path=\"../packages/kapusniak/arctic-prompt/index.ts\" />"),
+            barrel.contains(
+                "/// <reference path=\"../packages/kapusniak/arctic-prompt/index.ts\" />"
+            ),
             "package reference missing:\n{barrel}"
         );
 
@@ -801,7 +872,10 @@ mod tests {
         // self-prunes, leaving a header-only file.
         ensure_script_tsconfig_in(&dir, &[]).expect("ensure empty");
         let bare = fs::read_to_string(dir.join(".smudgy/types/installed-events.d.ts")).unwrap();
-        assert!(!bare.contains("arctic-prompt"), "stale reference lingered:\n{bare}");
+        assert!(
+            !bare.contains("arctic-prompt"),
+            "stale reference lingered:\n{bare}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -860,15 +934,21 @@ mod tests {
         }];
         let shims = interop_handles_dts(&packages);
         assert!(shims.contains("declare module \"smudgy:state/kapusniak/arctic-prompt\""));
-        assert!(shims.contains("declare module \"smudgy:state/kapusniak/arctic-prompt/promptState\""));
+        assert!(
+            shims.contains("declare module \"smudgy:state/kapusniak/arctic-prompt/promptState\"")
+        );
         assert!(shims.contains("declare module \"smudgy:events/kapusniak/arctic-prompt\""));
         assert!(shims.contains("declare module \"smudgy:procedures/kapusniak/arctic-prompt\""));
         assert!(
-            shims.contains("ConsumerOf<typeof import(\"smudgy://kapusniak/arctic-prompt\").promptState>"),
+            shims.contains(
+                "ConsumerOf<typeof import(\"smudgy://kapusniak/arctic-prompt\").promptState>"
+            ),
             "an exported handle derives from typeof its declaration:\n{shims}"
         );
         assert!(
-            shims.contains("ConsumerOf<import(\"smudgy://kapusniak/arctic-prompt\").RefreshRequest>"),
+            shims.contains(
+                "ConsumerOf<import(\"smudgy://kapusniak/arctic-prompt\").RefreshRequest>"
+            ),
             "a module-local handle still derives via its erased alias:\n{shims}"
         );
         assert!(
@@ -876,7 +956,9 @@ mod tests {
             "alias-less handle must fall back to an unknown payload:\n{shims}"
         );
         assert!(
-            shims.contains("export type promptState = import(\"smudgy:core\").Payload<typeof __h0>;"),
+            shims.contains(
+                "export type promptState = import(\"smudgy:core\").Payload<typeof __h0>;"
+            ),
             "the twin type export rides the handle's own name:\n{shims}"
         );
         assert!(
@@ -888,7 +970,9 @@ mod tests {
             "producer doc comments propagate:\n{shims}"
         );
         assert!(
-            shims.contains("export type Payload = import(\"smudgy:core\").Payload<typeof __handle>;"),
+            shims.contains(
+                "export type Payload = import(\"smudgy:core\").Payload<typeof __handle>;"
+            ),
             "subpath modules export the fixed-name Payload:\n{shims}"
         );
 
@@ -896,7 +980,10 @@ mod tests {
         // stands in for the materialized entry source `smudgy://…` resolves to.
         let mut ambient = BTreeMap::new();
         ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
-        ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
         ambient.insert("interop-handles.d.ts".to_string(), shims);
         ambient.insert(
             "producer-stub.d.ts".to_string(),
@@ -906,7 +993,7 @@ mod tests {
                export const promptState: StateHandle<PromptData>;\n\
                export type RefreshRequest = ProcedureHandle<{ full: boolean }>;\n\
              }\n"
-                .to_string(),
+            .to_string(),
         );
         let mut sources = BTreeMap::new();
         sources.insert(
@@ -950,8 +1037,8 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn declaration_grammar_conformance_across_all_consumers() {
         use smudgy_script::interop_extract::{
-            extract_interop_handles, inject_inferred_handle_names, scrub_handle_exports,
-            InteropKind,
+            InteropKind, extract_interop_handles, inject_inferred_handle_names,
+            scrub_handle_exports,
         };
 
         const FIXTURE: &str = r#"
@@ -992,7 +1079,11 @@ export function make() { return createEvent('dynamic'); }
         );
         assert!(extraction.duplicates.is_empty());
         // `export { pinned }` spells the identity's fold exactly — not a diagnostic.
-        assert!(extraction.export_diagnostics.is_empty(), "{:#?}", extraction.export_diagnostics);
+        assert!(
+            extraction.export_diagnostics.is_empty(),
+            "{:#?}",
+            extraction.export_diagnostics
+        );
         assert_eq!(
             extraction.handles[0].doc.as_deref(),
             Some("/** The current vitals reading. */")
@@ -1005,12 +1096,30 @@ export function make() { return createEvent('dynamic'); }
         // 2. Injection: names spliced in; explicit names + nested creation untouched; and —
         // the agreement property — extraction over the injected source sees the same handles.
         let injected = inject_inferred_handle_names(&url, FIXTURE).expect("injects");
-        assert!(injected.contains(r#"createState<VitalData>("vitals")"#), "{injected}");
-        assert!(injected.contains(r#"createEvent<{ raw: string }>("prompt")"#), "{injected}");
-        assert!(injected.contains(r#"createProcedure("refresh", (args"#), "{injected}");
-        assert!(injected.contains(r#"createDerived("hpPct", vitals as any"#), "{injected}");
-        assert!(injected.contains(r#"createState("options", { persist: true } as any)"#), "{injected}");
-        assert!(injected.contains("createState<VitalData>('Pinned')"), "{injected}");
+        assert!(
+            injected.contains(r#"createState<VitalData>("vitals")"#),
+            "{injected}"
+        );
+        assert!(
+            injected.contains(r#"createEvent<{ raw: string }>("prompt")"#),
+            "{injected}"
+        );
+        assert!(
+            injected.contains(r#"createProcedure("refresh", (args"#),
+            "{injected}"
+        );
+        assert!(
+            injected.contains(r#"createDerived("hpPct", vitals as any"#),
+            "{injected}"
+        );
+        assert!(
+            injected.contains(r#"createState("options", { persist: true } as any)"#),
+            "{injected}"
+        );
+        assert!(
+            injected.contains("createState<VitalData>('Pinned')"),
+            "{injected}"
+        );
         assert!(injected.contains("createEvent('dynamic')"), "{injected}");
         assert_eq!(FIXTURE.lines().count(), injected.lines().count());
         let re_extracted = extract_interop_handles(&url, &injected).expect("injected parses");
@@ -1019,13 +1128,22 @@ export function make() { return createEvent('dynamic'); }
             .iter()
             .map(|h| (h.name.as_str(), h.kind, h.exported))
             .collect();
-        assert_eq!(summary, re_summary, "injection must not change what extraction sees");
+        assert_eq!(
+            summary, re_summary,
+            "injection must not change what extraction sees"
+        );
 
         // 3. Scrub: every exported handle's export-ness removed (the aliased `pinned` named
         // export too), nothing else touched, line count preserved.
         let (scrubbed, removed) = scrub_handle_exports(&url, FIXTURE).expect("scrubs");
-        assert_eq!(removed, vec!["vitals", "prompt", "refresh", "hpPct", "pinned", "options"]);
-        assert!(scrubbed.contains("export interface VitalData"), "{scrubbed}");
+        assert_eq!(
+            removed,
+            vec!["vitals", "prompt", "refresh", "hpPct", "pinned", "options"]
+        );
+        assert!(
+            scrubbed.contains("export interface VitalData"),
+            "{scrubbed}"
+        );
         assert!(scrubbed.contains("export function make()"), "{scrubbed}");
         assert!(!scrubbed.contains("export const vitals"), "{scrubbed}");
         assert!(!scrubbed.contains("export { pinned }"), "{scrubbed}");
@@ -1049,7 +1167,9 @@ export function make() { return createEvent('dynamic'); }
             ("refresh", "procedures"),
         ] {
             assert!(
-                shims.contains(&format!("declare module \"smudgy:{scheme}/wbk/fixture/{name}\"")),
+                shims.contains(&format!(
+                    "declare module \"smudgy:{scheme}/wbk/fixture/{name}\""
+                )),
                 "missing subpath module for {name}:\n{shims}"
             );
             assert!(
@@ -1065,7 +1185,10 @@ export function make() { return createEvent('dynamic'); }
             shims.contains("export type { VitalData } from \"smudgy://wbk/fixture\";"),
             "{shims}"
         );
-        assert!(shims.contains("/** The current vitals reading. */"), "{shims}");
+        assert!(
+            shims.contains("/** The current vitals reading. */"),
+            "{shims}"
+        );
     }
 
     /// Compile the *real* shipped `smudgy-core.d.ts` (not a test mirror) through the
@@ -1085,7 +1208,10 @@ export function make() { return createEvent('dynamic'); }
         // smudgy-core.d.ts's `mapper` member references the global `Mapper` declared in the
         // sibling mapper typings, so the ambient set must include it (as it does in the editor
         // project and at publish time).
-        ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
 
         let mut sources = BTreeMap::new();
         sources.insert(
@@ -1119,8 +1245,8 @@ export function make() { return createEvent('dynamic'); }
         );
         sources.insert(
             "consumer.ts".to_string(),
-            "import { events, session, mapper, getSessions, createHotkey, line, createDerived } from \"smudgy:core\";\n\
-             import type { ConsumerOf, Payload } from \"smudgy:core\";\n\
+            "import { events, session, mapper, getSessions, createHotkey, line, createDerived, style } from \"smudgy:core\";\n\
+             import type { ConsumerOf, Payload, TextAttributes } from \"smudgy:core\";\n\
              import { connect, send } from \"smudgy:events/sys\";\n\
              import { room } from \"smudgy:events/map\";\n\
              import type { PromptState, PromptEvent, RefreshRequest } from \"./producer.ts\";\n\
@@ -1173,7 +1299,14 @@ export function make() { return createEvent('dynamic'); }
                  refreshRequest.to(s).post({ full: false });\n\
                }\n\
                createHotkey({ key: \"F1\", modifiers: [\"ctrl\"] }, () => {}).delete();\n\
+               createHotkey({ key: \"t\", modifiers: [\"ctrl\"] }, () => {}).delete();\n\
+               createHotkey({ key: \"Code(KeyT)\", modifiers: [\"alt\", \"shift\"] }, () => {}).delete();\n\
+               createHotkey({ key: \"Character(é)\", modifiers: [\"super\"] }, () => {}).delete();\n\
                const t: string = line.text; void t;\n\
+               const attributes: TextAttributes = { bold: true, faint: false, italic: true, underline: \"double\", blink: \"fast\", crossedOut: true, reverse: false };\n\
+               void style({ fg: { color: \"red\", bold: true, paletteBright: false }, attributes })`styled`;\n\
+               const span = line.styles?.[0];\n\
+               if (span) { const raw: boolean | undefined = typeof span.fg === \"object\" && \"paletteBright\" in span.fg ? span.fg.paletteBright : span.foregroundPaletteBright; void raw; line.highlightAt(span.begin, span.end, span); }\n\
                const a = mapper.areas[0];\n\
                if (a) { const r = a.room(1); void r; const id: readonly [number, number] = a.id; void id; }\n\
              }\n"
@@ -1215,7 +1348,7 @@ export function make() { return createEvent('dynamic'); }
                void kept;\n\
                return temp;\n\
              }\n"
-                .to_string(),
+            .to_string(),
         );
 
         let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
@@ -1236,7 +1369,10 @@ export function make() { return createEvent('dynamic'); }
 
         let mut ambient = BTreeMap::new();
         ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
-        ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
 
         let mut sources = BTreeMap::new();
         sources.insert(
@@ -1333,7 +1469,7 @@ export function make() { return createEvent('dynamic'); }
         }
     }
 
-    /// The Phase-5 typed split spec (`PaneSpec<D>`): the initial size is keyed to the split
+    /// The typed pane creation specs: a split's initial size is keyed to the split
     /// axis, so `width` on a `left`/`right` split (and `height` on `top`/`bottom`) compiles,
     /// while the off-axis dimension is a compile error (`never` on the wrong key). Also
     /// exercises `titleBar` round-tripping through the contract.
@@ -1343,10 +1479,13 @@ export function make() { return createEvent('dynamic'); }
 
         let mut ambient = BTreeMap::new();
         ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
-        ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
 
         let good = "import { session } from \"smudgy:core\";\n\
-             import type { TitleBarSpec, InputHandle } from \"smudgy:core\";\n\
+             import type { TitleBarSpec, InputHandle, GroupWithOptions } from \"smudgy:core\";\n\
              export function wire() {\n\
                const pinned: TitleBarSpec = \"always-show\";\n\
                const chat = session.mainPane.split(\"right\", { name: \"chat\", width: 300, titleBar: pinned,\n\
@@ -1356,6 +1495,10 @@ export function make() { return createEvent('dynamic'); }
                chat.split(\"bottom\", { name: \"log\", height: 120, terminal: false, titleBar: \"normal\" });\n\
                session.mainPane.split(\"top\", { name: \"status\", height: 80 });\n\
                session.mainPane.split(\"left\", { name: \"map\" });\n\
+               const tab = chat.addTab({ name: \"alerts\", selected: true });\n\
+               const grouping: GroupWithOptions = { position: \"before\", selected: false };\n\
+               tab.groupWith(session.mainPane, grouping);\n\
+               tab.select();\n\
              }\n";
         let mut sources = BTreeMap::new();
         sources.insert("consumer.ts".to_string(), good.to_string());
@@ -1373,6 +1516,8 @@ export function make() { return createEvent('dynamic'); }
              export function wire() {\n\
                session.mainPane.split(\"right\", { name: \"chat\", height: 300 });\n\
                session.mainPane.split(\"bottom\", { name: \"log\", width: 120 });\n\
+               session.mainPane.addTab({ name: \"tab\", width: 120 });\n\
+               session.mainPane.groupWith(session.mainPane, { position: \"middle\" });\n\
              }\n";
         let mut sources = BTreeMap::new();
         sources.insert("consumer.ts".to_string(), bad.to_string());
@@ -1395,17 +1540,26 @@ export function make() { return createEvent('dynamic'); }
 
         let mut ambient = BTreeMap::new();
         ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
-        ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
-        ambient.insert("smudgy-widgets.d.ts".to_string(), SMUDGY_WIDGETS_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
+        ambient.insert(
+            "smudgy-widgets.d.ts".to_string(),
+            SMUDGY_WIDGETS_DTS.to_string(),
+        );
 
         let mut sources = BTreeMap::new();
         sources.insert(
             "ui.tsx".to_string(),
             "import { createWidget, Column, Row, Text, ProgressBar, Button, MapView } from \"smudgy:widgets\";\n\
+             import type { MapStyleApplication, MapDoorState } from \"smudgy:widgets\";\n\
              import { session, createState } from \"smudgy:core\";\n\
              interface Vitals { hp: number; maxhp: number; name: string }\n\
+             interface Gps { apply: MapStyleApplication[]; doors: MapDoorState[] }\n\
              const vitals = createState<Vitals>('vitals');\n\
              const untyped = createState('untyped');\n\
+             const gps = createState<Gps>('gps');\n\
              export function mount() {\n\
                const panel = (\n\
                  <Column spacing={4} width=\"fill\">\n\
@@ -1416,6 +1570,17 @@ export function make() { return createEvent('dynamic'); }
                    </Row>\n\
                    {false && <Text>conditional</Text>}\n\
                    <MapView />\n\
+                   <MapView\n\
+                     roomSpacing={1.25} playerColor=\"#fff\" showDoors={true}\n\
+                     defaultStyle={{ connectionColor: \"#888\" }}\n\
+                     styles={{ route: { connectionColor: \"gold\", connectionWidth: 2, roomStroke: \"gold\", roomStrokeWidth: 2 },\n\
+                               visited: { roomFill: \"#223\", roomBorderRadius: 0.2, doorColor: \"#f00\" } }}\n\
+                     apply={[{ style: \"route\", rooms: [1, 2], exits: [{ room: 1, direction: \"North\" }] },\n\
+                             { style: \"visited\", rooms: [9], area: [1, 2] },\n\
+                             { style: \"visited\", rooms: [10], area: \"67e55044-10b1-426f-9247-bb680e5fe0c8\" }]}\n\
+                     doors={[{ exit: { room: 1, direction: \"North\" }, closed: true, locked: false }]}\n\
+                   />\n\
+                   <MapView apply={gps.bind('apply')} doors={gps.bind('doors')} roomSpacing={vitals.bind('hp')} />\n\
                  </Column>\n\
                );\n\
                createWidget(\"panel\", panel);\n\
@@ -1551,8 +1716,14 @@ export function make() { return createEvent('dynamic'); }
 
         let mut ambient = BTreeMap::new();
         ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
-        ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
-        ambient.insert("smudgy-widgets.d.ts".to_string(), SMUDGY_WIDGETS_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
+        ambient.insert(
+            "smudgy-widgets.d.ts".to_string(),
+            SMUDGY_WIDGETS_DTS.to_string(),
+        );
 
         let mut sources = BTreeMap::new();
         sources.insert(
@@ -1586,6 +1757,40 @@ export function make() { return createEvent('dynamic'); }
         );
     }
 
+    #[test]
+    fn invalid_hotkey_keys_and_modifiers_fail_to_compile() {
+        use std::collections::BTreeMap;
+
+        let mut ambient = BTreeMap::new();
+        ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
+
+        for (name, source) in [
+            (
+                "bad-key.ts",
+                "import { createHotkey } from \"smudgy:core\";\n\
+                 createHotkey({ key: \"DefinitelyNotAKey\" }, () => {});\n",
+            ),
+            (
+                "bad-modifier.ts",
+                "import { createHotkey } from \"smudgy:core\";\n\
+                 createHotkey({ key: \"t\", modifiers: [\"command\"] }, () => {});\n",
+            ),
+        ] {
+            let mut sources = BTreeMap::new();
+            sources.insert(name.to_string(), source.to_string());
+            let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+                .expect("the generator itself must not crash on a type error");
+            assert!(
+                !out.diagnostics.is_empty(),
+                "{name} must fail the strongly typed createHotkey contract"
+            );
+        }
+    }
+
     /// The runtime implementation in `js/smudgy.ts`, type-checked against the contract here.
     /// deno's extension transpiler only type-STRIPS this file at runtime, so this is the only
     /// place its TypeScript is actually checked.
@@ -1609,7 +1814,10 @@ export function make() { return createEvent('dynamic'); }
 
         let mut ambient = BTreeMap::new();
         ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
-        ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
 
         let mut sources = BTreeMap::new();
         sources.insert("impl.ts".to_string(), SMUDGY_TS.to_string());
@@ -1648,7 +1856,10 @@ export function make() { return createEvent('dynamic'); }
         let mut ambient = BTreeMap::new();
         // The contract declares `Mapper`/`Area`/`Room`/`Exit`/`AreaId`/… as global ambient types,
         // while smudgy:core publishes the Area runtime constructor.
-        ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
         ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
 
         let mut sources = BTreeMap::new();
@@ -1681,13 +1892,82 @@ export function make() { return createEvent('dynamic'); }
         );
     }
 
-    /// Rust↔TS enum drift guard: every serde variant name of the map enums must appear
-    /// (quoted) in BOTH the published contract and the runtime impl, whose string unions
-    /// mirror the Rust enums by hand. The impl↔contract guards above cannot catch this class
-    /// (they compare TS against TS); this pins both to the Rust source of truth — the
-    /// original regression was a Rust-side enum variant invisible to scripts. A tripwire on
-    /// quoted-name presence, not a union parser: adding a Rust variant fails here until the
-    /// unions name it.
+    /// The compatibility catalog is deliberately finite. These assertions do
+    /// three jobs together: old scripts still type-check during 0.5.x, every
+    /// compatibility member carries an editor-visible deprecation, and the
+    /// test itself blocks the first 0.6 build until the shims are removed.
+    #[test]
+    fn map_storage_compatibility_is_deprecated_and_expires_in_0_6() {
+        use std::collections::BTreeMap;
+
+        const DEPRECATION: &str = "@deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.";
+
+        assert_eq!(
+            smudgy_cloud::MAP_STORAGE_COMPATIBILITY_LAST_RELEASE,
+            "0.5.x"
+        );
+        assert_eq!(
+            smudgy_cloud::MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION,
+            "0.6.0"
+        );
+        let running = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("Cargo package versions are valid semver");
+        assert!(
+            (running.major, running.minor) < (0, 6),
+            "remove the legacy mapper creation overload, `ephemeral`, and `isEphemeral` \
+             before building the 0.6 release line"
+        );
+
+        assert_eq!(
+            SMUDGY_MAPPER_DTS.matches(DEPRECATION).count(),
+            3,
+            "the compatibility catalog is exactly: omitted-storage createArea, \
+             LegacyCreateAreaOptions.ephemeral, and Area.isEphemeral"
+        );
+        assert_eq!(
+            SMUDGY_MAPPER_TS.matches(DEPRECATION).count(),
+            2,
+            "the runtime implementation must mark its ephemeral option and getter"
+        );
+        let nukefire_mapper = include_str!("../../../packages/nukefire-mapper/mapper.ts");
+        assert_eq!(
+            nukefire_mapper.matches(DEPRECATION).count(),
+            1,
+            "the first-party NukeFire mapper's ephemeral option is part of the same finite window"
+        );
+        // Arctic deliberately uses the deprecated implicit durable destination so
+        // signed-in sessions prefer cloud and signed-out sessions fall back to local.
+        // The 0.6 release-version guard above, rather than a first-party source
+        // assertion, owns removal of that compatibility path.
+
+        let mut ambient = BTreeMap::new();
+        ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "compatibility-consumer.ts".to_string(),
+            "import { mapper } from \"smudgy:core\";\n\
+             declare const area: Area;\n\
+             export const oldDefault = mapper.createArea(\"old default\");\n\
+             export const oldSession = mapper.createArea(\"old session\", { ephemeral: true });\n\
+             export const oldPredicate: boolean = area.isEphemeral;\n\
+             export const canonical = mapper.createArea(\"canonical\", { storage: \"local\" });\n"
+                .to_string(),
+        );
+        let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+            .expect("compile legacy and canonical mapper creation forms");
+        assert!(
+            out.diagnostics.is_empty(),
+            "0.5 compatibility forms or their canonical replacements stopped type-checking:\n{:#?}",
+            out.diagnostics
+        );
+    }
+
+    /// Rust↔TS enum drift guard: every serde variant name of the map enums must
+    /// appear in both the published contract and runtime implementation.
     #[test]
     fn map_enum_unions_cover_rust_variants() {
         fn assert_covered<T: serde::Serialize>(variants: &[T], enum_name: &str) {
@@ -1707,7 +1987,10 @@ export function make() { return createEvent('dynamic'); }
         }
         assert_covered(&smudgy_cloud::ExitDirection::ALL, "ExitDirection");
         assert_covered(&smudgy_cloud::ShapeType::ALL, "ShapeType");
-        assert_covered(&smudgy_cloud::HorizontalAlignment::ALL, "HorizontalAlignment");
+        assert_covered(
+            &smudgy_cloud::HorizontalAlignment::ALL,
+            "HorizontalAlignment",
+        );
         assert_covered(&smudgy_cloud::VerticalAlignment::ALL, "VerticalAlignment");
         assert_covered(&smudgy_cloud::RoomSide::ALL, "RoomSide");
         assert_covered(
@@ -1745,7 +2028,10 @@ export function make() { return createEvent('dynamic'); }
 
         let mut ambient = BTreeMap::new();
         ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
-        ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
 
         let mut sources = BTreeMap::new();
         sources.insert(
@@ -1800,6 +2086,11 @@ export function make() { return createEvent('dynamic'); }
               const newArea: Area = await mapper.createArea("Town");
               const runtimeCheck: boolean = newArea instanceof Area;
               const newRoom: RoomNumber = await mapper.createRoom(room.area_id, { title: "x" });
+              const batchIds: OperationId[] = await mapper.mutateArea(room.area_id, async (mutation) => {
+                const batchedRoom: RoomNumber = await mutation.createRoom({ title: "batch" });
+                await mutation.setRoomProperty(batchedRoom, "terrain", "city");
+                await mutation.createRoomExit(batchedRoom, { from_direction: "South" });
+              }, { description: "typed batch" });
               const exitId: ExitId = await mapper.createRoomExit(room.area_id, room.room_number, { from_direction: "North" });
               const updateId: OperationId | null = await mapper.setRoomExit(room.area_id, room.room_number, exitId, { command: "enter hole" });
               const mergeId: OperationId | null = await mapper.mergeRooms(room.area_id, room.room_number, room.room_number + 1);
@@ -1817,7 +2108,7 @@ export function make() { return createEvent('dynamic'); }
               await mapper.setRoomTitle(room.area_id, room.room_number, "t");
               await mapper.setRoomDescription(room.area_id, room.room_number, "d");
               await mapper.renameArea(room.area_id, "n");
-              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void runtimeCheck; void newRoom; void updateId; void mergeId;
+              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void runtimeCheck; void newRoom; void batchIds; void updateId; void mergeId;
             }
             export { useRoom, useArea, useExit, useMapper };
             "##
@@ -1840,13 +2131,19 @@ export function make() { return createEvent('dynamic'); }
 
         // Deno lib (Deno namespace) + @types/node materialized to disk.
         assert!(dir.join(".smudgy/types/deno/lib.deno.ns.d.ts").is_file());
-        assert!(dir.join(".smudgy/node-types/@types/node/events.d.ts").is_file());
+        assert!(
+            dir.join(".smudgy/node-types/@types/node/events.d.ts")
+                .is_file()
+        );
         assert!(dir.join(".smudgy/.runtime-types-version").is_file());
 
         // The base tsconfig wires @types/node via types + typeRoots.
         let base = fs::read_to_string(dir.join(".smudgy/tsconfig.base.json")).unwrap();
         assert!(base.contains("\"node\""), "types: [node] missing:\n{base}");
-        assert!(base.contains("./node-types/@types"), "typeRoots missing:\n{base}");
+        assert!(
+            base.contains("./node-types/@types"),
+            "typeRoots missing:\n{base}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1873,12 +2170,18 @@ export function make() { return createEvent('dynamic'); }
 
         ensure_script_tsconfig_in(&dir, &[]).expect("ensure");
 
-        assert!(!modules.join(".smudgy").exists(), "stale managed dir removed");
+        assert!(
+            !modules.join(".smudgy").exists(),
+            "stale managed dir removed"
+        );
         // The stale heavy generated stub is replaced by the thin pointer at the server-level project
         // (it carries the new `../tsconfig.json` extends, not the old base-config marker).
         let modules_ts = fs::read_to_string(modules.join("tsconfig.json"))
             .expect("modules tsconfig seeded after migration");
-        assert!(modules_ts.contains("../tsconfig.json"), "thin pointer expected:\n{modules_ts}");
+        assert!(
+            modules_ts.contains("../tsconfig.json"),
+            "thin pointer expected:\n{modules_ts}"
+        );
         assert!(
             !modules_ts.contains(USER_TSCONFIG_MARKER),
             "stale base-config stub should be gone:\n{modules_ts}"

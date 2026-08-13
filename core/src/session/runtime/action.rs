@@ -20,7 +20,7 @@ use crate::session::{HotkeyId, SessionId};
 use super::input::{InputOp, InputSnapshot, InputSource};
 use super::line_operation::LineOperation;
 use super::origin::{IsolateId, Origin};
-use super::pane::{PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection};
+use super::pane::{PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection, TabPosition};
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
 use super::store::{PublishedStore, PublishedWrite};
@@ -80,6 +80,8 @@ pub enum RuntimeAction {
     Connect {
         host: Arc<String>,
         port: u16,
+        /// Profile text to send after the first fully processed inbound packet
+        /// containing at least one non-empty terminal line.
         send_on_connect: Option<Arc<String>>,
         /// Literal substrings of `send_on_connect` to mask from the client's echo
         /// and the session log (e.g. a substituted `$PASSWORD`). Empty ⇒ the
@@ -101,6 +103,8 @@ pub enum RuntimeAction {
     Disconnect,
     HandleIncomingLine(Arc<StyledLine>),
     HandleIncomingPartialLine(Arc<StyledLine>),
+    /// A decoded telnet GA/EOR boundary, ordered behind its prompt text.
+    PromptBoundary,
     /// A carriage-return overprint superseded the incoming open line: drop any
     /// prefix already delivered as a partial (the text after the `\r` replaces
     /// it). Emitted by the VT layer before the replacement frame's bytes.
@@ -205,6 +209,17 @@ pub enum RuntimeAction {
         shift: bool,
         ctrl: bool,
         alt: bool,
+    },
+    /// Lazily resolve a script link's hover text in the isolate that created
+    /// it. The shared state is also held by the line in the UI; completion
+    /// publishes into it and emits a repaint wake. Stale addresses fail the
+    /// state silently, matching click-callback lifetime semantics.
+    ResolveLinkTooltip {
+        session: SessionId,
+        isolate: IsolateId,
+        instance: u64,
+        id: u64,
+        state: Arc<crate::session::styled_line::LinkTooltipState>,
     },
     CallJavascriptFunction {
         /// The isolate owning `script_functions[id]` (see `EvalJavascript::isolate`).
@@ -317,6 +332,9 @@ pub enum RuntimeAction {
     /// user-created starts unassigned. Translated to
     /// `SessionEvent::MapAreaCreated`.
     AssociateCreatedArea(AreaId),
+    /// A script created or promoted a cloud atlas in this session. The UI
+    /// daemon associates it with this session's server entry.
+    AssociateCreatedAtlas(AtlasId),
     /// Emit `SessionEvent::PaneOpened` for a pane the split op already
     /// created synchronously in the registry. Queued by the op so the event
     /// leaves on the ordered UI channel ahead of any `AppendTo` for the key.
@@ -328,11 +346,13 @@ pub enum RuntimeAction {
         /// own-runtime opens must preserve their historical open/close order.
         reconcile_registry: bool,
     },
-    /// Emit `SessionEvent::PaneClosed` for a pane the close op already
-    /// retired from the registry. The dispatch handler flushes buffered
-    /// updates first, so the event trails every `AppendTo` that preceded it.
+    /// Finish closing a pane the op already retired from the registry. The
+    /// dispatch handler flushes buffered updates first, then emits either the
+    /// legacy close event or the ordered-bus display-retirement marker.
     PaneClosed {
         key: PaneKey,
+        /// The command bus already owns layout removal for this close.
+        ui_command_published: bool,
     },
     /// Emit `SessionEvent::PaneUpdated` for a def the queuing op already
     /// mutated in place (an explicit def-state field — `titleBar`, `hidden`,
@@ -355,6 +375,8 @@ pub enum RuntimeAction {
     PaneCloseRemote {
         namespace: PaneNamespace,
         name: Arc<str>,
+        /// The issuing runtime already published the resolved pane key.
+        ui_command_published: bool,
     },
     /// Cross-session `hide()`/`show()`, resolved by name on the target.
     /// Own-session calls never ride an action for the mutation itself — the
@@ -396,6 +418,18 @@ pub enum RuntimeAction {
         reference: PaneKey,
         direction: SplitDirection,
         size_px: Option<f32>,
+    },
+    /// Move or reorder a pane into another pane's current tab group.
+    PaneGroupWith {
+        key: PaneKey,
+        reference_session: SessionId,
+        reference: PaneKey,
+        position: TabPosition,
+        selected: bool,
+    },
+    /// Select a pane's tab without requesting keyboard focus.
+    PaneSelect {
+        key: PaneKey,
     },
     /// Forward `pane.tearOut` to the UI as `SessionEvent::PaneTearOut`.
     PaneTearOut {
@@ -489,6 +523,20 @@ pub enum RuntimeAction {
     /// subscription): tell the UI to start feeding the pane-size mirror
     /// (`SessionEvent::PaneMirrorInterest`). Sent once per session.
     PaneMirrorInterest,
+    /// A script asked for the calling session's window footprint to be
+    /// saved as the named layout. The UI daemon owns the capture and the
+    /// per-server store; the name was validated op-side, so the daemon can
+    /// treat it as a store key.
+    LayoutSave {
+        name: String,
+    },
+    /// A script asked for a named layout to be applied. Layout-only by
+    /// contract: the UI rebinds what exists, scoped to the calling
+    /// session's server, and never spawns, closes, prompts, or touches OS
+    /// windows.
+    LayoutApply {
+        name: String,
+    },
     /// One coalesced pane-size update from the UI (sent only while the
     /// session has flagged interest; change-gated per pane on settled
     /// layouts, never per drag frame). The dispatch arm writes it into the
@@ -541,8 +589,28 @@ pub enum RuntimeAction {
         script_settings: Box<crate::models::settings::ScriptSettings>,
     },
     RequestRepaint,
+    /// The connection reader finished one inbound read batch. Ordered after
+    /// every protocol message and text line decoded from that batch (and after
+    /// its [`Self::RequestRepaint`]), so dispatching this means the packet's
+    /// trigger/script/line-routing work and display flush have completed.
+    ///
+    /// `connection_generation` prevents a late marker from a replaced socket
+    /// from releasing the new connection's deferred profile send.
+    IncomingPacketProcessed {
+        connection_generation: u64,
+        has_displayable_text: bool,
+    },
+    /// A tooltip callback published into its shared result cell; wake the UI
+    /// even though no terminal-buffer mutation was needed.
+    LinkTooltipChanged,
     Connected,
-    Disconnected,
+    /// The socket task's teardown notification. `connection_generation`
+    /// identifies which socket ended: a replaced socket's late `Disconnected`
+    /// must not clear the NEW connection's pending deferred profile send
+    /// (the same staleness guard as [`Self::IncomingPacketProcessed`]).
+    Disconnected {
+        connection_generation: u64,
+    },
     /// One inbound GMCP message (`docs/gmcp.md` §3): the dotted message name and the
     /// raw data part exactly as received — unparsed; the dispatch arm parses on the session
     /// thread and writes the `gmcp` store subtree. Enqueued by the connection task at the

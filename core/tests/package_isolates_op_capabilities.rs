@@ -449,6 +449,94 @@ async fn get_session_character_gates_foreign_session() {
     );
 }
 
+/// Every `layout.*` op requires BOTH `panes` and `reach-others`,
+/// unconditionally — layout authority is workspace-wide, so the gate never
+/// varies with the footprint, and the op acts only on the calling session's
+/// own server (there is no cross-session form to gate differently). With
+/// either capability missing the op throws naming the missing one; with
+/// both, each op advances past the gate to its own validation (list
+/// returns, save queues, apply fails on the unknown name — never silently).
+#[tokio::test]
+async fn layout_ops_require_panes_and_reach_others_unconditionally() {
+    let src = r#"
+        import session, { echo } from "smudgy:core";
+        const probe = (name, fn) => {
+            try { fn(); echo(name + ":NO_THROW"); }
+            catch (e) { echo(name + ":ERR:" + (e?.message ?? String(e))); }
+        };
+        probe("list", () => session.layout.list());
+        probe("save", () => session.layout.save("gate probe"));
+        probe("apply", () => session.layout.apply("gate probe"));
+        echo("DONE");
+    "#;
+
+    // `panes` alone is not enough: the second grant is unconditional even
+    // though every layout op targets the caller's own server.
+    let panes_only = run_capability_case(
+        9660,
+        "pi_caps_layout_panes_only",
+        "smudgy://wbk/layouter",
+        Some(consent_with(|s| s.panes = true)),
+        make_package("wbk", "layouter", "1.0.0", src),
+    )
+    .await;
+    for probe in ["list", "save", "apply"] {
+        assert!(
+            !has_line(&panes_only, &format!("{probe}:NO_THROW"))
+                && panes_only.iter().any(|line| {
+                    line.contains(&format!("{probe}:ERR:")) && line.contains("reach-others")
+                }),
+            "layout.{probe} with only panes must be denied naming reach-others; transcript:\n{panes_only:#?}"
+        );
+    }
+
+    // `reach-others` alone is not enough either: `panes` is the op's own
+    // capability and is checked first.
+    let reach_only = run_capability_case(
+        9661,
+        "pi_caps_layout_reach_only",
+        "smudgy://wbk/layouter",
+        Some(consent_with(|s| s.reach_others = true)),
+        make_package("wbk", "layouter", "1.0.0", src),
+    )
+    .await;
+    for probe in ["list", "save", "apply"] {
+        assert!(
+            !has_line(&reach_only, &format!("{probe}:NO_THROW"))
+                && reach_only.iter().any(|line| {
+                    line.contains(&format!("{probe}:ERR:")) && line.contains("'panes'")
+                }),
+            "layout.{probe} with only reach-others must be denied naming panes; transcript:\n{reach_only:#?}"
+        );
+    }
+
+    // Both grants: past the gate, each op reaches its own validation. The
+    // store is empty in this harness, so list succeeds, save queues (its
+    // capture runs on the UI daemon, absent here), and apply throws the
+    // unknown-layout error rather than a capability one.
+    let allowed = run_capability_case(
+        9662,
+        "pi_caps_layout_allow",
+        "smudgy://wbk/layouter",
+        Some(consent_with(|s| {
+            s.panes = true;
+            s.reach_others = true;
+        })),
+        make_package("wbk", "layouter", "1.0.0", src),
+    )
+    .await;
+    assert!(
+        has_line(&allowed, "list:NO_THROW") && has_line(&allowed, "save:NO_THROW"),
+        "with both grants, list and save must pass the gate; transcript:\n{allowed:#?}"
+    );
+    assert!(
+        allowed
+            .iter()
+            .any(|line| line.contains("apply:ERR:") && line.contains("no layout named")),
+        "apply of an unknown layout must fail on the name, not the gate; transcript:\n{allowed:#?}"
+    );
+}
+
 /// `display:change` gates the line-manipulation ops (`line.gag()` here): denied for an echo-only
 /// package naming the capability. When `change_display` IS consented, the capability gate opens
 /// and the same top-level call fails on the NEXT gate instead — the current-line window (module

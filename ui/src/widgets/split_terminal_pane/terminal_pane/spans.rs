@@ -1,8 +1,4 @@
-use std::{
-    borrow::Cow,
-    cmp::{max, min},
-    rc::Rc,
-};
+use std::{borrow::Cow, cmp::min, rc::Rc};
 
 use crate::terminal_buffer::selection::LineSelection;
 use iced::widget::text::Span;
@@ -61,7 +57,7 @@ impl<Link: Clone> Spans<Link> {
     }
 
     pub fn select_range(&mut self, sel_start: usize, sel_end: usize) {
-        let mut char_position = 0; // Track character position across spans
+        let mut byte_position = 0;
 
         self.selected.clear();
 
@@ -69,22 +65,27 @@ impl<Link: Clone> Spans<Link> {
             self.spans
                 .iter()
                 .flat_map(|span| {
-                    // Convert span text to character indices for safe slicing
-                    let span_chars: Vec<char> = span.text.chars().collect();
-                    let span_char_len = span_chars.len();
-                    let span_char_end = char_position + span_char_len;
+                    let span_text = span.text.as_ref();
+                    let span_byte_end = byte_position + span_text.len();
+                    let boundary = |mut offset: usize| {
+                        offset = offset.min(span_text.len());
+                        while offset > 0 && !span_text.is_char_boundary(offset) {
+                            offset -= 1;
+                        }
+                        offset
+                    };
 
                     let mut spans = Vec::with_capacity(3);
 
                     // Part before selection
-                    if sel_start > char_position {
-                        let unselected_end = min(sel_start, span_char_end) - char_position;
+                    if sel_start > byte_position {
+                        let unselected_end =
+                            boundary(min(sel_start, span_byte_end).saturating_sub(byte_position));
                         if unselected_end > 0 {
-                            let text: String = span_chars[0..unselected_end].iter().collect();
                             spans.push((
                                 false,
                                 Span {
-                                    text: Cow::Owned(text),
+                                    text: Cow::Owned(span_text[..unselected_end].to_string()),
                                     link: span.link.clone(),
                                     ..*span
                                 },
@@ -93,17 +94,18 @@ impl<Link: Clone> Spans<Link> {
                     }
 
                     // Selected part
-                    if sel_start < span_char_end && sel_end > char_position {
-                        let selected_start = max(sel_start, char_position) - char_position;
-                        let selected_end = min(sel_end, span_char_end) - char_position;
+                    if sel_start < span_byte_end && sel_end > byte_position {
+                        let selected_start = boundary(sel_start.saturating_sub(byte_position));
+                        let selected_end =
+                            boundary(min(sel_end, span_byte_end).saturating_sub(byte_position));
 
                         if selected_end > selected_start {
-                            let text: String =
-                                span_chars[selected_start..selected_end].iter().collect();
                             spans.push((
                                 true,
                                 Span {
-                                    text: Cow::Owned(text),
+                                    text: Cow::Owned(
+                                        span_text[selected_start..selected_end].to_string(),
+                                    ),
                                     link: span.link.clone(),
                                     ..*span
                                 },
@@ -112,14 +114,13 @@ impl<Link: Clone> Spans<Link> {
                     }
 
                     // Part after selection
-                    if sel_end < span_char_end {
-                        let unselected_start = max(sel_end, char_position) - char_position;
-                        if unselected_start < span_char_len {
-                            let text: String = span_chars[unselected_start..].iter().collect();
+                    if sel_end < span_byte_end {
+                        let unselected_start = boundary(sel_end.saturating_sub(byte_position));
+                        if unselected_start < span_text.len() {
                             spans.push((
                                 false,
                                 Span {
-                                    text: Cow::Owned(text),
+                                    text: Cow::Owned(span_text[unselected_start..].to_string()),
                                     link: span.link.clone(),
                                     ..*span
                                 },
@@ -127,7 +128,7 @@ impl<Link: Clone> Spans<Link> {
                         }
                     }
 
-                    char_position = span_char_end;
+                    byte_position = span_byte_end;
                     spans
                 })
                 .enumerate()
@@ -143,5 +144,28 @@ impl<Link: Clone> Spans<Link> {
 
     pub fn selected(&self) -> &[usize] {
         &self.selected
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_ranges_are_utf8_byte_offsets() {
+        let mut spans = Spans::with_selection(
+            Rc::new(vec![Span::<'static, ()>::new(Cow::Borrowed("A🗝️B"))]),
+            Some((1, 8)),
+        );
+        let rendered = spans.spans();
+
+        assert_eq!(rendered.len(), 3);
+        assert_eq!(rendered[0].text, "A");
+        assert_eq!(rendered[1].text, "🗝️");
+        assert_eq!(rendered[2].text, "B");
+        assert_eq!(spans.selected(), &[1]);
+
+        spans.select_none();
+        assert!(spans.selected().is_empty());
     }
 }

@@ -10,9 +10,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use smudgy_core::session::connection::vt_processor::{AnsiColor, Color};
 use smudgy_core::session::runtime::RuntimeAction;
-use smudgy_core::session::styled_line::{Style, StyledLine, VtSpan};
-use smudgy_core::session::connection::vt_processor::Color;
+use smudgy_core::session::styled_line::{
+    Blink, Style, StyledLine, TextAttributes, Underline, VtSpan,
+};
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
 
 const QUIET_PERIOD: Duration = Duration::from_millis(900);
@@ -20,8 +22,8 @@ const QUIET_PERIOD: Duration = Duration::from_millis(900);
 /// A module that registers the triggers. Each trigger handler echoes a single sentinel
 /// encoding its pass/fail so the test asserts on the buffer transcript.
 ///
-/// - `style`: fires on an incoming line we feed with a known RGB span. The handler reads
-///   `line.text`, `line.number`, `line.styles` (must reflect the RGB color), then proves the
+/// - `style`: fires on an incoming line carrying every text attribute. The handler reads
+///   `line.text`, `line.number`, `line.styles`, then proves the
 ///   styles value round-trips by passing the first span's `fg` straight into `highlightAt`. It
 ///   stores the line number in `vars` so the next trigger can address the now-emitted line.
 /// - `findfirst`: fires on a separate incoming line and asserts the find-first methods return
@@ -42,15 +44,35 @@ createTrigger("^STYLE (.+)$", () => {
     const text = line.text;
     const num = line.number;
     const styles = line.styles;
-    const firstFg = (styles && styles.length > 0) ? styles[0].fg : null;
-    const isRgb = firstFg !== null && typeof firstFg === "object"
-        && firstFg.r === 10 && firstFg.g === 20 && firstFg.b === 30;
-    // Round-trip: the fg we just read must be a legal value for the write color API.
-    if (isRgb) {
-        line.highlightAt(0, 1, { fg: firstFg });
+    const first = (styles && styles.length > 0) ? styles[0] : null;
+    const fg = first?.fg;
+    const bg = first?.bg;
+    const defaultFg = styles?.[1]?.fg;
+    const brightDefaultFg = styles?.[2]?.fg;
+    const attributes = first?.attributes;
+    const styleExact = fg !== null && typeof fg === "object"
+        && fg.color === "red" && fg.bold === true && fg.paletteBright === false
+        && attributes?.bold === true && attributes.faint === true
+        && attributes.italic === true && attributes.underline === "double"
+        && attributes.blink === "fast" && attributes.crossedOut === true
+        && attributes.reverse === true
+        && typeof bg === "object" && bg.color === "blue"
+        && bg.bold === false && bg.paletteBright === false
+        // Keep the released StyleSpan contract: a bold default foreground is
+        // still the string token; font weight lives in attributes.bold.
+        && defaultFg === "default" && styles[1].attributes.bold === true
+        && brightDefaultFg === "default"
+        && styles[2].attributes.bold === false
+        && styles[2].foregroundPaletteBright === true;
+    // A complete StyleSpan is itself valid write options. paletteBright keeps
+    // the legacy conflated fg.bold from repainting this dim palette slot bright.
+    if (styleExact) {
+        line.highlightAt(0, 1, first);
+        line.highlightAt(styles[1].begin, styles[1].end, styles[1]);
+        line.highlightAt(styles[2].begin, styles[2].end, styles[2]);
     }
     vars.styleLineNumber = num;
-    vars.styleOk = isRgb && typeof text === "string" && text.indexOf("STYLE") === 0;
+    vars.styleOk = styleExact && typeof text === "string" && text.indexOf("STYLE") === 0;
 });
 
 createTrigger("^FIND$", () => {
@@ -96,26 +118,75 @@ createTrigger("^CHECK$", () => {
     // consistent through the write-through.
     const n = vars.styleLineNumber;
     const text = buffer.line(n).text;
-    echo((text.indexOf("EDITED") !== -1 && text.indexOf("STYLE ") === -1)
+    const readback = buffer.line(n).styles;
+    const first = readback?.[0];
+    const brightDefault = readback?.find((span) => span.foregroundPaletteBright === true);
+    const roundTrip = typeof first?.fg === "object"
+        && first.fg.color === "red" && first.fg.bold === true
+        && first.fg.paletteBright === false
+        && first.attributes.bold === true
+        && first.attributes.underline === "double"
+        && first.attributes.blink === "fast"
+        && brightDefault?.fg === "default"
+        && brightDefault.attributes.bold === false;
+    echo((text.indexOf("EDITED") !== -1 && text.indexOf("STYLE ") === -1 && roundTrip)
         ? "CHECK_OK"
-        : ("CHECK_FAIL text=" + text));
+        : ("CHECK_FAIL text=" + text + " style=" + JSON.stringify(first)));
 });
 
 echo("LB_READY");
 "#;
 
-/// Build an incoming server line carrying a single known RGB(10,20,30) foreground span over the
-/// whole text, so the `style` trigger's `line.styles` read has a concrete, round-trippable color.
-fn rgb_line(text: &str) -> Arc<StyledLine> {
-    let span = VtSpan {
-        style: Style {
-            fg: Color::Rgb { r: 10, g: 20, b: 30 },
-            bg: Color::DefaultBackground,
-        },
-        begin_pos: 0,
-        end_pos: text.len(),
+/// Build a line that separates legacy effective bold, raw palette brightness,
+/// and font weight, and exercise every lossless text attribute.
+fn attributed_line(text: &str) -> Arc<StyledLine> {
+    let attributes = TextAttributes {
+        bold: true,
+        faint: true,
+        italic: true,
+        underline: Underline::Double,
+        blink: Blink::Fast,
+        crossed_out: true,
+        reverse: true,
     };
-    Arc::new(StyledLine::new(text, vec![span]))
+    Arc::new(StyledLine::new(
+        text,
+        vec![
+            VtSpan {
+                style: Style {
+                    fg: Color::Ansi {
+                        color: AnsiColor::Red,
+                        bold: false,
+                    },
+                    bg: Color::Ansi {
+                        color: AnsiColor::Blue,
+                        bold: false,
+                    },
+                    attributes,
+                },
+                begin_pos: 0,
+                end_pos: 1,
+            },
+            VtSpan {
+                style: Style {
+                    fg: Color::DefaultForeground { bold: false },
+                    bg: Color::DefaultBackground,
+                    attributes,
+                },
+                begin_pos: 1,
+                end_pos: text.len().saturating_sub(1),
+            },
+            VtSpan {
+                style: Style {
+                    fg: Color::DefaultForeground { bold: true },
+                    bg: Color::DefaultBackground,
+                    attributes: TextAttributes::DEFAULT,
+                },
+                begin_pos: text.len().saturating_sub(1),
+                end_pos: text.len(),
+            },
+        ],
+    ))
 }
 
 #[tokio::test]
@@ -174,27 +245,29 @@ async fn line_buffer_unified_read_styles_writethrough_and_booleans() {
                     // live path flushes via a follow-up `RequestRepaint` (the vt_processor sends
                     // one after each read batch), so the test does the same after each line.
                     if !sent_style && line.text == "LB_READY" {
-                        tx.send(RuntimeAction::HandleIncomingLine(rgb_line("STYLE here")))
-                            .unwrap();
+                        tx.send(RuntimeAction::HandleIncomingLine(attributed_line(
+                            "STYLE here",
+                        )))
+                        .unwrap();
                         tx.send(RuntimeAction::RequestRepaint).unwrap();
                         sent_style = true;
                     }
                     // The `style` handler echoes nothing (to keep the incoming line's number
                     // stable), so gate the next step on the incoming server line itself.
                     if sent_style && !sent_find && line.text == "STYLE here" {
-                        tx.send(RuntimeAction::HandleIncomingLine(rgb_line("FIND")))
+                        tx.send(RuntimeAction::HandleIncomingLine(attributed_line("FIND")))
                             .unwrap();
                         tx.send(RuntimeAction::RequestRepaint).unwrap();
                         sent_find = true;
                     }
                     if !sent_buf && line.text == "FIND_OK" {
-                        tx.send(RuntimeAction::HandleIncomingLine(rgb_line("BUF")))
+                        tx.send(RuntimeAction::HandleIncomingLine(attributed_line("BUF")))
                             .unwrap();
                         tx.send(RuntimeAction::RequestRepaint).unwrap();
                         sent_buf = true;
                     }
                     if !sent_check && line.text == "BUF_OK" {
-                        tx.send(RuntimeAction::HandleIncomingLine(rgb_line("CHECK")))
+                        tx.send(RuntimeAction::HandleIncomingLine(attributed_line("CHECK")))
                             .unwrap();
                         tx.send(RuntimeAction::RequestRepaint).unwrap();
                         sent_check = true;
@@ -209,7 +282,7 @@ async fn line_buffer_unified_read_styles_writethrough_and_booleans() {
     let transcript = lines.join("\n");
     assert!(
         lines.iter().any(|l| l.starts_with("STYLE_OK")),
-        "line.styles must reflect the server RGB color and round-trip into highlightAt.\nTranscript:\n{transcript}"
+        "line.styles must expose and losslessly round-trip terminal attributes.\nTranscript:\n{transcript}"
     );
     assert!(
         lines.iter().any(|l| l == "FIND_OK"),

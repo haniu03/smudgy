@@ -89,11 +89,11 @@ mod ingest {
                 if b != b'\n' && b != b'\r' {
                     vt_processor.push_raw_incoming_byte(b);
                 }
-                vt_parser.parse_byte(b, &mut *vt_processor);
+                vt_parser.parse_byte(b, vt_processor);
             }
         } else {
             for &b in data {
-                vt_parser.parse_byte(b, &mut *vt_processor);
+                vt_parser.parse_byte(b, vt_processor);
             }
         }
     }
@@ -125,6 +125,14 @@ mod ingest {
                 // The reply rides the same inline buffer negotiation answers use.
                 if payload == [responders::ttype::SEND] {
                     self.protocol.on_ttype_send(self.replies);
+                }
+                return;
+            }
+            if option == telnet::option::NEW_ENVIRON {
+                // RFC 1572 / Mudlet capability convention: answer SEND with the
+                // small set of OSC 8 features Smudgy truthfully implements.
+                if let Some((&responders::new_environ::SEND, requested)) = payload.split_first() {
+                    responders::new_environ::answer_send(requested, self.replies);
                 }
                 return;
             }
@@ -746,6 +754,9 @@ pub struct Connection {
     ui_tx: mpsc::Sender<TaggedSessionEvent>,
     socket_tx: Arc<RwLock<Option<WeakSender<OutboundFrame>>>>,
     on_connect: Option<Box<dyn FnOnce() + Send>>,
+    /// Monotonic session-local id used to reject late packet markers from a
+    /// socket that was replaced by a reconnect.
+    generation: u64,
     /// The trigger manager's "any trigger has a raw pattern" flag; each connect
     /// task hands it to its [`VtProcessor`] so per-line raw capture only runs
     /// while something can match on it.
@@ -778,6 +789,7 @@ impl std::fmt::Debug for Connection {
             .field("ui_tx", &self.ui_tx)
             .field("socket_tx", &self.socket_tx)
             .field("on_connect", &self.on_connect.is_some())
+            .field("generation", &self.generation)
             .field("raw_wanted", &self.raw_wanted)
             .field("window_size", &self.window_size)
             .field("write_stall_timeout", &self.write_stall_timeout)
@@ -793,12 +805,24 @@ impl Connection {
         raw_wanted: Arc<std::sync::atomic::AtomicBool>,
         window_size: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
+        Self::with_generation(runtime_tx, ui_tx, raw_wanted, window_size, 0)
+    }
+
+    #[must_use]
+    pub(crate) fn with_generation(
+        runtime_tx: UnboundedSender<RuntimeAction>,
+        ui_tx: futures::channel::mpsc::Sender<TaggedSessionEvent>,
+        raw_wanted: Arc<std::sync::atomic::AtomicBool>,
+        window_size: Arc<std::sync::atomic::AtomicU32>,
+        generation: u64,
+    ) -> Self {
         Self {
             disconnect: None,
             runtime_tx,
             ui_tx,
             socket_tx: Arc::new(RwLock::new(None)),
             on_connect: None,
+            generation,
             raw_wanted,
             window_size,
             write_stall_timeout: WRITE_STALL_TIMEOUT,
@@ -917,13 +941,15 @@ impl Connection {
         let socket_tx = self.socket_tx.clone();
 
         let on_connect = self.on_connect.take();
+        let generation = self.generation;
         let raw_wanted = self.raw_wanted.clone();
         let window_size = self.window_size.clone();
         let write_stall_timeout = self.write_stall_timeout;
 
         spawn_io_task(async move {
             let mut vt_parser = VTParser::new();
-            let mut vt_processor = VtProcessor::new(runtime_tx.clone());
+            let mut vt_processor =
+                VtProcessor::with_connection_generation(runtime_tx.clone(), generation);
             vt_processor.set_raw_wanted_flag(raw_wanted);
             // Telnet/IAC preprocessor: consumes negotiation + prompt markers so the VT parser only
             // ever sees pure game text. Persists across reads (a sequence may straddle a read).
@@ -936,12 +962,10 @@ impl Connection {
             // Subnegotiation responder state (TTYPE cycle, NAWS reporting). Reads the
             // shared size cell at report time, so the first NAWS answer already carries
             // the size the UI last reported; `secure` sets the MTTS SSL bit.
-            let mut protocol =
-                responders::ProtocolState::new(window_size, tls != TlsMode::Off);
+            let mut protocol = responders::ProtocolState::new(window_size, tls != TlsMode::Off);
             // Charset transcoding: the per-server setting seeds it (None = UTF-8, a pure
             // pass-through); a CHARSET negotiation switches it mid-stream.
-            let mut transcode =
-                transcode::Transcode::new(encoding.unwrap_or(encoding_rs::UTF_8));
+            let mut transcode = transcode::Transcode::new(encoding.unwrap_or(encoding_rs::UTF_8));
             // Negotiation replies to write back to the server, reused across reads.
             let mut telnet_replies: Vec<u8> = Vec::new();
             let (write_to_socket_tx, mut write_to_socket_rx) =
@@ -1416,7 +1440,9 @@ impl Connection {
                 // Silently ignore errors here; when a session is closing the runtime may already be gone by the time
                 // we get here
                 runtime_tx
-                    .send(RuntimeAction::Disconnected)
+                    .send(RuntimeAction::Disconnected {
+                        connection_generation: generation,
+                    })
                     .map(|()| {
                         let notice = if graceful {
                             "Disconnected."
@@ -1625,6 +1651,36 @@ mod tests {
             // in the buffer), so the reply is exactly the IS frame.
             assert_eq!(replies, expected);
         }
+    }
+
+    #[test]
+    fn new_environ_advertises_osc8_tooltips_end_to_end() {
+        let option = telnet::option::NEW_ENVIRON;
+        let requested = [
+            &[responders::new_environ::SEND, 3][..],
+            b"OSC_HYPERLINKS_TOOLTIP",
+            &[3][..],
+            b"OSC_HYPERLINKS_TOOLTIP_SGR",
+        ]
+        .concat();
+        let mut input = vec![command::IAC, command::DO, option];
+        telnet::frame_subnegotiation(option, &requested, &mut input);
+
+        let (replies, actions) = ingest_buffer(&input);
+        assert!(actions.is_empty());
+        let mut expected = vec![command::IAC, command::WILL, option];
+        responders::new_environ::answer_send(&requested[1..], &mut expected);
+        assert_eq!(replies, expected);
+        assert!(
+            replies
+                .windows(b"OSC_HYPERLINKS_TOOLTIP".len())
+                .any(|window| window == b"OSC_HYPERLINKS_TOOLTIP")
+        );
+        assert!(
+            replies
+                .windows(b"OSC_HYPERLINKS_TOOLTIP_SGR".len())
+                .any(|window| window == b"OSC_HYPERLINKS_TOOLTIP_SGR")
+        );
     }
 
     /// `DO NAWS` is accepted and immediately answered with the current window
@@ -1973,7 +2029,7 @@ mod tests {
             loop {
                 let action = runtime_rx.recv().await.expect("runtime action");
                 match action {
-                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Disconnected { .. } => disconnected = true,
                     RuntimeAction::Echo(text) if text.as_str() == "Disconnected." => {
                         reported_disconnect = true;
                     }
@@ -2016,7 +2072,7 @@ mod tests {
             loop {
                 let action = runtime_rx.recv().await.expect("runtime action");
                 match action {
-                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Disconnected { .. } => disconnected = true,
                     RuntimeAction::Echo(text) if text.as_str() == "Connection lost" => {
                         reported_loss = true;
                     }
@@ -2063,7 +2119,7 @@ mod tests {
                     RuntimeAction::HandleIncomingLine(line) if line.text == "hello" => {
                         received_line = true;
                     }
-                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Disconnected { .. } => disconnected = true,
                     RuntimeAction::Echo(text) if text.as_str() == "Connection lost" => {
                         reported_loss = true;
                     }
@@ -2117,7 +2173,7 @@ mod tests {
             loop {
                 let action = runtime_rx.recv().await.expect("runtime action");
                 match action {
-                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Disconnected { .. } => disconnected = true,
                     RuntimeAction::Echo(text) if text.as_str() == "Disconnected." => {
                         reported_disconnect = true;
                     }

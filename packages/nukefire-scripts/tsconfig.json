@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.json",
+  "include": [
+    "./**/*",
+    "../../.smudgy/types/smudgy-core.d.ts",
+    "../../.smudgy/types/smudgy-mapper.d.ts",
+    "../../.smudgy/types/smudgy-widgets.d.ts"
+  ]
+}

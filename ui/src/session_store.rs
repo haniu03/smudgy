@@ -12,12 +12,11 @@ use crate::cloud_account::CloudHandles;
 use crate::components::session_input;
 use crate::images::image_store;
 use crate::terminal_buffer::selection::Selection;
-use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer};
+use crate::terminal_buffer::{LinkClickEvent, LinkProtocolState, TerminalBuffer};
 use crate::theme::Element;
 use crate::widgets::split_terminal_pane;
 use iced::widget::{
-    button, center, checkbox, column, container, mouse_area, opaque, operation, row, space, stack,
-    svg, text,
+    button, center, checkbox, column, container, mouse_area, opaque, row, space, stack, svg, text,
 };
 use iced::{Alignment, Border, Color, Length, Padding, Subscription, Task};
 use log::info;
@@ -26,17 +25,21 @@ use smudgy_cloud::{
     LocalBackend, Mapper, PackageApiClient,
 };
 use smudgy_core::get_smudgy_home;
+use smudgy_core::models::input_history::{load_input_history, save_input_history};
 use smudgy_core::models::map_scopes::MapScopes;
 use smudgy_core::models::profile::load_profile;
 use smudgy_core::models::server::{ServerConfig, link_url_host, load_server, update_server};
 use smudgy_core::models::settings::{ScriptSettings, Settings, load_settings};
 use smudgy_core::session::SessionParams;
-use smudgy_core::session::runtime::input::InputSnapshot;
+use smudgy_core::session::runtime::input::{InputOp, InputSnapshot};
 use smudgy_core::session::runtime::pane::{
     MAIN_PANE_KEY, MAIN_PANE_NAME_ID, PaneDef, PaneKey, PaneKind, TitleBarPolicy,
 };
 use smudgy_core::session::runtime::{IsolateId, RuntimeAction};
-use smudgy_core::session::styled_line::LinkAction;
+use smudgy_core::session::styled_line::{
+    InvisiblePolicy, LinkAction, LinkTooltipCallback, escape_invisible_text,
+};
+use smudgy_core::session::ui_command::UiCommandBus;
 use smudgy_core::session::{self, SessionEvent, SessionId};
 use smudgy_core::session::{BufferUpdate, TaggedSessionEvent};
 use smudgy_map_widget::map_view;
@@ -58,6 +61,7 @@ use tokio::sync::mpsc::{self};
 /// torn down — late events and actions for it are dropped by the daemon.
 pub struct SessionStore {
     cloud: CloudHandles,
+    ui_commands: Option<UiCommandBus>,
     sessions: BTreeMap<SessionId, ManagedSession>,
     next_session_id: SessionId,
 }
@@ -66,9 +70,18 @@ impl SessionStore {
     pub fn new(cloud: CloudHandles) -> Self {
         Self {
             cloud,
+            ui_commands: None,
             sessions: BTreeMap::new(),
             next_session_id: 0.into(),
         }
+    }
+
+    /// Construct the production store attached to the daemon's one ordered
+    /// command bus. Tests that only exercise local UI state use [`Self::new`].
+    pub fn with_ui_commands(cloud: CloudHandles, ui_commands: UiCommandBus) -> Self {
+        let mut store = Self::new(cloud);
+        store.ui_commands = Some(ui_commands);
+        store
     }
 
     /// Allocates an id and creates the session state. Giving the session a
@@ -89,6 +102,7 @@ impl SessionStore {
             self.cloud.credentials.clone(),
             self.cloud.base_url.as_str(),
             auto_connect,
+            self.ui_commands.clone(),
         );
         self.sessions.insert(session_id, session);
         session_id
@@ -104,6 +118,49 @@ impl SessionStore {
 
     pub fn iter(&self) -> impl Iterator<Item = (SessionId, &ManagedSession)> {
         self.sessions.iter().map(|(id, session)| (*id, session))
+    }
+
+    /// Reconcile the application-wide input-focus invariant. A successful
+    /// focus gain belongs to exactly one session input, so publish loss for
+    /// every other input before publishing the target's gain. A focus loss
+    /// only changes its named input; it must not guess which input receives
+    /// focus next.
+    pub fn note_input_focus(&mut self, session_id: SessionId, key: PaneKey, focused: bool) -> bool {
+        if !focused {
+            return self
+                .sessions
+                .get_mut(&session_id)
+                .is_some_and(|session| session.note_input_focus_state(key, false));
+        }
+
+        let target_exists = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.input_for(key).is_some());
+        if !target_exists {
+            return false;
+        }
+
+        for (other_id, session) in &mut self.sessions {
+            if *other_id != session_id {
+                session.clear_input_focus();
+            }
+        }
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.focus_only_input(key);
+        }
+        true
+    }
+
+    /// Collect and clear every session's workspace-dirty mark (connection-
+    /// intent changes). Part of the daemon's once-per-update sweep into the
+    /// autosave schedule.
+    pub fn take_workspace_dirty(&mut self) -> bool {
+        let mut dirty = false;
+        for session in self.sessions.values_mut() {
+            dirty |= std::mem::take(&mut session.workspace_dirty);
+        }
+        dirty
     }
 
     /// Shuts the session's runtime down and drops its state. Returns whether
@@ -152,10 +209,12 @@ pub struct ManagedSession {
     pub input: session_input::SessionInput,
 
     pub session_params: Arc<SessionParams>,
+    ui_commands: Option<UiCommandBus>,
 
     pub mapper: Option<Mapper>,
 
     terminal_buffer: Rc<RefCell<TerminalBuffer>>,
+    link_protocol_state: Rc<RefCell<LinkProtocolState>>,
     terminal_pane_selection: Rc<RefCell<Selection>>,
 
     /// Display state for this session's non-main panes, keyed by the
@@ -168,10 +227,9 @@ pub struct ManagedSession {
     /// so the mutable def fields the UI reads are mirrored here — set via
     /// `PaneUpdated` when a script re-policies `main`.
     main_title_bar: TitleBarPolicy,
-    /// The main pane's terminal font override, mirrored beside
+    /// The main pane's font override, mirrored beside
     /// `main_title_bar` (set via `setFontSize` on main, `change-display`
-    /// gated). Scrollback text only — the session input stays on the global
-    /// preference.
+    /// gated). Applied to both scrollback and the session input.
     main_font_size: Option<f32>,
 
     widget_root: WidgetRoot<'static, crate::Theme, crate::Renderer>,
@@ -208,6 +266,10 @@ pub struct ManagedSession {
     /// Whether this session has ever been connected. Drives the Connect (never
     /// connected) vs Reconnect (was connected) label on the title-bar control.
     ever_connected: bool,
+    /// The connection intent changed since the daemon's last workspace
+    /// sweep (the intent is persisted per session slot). A mutation's whole
+    /// persistence cost is this boolean store.
+    workspace_dirty: bool,
 
     /// This server's config — the address plus the OSC 8 link-trust grants —
     /// shared with the link handler and updated when the user opts in from
@@ -237,8 +299,9 @@ pub struct ManagedSession {
 struct PendingLinkConfirm {
     /// The gated action, performed verbatim on Proceed.
     action: LinkAction,
-    /// What the user is shown: the full URL, or the exact command a `send:`
-    /// link would transmit. Never server-relabelable.
+    /// Safe, middle-elided display copy of the full URL or `send:` target.
+    /// Deceptive invisible characters are escaped and the value is never
+    /// server-relabelable; elision preserves the genuine target suffix.
     display: String,
     /// The URL's host (the per-host grant key); `None` for a `send:` link.
     host: Option<String>,
@@ -246,10 +309,19 @@ struct PendingLinkConfirm {
     grant_server: bool,
 }
 
+const LINK_CONFIRM_DISPLAY_CHARS: usize = 180;
+
+fn safe_link_confirmation_display(action: &LinkAction) -> String {
+    let Some(target) = action.disclosure_target_text() else {
+        return String::new();
+    };
+    let elided = elide_middle(target.as_ref(), LINK_CONFIRM_DISPLAY_CHARS);
+    escape_invisible_text(&elided, InvisiblePolicy::ActionTarget).into_owned()
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     None,
-    Close,
     Input(session_input::Message),
     /// A message for one pane-hosted input's `SessionInput`.
     PaneInput(PaneKey, session_input::Message),
@@ -270,6 +342,9 @@ pub enum Message {
     /// deliberately leaves presses uncaptured). Focuses the session input
     /// when the click didn't create a selection.
     TerminalClicked,
+    /// A terminal link activation, published by the widget and handled only
+    /// after its immutable scrollback borrow has been released.
+    LinkActivated(LinkClickEvent),
     /// Global settings changed: apply the scrollback limit and re-bake span
     /// styles here, and forward the runtime-relevant pieces to the session.
     ApplySettings(Settings),
@@ -281,6 +356,32 @@ pub enum Message {
     LinkConfirmProceed,
     /// Dismiss the pending server link without acting.
     LinkConfirmCancel,
+}
+
+impl Message {
+    /// The input-focus edge carried by this session message, if any. Window
+    /// chrome uses the edge before delegating the message so a user click and
+    /// an explicit widget operation both update activation through the same
+    /// path.
+    pub fn input_focus_change(&self) -> Option<(PaneKey, bool)> {
+        fn focused(message: &session_input::Message) -> Option<bool> {
+            match message {
+                session_input::Message::FocusGained => Some(true),
+                session_input::Message::FocusLost => Some(false),
+                session_input::Message::FocusSettled {
+                    focused,
+                    found: true,
+                } => Some(*focused),
+                _ => None,
+            }
+        }
+
+        match self {
+            Self::Input(message) => focused(message).map(|focused| (MAIN_PANE_KEY, focused)),
+            Self::PaneInput(key, message) => focused(message).map(|focused| (*key, focused)),
+            _ => None,
+        }
+    }
 }
 
 /// The unit a per-server cloud-map scope association is written against, mirrored
@@ -606,7 +707,53 @@ pub fn title_bar_icon_button<M: Clone + 'static>(
     .into()
 }
 
+/// Build the terminal's event-only link callback once a session runtime exists.
+/// Keeping this callback free of session captures is what makes it safe to run
+/// while the terminal widget still holds its immutable scrollback borrow.
+fn link_activation_handler(
+    runtime_available: bool,
+) -> Option<Rc<dyn Fn(LinkClickEvent) -> Message>> {
+    runtime_available
+        .then(|| Rc::new(Message::LinkActivated) as Rc<dyn Fn(LinkClickEvent) -> Message>)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VisibilityFanout {
+    Input,
+    Prompt,
+}
+
+fn fan_visibility_event<'a>(
+    main: &'a Rc<RefCell<TerminalBuffer>>,
+    panes: impl Iterator<Item = &'a Rc<RefCell<TerminalBuffer>>>,
+    event: VisibilityFanout,
+) {
+    for buffer in std::iter::once(main).chain(panes) {
+        let buffer = buffer.borrow();
+        match event {
+            VisibilityFanout::Input => buffer.note_visibility_input(),
+            VisibilityFanout::Prompt => buffer.note_visibility_prompt(),
+        }
+    }
+}
+
 impl ManagedSession {
+    fn note_visibility_input(&self) {
+        fan_visibility_event(
+            &self.terminal_buffer,
+            self.panes.values().filter_map(|pane| pane.buffer.as_ref()),
+            VisibilityFanout::Input,
+        );
+    }
+
+    fn note_visibility_prompt(&self) {
+        fan_visibility_event(
+            &self.terminal_buffer,
+            self.panes.values().filter_map(|pane| pane.buffer.as_ref()),
+            VisibilityFanout::Prompt,
+        );
+    }
+
     /// Creates the session state for `server_name`/`profile_name`. With
     /// `auto_connect` the connection is established as soon as the runtime is
     /// ready; without it the session opens **offline** — the runtime, mapper,
@@ -623,14 +770,16 @@ impl ManagedSession {
         credentials: CredentialSource,
         base_url: &str,
         auto_connect: bool,
+        ui_commands: Option<UiCommandBus>,
     ) -> Self {
         let settings = load_settings();
 
         info!("Settings: {settings:?}");
 
-        // Create a single shared terminal buffer, sized from settings
-        let terminal_buffer = Rc::new(RefCell::new(TerminalBuffer::new_with_max_lines(
+        let link_protocol_state = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let terminal_buffer = Rc::new(RefCell::new(TerminalBuffer::new_with_protocol_state(
             scrollback_limit(&settings),
+            link_protocol_state.clone(),
         )));
 
         // Load profile to get the subtext (caption) once
@@ -693,6 +842,19 @@ impl ManagedSession {
         let map_store = MapStore::new();
         let text_store = TextEditorStore::new();
 
+        let input_history = match load_input_history(&server_name, &profile_name) {
+            Ok(history) => history,
+            Err(error) => {
+                log::warn!(
+                    "Failed to load input history for '{profile_name}' on '{server_name}': {error}"
+                );
+                Vec::new()
+            }
+        };
+        let input = session_input::SessionInput::new()
+            .with_terminal_buffer(terminal_buffer.clone())
+            .with_history(input_history);
+
         // The image store is process-global (entries are keyed by content source, shared
         // across sessions). Register this session's repaint waker so a completed load repaints
         // its widgets (the store pokes every live session on completion), and the package
@@ -735,6 +897,7 @@ impl ManagedSession {
                 extra_script_extensions,
                 on_engine_rebuild,
             }),
+            ui_commands,
             server_config: Rc::new(RefCell::new(load_server(&server_name).map_or_else(
                 |e| {
                     // Sessions can outlive an on-disk rename; a fallback
@@ -750,8 +913,9 @@ impl ManagedSession {
             server_echo: false,
             server_name,
             profile_name,
-            input: session_input::SessionInput::new().with_terminal_buffer(terminal_buffer.clone()),
+            input,
             terminal_buffer: terminal_buffer.clone(),
+            link_protocol_state,
             terminal_pane_selection: Rc::new(RefCell::new(Selection::default())),
             panes: HashMap::new(),
             main_title_bar: TitleBarPolicy::Normal,
@@ -764,6 +928,7 @@ impl ManagedSession {
             connected_at_unix_ms: None,
             auto_connect,
             ever_connected: false,
+            workspace_dirty: false,
             mapper,
             widget_root,
             map_store,
@@ -795,13 +960,17 @@ impl ManagedSession {
         let key = def.key;
         let main_input = &self.input;
         let mirror_interest = self.input_mirror_feed.interest;
+        let link_protocol_state = self.link_protocol_state.clone();
         self.panes.entry(def.key).or_insert_with(|| {
             let buffer = match def.kind {
                 PaneKind::Terminal => {
                     let settings = load_settings();
-                    Some(Rc::new(RefCell::new(TerminalBuffer::new_with_max_lines(
-                        scrollback_limit(&settings),
-                    ))))
+                    Some(Rc::new(RefCell::new(
+                        TerminalBuffer::new_with_protocol_state(
+                            scrollback_limit(&settings),
+                            link_protocol_state.clone(),
+                        ),
+                    )))
                 }
                 // Widgets-only: no scrollback (the widget stack is the
                 // pane's whole body).
@@ -865,25 +1034,50 @@ impl ManagedSession {
         }
     }
 
-    /// Slim title-bar content for a script pane: its display-cased name. Kept
-    /// intrinsic-width — the bar's leftover space is the drag pick area.
-    pub fn script_pane_title(&self, key: PaneKey) -> Element<'static, Message> {
-        let label = self
-            .panes
-            .get(&key)
-            .map_or_else(|| key.to_string(), |pane| pane.def.name.to_string());
-        container(
-            text(label)
-                .size(12)
-                .color(Color::from_rgba8(255, 250, 239, 0.6)),
-        )
-        .padding(Padding {
-            top: 4.0,
-            right: 10.0,
-            bottom: 4.0,
-            left: 10.0,
-        })
-        .into()
+    /// The display label for one of this session's panes: profile/server for
+    /// main, the display-cased pane name for a script pane (unknown keys — a
+    /// stale slot mid-teardown — fall back to the key itself).
+    pub fn pane_label(&self, key: PaneKey) -> String {
+        if key == MAIN_PANE_KEY {
+            format!("{} ({})", self.profile_name, self.server_name)
+        } else {
+            self.panes
+                .get(&key)
+                .map_or_else(|| key.to_string(), |pane| pane.def.name.to_string())
+        }
+    }
+
+    /// Whether this session has ever been connected (drives the Connect vs
+    /// Reconnect label on its tab's connection control).
+    pub fn ever_connected(&self) -> bool {
+        self.ever_connected
+    }
+
+    /// The session's connection *intent* — the explicit online/offline
+    /// choice (Connect sets it, Disconnect clears it), never the observed
+    /// socket state. This is what the workspace mirror persists, so a
+    /// snapshot taken during a transient outage cannot flip next-launch
+    /// behavior.
+    pub fn connect_intent(&self) -> bool {
+        self.auto_connect
+    }
+
+    /// One pane's definition, for durable descriptor building (namespace +
+    /// name identity). `None` for the main pane (which has no `PaneDisplay`
+    /// entry) and for stale keys mid-teardown.
+    pub fn pane_def(&self, key: PaneKey) -> Option<&PaneDef> {
+        self.panes.get(&key).map(|pane| &pane.def)
+    }
+
+    /// Tell every terminal widget rendering `key` that its command editor
+    /// owns keyboard focus again. The widgets consume this epoch during
+    /// layout and discard any stale mouse/Tab link-navigation focus.
+    pub fn note_command_input_focus(&self, key: PaneKey) {
+        if key == MAIN_PANE_KEY {
+            self.terminal_buffer.borrow_mut().note_command_input_focus();
+        } else if let Some(buffer) = self.panes.get(&key).and_then(|pane| pane.buffer.as_ref()) {
+            buffer.borrow_mut().note_command_input_focus();
+        }
     }
 
     /// The body of a script pane: the widget entries targeting it, stacked
@@ -909,6 +1103,7 @@ impl ManagedSession {
                             buffer.borrow(),
                             pane.selection.clone(),
                             self.link_handler(),
+                            self.link_tooltip_handler(),
                             // NAWS describes the main terminal; script panes don't report.
                             None,
                             pane.def.font_size,
@@ -936,7 +1131,9 @@ impl ManagedSession {
                 match pane.input.as_ref() {
                     Some(input) => column![
                         content,
-                        input.view().map(move |msg| Message::PaneInput(key, msg))
+                        input
+                            .view_with_font_size(pane.def.font_size)
+                            .map(move |msg| Message::PaneInput(key, msg))
                     ]
                     .spacing(10)
                     .width(Length::Fill)
@@ -968,6 +1165,19 @@ impl ManagedSession {
     /// dropped session-event subscription owns the corresponding early
     /// shutdown signal instead.
     fn shutdown(&mut self) {
+        let history: Vec<String> = self
+            .input
+            .history_snapshot()
+            .iter()
+            .map(|entry| entry.as_str().to_string())
+            .collect();
+        if let Err(error) = save_input_history(&self.server_name, &self.profile_name, &history) {
+            log::warn!(
+                "Failed to save input history for '{}' on '{}': {error}",
+                self.profile_name,
+                self.server_name
+            );
+        }
         if let Some(tx) = self.runtime_tx.take() {
             tx.send(RuntimeAction::Shutdown).ok();
         }
@@ -985,70 +1195,116 @@ impl ManagedSession {
         }))
     }
 
-    /// The link-click handler this session's terminal panes call: a command link
-    /// sends on THIS session (the one whose pane was clicked); a callback link is
-    /// addressed to the session/isolate that minted it — sent here too, and the
-    /// dispatch arm forwards it home when that is another session. Server-sent
-    /// links (OSC 8: browser URLs and `send:` commands) pass the per-server
-    /// trust gate first — ungranted ones stage the confirm dialog instead of
-    /// acting. `None` until the runtime is ready (links echoed that early
-    /// cannot exist anyway).
-    fn link_handler(&self) -> Option<Rc<dyn Fn(LinkClickEvent)>> {
-        let tx = self.runtime_tx.clone()?;
-        let server_config = self.server_config.clone();
-        let pending = self.pending_link_confirm.clone();
-        Some(Rc::new(move |event: LinkClickEvent| {
-            let action = match event.action {
-                LinkAction::Send(command) => RuntimeAction::Send(Arc::new(command.to_string())),
-                LinkAction::Callback {
+    /// Map a terminal link click into the ordinary iced update path. This must
+    /// not mutate session state directly: terminal elements retain an immutable
+    /// `Ref<TerminalBuffer>` while dispatching widget events.
+    fn link_handler(&self) -> Option<Rc<dyn Fn(LinkClickEvent) -> Message>> {
+        link_activation_handler(self.runtime_tx.is_some())
+    }
+
+    /// Act on a link only after iced has dropped the terminal element that
+    /// published it. A command link sends on this pane's session; a callback
+    /// link retains the session/isolate address that minted it. Server OSC 8
+    /// actions pass the per-server trust gate first.
+    fn handle_link_activation(&mut self, event: LinkClickEvent) {
+        let action = match event.action {
+            LinkAction::Send(command) => {
+                self.note_visibility_input();
+                RuntimeAction::Send(Arc::new(command.to_string()))
+            }
+            LinkAction::Callback {
+                session,
+                isolate_token,
+                id,
+            } => {
+                let (isolate, instance) = IsolateId::from_widget_token(&isolate_token);
+                RuntimeAction::InvokeLinkCallback {
                     session,
-                    isolate_token,
+                    isolate,
+                    instance,
                     id,
-                } => {
-                    let (isolate, instance) = IsolateId::from_widget_token(&isolate_token);
-                    RuntimeAction::InvokeLinkCallback {
-                        session,
-                        isolate,
-                        instance,
-                        id,
-                        shift: event.shift,
-                        ctrl: event.ctrl,
-                        alt: event.alt,
-                    }
+                    shift: event.shift,
+                    ctrl: event.ctrl,
+                    alt: event.alt,
                 }
-                LinkAction::OpenUrl(url) => {
-                    let host = link_url_host(&url);
-                    if server_config.borrow().allows_server_link(host.as_deref()) {
-                        open_url_in_browser(&url);
-                    } else {
-                        *pending.borrow_mut() = Some(PendingLinkConfirm {
-                            display: url.to_string(),
-                            action: LinkAction::OpenUrl(url),
-                            host,
-                            grant_host: false,
-                            grant_server: false,
-                        });
-                    }
+            }
+            LinkAction::OpenUrl(url) => {
+                let host = link_url_host(&url);
+                if self
+                    .server_config
+                    .borrow()
+                    .allows_server_link(host.as_deref())
+                {
+                    open_url_in_browser(&url);
+                } else {
+                    let action = LinkAction::OpenUrl(url);
+                    *self.pending_link_confirm.borrow_mut() = Some(PendingLinkConfirm {
+                        display: safe_link_confirmation_display(&action),
+                        action,
+                        host,
+                        grant_host: false,
+                        grant_server: false,
+                    });
+                }
+                return;
+            }
+            LinkAction::ServerSend(command) => {
+                if self.server_config.borrow().allows_server_link(None) {
+                    self.note_visibility_input();
+                    RuntimeAction::Send(Arc::new(command.to_string()))
+                } else {
+                    let action = LinkAction::ServerSend(command);
+                    *self.pending_link_confirm.borrow_mut() = Some(PendingLinkConfirm {
+                        display: safe_link_confirmation_display(&action),
+                        action,
+                        host: None,
+                        grant_host: false,
+                        grant_server: false,
+                    });
                     return;
                 }
-                LinkAction::ServerSend(command) => {
-                    if server_config.borrow().allows_server_link(None) {
-                        RuntimeAction::Send(Arc::new(command.to_string()))
-                    } else {
-                        *pending.borrow_mut() = Some(PendingLinkConfirm {
-                            display: command.to_string(),
-                            action: LinkAction::ServerSend(command),
-                            host: None,
-                            grant_host: false,
-                            grant_server: false,
-                        });
-                        return;
+            }
+            LinkAction::Prompt(text) => {
+                let Some(tx) = &self.runtime_tx else {
+                    log::warn!(
+                        "Session {}: dropping OSC prompt: session runtime not ready",
+                        self.id
+                    );
+                    return;
+                };
+                for op in [InputOp::Replace(Arc::new(text.to_string())), InputOp::Focus] {
+                    if let Err(e) = tx.send(RuntimeAction::InputApply {
+                        key: MAIN_PANE_KEY,
+                        op,
+                    }) {
+                        log::error!("Failed to apply OSC prompt to session input: {e}");
+                        break;
                     }
                 }
-            };
-            if let Err(e) = tx.send(action) {
-                log::error!("Failed to send link action to session runtime: {e}");
+                return;
             }
+            // TerminalPane resolves configured primary actions and menu rows
+            // before dispatch. Treat an unexpected wrapper as inert.
+            LinkAction::Configured { .. } => return,
+        };
+        self.send_runtime_action(action);
+    }
+
+    /// Route a lazy hover callback to the isolate that created the styled link.
+    /// The shared result cell lives in terminal scrollback, so completion needs
+    /// only a repaint wake rather than a buffer mutation.
+    fn link_tooltip_handler(&self) -> Option<Rc<dyn Fn(LinkTooltipCallback)>> {
+        let tx = self.runtime_tx.clone()?;
+        Some(Rc::new(move |request: LinkTooltipCallback| {
+            let (isolate, instance) = IsolateId::from_widget_token(&request.isolate_token);
+            tx.send(RuntimeAction::ResolveLinkTooltip {
+                session: request.session,
+                isolate,
+                instance,
+                id: request.id,
+                state: request.state,
+            })
+            .ok();
         }))
     }
 
@@ -1057,10 +1313,14 @@ impl ManagedSession {
         match action {
             LinkAction::OpenUrl(url) => open_url_in_browser(url),
             LinkAction::ServerSend(command) => {
+                self.note_visibility_input();
                 self.send_runtime_action(RuntimeAction::Send(Arc::new(command.to_string())));
             }
-            // Script links never pass through the trust gate.
-            LinkAction::Send(_) | LinkAction::Callback { .. } => {}
+            // Prompt and script links never pass through the trust gate.
+            LinkAction::Prompt(_)
+            | LinkAction::Configured { .. }
+            | LinkAction::Send(_)
+            | LinkAction::Callback { .. } => {}
         }
     }
 
@@ -1131,10 +1391,14 @@ impl ManagedSession {
     fn handle_input_event(&mut self, event: session_input::Event) {
         match event {
             session_input::Event::Submit { text, masked } => {
+                self.note_visibility_input();
                 self.send_runtime_action(submit_runtime_action(text, masked));
             }
             session_input::Event::HotkeyTriggered(id) => {
                 self.send_runtime_action(RuntimeAction::ExecHotkey { id });
+            }
+            session_input::Event::FocusGained => {
+                self.note_command_input_focus(MAIN_PANE_KEY);
             }
             // The main input never opts into Escape-to-main.
             session_input::Event::FocusMain => {}
@@ -1162,7 +1426,19 @@ impl ManagedSession {
                 self.send_runtime_action(RuntimeAction::ExecHotkey { id });
                 Task::none()
             }
-            session_input::Event::FocusMain => operation::focus(self.input.input_id()),
+            session_input::Event::FocusGained => {
+                self.note_command_input_focus(key);
+                Task::none()
+            }
+            session_input::Event::FocusMain => {
+                self.note_command_input_focus(MAIN_PANE_KEY);
+                session_input::focus_target(self.input.input_id()).map(|found| {
+                    Message::Input(session_input::Message::FocusSettled {
+                        focused: true,
+                        found,
+                    })
+                })
+            }
         }
     }
 
@@ -1211,6 +1487,82 @@ impl ManagedSession {
             Some(&self.input)
         } else {
             self.panes.get(&key).and_then(|pane| pane.input.as_ref())
+        }
+    }
+
+    fn input_for_mut(&mut self, key: PaneKey) -> Option<&mut session_input::SessionInput> {
+        if key == MAIN_PANE_KEY {
+            Some(&mut self.input)
+        } else {
+            self.panes
+                .get_mut(&key)
+                .and_then(|pane| pane.input.as_mut())
+        }
+    }
+
+    /// Set one input's model-side focus state and publish the mirror edge.
+    /// The widget tree is deliberately not touched here: this is the
+    /// authoritative completion/observation half of an iced focus change.
+    fn note_input_focus_state(&mut self, key: PaneKey, focused: bool) -> bool {
+        let Some(input) = self.input_for_mut(key) else {
+            return false;
+        };
+        input.note_focus_state(focused);
+        self.sync_input_mirror(key);
+        true
+    }
+
+    fn clear_input_focus(&mut self) {
+        let mut keys = self.pane_input_keys();
+        keys.push(MAIN_PANE_KEY);
+        for key in keys {
+            self.note_input_focus_state(key, false);
+        }
+    }
+
+    fn focus_only_input(&mut self, target: PaneKey) {
+        let mut keys = self.pane_input_keys();
+        keys.push(MAIN_PANE_KEY);
+        for key in keys {
+            if key != target {
+                self.note_input_focus_state(key, false);
+            }
+        }
+        self.note_input_focus_state(target, true);
+    }
+
+    /// The exact widget id for the input hosted by `key`, if any. Window
+    /// chrome uses it to blur only the pane it obscured; iced widget
+    /// operations otherwise traverse every application window.
+    pub fn pane_input_id(&self, key: PaneKey) -> Option<iced::widget::Id> {
+        self.input_for(key)
+            .map(session_input::SessionInput::input_id)
+    }
+
+    /// Arm the obscured-blur mark on the input behind `key` (see
+    /// [`session_input::SessionInput::note_obscured`]): the tab switch about
+    /// to obscure the pane must not let the blur it inflicts clear the
+    /// user's in-progress text. Publish the synthetic focus loss immediately;
+    /// the now-inactive widget subtree cannot deliver its real blur until it
+    /// is selected again. A pane without an input takes no mark.
+    pub fn note_pane_input_obscured(&mut self, key: PaneKey) {
+        let noted = {
+            let input = if key == MAIN_PANE_KEY {
+                Some(&mut self.input)
+            } else {
+                self.panes
+                    .get_mut(&key)
+                    .and_then(|pane| pane.input.as_mut())
+            };
+            if let Some(input) = input {
+                input.note_obscured();
+                true
+            } else {
+                false
+            }
+        };
+        if noted {
+            self.sync_input_mirror(key);
         }
     }
 
@@ -1302,19 +1654,23 @@ impl ManagedSession {
     }
 
     pub fn session_subscription(&self) -> Subscription<TaggedSessionEvent> {
-        Subscription::run_with(self.session_params.clone(), |params| {
-            session::spawn(params.clone())
-        })
+        if let Some(ui_commands) = &self.ui_commands {
+            Subscription::run_with(
+                (self.session_params.clone(), ui_commands.clone()),
+                |(params, ui_commands)| {
+                    session::spawn_with_ui_commands(params.clone(), ui_commands.clone())
+                },
+            )
+        } else {
+            Subscription::run_with(self.session_params.clone(), |params| {
+                session::spawn(params.clone())
+            })
+        }
     }
 
     /// Handle session-specific messages
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Close => {
-                // Session teardown is the daemon's job (store removal, grid
-                // cleanup, runtime shutdown); nothing to do at this level.
-                Task::none()
-            }
             Message::SetMapperCurrentLocation(area_id, room_number) => {
                 self.map_store.set_current_location(area_id, room_number);
                 Task::none()
@@ -1334,6 +1690,10 @@ impl ManagedSession {
             Message::Input(input_msg) => {
                 let update = self.input.update(input_msg);
                 self.finish_main_input_update(update)
+            }
+            Message::LinkActivated(event) => {
+                self.handle_link_activation(event);
+                Task::none()
             }
             Message::PaneInput(key, input_msg) => {
                 // Deliberately not `input_for_mut`: a `PaneInput` message is
@@ -1356,13 +1716,26 @@ impl ManagedSession {
                 let Some(pane) = self.panes.get(&key) else {
                     return Task::none();
                 };
-                let Some(input) = pane.input.as_ref() else {
+                let Some(input_id) = pane
+                    .input
+                    .as_ref()
+                    .map(session_input::SessionInput::input_id)
+                else {
                     return Task::none();
                 };
                 if pane.selection.borrow().blocks_focus() {
                     Task::none()
                 } else {
-                    operation::focus(input.input_id())
+                    self.note_command_input_focus(key);
+                    session_input::focus_target(input_id).map(move |found| {
+                        Message::PaneInput(
+                            key,
+                            session_input::Message::FocusSettled {
+                                focused: true,
+                                found,
+                            },
+                        )
+                    })
                 }
             }
             Message::SessionEvent(event) => {
@@ -1430,8 +1803,13 @@ impl ManagedSession {
                                 BufferUpdate::EnsureNewLine => {
                                     self.terminal_buffer.borrow_mut().commit_current_line();
                                 }
+                                BufferUpdate::PromptBoundary => {
+                                    self.note_visibility_prompt();
+                                }
                                 BufferUpdate::Append(line) => {
-                                    self.terminal_buffer.borrow_mut().extend_line(line.clone());
+                                    let mut buffer = self.terminal_buffer.borrow_mut();
+                                    buffer.note_visibility_output();
+                                    buffer.extend_line(line.clone());
                                 }
                                 BufferUpdate::AppendTo(key, line) => {
                                     // Core validates sinks against the live registry when it
@@ -1443,6 +1821,7 @@ impl ManagedSession {
                                     {
                                         Some(buffer) => {
                                             let mut buffer = buffer.borrow_mut();
+                                            buffer.note_visibility_output();
                                             // Whole-line delivery: start a fresh line, commit it.
                                             buffer.extend_line(line.clone());
                                             buffer.commit_current_line();
@@ -1451,6 +1830,17 @@ impl ManagedSession {
                                             "Dropping AppendTo for unknown or bufferless {key}"
                                         ),
                                     }
+                                }
+                                BufferUpdate::BeginOpenLineReplacement => self
+                                    .terminal_buffer
+                                    .borrow_mut()
+                                    .begin_open_line_replacement(),
+                                BufferUpdate::FinishOpenLineReplacement(line) => {
+                                    let mut buffer = self.terminal_buffer.borrow_mut();
+                                    if line.is_some() {
+                                        buffer.note_visibility_output();
+                                    }
+                                    buffer.finish_open_line_replacement(line.clone());
                                 }
                                 BufferUpdate::RetractOpenLine => {
                                     self.terminal_buffer.borrow_mut().retract_open_line();
@@ -1477,7 +1867,7 @@ impl ManagedSession {
                         self.open_pane(def);
                         Task::none()
                     }
-                    SessionEvent::PaneClosed(key) => {
+                    SessionEvent::PaneClosed(key) | SessionEvent::PaneClosedOrdered(key) => {
                         self.panes.remove(&key);
                         // The feeds' per-key records die with the pane's input
                         // (keys are never reused; the runtime purges its side
@@ -1541,19 +1931,23 @@ impl ManagedSession {
                     // session store has nothing to do with them.
                     SessionEvent::MapperNavigated(_)
                     | SessionEvent::OfferMapRescue { .. }
-                    | SessionEvent::MapAreaCreated(_) => Task::none(),
+                    | SessionEvent::MapAreaCreated(_)
+                    | SessionEvent::MapAtlasCreated(_) => Task::none(),
                     // Placement commands — applied by the daemon (which owns
                     // the windows and their cluster models) before this
                     // forward; no session-store state is involved.
                     SessionEvent::PaneResize { .. }
                     | SessionEvent::PaneRelocate { .. }
+                    | SessionEvent::PaneGroupWith { .. }
+                    | SessionEvent::PaneSelect { .. }
                     | SessionEvent::PaneTearOut { .. }
-                    | SessionEvent::PaneSwap { .. } => Task::none(),
+                    | SessionEvent::PaneSwap { .. }
+                    | SessionEvent::LayoutSave { .. }
+                    | SessionEvent::LayoutApply { .. } => Task::none(),
                     SessionEvent::Connected => {
                         self.connected = true;
                         self.ever_connected = true;
-                        self.connected_at_unix_ms =
-                            Some(crate::discord_presence::unix_now_ms());
+                        self.connected_at_unix_ms = Some(crate::discord_presence::unix_now_ms());
                         Task::none()
                     }
                     SessionEvent::Disconnected => {
@@ -1567,10 +1961,14 @@ impl ManagedSession {
                         // update here — processing the message redraws the view.
                         Task::none()
                     }
+                    SessionEvent::LinkTooltipChanged => Task::none(),
                     SessionEvent::InputOp { key, op } => {
                         // The op layer refuses targets without an input, so a
                         // miss here can only be a bug. Warn-and-drop like an
                         // AppendTo miss.
+                        if matches!(op, InputOp::Focus) {
+                            self.note_command_input_focus(key);
+                        }
                         if key == MAIN_PANE_KEY {
                             let update = self.input.apply_script_op(&op);
                             self.finish_main_input_update(update)
@@ -1667,6 +2065,8 @@ impl ManagedSession {
                 // An explicit connect marks online intent, so a later reload
                 // restores the connection like any normal session.
                 self.auto_connect = true;
+                // Connection intent persists per session slot.
+                self.workspace_dirty = true;
                 match session::config::load_connect_action(&self.server_name, &self.profile_name) {
                     Ok(action) => self.send_runtime_action(action),
                     Err(e) => log::error!("Failed to load connection config: {e:?}"),
@@ -1680,7 +2080,13 @@ impl ManagedSession {
                 if self.terminal_pane_selection.borrow().blocks_focus() {
                     Task::none()
                 } else {
-                    operation::focus(self.input.input_id())
+                    self.note_command_input_focus(MAIN_PANE_KEY);
+                    session_input::focus_target(self.input.input_id()).map(|found| {
+                        Message::Input(session_input::Message::FocusSettled {
+                            focused: true,
+                            found,
+                        })
+                    })
                 }
             }
             Message::Disconnect => {
@@ -1689,6 +2095,8 @@ impl ManagedSession {
                 // silently reconnect. The runtime emits `Disconnected` back,
                 // which flips `connected` off.
                 self.auto_connect = false;
+                // Connection intent persists per session slot.
+                self.workspace_dirty = true;
                 self.send_runtime_action(RuntimeAction::Disconnect);
                 Task::none()
             }
@@ -1761,12 +2169,8 @@ impl ManagedSession {
                         }
                         if pending.grant_host
                             && let Some(host) = &pending.host
-                            && !config
-                                .trusted_link_hosts
-                                .iter()
-                                .any(|t| t.eq_ignore_ascii_case(host))
                         {
-                            config.trusted_link_hosts.push(host.clone());
+                            config.grant_link_host(host);
                         }
                         if let Err(e) = update_server(&self.server_name, config.clone()) {
                             log::error!(
@@ -1784,82 +2188,6 @@ impl ManagedSession {
         }
     }
 
-    /// Title-bar content for this session's pane: the profile/server label,
-    /// styled as a tab. Deliberately intrinsic-width — pane_grid's drag pick
-    /// area is the title bar minus the bounds of the content *and* controls,
-    /// so a fill-width header would leave nothing to drag the pane by.
-    pub fn title_content(&self, is_active: bool) -> Element<'_, Message> {
-        let title = text(format!("{} ({})", self.profile_name, self.server_name))
-            .size(13)
-            .color(Color::from_rgba8(
-                255,
-                250,
-                239,
-                if is_active { 1.0 } else { 0.45 },
-            ));
-
-        container(title)
-            .padding(Padding {
-                top: 5.0,
-                right: 12.0,
-                bottom: 5.0,
-                left: 12.0,
-            })
-            .style(move |_: &crate::Theme| container::Style {
-                background: Some(
-                    Color::from_rgba8(255, 255, 255, if is_active { 0.08 } else { 0.03 }).into(),
-                ),
-                border: Border {
-                    radius: iced::border::Radius {
-                        top_left: 6.0,
-                        top_right: 6.0,
-                        bottom_right: 0.0,
-                        bottom_left: 0.0,
-                    },
-                    ..Border::default()
-                },
-                ..Default::default()
-            })
-            .into()
-    }
-
-    /// Title-bar controls: the connection toggle and session close. pane_grid
-    /// renders controls outside the drag pick area, so these stay plain
-    /// clicks even mid-bar.
-    pub fn title_controls(&self) -> Element<'_, Message> {
-        // The connection control: Disconnect when live, otherwise Reconnect
-        // (was connected before) or Connect (opened offline, never connected).
-        let (conn_label, conn_message) = if self.connected {
-            (
-                crate::i18n::t!("session-action-disconnect"),
-                Message::Disconnect,
-            )
-        } else if self.ever_connected {
-            (
-                crate::i18n::t!("session-action-reconnect"),
-                Message::Reconnect,
-            )
-        } else {
-            (
-                crate::i18n::t!("session-action-connect"),
-                Message::Reconnect,
-            )
-        };
-
-        let connection_button = button(text(conn_label).size(12))
-            .style(smudgy_theme::builtins::button::subtle)
-            .padding([2, 10])
-            .on_press(conn_message);
-
-        let close_button =
-            title_bar_icon_button(crate::assets::hero_icons::X_MARK.clone(), Message::Close);
-
-        row![connection_button, close_button]
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .into()
-    }
-
     /// The pane body under the title bar: the terminal (with the
     /// script-widget overlay stacked over it) above the command input.
     /// Activation on click is handled by the parent grid's `on_click`.
@@ -1873,6 +2201,7 @@ impl ManagedSession {
             self.terminal_buffer.borrow(),
             self.terminal_pane_selection.clone(),
             self.link_handler(),
+            self.link_tooltip_handler(),
             self.grid_change_handler(),
             self.main_font_size,
         ))
@@ -1886,7 +2215,10 @@ impl ManagedSession {
         let terminal_area = stack![terminal, widgets];
 
         // Map input messages to session messages
-        let input = self.input.view().map(Message::Input);
+        let input = self
+            .input
+            .view_with_font_size(self.main_font_size)
+            .map(Message::Input);
 
         let body: Element<'_, Message> = column![terminal_area, input]
             .spacing(10)
@@ -1914,8 +2246,8 @@ impl ManagedSession {
             .into()
     }
 
-    /// The trust-gate dialog for a server-sent link: the verbatim destination
-    /// (never server-relabelable), a perform/cancel pair, and the two opt-in
+    /// The trust-gate dialog for a server-sent link: a safely escaped,
+    /// never-server-relabelable destination, a perform/cancel pair, and two opt-in
     /// grants — per-host (URL links only) and trust-everything-from-this-
     /// server. Clicking the dimmed backdrop cancels.
     fn link_confirm_dialog(&self, pending: &PendingLinkConfirm) -> Element<'static, Message> {
@@ -1930,11 +2262,10 @@ impl ManagedSession {
             ),
         };
 
-        // A server can make the URL/command up to the OSC 8 URI cap (8 KiB);
-        // middle-elide so a long unbroken token can't overflow the card and
-        // push the buttons off-screen. The user still sees both ends — enough
-        // to judge the destination.
-        let display = elide_middle(&pending.display, 180);
+        // `safe_link_confirmation_display` has already middle-elided the full
+        // raw target before escaping it, so this bounded string preserves the
+        // genuine destination suffix and cannot split a `\u{...}` escape.
+        let display = pending.display.clone();
 
         let mut body = column![
             text(title).size(15),
@@ -2197,9 +2528,206 @@ fn migrate_global_local_maps(legacy: &Path, server_local_dirs: &[PathBuf]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn input_focus_edges_are_visible_to_window_and_daemon_routers() {
+        assert_eq!(
+            Message::Input(session_input::Message::FocusGained).input_focus_change(),
+            Some((MAIN_PANE_KEY, true))
+        );
+        assert_eq!(
+            Message::Input(session_input::Message::FocusLost).input_focus_change(),
+            Some((MAIN_PANE_KEY, false))
+        );
+        assert_eq!(
+            Message::Input(session_input::Message::FocusSettled {
+                focused: true,
+                found: true,
+            })
+            .input_focus_change(),
+            Some((MAIN_PANE_KEY, true))
+        );
+        assert_eq!(
+            Message::Input(session_input::Message::FocusSettled {
+                focused: true,
+                found: false,
+            })
+            .input_focus_change(),
+            None,
+            "an operation that found no widget must not invent activation"
+        );
+    }
+
+    #[test]
+    fn link_confirmation_escapes_deceptive_action_target_text() {
+        let action = LinkAction::ServerSend(Arc::from("pay\u{202e}gold\u{200b}"));
+        assert_eq!(
+            safe_link_confirmation_display(&action),
+            "send:pay\\u{202E}gold\\u{200B}"
+        );
+    }
+
+    #[test]
+    fn link_confirmation_preserves_the_actual_action_tail() {
+        let command = format!("{}\u{202e}delete-everything", "safe-prefix-".repeat(50));
+        let action = LinkAction::ServerSend(Arc::from(command));
+        let display = safe_link_confirmation_display(&action);
+
+        assert!(display.starts_with("send:safe-prefix-"));
+        assert!(display.contains('\u{2026}'));
+        assert!(display.ends_with("\\u{202E}delete-everything"));
+        assert!(!display.contains('\u{202e}'));
+        assert!(!display.contains("\\\\u{202E}delete-everything"));
+    }
 
     fn atlas_target(n: u128) -> BindTarget {
         BindTarget::Atlas(AtlasId(smudgy_cloud::Uuid::from_u128(n)))
+    }
+
+    /// Link callbacks run during terminal event dispatch, while the widget's
+    /// immutable scrollback borrow is still live. They must only publish a
+    /// message; the subsequent update is where session mutation belongs.
+    #[test]
+    fn link_click_defers_activation_past_the_terminal_borrow() {
+        let buffer = RefCell::new(TerminalBuffer::new());
+        let render_borrow = buffer.borrow();
+        let handler = link_activation_handler(true).expect("a ready runtime enables links");
+        let event = LinkClickEvent {
+            action: LinkAction::ServerSend(Arc::from("look")),
+            shift: true,
+            ctrl: false,
+            alt: true,
+        };
+
+        let Message::LinkActivated(published) = handler(event.clone()) else {
+            panic!("the terminal callback must only publish LinkActivated");
+        };
+        assert_eq!(published.action, event.action);
+        assert_eq!(
+            (published.shift, published.ctrl, published.alt),
+            (event.shift, event.ctrl, event.alt)
+        );
+        assert!(
+            buffer.try_borrow_mut().is_err(),
+            "the render borrow intentionally remains live during the callback"
+        );
+
+        drop(render_borrow);
+        assert!(buffer.try_borrow_mut().is_ok());
+        assert!(
+            link_activation_handler(false).is_none(),
+            "links remain inert until the session runtime is available"
+        );
+    }
+
+    fn visibility_line(
+        prompt: bool,
+        input: bool,
+    ) -> Arc<smudgy_core::session::styled_line::StyledLine> {
+        use smudgy_core::session::styled_line::{
+            LinkProtocol, LinkSpan, LinkVisibility, LinkVisibilityAction, LinkVisibilityExpire,
+            StyledLine,
+        };
+
+        let action = LinkAction::Configured {
+            primary: Some(Box::new(LinkAction::ServerSend(Arc::from("look")))),
+            disabled: false,
+            primary_enabled: true,
+            menu: None,
+            menu_on_left_click: false,
+            protocol: Some(LinkProtocol {
+                visibility: Some(LinkVisibility {
+                    action: LinkVisibilityAction::Conceal,
+                    delay_ms: None,
+                    expire: LinkVisibilityExpire {
+                        input,
+                        prompt,
+                        output: false,
+                        output_delay_ms: 0,
+                    },
+                    whole_line: false,
+                }),
+                ..LinkProtocol::default()
+            }),
+        };
+        let mut line = StyledLine::new("link", Vec::new());
+        line.links.push(LinkSpan {
+            begin_pos: 0,
+            end_pos: 4,
+            action,
+            tooltip: None,
+            style: None,
+        });
+        Arc::new(line)
+    }
+
+    #[test]
+    fn visibility_input_and_prompt_events_fan_out_to_routed_buffers() {
+        use crate::terminal_buffer::LinkProtocolState;
+
+        let shared = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let main = Rc::new(RefCell::new(TerminalBuffer::new_with_protocol_state(
+            NonZeroUsize::new(10).unwrap(),
+            shared.clone(),
+        )));
+        let routed = Rc::new(RefCell::new(TerminalBuffer::new_with_protocol_state(
+            NonZeroUsize::new(10).unwrap(),
+            shared,
+        )));
+        main.borrow_mut().push_line(visibility_line(false, true));
+        routed.borrow_mut().push_line(visibility_line(true, false));
+        let main_key = main.borrow().link_keys().next().expect("main link key");
+        let routed_key = routed.borrow().link_keys().next().expect("routed link key");
+
+        // Expiry fanout is inert until each link has been activated.
+        fan_visibility_event(&main, std::iter::once(&routed), VisibilityFanout::Input);
+        fan_visibility_event(&main, std::iter::once(&routed), VisibilityFanout::Prompt);
+        assert!(!main.borrow().link_state().borrow().concealed(main_key));
+        assert!(!routed.borrow().link_state().borrow().concealed(routed_key));
+
+        let now = Instant::now();
+        main.borrow()
+            .link_state()
+            .borrow_mut()
+            .activate_visibility(main_key, now);
+        routed
+            .borrow()
+            .link_state()
+            .borrow_mut()
+            .activate_visibility(routed_key, now);
+
+        fan_visibility_event(&main, std::iter::once(&routed), VisibilityFanout::Input);
+        assert!(main.borrow().link_state().borrow().concealed(main_key));
+        assert!(!routed.borrow().link_state().borrow().concealed(routed_key));
+
+        // The first prompt after activation belongs to the click response.
+        fan_visibility_event(&main, std::iter::once(&routed), VisibilityFanout::Prompt);
+        assert!(!routed.borrow().link_state().borrow().concealed(routed_key));
+        fan_visibility_event(&main, std::iter::once(&routed), VisibilityFanout::Prompt);
+        assert!(routed.borrow().link_state().borrow().concealed(routed_key));
+    }
+
+    #[test]
+    fn protocol_mutation_does_not_reborrow_the_rendered_scrollback() {
+        use crate::terminal_buffer::LinkProtocolState;
+
+        let shared = Rc::new(RefCell::new(LinkProtocolState::default()));
+        let buffer = RefCell::new(TerminalBuffer::new_with_protocol_state(
+            NonZeroUsize::new(10).unwrap(),
+            shared.clone(),
+        ));
+        let buffer_link_state = buffer.borrow().link_state();
+        let render_borrow = buffer.borrow();
+
+        shared
+            .borrow_mut()
+            .mark_visited(&LinkAction::Send(Arc::from("look")));
+        assert_eq!(buffer_link_state.borrow().visual_generation(), 0);
+        assert!(buffer.try_borrow_mut().is_err());
+
+        drop(render_borrow);
+        assert!(buffer.try_borrow_mut().is_ok());
     }
 
     /// The input mirror feed's interest gate and coalescing: without interest

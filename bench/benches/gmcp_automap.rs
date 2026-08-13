@@ -26,8 +26,8 @@ use criterion::{
 };
 use smudgy_bench::atlas::synthetic_area;
 use smudgy_cloud::{
-    AreaId, AreaWithDetails, CloudMapper, CompositeBackend, LocalBackend, Mapper, MapperBackend,
-    RoomNumber, RoomUpdates, mapper::RoomKey,
+    AreaId, AreaWithDetails, CloudMapper, CompositeBackend, LocalBackend, MapDestination,
+    MapStorage, Mapper, MapperBackend, RoomNumber, RoomUpdates, mapper::RoomKey,
 };
 
 const MED: usize = 10_000;
@@ -95,7 +95,10 @@ fn build(total_rooms: usize) -> AutomapBench {
         let mapper = Mapper::new(backend, cache_dir.path());
         mapper.load_all_areas().await.expect("load synthetic areas");
         let session_area = mapper
-            .create_area_ephemeral("bench session map".to_string())
+            .create_area_at(
+                "bench session map".to_string(),
+                MapDestination::loose(MapStorage::Session),
+            )
             .await
             .expect("create ephemeral area");
         (mapper, session_area)
@@ -128,7 +131,10 @@ fn sanity(bench: &mut AutomapBench) {
     let atlas = bench.mapper.get_current_atlas();
     let loaded: usize = atlas.areas().map(|a| a.room_count()).sum();
     assert_eq!(loaded, bench.total_rooms, "corpus loaded in full");
-    assert!(bench.mapper.is_ephemeral(&bench.session_area));
+    assert_eq!(
+        bench.mapper.area_storage(&bench.session_area),
+        MapStorage::Session
+    );
     assert!(
         atlas.find_room_by_external_id("ext-0").is_some(),
         "seeded external ids resolve"
@@ -137,7 +143,10 @@ fn sanity(bench: &mut AutomapBench) {
     // One full create round-trip through the ephemeral tier.
     let key = RoomKey::new(bench.session_area, RoomNumber(bench.next_room));
     bench.next_room += 1;
-    bench.mapper.upsert_room(key.clone(), automap_room(0));
+    bench
+        .mapper
+        .upsert_room(key.clone(), automap_room(0))
+        .expect("sanity room queues");
     let atlas = bench.mapper.get_current_atlas();
     let (found, room) = atlas
         .find_room_by_external_id("bench-room-0")

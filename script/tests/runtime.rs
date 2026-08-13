@@ -220,6 +220,74 @@ fn basic_eval_load_smoke() -> Result<()> {
     Ok(())
 }
 
+fn delayed_js_module_server() -> (ModuleSpecifier, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed module server");
+    let address = listener
+        .local_addr()
+        .expect("delayed module server address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept module request");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while let Ok(read) = stream.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(250));
+        let body = "export const ok = true;";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write module response");
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+    (
+        ModuleSpecifier::parse(&format!("http://{address}/delayed.ts")).unwrap(),
+        handle,
+    )
+}
+
+#[test]
+fn http_module_load_yields_to_the_runtime() -> Result<()> {
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir()?;
+    let (tokio, mut rt) = script_runtime(temp.path())?;
+    let (specifier, server) = delayed_js_module_server();
+    let _entered = EnteredIsolate::enter(&mut rt);
+
+    tokio.block_on(async {
+        let mut load = Box::pin(rt.deno_runtime().load_main_es_module(&specifier));
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep(Duration::from_millis(25)) => {}
+            result = &mut load => {
+                panic!("HTTP module loading blocked the runtime instead of yielding: {result:?}");
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(3), load)
+            .await
+            .expect("HTTP module load timed out")?;
+        Ok::<(), deno_core::error::CoreError>(())
+    })?;
+
+    server.join().expect("delayed module server panicked");
+    Ok(())
+}
+
 #[test]
 fn inspector_attach_first_does_not_block_execution() -> Result<()> {
     let temp = tempfile::tempdir()?;

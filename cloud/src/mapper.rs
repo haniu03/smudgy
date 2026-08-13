@@ -9,7 +9,8 @@ use crate::mutation::{
 use crate::{
     Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CreateAreaRequest, Exit, ExitArgs, ExitId, ExitUpdates, LabelArgs, LabelId,
-    LabelUpdates, RoomNumber, RoomUpdates, ShapeArgs, ShapeId, ShapeUpdates,
+    LabelUpdates, MapDestination, MapStorage, RoomNumber, RoomUpdates, ShapeArgs, ShapeId,
+    ShapeUpdates,
 };
 
 use arc_swap::ArcSwap;
@@ -565,7 +566,7 @@ impl<'de> serde::Deserialize<'de> for AreaImportDocument {
 /// `connection_id` resolves in the document's `connections`, and every
 /// Connection has one or two member exits. A violation rejects the whole
 /// import.
-fn validate_import_document(details: &AreaWithDetails) -> CloudResult<()> {
+pub(crate) fn validate_import_document(details: &AreaWithDetails) -> CloudResult<()> {
     let mut members: HashMap<crate::ConnectionId, u32> = details
         .connections
         .iter()
@@ -672,6 +673,7 @@ impl SyncStats {
 struct AcknowledgedWrite {
     area_id: AreaId,
     pending_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
+    metadata_writes_by_area: Option<Arc<Mutex<HashMap<AreaId, u64>>>>,
     stats: Arc<SyncStats>,
     settled: bool,
 }
@@ -687,8 +689,27 @@ impl AcknowledgedWrite {
         Self {
             area_id,
             pending_by_area,
+            metadata_writes_by_area: None,
             stats,
             settled: false,
+        }
+    }
+
+    fn new_metadata(
+        area_id: AreaId,
+        pending_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
+        metadata_writes_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
+        stats: Arc<SyncStats>,
+    ) -> Self {
+        let mut write = Self::new(area_id, pending_by_area, stats);
+        *metadata_writes_by_area.lock().entry(area_id).or_insert(0) += 1;
+        write.metadata_writes_by_area = Some(metadata_writes_by_area);
+        write
+    }
+
+    fn release_metadata_marker(&self) {
+        if let Some(writes) = &self.metadata_writes_by_area {
+            Inner::decrement_pending(writes, self.area_id);
         }
     }
 
@@ -700,6 +721,7 @@ impl AcknowledgedWrite {
         };
         counter.fetch_add(1, Ordering::Relaxed);
         Inner::decrement_pending(&self.pending_by_area, self.area_id);
+        self.release_metadata_marker();
         self.settled = true;
     }
 }
@@ -709,11 +731,12 @@ impl Drop for AcknowledgedWrite {
         if !self.settled {
             self.stats.operations_failed.fetch_add(1, Ordering::Relaxed);
             Inner::decrement_pending(&self.pending_by_area, self.area_id);
+            self.release_metadata_marker();
         }
     }
 }
 
-struct AreaDeleteFence {
+pub(crate) struct AreaDeleteFence {
     area_id: AreaId,
     pending: Arc<PendingQueue>,
     armed: bool,
@@ -777,6 +800,26 @@ impl Drop for AreaDeleteFence {
     }
 }
 
+/// In-memory pre-delete fence held while a move copies its destination.
+/// Dropping an uncommitted fence reopens the source and its queued WAL.
+pub(crate) struct AreaMoveFence {
+    area_id: AreaId,
+    delete_fence: Option<AreaDeleteFence>,
+}
+
+impl AreaMoveFence {
+    #[must_use]
+    pub(crate) fn area_id(&self) -> AreaId {
+        self.area_id
+    }
+
+    fn into_delete_fence(mut self) -> AreaDeleteFence {
+        self.delete_fence
+            .take()
+            .expect("a move fence is committed at most once")
+    }
+}
+
 #[derive(Clone)]
 pub struct Mapper {
     inner: Arc<Inner>,
@@ -801,6 +844,9 @@ pub struct Inner {
     /// In-flight local write operations per area; the sync engine defers
     /// refetching an area while its count is non-zero.
     pending_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
+    /// Acknowledged area metadata writes (rename/refile) that are not part of
+    /// the content WAL. Relocation must not snapshot while one is in flight.
+    metadata_writes_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
     /// Operations already represented in session diagnostics. Reactivating a
     /// dormant viewer journal must not count the same durable edit twice.
     accounted_operations: Mutex<HashSet<OperationId>>,
@@ -824,6 +870,22 @@ pub struct Inner {
     /// pending-queue order. This becomes the write-ahead journal boundary:
     /// cache order and replay order must never diverge.
     mutation_gate: Mutex<()>,
+    /// Room numbers handed out to open scripted mutators but not yet
+    /// occupied by a committed room (see [`Mapper::reserve_room_number`]).
+    /// Every ambient allocation path consults this through
+    /// [`Mapper::next_room_number`] so a draft and a concurrent create can
+    /// never receive the same number.
+    room_reservations: Mutex<HashMap<AreaId, RoomReservations>>,
+}
+
+/// Per-area reservation state: the next number a reservation would take and
+/// the tokens (one per open mutator) holding numbers below it. The entry is
+/// dropped when the last holder releases, returning allocation to the cache
+/// maximum — an aborted mutator's numbers become available again.
+#[derive(Debug, Default)]
+struct RoomReservations {
+    floor: i32,
+    holders: HashMap<Uuid, u32>,
 }
 
 /// The outcome of a presence-checked import: what was added and what was
@@ -906,12 +968,14 @@ impl Mapper {
             auth_projection_revision: AtomicU64::new(0),
             sync_notify: Arc::new(Notify::new()),
             pending_by_area: Arc::new(Mutex::new(pending_by_area)),
+            metadata_writes_by_area: Arc::new(Mutex::new(HashMap::new())),
             accounted_operations: Mutex::new(accounted_operations),
             pending,
             ephemeral_cap_warned: AtomicBool::new(false),
             initial_load: tokio::sync::watch::channel(None).0,
             import_gate: tokio::sync::Mutex::new(()),
             mutation_gate: Mutex::new(()),
+            room_reservations: Mutex::new(HashMap::new()),
         };
 
         let mapper = Self {
@@ -1044,6 +1108,10 @@ impl Mapper {
             .rcu(|cache| Arc::new(cache.with_scope_exclusions(atlases.clone(), areas.clone())));
     }
 
+    #[deprecated(
+        since = "0.5.3",
+        note = "use create_area_at with an explicit MapDestination; supported through Smudgy 0.5.x and removed in 0.6.0"
+    )]
     pub fn create_area(&self, name: String) -> impl Future<Output = CloudResult<AreaId>> {
         self.inner.create_area(name)
     }
@@ -1057,21 +1125,132 @@ impl Mapper {
     /// Propagates the backend's create error (the ephemeral tier itself is
     /// infallible; a non-composite backend without the tier routes this to
     /// its default create path).
+    #[deprecated(
+        since = "0.5.3",
+        note = "use create_area_at with MapStorage::Session; supported through Smudgy 0.5.x and removed in 0.6.0"
+    )]
     pub fn create_area_ephemeral(&self, name: String) -> impl Future<Output = CloudResult<AreaId>> {
-        self.inner.create_area_ephemeral(name)
+        self.create_area_at(name, MapDestination::loose(MapStorage::Session))
+    }
+
+    /// Create an area at an explicit storage + folder destination.
+    ///
+    /// This is the canonical creation surface. The deprecated `create_area*`
+    /// compatibility helpers delegate here only through 0.5.x and are removed
+    /// in 0.6.0.
+    pub fn create_area_at(
+        &self,
+        name: String,
+        destination: MapDestination,
+    ) -> impl Future<Output = CloudResult<AreaId>> {
+        self.inner.create_area_at(name, destination)
     }
 
     /// Whether `area_id` lives in the ephemeral (session-lifetime) tier.
     #[must_use]
+    #[deprecated(
+        since = "0.5.3",
+        note = "use area_storage(area_id) == MapStorage::Session; supported through Smudgy 0.5.x and removed in 0.6.0"
+    )]
     pub fn is_ephemeral(&self, area_id: &AreaId) -> bool {
-        self.inner.backend.ephemeral_area_ids().contains(area_id)
+        self.area_storage(area_id) == MapStorage::Session
     }
 
-    /// Area ids of the ephemeral tier — the set the editor's atlas tree and
-    /// per-area preference writes exclude.
+    /// The authoritative storage tier for a loaded area.
     #[must_use]
-    pub fn ephemeral_area_ids(&self) -> HashSet<AreaId> {
+    pub fn area_storage(&self, area_id: &AreaId) -> MapStorage {
+        if self.inner.backend.ephemeral_area_ids().contains(area_id) {
+            MapStorage::Session
+        } else if self.inner.backend.local_area_ids().contains(area_id) {
+            MapStorage::Local
+        } else {
+            MapStorage::Cloud
+        }
+    }
+
+    /// The authoritative storage tier for an owned atlas.
+    #[must_use]
+    pub fn atlas_storage(&self, atlas_id: &AtlasId) -> MapStorage {
+        if self.inner.backend.local_atlas_ids().contains(atlas_id) {
+            MapStorage::Local
+        } else {
+            MapStorage::Cloud
+        }
+    }
+
+    /// The next free room number for an area, skipping numbers reserved by
+    /// open scripted mutators. Every ambient creation path (script
+    /// `createRoom`, the map editor's place/paste gestures) must allocate
+    /// through this rather than the raw cache maximum, or a concurrent
+    /// mutator draft and the ambient create would silently merge into one
+    /// room. Returns `None` when the area is not loaded.
+    #[must_use]
+    pub fn next_room_number(&self, area_id: &AreaId) -> Option<RoomNumber> {
+        let base = self
+            .inner
+            .atlas_cache
+            .load()
+            .get_area(area_id)?
+            .next_room_number()
+            .0;
+        let reservations = self.inner.room_reservations.lock();
+        let floor = reservations.get(area_id).map_or(base, |state| state.floor);
+        Some(RoomNumber(base.max(floor)))
+    }
+
+    /// Reserve the next free room number for an open scripted mutator.
+    /// The number is provisional: no room exists until the mutator's batch
+    /// commits, but ambient allocation skips it until every reservation
+    /// held under `token` is released. Releasing without committing (an
+    /// aborted mutator) returns the numbers to the allocator.
+    ///
+    /// # Errors
+    /// [`CloudError::AreaNotFound`] when the area is not loaded.
+    pub fn reserve_room_number(&self, area_id: &AreaId, token: Uuid) -> CloudResult<RoomNumber> {
+        let base = self
+            .inner
+            .atlas_cache
+            .load()
+            .get_area(area_id)
+            .ok_or(CloudError::AreaNotFound(*area_id))?
+            .next_room_number()
+            .0;
+        let mut reservations = self.inner.room_reservations.lock();
+        let state = reservations.entry(*area_id).or_default();
+        let number = base.max(state.floor);
+        state.floor = number + 1;
+        *state.holders.entry(token).or_insert(0) += 1;
+        Ok(RoomNumber(number))
+    }
+
+    /// Release every room-number reservation held under `token` for an
+    /// area. Idempotent; when the last holder releases, allocation falls
+    /// back to the cache maximum.
+    pub fn release_room_reservations(&self, area_id: &AreaId, token: Uuid) {
+        let mut reservations = self.inner.room_reservations.lock();
+        if let Some(state) = reservations.get_mut(area_id) {
+            state.holders.remove(&token);
+            if state.holders.is_empty() {
+                reservations.remove(area_id);
+            }
+        }
+    }
+
+    /// Area ids in session storage — the set the editor's atlas tree and
+    /// per-area preference writes exclude from durable filing.
+    #[must_use]
+    pub fn session_area_ids(&self) -> HashSet<AreaId> {
         self.inner.backend.ephemeral_area_ids()
+    }
+
+    /// Compatibility name for [`Self::session_area_ids`].
+    #[must_use]
+    #[deprecated(
+        since = "0.5.3",
+        note = "use session_area_ids; supported through Smudgy 0.5.x and removed in 0.6.0"
+    )]
+    pub fn ephemeral_area_ids(&self) -> HashSet<AreaId> {
+        self.session_area_ids()
     }
 
     /// Like [`Self::create_area`] but files the new area into `atlas_id`
@@ -1079,6 +1258,10 @@ impl Mapper {
     ///
     /// # Errors
     /// Propagates the backend's create error (e.g. unauthorized, network).
+    #[deprecated(
+        since = "0.5.3",
+        note = "use create_area_at with an explicit MapDestination; supported through Smudgy 0.5.x and removed in 0.6.0"
+    )]
     pub fn create_area_in(
         &self,
         name: String,
@@ -1116,6 +1299,61 @@ impl Mapper {
     /// Propagates the backend's read error.
     pub async fn export_area(&self, area_id: AreaId) -> CloudResult<AreaWithDetails> {
         self.inner.export_area(area_id).await
+    }
+
+    /// Snapshot the displayed area, including durably-journaled optimistic
+    /// edits that have not reached their backend yet. Relocation uses this
+    /// rather than a backend export so moving a map can never omit edits the
+    /// user can already see.
+    pub(crate) fn snapshot_area(&self, area_id: AreaId) -> CloudResult<AreaWithDetails> {
+        self.inner
+            .atlas_cache
+            .load()
+            .get_area(&area_id)
+            .map(|area| area.to_details())
+            .ok_or(CloudError::AreaNotFound(area_id))
+    }
+
+    /// Freeze source content before a move snapshot. The fence is deliberately
+    /// not durable yet: a crash during destination copy must leave the source
+    /// and its WAL usable. Existing in-flight content writes are allowed to
+    /// finish; future content and metadata writes are rejected until these
+    /// guards are committed or dropped.
+    pub(crate) fn begin_area_move(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaMoveFence>> {
+        self.inner.begin_area_move(area_ids)
+    }
+
+    pub(crate) async fn wait_area_move_quiescent(&self, fences: &[AreaMoveFence]) {
+        for fence in fences {
+            self.inner
+                .pending
+                .wait_until_delete_quiescent(fence.area_id())
+                .await;
+        }
+    }
+
+    /// Delete a move's source after its destination copy is fully
+    /// acknowledged. `expected_rev` is the backend revision the move
+    /// snapshot was taken against: the delete re-reads the authoritative
+    /// revision first and refuses on drift, so a behind-cache client fails
+    /// safe into the documented harmless-duplicate outcome instead of
+    /// destroying edits it never saw.
+    pub(crate) async fn commit_area_move(
+        &self,
+        fence: AreaMoveFence,
+        expected_rev: Option<i64>,
+    ) -> CloudResult<()> {
+        let area_id = fence.area_id();
+        self.inner
+            .delete_area_with_fence(area_id, fence.into_delete_fence(), expected_rev)
+            .await
+    }
+
+    /// The last backend-acknowledged revision for an area, when one is
+    /// known. Optimistic cache revisions (which run ahead while envelopes
+    /// are queued) never surface here.
+    pub(crate) fn confirmed_area_rev(&self, area_id: AreaId) -> Option<i64> {
+        self.inner.pending.confirmed_rev(area_id).0
     }
 
     /// The viewer's effective access for an area, or `None` if it isn't in the current atlas.
@@ -1180,6 +1418,10 @@ impl Mapper {
     ///
     /// # Errors
     /// Propagates the backend's create error (e.g. unauthorized, network).
+    #[deprecated(
+        since = "0.5.3",
+        note = "use create_atlas_at with an explicit MapStorage; supported through Smudgy 0.5.x and removed in 0.6.0"
+    )]
     pub fn create_atlas(&self, name: String) -> impl Future<Output = CloudResult<Atlas>> {
         let backend = self.inner.backend.clone();
         async move { backend.create_atlas(&name).await }
@@ -1191,6 +1433,10 @@ impl Mapper {
     ///
     /// # Errors
     /// Propagates the backend's create error (e.g. unauthorized, network).
+    #[deprecated(
+        since = "0.5.3",
+        note = "use create_atlas_at with an explicit MapStorage; supported through Smudgy 0.5.x and removed in 0.6.0"
+    )]
     pub fn create_atlas_in(
         &self,
         name: String,
@@ -1198,6 +1444,16 @@ impl Mapper {
     ) -> impl Future<Output = CloudResult<Atlas>> {
         let backend = self.inner.backend.clone();
         async move { backend.create_atlas_in(&name, prefer_local).await }
+    }
+
+    /// Create an atlas in an explicit durable storage tier.
+    pub fn create_atlas_at(
+        &self,
+        name: String,
+        storage: MapStorage,
+    ) -> impl Future<Output = CloudResult<Atlas>> {
+        let backend = self.inner.backend.clone();
+        async move { backend.create_atlas_at(&name, storage).await }
     }
 
     /// Rename an atlas.
@@ -1867,22 +2123,51 @@ impl Inner {
         self.create_area_from_request(request).await
     }
 
+    /// Create an area in an explicit storage tier and optional atlas.
+    pub async fn create_area_at(
+        &self,
+        name: String,
+        destination: MapDestination,
+    ) -> CloudResult<AreaId> {
+        if destination.storage == MapStorage::Session && destination.atlas_id.is_some() {
+            return Err(CloudError::InvalidInput(
+                "session maps cannot be filed into atlases".to_string(),
+            ));
+        }
+        let request = CreateAreaRequest {
+            name,
+            atlas_id: destination.atlas_id,
+            ephemeral: destination.storage == MapStorage::Session,
+        };
+        self.create_area_from_request_at(request, destination.storage)
+            .await
+    }
+
     /// Create an area in the ephemeral tier (see [`Mapper::create_area_ephemeral`]).
     ///
     /// # Errors
     /// Propagates the backend's create error.
     pub async fn create_area_ephemeral(&self, name: String) -> CloudResult<AreaId> {
-        let request = CreateAreaRequest {
-            name,
-            atlas_id: None,
-            ephemeral: true,
-        };
-        self.create_area_from_request(request).await
+        self.create_area_at(name, MapDestination::loose(MapStorage::Session))
+            .await
+    }
+
+    async fn create_area_from_request_at(
+        &self,
+        request: CreateAreaRequest,
+        storage: MapStorage,
+    ) -> CloudResult<AreaId> {
+        let backend_area = self.backend.create_area_at(request, storage).await?;
+        self.finish_created_area(backend_area)
     }
 
     async fn create_area_from_request(&self, request: CreateAreaRequest) -> CloudResult<AreaId> {
         // Create area on backend first to get the real ID
         let backend_area = self.backend.create_area(request).await?;
+        self.finish_created_area(backend_area)
+    }
+
+    fn finish_created_area(&self, backend_area: Area) -> CloudResult<AreaId> {
         let area_id = backend_area.id;
 
         // The created row is backend truth for the new area's revision.
@@ -2138,13 +2423,111 @@ impl Inner {
             .map(|area| area.effective_access())
     }
 
+    fn begin_area_move(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaMoveFence>> {
+        let _mutation_guard = self.mutation_gate.lock();
+        let metadata = self.metadata_writes_by_area.lock();
+        if let Some(area_id) = area_ids
+            .iter()
+            .find(|area_id| metadata.contains_key(area_id))
+        {
+            return Err(CloudError::PendingOperations(format!(
+                "map {area_id} is still being renamed or filed; retry the move when it finishes"
+            )));
+        }
+        drop(metadata);
+
+        // A queue paused for review holds edits the backend has not accepted.
+        // Moving such an area would snapshot the optimistic view and delete
+        // the source, silently resolving the pause as "keep mine" against
+        // whatever the other side holds — the user must resolve it first.
+        if let Some(area_id) = area_ids.iter().find(|area_id| {
+            matches!(
+                self.pending.save_status(**area_id),
+                AreaSaveStatus::ConflictNeedsReview | AreaSaveStatus::CouldNotSave { .. }
+            )
+        }) {
+            return Err(CloudError::PendingOperations(format!(
+                "map {area_id} has edits awaiting conflict or failure review; resolve them before moving the map"
+            )));
+        }
+
+        let mut fences = Vec::with_capacity(area_ids.len());
+        for &area_id in area_ids {
+            fences.push(AreaMoveFence {
+                area_id,
+                delete_fence: Some(AreaDeleteFence::begin(area_id, self.pending.clone())?),
+            });
+        }
+        Ok(fences)
+    }
+
     async fn delete_area_and_wait(&self, area_id: AreaId) -> CloudResult<()> {
         let auth_generation = self.metadata_auth_generation(area_id);
-        let mut delete_fence = {
-            let _mutation_guard = self.mutation_gate.lock();
-            AreaDeleteFence::begin(area_id, self.pending.clone())?
-        };
+        let mut fences = self.begin_area_move(&[area_id])?;
+        let delete_fence = fences
+            .pop()
+            .expect("one requested delete produces one fence")
+            .into_delete_fence();
+        self.delete_area_with_fence_at_generation(area_id, delete_fence, auth_generation, None)
+            .await
+    }
+
+    async fn delete_area_with_fence(
+        &self,
+        area_id: AreaId,
+        delete_fence: AreaDeleteFence,
+        expected_rev: Option<i64>,
+    ) -> CloudResult<()> {
+        let auth_generation = self.metadata_auth_generation(area_id);
+        self.delete_area_with_fence_at_generation(
+            area_id,
+            delete_fence,
+            auth_generation,
+            expected_rev,
+        )
+        .await
+    }
+
+    async fn delete_area_with_fence_at_generation(
+        &self,
+        area_id: AreaId,
+        mut delete_fence: AreaDeleteFence,
+        auth_generation: Option<u64>,
+        expected_rev: Option<i64>,
+    ) -> CloudResult<()> {
         self.pending.wait_until_delete_quiescent(area_id).await;
+        if let Some(expected_rev) = expected_rev {
+            // Compare-then-delete: the backend's DELETE carries no revision
+            // precondition, so the strongest available guard is re-reading the
+            // authoritative revision immediately before deleting and refusing
+            // on drift. Returning before `prepare()` drops the still-armed
+            // fence, which aborts the delete intent and reopens the source. A
+            // TOCTOU window remains between this read and the DELETE below;
+            // closing it needs a server-side expected-rev delete precondition.
+            let current = if let Some(auth_generation) = auth_generation {
+                self.backend
+                    .get_area_at_generation(&area_id, auth_generation)
+                    .await
+            } else {
+                self.backend.get_area(&area_id).await
+            };
+            match current {
+                Ok(details) if details.area.rev != expected_rev => {
+                    return Err(CloudError::RevisionConflict {
+                        id: area_id.0,
+                        expected_rev,
+                        current_rev: details.area.rev,
+                    });
+                }
+                Ok(_) => {}
+                // Already gone (or access revoked): the DELETE below reports
+                // the authoritative outcome through the existing path.
+                Err(CloudError::NotFoundOrNoAccess) => {}
+                // The revision could not be verified; refuse rather than
+                // delete blind. Both sides keep a complete copy.
+                Err(error) => return Err(error),
+            }
+        }
         delete_fence.prepare()?;
         delete_fence.request_started();
         let tracking = AcknowledgedWrite::new(
@@ -2195,11 +2578,20 @@ impl Inner {
             name: Some(name.to_string()),
             atlas_id: None,
         };
-        let tracking = AcknowledgedWrite::new(
-            area_id,
-            self.pending_by_area.clone(),
-            self.sync_stats.clone(),
-        );
+        let tracking = {
+            let _mutation_guard = self.mutation_gate.lock();
+            if self.pending.is_delete_fenced(area_id) {
+                return Err(CloudError::PendingOperations(
+                    "this map is being moved or deleted".to_string(),
+                ));
+            }
+            AcknowledgedWrite::new_metadata(
+                area_id,
+                self.pending_by_area.clone(),
+                self.metadata_writes_by_area.clone(),
+                self.sync_stats.clone(),
+            )
+        };
         let result = if let Some(auth_generation) = auth_generation {
             self.backend
                 .update_area_at_generation(&area_id, updates, auth_generation)
@@ -2207,9 +2599,12 @@ impl Inner {
         } else {
             self.backend.update_area(&area_id, updates).await
         };
-        tracking.settle(result.is_ok());
-        result?;
+        if let Err(error) = result {
+            tracking.settle(false);
+            return Err(error);
+        }
         if auth_generation.is_some_and(|generation| self.backend.auth_generation() != generation) {
+            tracking.settle(true);
             return Ok(());
         }
         self.atlas_cache.rcu(|cache| {
@@ -2218,6 +2613,7 @@ impl Inner {
                 |area| Arc::new(cache.insert_area(area_id, Arc::new(area.rename(name)))),
             )
         });
+        tracking.settle(true);
         Ok(())
     }
 
@@ -2227,11 +2623,20 @@ impl Inner {
         atlas_id: Option<AtlasId>,
     ) -> CloudResult<()> {
         let auth_generation = self.metadata_auth_generation(area_id);
-        let tracking = AcknowledgedWrite::new(
-            area_id,
-            self.pending_by_area.clone(),
-            self.sync_stats.clone(),
-        );
+        let tracking = {
+            let _mutation_guard = self.mutation_gate.lock();
+            if self.pending.is_delete_fenced(area_id) {
+                return Err(CloudError::PendingOperations(
+                    "this map is being moved or deleted".to_string(),
+                ));
+            }
+            AcknowledgedWrite::new_metadata(
+                area_id,
+                self.pending_by_area.clone(),
+                self.metadata_writes_by_area.clone(),
+                self.sync_stats.clone(),
+            )
+        };
         let result = if let Some(auth_generation) = auth_generation {
             self.backend
                 .move_area_to_atlas_at_generation(&area_id, atlas_id, auth_generation)
@@ -2239,9 +2644,12 @@ impl Inner {
         } else {
             self.backend.move_area_to_atlas(&area_id, atlas_id).await
         };
-        tracking.settle(result.is_ok());
-        result?;
+        if let Err(error) = result {
+            tracking.settle(false);
+            return Err(error);
+        }
         if auth_generation.is_some_and(|generation| self.backend.auth_generation() != generation) {
+            tracking.settle(true);
             return Ok(());
         }
         self.atlas_cache.rcu(|cache| {
@@ -2250,6 +2658,7 @@ impl Inner {
                 |area| Arc::new(cache.insert_area(area_id, Arc::new(area.with_atlas(atlas_id)))),
             )
         });
+        tracking.settle(true);
         Ok(())
     }
 
@@ -4638,7 +5047,10 @@ mod tests {
 
         let mapper = Mapper::new(Arc::new(EphemeralBackend::new()), temp_cache_dir());
         let area_id = mapper
-            .create_area_ephemeral("Session".to_string())
+            .create_area_at(
+                "Session".to_string(),
+                MapDestination::loose(MapStorage::Session),
+            )
             .await
             .expect("create ephemeral");
         mapper
@@ -5357,6 +5769,112 @@ mod tests {
             mapper.wait_for_sync_completion(5).await,
             Ok(true),
             "the settled counters unblock the quit-time flush"
+        );
+    }
+
+    /// A queue parked for conflict/failure review must refuse a move:
+    /// snapshotting the optimistic view and deleting the source would
+    /// silently resolve the review as "keep mine" against whatever the
+    /// backend holds.
+    #[tokio::test]
+    async fn area_move_refuses_a_queue_parked_for_review() {
+        let a_id = AreaId(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![sample_area(a_id, "Plaza")]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+
+        backend.fail_mutations_with(Some(CloudError::PermissionDenied(
+            "read-only share".to_string(),
+        )));
+        mapper
+            .upsert_room(
+                RoomKey::new(a_id, RoomNumber(2)),
+                RoomUpdates {
+                    title: Some("Annex".to_string()),
+                    ..RoomUpdates::default()
+                },
+            )
+            .expect("enqueue room");
+        wait_until(|| {
+            matches!(
+                mapper.area_save_status(a_id),
+                AreaSaveStatus::CouldNotSave { .. }
+            )
+        })
+        .await;
+
+        assert!(
+            matches!(
+                mapper.begin_area_move(&[a_id]),
+                Err(CloudError::PendingOperations(_))
+            ),
+            "a parked queue refuses the move fence"
+        );
+
+        // Resolving the failure reopens the move.
+        backend.fail_mutations_with(None);
+        mapper
+            .resolve_failed(a_id, true)
+            .await
+            .expect("retry failure");
+        wait_until(|| matches!(mapper.area_save_status(a_id), AreaSaveStatus::Saved)).await;
+        let fences = mapper
+            .begin_area_move(&[a_id])
+            .expect("a drained queue moves freely");
+        drop(fences);
+    }
+
+    /// Numbers drafted by an open scripted mutator are reserved against the
+    /// live allocator: an ambient create landing mid-callback takes the next
+    /// number past the drafts instead of silently merging with one, and an
+    /// aborted mutator returns its numbers.
+    #[tokio::test]
+    async fn ambient_creates_skip_room_numbers_reserved_by_open_mutators() {
+        let a_id = AreaId(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![sample_area(a_id, "Plaza")]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+
+        // The sample area holds room 1; two mutator drafts reserve 2 and 3.
+        let token = Uuid::new_v4();
+        assert_eq!(
+            mapper.reserve_room_number(&a_id, token).expect("reserve"),
+            RoomNumber(2)
+        );
+        assert_eq!(
+            mapper.reserve_room_number(&a_id, token).expect("reserve"),
+            RoomNumber(3)
+        );
+
+        // The ambient allocator skips the drafted range.
+        let ambient = mapper.next_room_number(&a_id).expect("area loaded");
+        assert_eq!(ambient, RoomNumber(4), "ambient create lands past the drafts");
+        mapper
+            .upsert_room(RoomKey::new(a_id, ambient), RoomUpdates::default())
+            .expect("enqueue ambient room");
+        wait_until(|| matches!(mapper.area_save_status(a_id), AreaSaveStatus::Saved)).await;
+
+        // Later drafts continue past the ambient room; a second open mutator
+        // holds its own reservations.
+        assert_eq!(
+            mapper.reserve_room_number(&a_id, token).expect("reserve"),
+            RoomNumber(5)
+        );
+        let other = Uuid::new_v4();
+        assert_eq!(
+            mapper.reserve_room_number(&a_id, other).expect("reserve"),
+            RoomNumber(6)
+        );
+
+        // Releasing one mutator keeps the other's range guarded; releasing
+        // the last returns allocation to the cache maximum.
+        mapper.release_room_reservations(&a_id, token);
+        assert_eq!(mapper.next_room_number(&a_id), Some(RoomNumber(7)));
+        mapper.release_room_reservations(&a_id, other);
+        assert_eq!(
+            mapper.next_room_number(&a_id),
+            Some(RoomNumber(5)),
+            "an aborted mutator's numbers become available again"
         );
     }
 }

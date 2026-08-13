@@ -12,6 +12,11 @@ import {
     op_smudgy_mapper_list_rooms_by_title_and_description,
     op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits,
     op_smudgy_mapper_create_area,
+    op_smudgy_mapper_get_area_storage,
+    op_smudgy_mapper_list_atlases,
+    op_smudgy_mapper_create_atlas,
+    op_smudgy_mapper_relocate_areas,
+    op_smudgy_mapper_relocate_atlas,
     op_smudgy_mapper_delete_area,
     op_smudgy_mapper_get_area_is_ephemeral,
     op_smudgy_mapper_rename_area,
@@ -21,6 +26,8 @@ import {
     op_smudgy_mapper_get_area_room_by_number,
     op_smudgy_mapper_get_area_property,
     op_smudgy_mapper_get_area_next_room_number,
+    op_smudgy_mapper_reserve_room_number,
+    op_smudgy_mapper_release_room_reservations,
     op_smudgy_mapper_get_room_number,
     op_smudgy_mapper_get_room_area_id,
     op_smudgy_mapper_get_room_title,
@@ -52,6 +59,8 @@ import {
     op_smudgy_mapper_create_room,
     op_smudgy_mapper_update_room,
     op_smudgy_mapper_update_rooms,
+    op_smudgy_mapper_generate_id,
+    op_smudgy_mapper_mutate_area,
     op_smudgy_mapper_create_room_exit,
     op_smudgy_mapper_set_room_exit,
     op_smudgy_mapper_merge_rooms,
@@ -87,6 +96,7 @@ import {
 // numbers (the ops serialize the `u64` pair to f64). It is an OPAQUE handle: pass it back to
 // mapper methods unchanged; each half exceeds 2^53, so the numbers are not exact.
 type AreaId = readonly [number, number];
+type AtlasId = readonly [number, number];
 type RoomNumber = number;
 type ExitId = readonly [number, number];
 type ConnectionId = readonly [number, number];
@@ -124,13 +134,109 @@ interface CreateRoomParams {
 type UpdateRoomParams = CreateRoomParams;
 
 interface CreateAreaOptions {
+    storage: MapStorage;
+    atlas?: Atlas | AtlasId;
+    ephemeral?: never;
+}
+
+interface LegacyCreateAreaOptions {
+    storage?: never;
+    atlas?: never;
+    /**
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+     * Use `storage: "session"` instead.
+     */
     ephemeral?: boolean;
 }
 
+type AnyCreateAreaOptions = CreateAreaOptions | LegacyCreateAreaOptions;
+
+type MapStorage = "session" | "local" | "cloud";
+
+interface MapDestination {
+    storage: MapStorage;
+    atlas?: Atlas | AtlasId;
+}
+
+interface CreateAtlasOptions {
+    storage: "local" | "cloud";
+}
+
+interface MutateAreaOptions {
+    description?: string;
+}
+
+function atlasIdOf(atlas: Atlas | AtlasId | undefined): AtlasId | undefined {
+    return atlas instanceof Atlas ? atlas.id : atlas;
+}
+
+function areaIdOf(area: Area | AreaId): AreaId {
+    return area instanceof Area ? area.id : area;
+}
+
+function destinationForOp(destination: MapDestination) {
+    return {
+        storage: destination.storage,
+        atlas_id: atlasIdOf(destination.atlas),
+    };
+}
+
 const mapper = {
-    async createArea(name: string, options?: CreateAreaOptions) {
-        const id = await op_smudgy_mapper_create_area(name, options?.ephemeral === true);
+    async createArea(name: string, options?: AnyCreateAreaOptions) {
+        const id = await op_smudgy_mapper_create_area(name, {
+            storage: options?.storage,
+            atlas_id: atlasIdOf(options?.atlas),
+            ephemeral: options?.ephemeral === true,
+        });
         return new Area(id);
+    },
+
+    async listAtlases(): Promise<Atlas[]> {
+        const atlases = await op_smudgy_mapper_list_atlases();
+        return atlases.map((atlas: { id: AtlasId; name: string; storage: MapStorage }) =>
+            new Atlas(atlas.id, atlas.name, atlas.storage)
+        );
+    },
+
+    async createAtlas(name: string, options: CreateAtlasOptions): Promise<Atlas> {
+        const atlas = await op_smudgy_mapper_create_atlas(name, options.storage);
+        return new Atlas(atlas.id, atlas.name, atlas.storage);
+    },
+
+    async copyAreas(areas: (Area | AreaId)[], destination: MapDestination): Promise<Area[]> {
+        const ids = await op_smudgy_mapper_relocate_areas(
+            areas.map(areaIdOf),
+            destinationForOp(destination),
+            false,
+        );
+        return ids.map((id: AreaId) => this.getAreaById(id));
+    },
+
+    async moveAreas(areas: (Area | AreaId)[], destination: MapDestination): Promise<Area[]> {
+        const ids = await op_smudgy_mapper_relocate_areas(
+            areas.map(areaIdOf),
+            destinationForOp(destination),
+            true,
+        );
+        return ids.map((id: AreaId) => this.getAreaById(id));
+    },
+
+    async copyArea(area: Area | AreaId, destination: MapDestination): Promise<Area> {
+        return (await this.copyAreas([area], destination))[0];
+    },
+
+    async moveArea(area: Area | AreaId, destination: MapDestination): Promise<Area> {
+        return (await this.moveAreas([area], destination))[0];
+    },
+
+    async copyAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas> {
+        const copied = await op_smudgy_mapper_relocate_atlas(atlasIdOf(atlas), storage, false);
+        return new Atlas(copied.id, copied.name, copied.storage);
+    },
+
+    async moveAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas> {
+        const moved = await op_smudgy_mapper_relocate_atlas(atlasIdOf(atlas), storage, true);
+        return new Atlas(moved.id, moved.name, moved.storage);
     },
 
     setCurrentLocation(areaId: AreaId, roomNumber?: RoomNumber) {
@@ -157,6 +263,45 @@ const mapper = {
     getAreaById(id: AreaId) {
         let area = op_smudgy_mapper_get_area_by_id(id);
         return new Area(area);
+    },
+
+    /** Collect related writes to one area and submit them in the fewest practical
+     * ordered envelopes. The whole callback is validated and durably staged before
+     * anything is published, so a locally invalid batch submits nothing even across
+     * an envelope split. Each emitted envelope is atomic at the backend; if a later
+     * envelope fails after earlier ones were acknowledged, the thrown Error carries
+     * the acknowledged prefix as `committedOperations` (acknowledged envelopes are
+     * never rolled back). Draft room numbers are reserved host-side for the life of
+     * the callback (see AreaMutator.createRoom). */
+    async mutateArea(
+        area: Area | AreaId,
+        callback: (mutation: AreaMutator) => void | Promise<void>,
+        options?: MutateAreaOptions,
+    ): Promise<OperationId[]> {
+        // Always start from the current host snapshot. A script may retain an Area
+        // wrapper across prior writes, including a now-stale next_room_number.
+        const target = this.getAreaById(area instanceof Area ? area.id : area);
+        const mutation = new AreaMutator(target);
+        try {
+            await callback(mutation);
+            const outcome: { committed: OperationId[]; error: string | null } =
+                await op_smudgy_mapper_mutate_area(
+                    target.id,
+                    mutation.finish(),
+                    options?.description ?? "Scripted area mutation",
+                );
+            if (outcome.error !== null && outcome.error !== undefined) {
+                const failure = new Error(outcome.error);
+                (failure as any).committedOperations = outcome.committed;
+                throw failure;
+            }
+            return outcome.committed;
+        } catch (error) {
+            mutation.abort();
+            throw error;
+        } finally {
+            mutation.release();
+        }
     },
 
     getPathBetweenRooms(fromAreaId: AreaId, fromRoomNumber: RoomNumber, toAreaId: AreaId, toRoomNumber: RoomNumber): [AreaId, RoomNumber][] {
@@ -555,6 +700,205 @@ interface LinkCreateArgs extends ConnectionUpdates {
     traversals: LinkTraversalArgs[];
 }
 
+type AreaBatchOperation =
+    | { upsert_room: { room_number: RoomNumber; body: CreateRoomParams } }
+    | { delete_room: { room_number: RoomNumber } }
+    | { upsert_room_property: { room_number: RoomNumber; name: string; value: string } }
+    | { upsert_area_property: { name: string; value: string } }
+    | { add_room_tag: { room_number: RoomNumber; tag: string } }
+    | { remove_room_tag: { room_number: RoomNumber; tag: string } }
+    | { create_exit: { room_number: RoomNumber; id: ExitId; body: ExitArgs } }
+    | { update_exit: { exit_id: ExitId; body: ExitUpdates } }
+    | { delete_exit: { exit_id: ExitId } }
+    | { create_link: { connection_id: ConnectionId; body: LinkCreateArgs } }
+    | { update_connection: { connection_id: ConnectionId; body: ConnectionUpdates } };
+
+function roomNumberInArea(areaId: AreaId, room: Room | RoomNumber): RoomNumber {
+    if (!(room instanceof Room)) return room;
+    if (room.area_id[0] !== areaId[0] || room.area_id[1] !== areaId[1]) {
+        throw new TypeError("mutateArea cannot edit a room from another area");
+    }
+    return room.room_number;
+}
+
+/** A callback-scoped write collector. Its methods preserve the familiar async
+ * mapper shape, but only record draft operations; the host is touched once the
+ * callback completes. Draft room numbers are reserved against the host's live
+ * allocator under a per-mutator token, so ambient creates cannot collide with
+ * a draft; the reservation is released when the mutator finishes or aborts. */
+class AreaMutator {
+    readonly #areaId: AreaId;
+    readonly #token: readonly [number, number];
+    #operations: AreaBatchOperation[] = [];
+    #open = true;
+
+    constructor(area: Area) {
+        this.#areaId = area.id;
+        this.#token = op_smudgy_mapper_generate_id();
+    }
+
+    #record(operation: AreaBatchOperation): void {
+        if (!this.#open) throw new TypeError("this mutateArea callback has finished");
+        this.#operations.push(operation);
+    }
+
+    async createRoom(params: CreateRoomParams): Promise<RoomNumber> {
+        if (!this.#open) throw new TypeError("this mutateArea callback has finished");
+        const roomNumber: RoomNumber = op_smudgy_mapper_reserve_room_number(
+            this.#areaId,
+            this.#token,
+        );
+        this.#record({
+            upsert_room: { room_number: roomNumber, body: { ...params } },
+        });
+        return roomNumber;
+    }
+
+    async updateRoom(room: Room | RoomNumber, fields: UpdateRoomParams): Promise<void> {
+        this.#record({
+            upsert_room: {
+                room_number: roomNumberInArea(this.#areaId, room),
+                body: { ...fields },
+            },
+        });
+    }
+
+    async updateRooms(updates: [RoomNumber, UpdateRoomParams][]): Promise<void> {
+        for (const [roomNumber, fields] of updates) {
+            this.#record({
+                upsert_room: { room_number: roomNumber, body: { ...fields } },
+            });
+        }
+    }
+
+    setRoomTitle(room: Room | RoomNumber, title: string): Promise<void> {
+        return this.updateRoom(room, { title });
+    }
+
+    setRoomDescription(room: Room | RoomNumber, description: string): Promise<void> {
+        return this.updateRoom(room, { description });
+    }
+
+    setRoomColor(room: Room | RoomNumber, color: string): Promise<void> {
+        return this.updateRoom(room, { color });
+    }
+
+    setRoomLevel(room: Room | RoomNumber, level: number): Promise<void> {
+        return this.updateRoom(room, { level });
+    }
+
+    setRoomX(room: Room | RoomNumber, x: number): Promise<void> {
+        return this.updateRoom(room, { x });
+    }
+
+    setRoomY(room: Room | RoomNumber, y: number): Promise<void> {
+        return this.updateRoom(room, { y });
+    }
+
+    setRoomExternalId(room: Room | RoomNumber, externalId: string): Promise<void> {
+        return this.updateRoom(room, { externalId });
+    }
+
+    async setRoomProperty(room: Room | RoomNumber, name: string, value: string): Promise<void> {
+        this.#record({
+            upsert_room_property: {
+                room_number: roomNumberInArea(this.#areaId, room),
+                name,
+                value,
+            },
+        });
+    }
+
+    async setAreaProperty(name: string, value: string): Promise<void> {
+        this.#record({ upsert_area_property: { name, value } });
+    }
+
+    async addRoomTag(room: Room | RoomNumber, tag: string): Promise<void> {
+        this.#record({
+            add_room_tag: {
+                room_number: roomNumberInArea(this.#areaId, room),
+                tag,
+            },
+        });
+    }
+
+    async removeRoomTag(room: Room | RoomNumber, tag: string): Promise<void> {
+        this.#record({
+            remove_room_tag: {
+                room_number: roomNumberInArea(this.#areaId, room),
+                tag,
+            },
+        });
+    }
+
+    async createRoomExit(room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId> {
+        const id: ExitId = op_smudgy_mapper_generate_id();
+        this.#record({
+            create_exit: {
+                room_number: roomNumberInArea(this.#areaId, room),
+                id,
+                body: { ...exit },
+            },
+        });
+        return id;
+    }
+
+    async setRoomExit(
+        room: Room | RoomNumber,
+        exitId: ExitId,
+        exit: ExitUpdates,
+    ): Promise<void> {
+        roomNumberInArea(this.#areaId, room);
+        this.#record({ update_exit: { exit_id: exitId, body: { ...exit } } });
+    }
+
+    async deleteRoom(room: Room | RoomNumber): Promise<void> {
+        this.#record({
+            delete_room: { room_number: roomNumberInArea(this.#areaId, room) },
+        });
+    }
+
+    async deleteRoomExit(room: Room | RoomNumber, exitId: ExitId): Promise<void> {
+        roomNumberInArea(this.#areaId, room);
+        this.#record({ delete_exit: { exit_id: exitId } });
+    }
+
+    async createLink(link: LinkCreateArgs): Promise<ConnectionId> {
+        const connectionId: ConnectionId = op_smudgy_mapper_generate_id();
+        this.#record({
+            create_link: {
+                connection_id: connectionId,
+                body: { ...link, traversals: link.traversals.map((value) => ({ ...value })) },
+            },
+        });
+        return connectionId;
+    }
+
+    async setConnection(connectionId: ConnectionId, updates: ConnectionUpdates): Promise<void> {
+        this.#record({
+            update_connection: { connection_id: connectionId, body: { ...updates } },
+        });
+    }
+
+    finish(): AreaBatchOperation[] {
+        if (!this.#open) throw new TypeError("this mutateArea callback has finished");
+        this.#open = false;
+        return this.#operations;
+    }
+
+    abort(): void {
+        this.#open = false;
+        this.#operations = [];
+    }
+
+    /** Return this mutator's reserved room numbers to the allocator.
+     * Idempotent; committed drafts already occupy their numbers by the time
+     * this runs, so releasing after submission frees nothing in use. */
+    release(): void {
+        op_smudgy_mapper_release_room_reservations(this.#areaId, this.#token);
+    }
+}
+
 // A label/shape id: a 2-element `[hi, lo]` UUID pair, like `AreaId`/`ExitId`. Opaque.
 type LabelId = readonly [number, number];
 type ShapeId = readonly [number, number];
@@ -661,6 +1005,18 @@ interface ShapeUpdates {
 // A portable area JSON blob produced by `exportArea` and consumed by `importArea`/`importAreas`.
 // Treat it as opaque: round-trip it (export -> store -> import) without introspecting its shape.
 type AreaJson = Record<string, unknown>;
+class Atlas {
+    constructor(
+        readonly id: AtlasId,
+        readonly name: string,
+        readonly storage: MapStorage,
+    ) {}
+
+    toString() {
+        return this.name;
+    }
+}
+
 class Area {
     #obj: any;
 
@@ -680,8 +1036,16 @@ class Area {
         return op_smudgy_mapper_list_area_room_numbers(this.#obj) || [];
     }
 
+    /**
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+     * Use `storage === "session"` instead.
+     */
     get isEphemeral(): boolean {
         return op_smudgy_mapper_get_area_is_ephemeral(this.#obj) === true;
+    }
+
+    get storage(): MapStorage {
+        return op_smudgy_mapper_get_area_storage(this.#obj);
     }
 
     get next_room_number(): RoomNumber {

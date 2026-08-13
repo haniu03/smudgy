@@ -4,6 +4,7 @@ use crate::image_store::{EntryState, ImageEntryCell, ImageStore};
 use crate::{WidgetMessage, WidgetRoot};
 use deno_core::{GarbageCollected, OpState, ascii_str, op2, v8};
 use iced::alignment::{Horizontal, Vertical};
+use serde::{Deserialize, de::DeserializeOwned};
 use smudgy_cloud::image_source::{
     ImageSourcePolicy, RegisteredImageCreator, ResolvedImageSource, SrcMemoKey, memo_key,
     register_creator, resolve_src,
@@ -35,19 +36,23 @@ fn ensure_widgets(state: &OpState) -> Result<(), WidgetsNotCapable> {
 
 #[derive(Clone)]
 struct Element {
-    view_fn: Arc<dyn Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>>,
+    view_fn:
+        Arc<dyn Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>>,
 }
 
 impl Element {
     fn new(
-        f: impl Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer> + 'static,
+        f: impl Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>
+        + 'static,
     ) -> Self {
         Self {
             view_fn: Arc::new(f),
         }
     }
 
-    fn element(&self) -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer> {
+    fn element(
+        &self,
+    ) -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer> {
         (self.view_fn)()
     }
 }
@@ -58,7 +63,8 @@ static NEXT_TEXT_EDITOR_ID: AtomicU64 = AtomicU64::new(0);
 
 type ProgressBar = iced::widget::ProgressBar<'static, smudgy_theme::Theme>;
 type Column = iced::widget::Column<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
-type Container = iced::widget::Container<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
+type Container =
+    iced::widget::Container<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
 type Row = iced::widget::Row<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
 type Button = iced::widget::Button<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
 type Stack = iced::widget::Stack<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
@@ -377,6 +383,137 @@ impl<T: Clone> DynProp<T> {
     }
 }
 
+fn serde_from_node<T: DeserializeOwned>(node: &Node) -> Result<T, serde_json::Error> {
+    serde_json::to_value(node).and_then(serde_json::from_value)
+}
+
+/// Log a widget prop diagnostic once per distinct message. Bound props re-read
+/// per frame and static props re-build per mount, so an unconditional warn on a
+/// malformed value would repeat for as long as the value stays bad.
+fn warn_once(message: String) {
+    use std::sync::{LazyLock, Mutex};
+    static WARNED: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+    let mut warned = match WARNED.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if warned.insert(message.clone()) {
+        log::warn!("{message}");
+    }
+}
+
+/// A structured prop resolved through serde: a build-time constant, or a store
+/// binding whose parse result is memoized on the snapshot's `Arc` identity —
+/// an unchanged store node is never re-parsed on later renders
+/// (`serde_json::to_value` deep-copies the tree, so the memo is what keeps
+/// bound structured props off the per-frame hot path). Used by MapView's
+/// defaultStyle/apply/doors objects.
+enum SerdeProp<T> {
+    Static(T),
+    Bound {
+        prop: BoundProp,
+        name: &'static str,
+        parse: fn(&Node) -> Result<T, serde_json::Error>,
+        cache: RefCell<Option<(Arc<Node>, Option<T>)>>,
+    },
+}
+
+impl<T: Clone> SerdeProp<T> {
+    fn get(&self) -> Option<T> {
+        match self {
+            Self::Static(value) => Some(value.clone()),
+            Self::Bound {
+                prop,
+                name,
+                parse,
+                cache,
+            } => {
+                let loaded = prop.cell.load();
+                if let Some((snapshot, parsed)) = cache.borrow().as_ref()
+                    && Arc::ptr_eq(snapshot, &loaded)
+                {
+                    return parsed.clone();
+                }
+                let parsed = Self::parse_snapshot(&loaded, prop, name, *parse);
+                *cache.borrow_mut() = Some((loaded, parsed.clone()));
+                parsed
+            }
+        }
+    }
+
+    /// Parse a fresh snapshot. A null snapshot (unset store path) silently
+    /// takes the token's `fallback`; a malformed one is reported once and
+    /// then also falls back.
+    fn parse_snapshot(
+        loaded: &Node,
+        prop: &BoundProp,
+        name: &str,
+        parse: fn(&Node) -> Result<T, serde_json::Error>,
+    ) -> Option<T> {
+        if !loaded.is_null() {
+            match parse(loaded) {
+                Ok(parsed) => return Some(parsed),
+                Err(err) => warn_once(format!(
+                    "smudgy widgets: bound `{name}` value failed to parse: {err}"
+                )),
+            }
+        }
+        let fallback = prop.fallback.as_ref()?;
+        match parse(fallback) {
+            Ok(parsed) => Some(parsed),
+            Err(err) => {
+                warn_once(format!(
+                    "smudgy widgets: `{name}` binding fallback failed to parse: {err}"
+                ));
+                None
+            }
+        }
+    }
+}
+
+/// Resolve a structured prop from either a static JS value or a live store
+/// binding. `P` is the wire shape (parsed directly by serde_v8, which keeps
+/// BigInt-carried u64 halves intact on the static path), `T` the widget-side
+/// value cached per snapshot; `parse` is `T`'s from-store-node reading. A
+/// malformed static value is reported once and dropped rather than silently
+/// nulled.
+fn get_serde_prop<P, T>(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    props: v8::Local<v8::Object>,
+    name: &'static str,
+    parse: fn(&Node) -> Result<T, serde_json::Error>,
+    convert: fn(P) -> T,
+) -> Option<SerdeProp<T>>
+where
+    P: DeserializeOwned,
+    T: Clone,
+{
+    let key = v8::String::new(scope, name)?.into();
+    let value = props.get(scope, key)?;
+    if value.is_null_or_undefined() {
+        return None;
+    }
+    if is_binding_token(scope, value) {
+        return bound_prop_from_v8(scope, state, value).map(|prop| SerdeProp::Bound {
+            prop,
+            name,
+            parse,
+            cache: RefCell::new(None),
+        });
+    }
+    match deno_core::serde_v8::from_v8::<P>(scope, value) {
+        Ok(parsed) => Some(SerdeProp::Static(convert(parsed))),
+        Err(err) => {
+            warn_once(format!(
+                "smudgy widgets: `{name}` prop failed to parse: {err}"
+            ));
+            None
+        }
+    }
+}
+
 // The `DynProp::Bound` parse fns: how a store value lands in each prop type. Truncating
 // f64 → f32 is the same conversion every static prop path already applies.
 #[allow(clippy::cast_possible_truncation)]
@@ -387,9 +524,9 @@ fn f32_from_value(value: &Node) -> Option<f32> {
 #[allow(clippy::cast_possible_truncation)]
 fn length_from_value(value: &Node) -> Option<iced::Length> {
     match value {
-        Node::Number(number) => {
-            number.as_f64().map(|number| iced::Length::Fixed(number as f32))
-        }
+        Node::Number(number) => number
+            .as_f64()
+            .map(|number| iced::Length::Fixed(number as f32)),
         Node::String(text) => match &**text {
             "fill" => Some(iced::Length::Fill),
             "shrink" => Some(iced::Length::Shrink),
@@ -436,7 +573,10 @@ macro_rules! get_dyn_f32_prop {
             .into();
         $obj.get($scope, prop).and_then(|v| {
             if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
-                Some(DynProp::Bound { prop: bound, parse: f32_from_value })
+                Some(DynProp::Bound {
+                    prop: bound,
+                    parse: f32_from_value,
+                })
             } else {
                 v.to_number($scope)
                     .and_then(|v| v.number_value($scope))
@@ -459,7 +599,10 @@ macro_rules! get_dyn_length_prop {
             .into();
         if let Some(v) = $obj.get($scope, prop) {
             if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
-                Some(DynProp::Bound { prop: bound, parse: length_from_value })
+                Some(DynProp::Bound {
+                    prop: bound,
+                    parse: length_from_value,
+                })
             } else {
                 get_length_prop!($scope, $obj, $name).map(DynProp::Static)
             }
@@ -477,7 +620,10 @@ macro_rules! get_dyn_color_prop {
             .into();
         if let Some(v) = $obj.get($scope, prop) {
             if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
-                Some(DynProp::Bound { prop: bound, parse: color_from_value })
+                Some(DynProp::Bound {
+                    prop: bound,
+                    parse: color_from_value,
+                })
             } else {
                 iced_color_from_maybe_v8_string!(get_string_prop!($scope, $obj, $name))
                     .map(DynProp::Static)
@@ -496,7 +642,10 @@ macro_rules! get_dyn_bool_prop {
             .into();
         $obj.get($scope, prop).and_then(|v| {
             if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
-                Some(DynProp::Bound { prop: bound, parse: bool_from_value })
+                Some(DynProp::Bound {
+                    prop: bound,
+                    parse: bool_from_value,
+                })
             } else if v.is_boolean() {
                 Some(DynProp::Static(v.boolean_value($scope)))
             } else {
@@ -514,7 +663,10 @@ macro_rules! get_dyn_string_prop {
             .into();
         $obj.get($scope, prop).and_then(|v| {
             if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
-                Some(DynProp::Bound { prop: bound, parse: string_from_value })
+                Some(DynProp::Bound {
+                    prop: bound,
+                    parse: string_from_value,
+                })
             } else {
                 get_opt_string_prop!($scope, $obj, $name).map(DynProp::Static)
             }
@@ -773,7 +925,11 @@ fn op_smudgy_widget_build_progress_bar(
 
     Element::new(move || {
         let min = min.as_ref().and_then(DynProp::get).unwrap_or(0.0);
-        let max = max.as_ref().and_then(DynProp::get).unwrap_or(100.0).max(min);
+        let max = max
+            .as_ref()
+            .and_then(DynProp::get)
+            .unwrap_or(100.0)
+            .max(min);
         let value = value
             .as_ref()
             .and_then(DynProp::get)
@@ -1031,13 +1187,15 @@ fn op_smudgy_widget_build_button(
 
     // The named emphasis variants from the theme. Script-spawned buttons overlay the terminal, so
     // an unspecified variant defaults to the low-emphasis `subtle` rather than the loud `primary`.
-    let style_fn: fn(&smudgy_theme::Theme, iced::widget::button::Status) -> iced::widget::button::Style =
-        match get_string_prop!(scope, props, "variant").as_deref() {
-            Some("primary") => smudgy_theme::builtins::button::primary,
-            Some("secondary") => smudgy_theme::builtins::button::secondary,
-            Some("link") => smudgy_theme::builtins::button::link,
-            _ => smudgy_theme::builtins::button::subtle,
-        };
+    let style_fn: fn(
+        &smudgy_theme::Theme,
+        iced::widget::button::Status,
+    ) -> iced::widget::button::Style = match get_string_prop!(scope, props, "variant").as_deref() {
+        Some("primary") => smudgy_theme::builtins::button::primary,
+        Some("secondary") => smudgy_theme::builtins::button::secondary,
+        Some("link") => smudgy_theme::builtins::button::link,
+        _ => smudgy_theme::builtins::button::subtle,
+    };
 
     Element::new(move || {
         let button = iced::widget::button(child.element()).style(style_fn);
@@ -1068,19 +1226,15 @@ fn op_smudgy_widget_build_scrollable(
     let mut attr_fns: Vec<Box<dyn Fn(Scrollable) -> Scrollable>> = Vec::new();
 
     if let Some(width) = width {
-        attr_fns.push(Box::new(move |scrollable: Scrollable| {
-            match width.get() {
-                Some(width) => scrollable.width(width),
-                None => scrollable,
-            }
+        attr_fns.push(Box::new(move |scrollable: Scrollable| match width.get() {
+            Some(width) => scrollable.width(width),
+            None => scrollable,
         }));
     }
     if let Some(height) = height {
-        attr_fns.push(Box::new(move |scrollable: Scrollable| {
-            match height.get() {
-                Some(height) => scrollable.height(height),
-                None => scrollable,
-            }
+        attr_fns.push(Box::new(move |scrollable: Scrollable| match height.get() {
+            Some(height) => scrollable.height(height),
+            None => scrollable,
         }));
     }
 
@@ -1103,9 +1257,13 @@ fn op_smudgy_widget_build_scrollable(
     // streamed transcript -- keeps its newest line on screen.
     if anchor_end {
         if is_horizontal {
-            attr_fns.push(Box::new(|scrollable: Scrollable| scrollable.anchor_x(Anchor::End)));
+            attr_fns.push(Box::new(|scrollable: Scrollable| {
+                scrollable.anchor_x(Anchor::End)
+            }));
         } else {
-            attr_fns.push(Box::new(|scrollable: Scrollable| scrollable.anchor_y(Anchor::End)));
+            attr_fns.push(Box::new(|scrollable: Scrollable| {
+                scrollable.anchor_y(Anchor::End)
+            }));
         }
     }
 
@@ -1226,7 +1384,10 @@ fn markdown_options() -> pulldown_cmark::Options {
 /// admits word and multi-word commands (`look`, `go north`, `enter the temple`) while leaving real
 /// HTML (`<a href="x">`, `</b>`, `<br/>`) and comments (`<!-- -->`) to render as before.
 fn is_command_autolink(inner: &str) -> bool {
-    inner.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+    inner
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
         && !inner
             .chars()
             .any(|c| matches!(c, '=' | '/' | '"' | '\'' | '<' | '>' | '\n'))
@@ -1381,8 +1542,13 @@ impl SmudgyMarkdownViewer {
     }
 }
 
-impl<'a> iced::widget::markdown::Viewer<'a, iced::widget::markdown::Uri, smudgy_theme::Theme, iced::Renderer>
-    for SmudgyMarkdownViewer
+impl<'a>
+    iced::widget::markdown::Viewer<
+        'a,
+        iced::widget::markdown::Uri,
+        smudgy_theme::Theme,
+        iced::Renderer,
+    > for SmudgyMarkdownViewer
 {
     fn on_link_click(url: iced::widget::markdown::Uri) -> iced::widget::markdown::Uri {
         url
@@ -1416,7 +1582,11 @@ impl<'a> iced::widget::markdown::Viewer<'a, iced::widget::markdown::Uri, smudgy_
             HeadingLevel::H6 => settings.h6_size,
         };
         // Match the default viewer's top padding so headings keep their breathing room.
-        let top = if index > 0 { settings.text_size.0 / 2.0 } else { 0.0 };
+        let top = if index > 0 {
+            settings.text_size.0 / 2.0
+        } else {
+            0.0
+        };
         iced::widget::container(
             iced::widget::rich_text(self.restyle(text, &settings.style))
                 .size(size)
@@ -1475,11 +1645,13 @@ impl<'a> iced::widget::markdown::Viewer<'a, iced::widget::markdown::Uri, smudgy_
         )
         .width(iced::Length::Fill)
         .padding(settings.code_size / 4)
-        .style(move |_theme: &smudgy_theme::Theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(panel_background)),
-            border: iced::border::rounded(4),
-            ..iced::widget::container::Style::default()
-        })
+        .style(
+            move |_theme: &smudgy_theme::Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(panel_background)),
+                border: iced::border::rounded(4),
+                ..iced::widget::container::Style::default()
+            },
+        )
         .into()
     }
 
@@ -1496,22 +1668,24 @@ impl<'a> iced::widget::markdown::Viewer<'a, iced::widget::markdown::Uri, smudgy_
         use iced::widget::markdown::Bullet;
         let body = self.colors.body;
         let rows = bullets.iter().map(move |bullet| {
-            let marker: iced::Element<'a, iced::widget::markdown::Uri, smudgy_theme::Theme, iced::Renderer> =
-                match bullet {
-                    Bullet::Point { .. } => iced::widget::text("\u{2022}")
-                        .size(settings.text_size)
-                        .color(body)
-                        .into(),
-                    Bullet::Task { done, .. } => iced::Element::from(
-                        iced::widget::container(
-                            iced::widget::checkbox(*done).size(settings.text_size),
-                        )
+            let marker: iced::Element<
+                'a,
+                iced::widget::markdown::Uri,
+                smudgy_theme::Theme,
+                iced::Renderer,
+            > = match bullet {
+                Bullet::Point { .. } => iced::widget::text("\u{2022}")
+                    .size(settings.text_size)
+                    .color(body)
+                    .into(),
+                Bullet::Task { done, .. } => iced::Element::from(
+                    iced::widget::container(iced::widget::checkbox(*done).size(settings.text_size))
                         .center_y(
                             iced::widget::text::LineHeight::default()
                                 .to_absolute(settings.text_size),
                         ),
-                    ),
-                };
+                ),
+            };
             let (Bullet::Point { items } | Bullet::Task { items, .. }) = bullet;
             iced::widget::Row::with_children([
                 marker,
@@ -1634,7 +1808,10 @@ fn op_smudgy_widget_build_text_editor(
         .map_or(isolate_token, |(_, role)| role);
     let key = match get_opt_string_prop!(scope, props, "id") {
         Some(id) if !id.is_empty() => format!("{stable_isolate}\u{1f}{id}"),
-        _ => format!("\u{1f}auto\u{1f}{}", NEXT_TEXT_EDITOR_ID.fetch_add(1, Ordering::Relaxed)),
+        _ => format!(
+            "\u{1f}auto\u{1f}{}",
+            NEXT_TEXT_EDITOR_ID.fetch_add(1, Ordering::Relaxed)
+        ),
     };
     let initial_text = get_opt_string_prop!(scope, props, "value").unwrap_or_default();
     let on_change = get_v8_function_prop!(scope, props, "onChange").map(Arc::new);
@@ -1716,10 +1893,12 @@ fn op_smudgy_widget_build_modal(
         let backdrop = iced::widget::container(iced::widget::space::horizontal())
             .width(iced::Length::Fill)
             .height(iced::Length::Fill)
-            .style(move |_theme: &smudgy_theme::Theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(background)),
-                ..Default::default()
-            });
+            .style(
+                move |_theme: &smudgy_theme::Theme| iced::widget::container::Style {
+                    background: Some(iced::Background::Color(background)),
+                    ..Default::default()
+                },
+            );
         let mut backdrop = iced::widget::mouse_area(backdrop);
         if let Some(on_dismiss) = &on_dismiss {
             backdrop = backdrop.on_press(WidgetMessage::InvokeCallback {
@@ -1729,7 +1908,9 @@ fn op_smudgy_widget_build_modal(
             });
         }
 
-        let layers: Vec<iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>> = vec![
+        let layers: Vec<
+            iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>,
+        > = vec![
             iced::widget::opaque(backdrop),
             iced::widget::center(child.element()).into(),
         ];
@@ -1739,8 +1920,44 @@ fn op_smudgy_widget_build_modal(
 
 #[op2]
 #[cppgc]
-fn op_smudgy_widget_build_map_view(state: &mut OpState) -> Element {
+fn op_smudgy_widget_build_map_view(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    props: v8::Local<v8::Object>,
+) -> Element {
     let mapper = state.borrow::<Option<Mapper>>().clone();
+    // View-global knobs are plain bindable scalars. The style surface is a
+    // static named palette (`styles`) plus bindable structured props:
+    // `defaultStyle`, the per-item `apply` associations (the dynamic hot
+    // path), and semantic `doors` state.
+    let room_spacing = get_dyn_f32_prop!(scope, state, props, "roomSpacing");
+    let player_color = get_dyn_string_prop!(scope, state, props, "playerColor");
+    let show_doors = get_dyn_bool_prop!(scope, state, props, "showDoors");
+    let default_style = get_serde_prop::<MapStyleProp, smudgy_map_widget::MapStyle>(
+        scope,
+        state,
+        props,
+        "defaultStyle",
+        map_style_from_node,
+        Into::into,
+    );
+    let styles = get_static_styles(scope, props);
+    let apply = get_serde_prop::<Vec<MapStyleApplicationProp>, Vec<smudgy_map_widget::MapStyleApplication>>(
+        scope,
+        state,
+        props,
+        "apply",
+        style_applications_from_node,
+        convert_style_applications,
+    );
+    let doors = get_serde_prop::<Vec<MapDoorStateProp>, Vec<smudgy_map_widget::MapDoorState>>(
+        scope,
+        state,
+        props,
+        "doors",
+        door_states_from_node,
+        convert_door_states,
+    );
     let widget_id = NEXT_MAP_WIDGET_ID.fetch_add(1, Ordering::Relaxed);
 
     // The reap guard rides inside the render closure: the closure is the only
@@ -1758,7 +1975,22 @@ fn op_smudgy_widget_build_map_view(state: &mut OpState) -> Element {
         if let Some(mapper) = mapper.clone() {
             crate::map::with_active_store(|store| {
                 let widget_id = reap.id();
-                let handle = store.ensure_map(mapper.clone(), widget_id);
+                let presentation = smudgy_map_widget::MapViewPresentation {
+                    room_spacing: room_spacing
+                        .as_ref()
+                        .and_then(DynProp::get)
+                        .unwrap_or(1.0),
+                    player_color: player_color.as_ref().and_then(DynProp::get),
+                    show_doors: show_doors.as_ref().and_then(DynProp::get).unwrap_or(true),
+                    default_style: default_style
+                        .as_ref()
+                        .and_then(SerdeProp::get)
+                        .unwrap_or_default(),
+                    styles: styles.clone(),
+                    apply: apply.as_ref().and_then(SerdeProp::get).unwrap_or_default(),
+                    doors: doors.as_ref().and_then(SerdeProp::get).unwrap_or_default(),
+                };
+                let handle = store.ensure_map(mapper.clone(), widget_id, presentation);
                 Some(
                     handle
                         .element()
@@ -1774,6 +2006,242 @@ fn op_smudgy_widget_build_map_view(state: &mut OpState) -> Element {
             iced::widget::text("map unavailable (no mapper)").into()
         }
     })
+}
+
+/// The `styles` palette: a static prop by design (`apply` entries change per
+/// route step; the palette does not), read once at build. A binding token or
+/// malformed record is reported and treated as an empty palette.
+fn get_static_styles(
+    scope: &mut v8::PinScope,
+    props: v8::Local<v8::Object>,
+) -> std::collections::HashMap<String, smudgy_map_widget::MapStyle> {
+    let Some(key) = v8::String::new(scope, "styles") else {
+        return std::collections::HashMap::new();
+    };
+    let Some(value) = props.get(scope, key.into()) else {
+        return std::collections::HashMap::new();
+    };
+    if value.is_null_or_undefined() {
+        return std::collections::HashMap::new();
+    }
+    match deno_core::serde_v8::from_v8::<std::collections::HashMap<String, MapStyleProp>>(
+        scope, value,
+    ) {
+        Ok(styles) => styles
+            .into_iter()
+            .map(|(name, style)| (name, style.into()))
+            .collect(),
+        Err(err) => {
+            warn_once(format!(
+                "smudgy widgets: `styles` prop failed to parse (it must be a static record of \
+                 named styles): {err}"
+            ));
+            std::collections::HashMap::new()
+        }
+    }
+}
+
+/// Per-item paint channels, camelCase from JS. Absent fields inherit
+/// `defaultStyle`, then the widget default.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct MapStyleProp {
+    room_fill: Option<String>,
+    room_stroke: Option<String>,
+    room_stroke_width: Option<f32>,
+    room_border_radius: Option<f32>,
+    connection_color: Option<String>,
+    connection_width: Option<f32>,
+    door_color: Option<String>,
+}
+
+impl From<MapStyleProp> for smudgy_map_widget::MapStyle {
+    fn from(value: MapStyleProp) -> Self {
+        Self {
+            room_fill: value.room_fill,
+            room_stroke: value.room_stroke,
+            room_stroke_width: value.room_stroke_width,
+            room_border_radius: value.room_border_radius,
+            connection_color: value.connection_color,
+            connection_width: value.connection_width,
+            door_color: value.door_color,
+        }
+    }
+}
+
+fn map_style_from_node(node: &Node) -> Result<smudgy_map_widget::MapStyle, serde_json::Error> {
+    serde_from_node::<MapStyleProp>(node).map(Into::into)
+}
+
+/// One Connection selected from either endpoint by room + direction (never a
+/// ConnectionId: its u64 halves exceed `Number.MAX_SAFE_INTEGER` and cannot
+/// travel the JSON store-binding path).
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MapExitRefProp {
+    room: i32,
+    direction: smudgy_cloud::ExitDirection,
+}
+
+impl From<MapExitRefProp> for smudgy_map_widget::MapExitRef {
+    fn from(value: MapExitRefProp) -> Self {
+        Self {
+            room: smudgy_cloud::RoomNumber(value.room),
+            direction: value.direction,
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MapStyleApplicationProp {
+    style: String,
+    #[serde(default)]
+    rooms: Vec<i32>,
+    #[serde(default)]
+    exits: Vec<MapExitRefProp>,
+    /// Area scope in either accepted spelling (see [`MapAreaIdProp`]);
+    /// entries scoped to another area are ignored at resolution.
+    #[serde(default)]
+    area: Option<MapAreaIdProp>,
+}
+
+/// An apply entry's `area` scope in either accepted spelling: the `[hi, lo]`
+/// u64 id halves (BigInt-carried on the static prop path) or the canonical
+/// hyphenated UUID string. The string is the JSON-safe spelling: real id
+/// halves exceed `Number.MAX_SAFE_INTEGER` and surface as `BigInt`, which
+/// `JSON.stringify` rejects, so store-bound apply arrays carry the string.
+#[derive(Clone)]
+enum MapAreaIdProp {
+    Pair(u64, u64),
+    Text(String),
+}
+
+impl<'de> Deserialize<'de> for MapAreaIdProp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct AreaIdVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for AreaIdVisitor {
+            type Value = MapAreaIdProp;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an `[hi, lo]` area id pair or a UUID string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(MapAreaIdProp::Text(value.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(MapAreaIdProp::Text(value))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let hi = seq
+                    .next_element::<u64>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let lo = seq
+                    .next_element::<u64>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(3, &self));
+                }
+                Ok(MapAreaIdProp::Pair(hi, lo))
+            }
+        }
+
+        deserializer.deserialize_any(AreaIdVisitor)
+    }
+}
+
+impl MapAreaIdProp {
+    /// Resolve either spelling to the internal id. A string that is not a
+    /// UUID reports once and yields `None`; the caller drops that entry —
+    /// an entry whose scope cannot be resolved must not widen to every area.
+    fn resolve(&self) -> Option<smudgy_cloud::AreaId> {
+        match self {
+            Self::Pair(hi, lo) => Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
+                *hi, *lo,
+            ))),
+            Self::Text(text) => match text.parse::<smudgy_cloud::Uuid>() {
+                Ok(uuid) => Some(smudgy_cloud::AreaId(uuid)),
+                Err(_) => {
+                    warn_once(format!(
+                        "smudgy widgets: apply entry `area` {text:?} is not a UUID; entry skipped"
+                    ));
+                    None
+                }
+            },
+        }
+    }
+}
+
+impl MapStyleApplicationProp {
+    /// Convert to the widget-side entry; `None` when the `area` scope fails
+    /// to resolve.
+    fn resolve(self) -> Option<smudgy_map_widget::MapStyleApplication> {
+        let area = match &self.area {
+            None => None,
+            Some(area) => Some(area.resolve()?),
+        };
+        Some(smudgy_map_widget::MapStyleApplication {
+            style: self.style,
+            rooms: self.rooms.into_iter().map(smudgy_cloud::RoomNumber).collect(),
+            exits: self.exits.into_iter().map(Into::into).collect(),
+            area,
+        })
+    }
+}
+
+fn style_applications_from_node(
+    node: &Node,
+) -> Result<Vec<smudgy_map_widget::MapStyleApplication>, serde_json::Error> {
+    serde_from_node::<Vec<MapStyleApplicationProp>>(node).map(convert_style_applications)
+}
+
+fn convert_style_applications(
+    entries: Vec<MapStyleApplicationProp>,
+) -> Vec<smudgy_map_widget::MapStyleApplication> {
+    entries
+        .into_iter()
+        .filter_map(MapStyleApplicationProp::resolve)
+        .collect()
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MapDoorStateProp {
+    exit: MapExitRefProp,
+    #[serde(default)]
+    closed: Option<bool>,
+    #[serde(default)]
+    locked: Option<bool>,
+}
+
+impl From<MapDoorStateProp> for smudgy_map_widget::MapDoorState {
+    fn from(value: MapDoorStateProp) -> Self {
+        Self {
+            exit: value.exit.into(),
+            closed: value.closed,
+            locked: value.locked,
+        }
+    }
+}
+
+fn door_states_from_node(
+    node: &Node,
+) -> Result<Vec<smudgy_map_widget::MapDoorState>, serde_json::Error> {
+    serde_from_node::<Vec<MapDoorStateProp>>(node).map(convert_door_states)
+}
+
+fn convert_door_states(entries: Vec<MapDoorStateProp>) -> Vec<smudgy_map_widget::MapDoorState> {
+    entries.into_iter().map(Into::into).collect()
 }
 
 /// Parse an author-written scene (a static `scene` value or a binding fallback) with
@@ -1822,7 +2290,9 @@ fn op_smudgy_widget_build_canvas(
     //   of the same scene never re-run URL parsing or `data:` hashing.
     // - Live bound values re-parse on the UI thread (no OpState there) with the ctx below:
     //   bound provenance — descend-only srcs, no absolute paths (plan D2).
-    let image_store = state.try_borrow::<Option<ImageStore>>().and_then(Clone::clone);
+    let image_store = state
+        .try_borrow::<Option<ImageStore>>()
+        .and_then(Clone::clone);
     let bound_image_ctx = match &image_store {
         Some(store) => state
             .borrow::<RefCell<ImageRegistry>>()
@@ -1847,9 +2317,7 @@ fn op_smudgy_widget_build_canvas(
             .get(scope, key)
             .and_then(|v| deno_core::serde_v8::from_v8::<[f32; 4]>(scope, v).ok())
             .filter(|[_, _, w, h]| w.is_finite() && h.is_finite() && *w > 0.0 && *h > 0.0)
-            .map(|[x, y, w, h]| {
-                iced::Rectangle::new(iced::Point::new(x, y), iced::Size::new(w, h))
-            })
+            .map(|[x, y, w, h]| iced::Rectangle::new(iced::Point::new(x, y), iced::Size::new(w, h)))
     };
 
     // The scene: a store binding (the live path — repaints per store flush, parse memoized by
@@ -1862,9 +2330,10 @@ fn op_smudgy_widget_build_canvas(
         .into();
     let scene_value = props.get(scope, scene_key);
     let scene = match scene_value {
-        Some(value) if is_binding_token(scope, value) => match bound_prop_from_v8(scope, state, value) {
-            Some(bound) => {
-                let fallback = bound
+        Some(value) if is_binding_token(scope, value) => {
+            match bound_prop_from_v8(scope, state, value) {
+                Some(bound) => {
+                    let fallback = bound
                     .fallback
                     .as_ref()
                     .and_then(|node| {
@@ -1890,18 +2359,19 @@ fn op_smudgy_widget_build_canvas(
                         }
                     })
                     .unwrap_or_default();
-                SceneSource::Bound {
-                    cell: bound.cell,
-                    memo: Arc::new(std::sync::Mutex::new(SceneMemo::default())),
-                    fallback: Arc::new(fallback),
-                    // Live bound values re-parse on the UI thread with bound provenance:
-                    // descend-only srcs, no absolute paths (the producer of a bound scene
-                    // is not the widget's author — plan D2).
-                    image_ctx: bound_image_ctx.map(Arc::new),
+                    SceneSource::Bound {
+                        cell: bound.cell,
+                        memo: Arc::new(std::sync::Mutex::new(SceneMemo::default())),
+                        fallback: Arc::new(fallback),
+                        // Live bound values re-parse on the UI thread with bound provenance:
+                        // descend-only srcs, no absolute paths (the producer of a bound scene
+                        // is not the widget's author — plan D2).
+                        image_ctx: bound_image_ctx.map(Arc::new),
+                    }
                 }
+                None => SceneSource::Static(Arc::new(ParsedScene::default())),
             }
-            None => SceneSource::Static(Arc::new(ParsedScene::default())),
-        },
+        }
         Some(value) if !value.is_null_or_undefined() => {
             let parsed = deno_core::serde_v8::from_v8::<serde_json::Value>(scope, value)
                 .ok()
@@ -1930,10 +2400,11 @@ fn op_smudgy_widget_build_canvas(
         _ => SceneSource::Static(Arc::new(ParsedScene::default())),
     };
 
-    let on_pointer = get_v8_function_prop!(scope, props, "onPointer").map(|callback| PointerHandler {
-        callback: Arc::new(callback),
-        isolate: WidgetIsolate(isolate_token.to_string()),
-    });
+    let on_pointer =
+        get_v8_function_prop!(scope, props, "onPointer").map(|callback| PointerHandler {
+            callback: Arc::new(callback),
+            isolate: WidgetIsolate(isolate_token.to_string()),
+        });
 
     // `fit: "contain"` opts into uniform scale-to-fit with centering; the default is the
     // exact (possibly non-uniform) rect-to-bounds mapping.
@@ -1951,13 +2422,21 @@ fn op_smudgy_widget_build_canvas(
     };
 
     Element::new(move || {
-        let width = width.as_ref().and_then(DynProp::get).unwrap_or(iced::Length::Fill);
-        let height = height.as_ref().and_then(DynProp::get).unwrap_or(iced::Length::Fill);
+        let width = width
+            .as_ref()
+            .and_then(DynProp::get)
+            .unwrap_or(iced::Length::Fill);
+        let height = height
+            .as_ref()
+            .and_then(DynProp::get)
+            .unwrap_or(iced::Length::Fill);
         // Clipped like the map canvas: scene geometry may exceed the bounds (the burst-alert
         // ring deliberately does), and tiny-skia's damage-tracked partial redraws would leave
         // the spill on screen without the clipping container.
         iced::widget::container(
-            iced::widget::canvas(program.clone()).width(width).height(height),
+            iced::widget::canvas(program.clone())
+                .width(width)
+                .height(height),
         )
         .width(width)
         .height(height)
@@ -2045,7 +2524,9 @@ impl ImageRegistry {
         if token == 0 {
             return None;
         }
-        self.creators.get((token - 1) as usize).and_then(Option::as_ref)
+        self.creators
+            .get((token - 1) as usize)
+            .and_then(Option::as_ref)
     }
 
     fn bound_table(&self, token: u32) -> Option<Arc<BoundSrcTable>> {
@@ -2151,7 +2632,10 @@ impl std::fmt::Display for LogSrc<'_> {
         if self.0.len() <= MAX {
             f.write_str(self.0)
         } else {
-            let cut = (0..=MAX).rev().find(|i| self.0.is_char_boundary(*i)).unwrap_or(0);
+            let cut = (0..=MAX)
+                .rev()
+                .find(|i| self.0.is_char_boundary(*i))
+                .unwrap_or(0);
             write!(f, "{}… ({} bytes)", &self.0[..cut], self.0.len())
         }
     }
@@ -2168,7 +2652,9 @@ fn op_smudgy_widget_register_image_creator(
     #[string] creator_json: &str,
     #[string] module: &str,
 ) -> u32 {
-    let policy = state.try_borrow::<ImageSourcePolicy>().map(|p| Arc::new(p.clone()));
+    let policy = state
+        .try_borrow::<ImageSourcePolicy>()
+        .map(|p| Arc::new(p.clone()));
     let module = (!module.is_empty()).then_some(module);
     let creator = policy.and_then(|policy| register_creator(creator_json, module, policy));
     state
@@ -2247,13 +2733,14 @@ fn op_smudgy_widget_build_image(
     let opacity = get_dyn_f32_prop!(scope, state, props, "opacity");
     let content_fit =
         content_fit_from(get_opt_string_prop!(scope, props, "content_fit").as_deref());
-    let filter =
-        filter_method_from(get_opt_string_prop!(scope, props, "filter_method").as_deref());
+    let filter = filter_method_from(get_opt_string_prop!(scope, props, "filter_method").as_deref());
     // Degrees fit losslessly in f32 for any sane rotation; truncation is fine.
     #[allow(clippy::cast_possible_truncation)]
     let rotation_deg = get_number_prop!(scope, props, "rotation").unwrap_or(0.0) as f32;
 
-    let store = state.try_borrow::<Option<ImageStore>>().and_then(Clone::clone);
+    let store = state
+        .try_borrow::<Option<ImageStore>>()
+        .and_then(Clone::clone);
 
     // `src` is either a static string or a store binding (its value changes per frame).
     let src = get_dyn_string_prop!(scope, state, props, "src");
@@ -2294,7 +2781,10 @@ fn op_smudgy_widget_build_image(
     Element::new(move || {
         let w = width.as_ref().and_then(DynProp::get);
         let h = height.as_ref().and_then(DynProp::get);
-        let op = opacity.as_ref().and_then(DynProp::get).unwrap_or(default_opacity);
+        let op = opacity
+            .as_ref()
+            .and_then(DynProp::get)
+            .unwrap_or(default_opacity);
         // Resolve the live cell: static (captured once) or bound (per distinct value).
         let cell = match (&static_cell, &bound_ctx, &src) {
             (Some(cell), _, _) => Some(cell.clone()),
@@ -2370,7 +2860,10 @@ impl BoundSrcTable {
                 (Ok((source, key)), Some(cell))
             }
             Err(reason) => {
-                log::warn!("smudgy images: bound src '{}' rejected: {reason}", LogSrc(raw));
+                log::warn!(
+                    "smudgy images: bound src '{}' rejected: {reason}",
+                    LogSrc(raw)
+                );
                 (Err(()), None)
             }
         };
@@ -2519,8 +3012,7 @@ fn op_smudgy_widget_build_tooltip(
     let chrome = get_bool_prop!(scope, props, "tip_chrome").unwrap_or(false);
 
     Element::new(move || {
-        let mut tooltip: Tooltip =
-            iced::widget::tooltip(target.element(), tip.element(), position);
+        let mut tooltip: Tooltip = iced::widget::tooltip(target.element(), tip.element(), position);
         if let Some(gap) = gap.as_ref().and_then(DynProp::get) {
             tooltip = tooltip.gap(gap);
         }
@@ -2645,23 +3137,27 @@ fn op_smudgy_widget_build_table(
     let row_count = cells.len().checked_div(column_count).unwrap_or(0);
 
     Element::new(move || {
-        let columns = metas.iter().take(column_count).enumerate().map(|(index, meta)| {
-            let cells = cells.clone();
-            let mut column = iced::widget::table::column(
-                headers[index].element(),
-                move |row: usize| cells[row * column_count + index].element(),
-            );
-            if let Some(width) = meta.width {
-                column = column.width(width);
-            }
-            if let Some(align_x) = meta.align_x {
-                column = column.align_x(align_x);
-            }
-            if let Some(align_y) = meta.align_y {
-                column = column.align_y(align_y);
-            }
-            column
-        });
+        let columns = metas
+            .iter()
+            .take(column_count)
+            .enumerate()
+            .map(|(index, meta)| {
+                let cells = cells.clone();
+                let mut column =
+                    iced::widget::table::column(headers[index].element(), move |row: usize| {
+                        cells[row * column_count + index].element()
+                    });
+                if let Some(width) = meta.width {
+                    column = column.width(width);
+                }
+                if let Some(align_x) = meta.align_x {
+                    column = column.align_x(align_x);
+                }
+                if let Some(align_y) = meta.align_y {
+                    column = column.align_y(align_y);
+                }
+                column
+            });
         let mut table = iced::widget::table(columns, 0..row_count);
         if let Some(width) = width.as_ref().and_then(DynProp::get) {
             table = table.width(width);
@@ -2693,7 +3189,10 @@ mod tests {
             "[enter the temple](<enter the temple>)"
         );
         // Hyphens are fine; a command on its own line still parses as inline HTML.
-        assert_eq!(expand_command_autolinks("<go-north>"), "[go-north](<go-north>)");
+        assert_eq!(
+            expand_command_autolinks("<go-north>"),
+            "[go-north](<go-north>)"
+        );
     }
 
     #[test]
@@ -2706,7 +3205,7 @@ mod tests {
             "Email <foo@bar.com> me.",
             "Inline `<look>` stays literal.",
             "```\n<look>\n```",
-            "<say hi!>",  // `!` -> not tokenized as inline HTML
+            "<say hi!>", // `!` -> not tokenized as inline HTML
             "no angle brackets at all",
         ] {
             assert!(
@@ -2731,17 +3230,29 @@ mod tests {
     #[test]
     fn bound_display_text_renders_bare_values_fallback_and_format() {
         use serde_json::json;
-        assert_eq!(bound(json!("hi")).display_text(), "hi", "strings render unquoted");
+        assert_eq!(
+            bound(json!("hi")).display_text(),
+            "hi",
+            "strings render unquoted"
+        );
         assert_eq!(bound(json!(42.5)).display_text(), "42.5");
         assert_eq!(bound(json!(true)).display_text(), "true");
-        assert_eq!(bound(json!(null)).display_text(), "", "null/absent renders empty");
+        assert_eq!(
+            bound(json!(null)).display_text(),
+            "",
+            "null/absent renders empty"
+        );
         assert_eq!(bound(json!({ "a": 1 })).display_text(), r#"{"a":1}"#);
 
         let with_fallback = BoundProp {
             fallback: Some(Node::from(json!(0))),
             ..bound(json!(null))
         };
-        assert_eq!(with_fallback.display_text(), "0", "fallback covers null/absent");
+        assert_eq!(
+            with_fallback.display_text(),
+            "0",
+            "fallback covers null/absent"
+        );
 
         let formatted = BoundProp {
             format: Some("{} hp".to_string()),
@@ -2759,12 +3270,28 @@ mod tests {
         use serde_json::json;
         let node = |value: serde_json::Value| Node::from(value);
         assert_eq!(f32_from_value(&node(json!(12.5))), Some(12.5));
-        assert_eq!(f32_from_value(&node(json!("12"))), None, "no string-to-number coercion");
+        assert_eq!(
+            f32_from_value(&node(json!("12"))),
+            None,
+            "no string-to-number coercion"
+        );
 
-        assert_eq!(length_from_value(&node(json!(120))), Some(iced::Length::Fixed(120.0)));
-        assert_eq!(length_from_value(&node(json!("fill"))), Some(iced::Length::Fill));
-        assert_eq!(length_from_value(&node(json!("shrink"))), Some(iced::Length::Shrink));
-        assert_eq!(length_from_value(&node(json!("64"))), Some(iced::Length::Fixed(64.0)));
+        assert_eq!(
+            length_from_value(&node(json!(120))),
+            Some(iced::Length::Fixed(120.0))
+        );
+        assert_eq!(
+            length_from_value(&node(json!("fill"))),
+            Some(iced::Length::Fill)
+        );
+        assert_eq!(
+            length_from_value(&node(json!("shrink"))),
+            Some(iced::Length::Shrink)
+        );
+        assert_eq!(
+            length_from_value(&node(json!("64"))),
+            Some(iced::Length::Fixed(64.0))
+        );
         assert_eq!(length_from_value(&node(json!(null))), None);
 
         assert_eq!(
@@ -2789,8 +3316,235 @@ mod tests {
         if let DynProp::Bound { prop: inner, .. } = &prop {
             inner.cell.set(json!(75));
         }
-        assert_eq!(prop.get(), Some(75.0), "a live value wins over the fallback");
+        assert_eq!(
+            prop.get(),
+            Some(75.0),
+            "a live value wins over the fallback"
+        );
         assert_eq!(DynProp::Static(1.0f32).get(), Some(1.0));
+    }
+
+    #[test]
+    fn map_view_apply_and_doors_parse_from_store_nodes() {
+        use serde_json::json;
+        use smudgy_cloud::{ExitDirection, RoomNumber};
+
+        let apply = style_applications_from_node(&Node::from(json!([
+            {
+                "style": "route",
+                "rooms": [1, 2, 3],
+                "exits": [{ "room": 3, "direction": "Up" }],
+            },
+            {
+                "style": "visited",
+                "rooms": [9],
+                "area": [1, 2],
+            }
+        ])))
+        .expect("apply entries parse");
+        assert_eq!(apply[0].style, "route");
+        assert_eq!(
+            apply[0].rooms,
+            vec![RoomNumber(1), RoomNumber(2), RoomNumber(3)]
+        );
+        assert_eq!(apply[0].exits[0].room, RoomNumber(3));
+        assert_eq!(apply[0].exits[0].direction, ExitDirection::Up);
+        assert_eq!(apply[0].area, None);
+        assert_eq!(
+            apply[1].area,
+            Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
+                1, 2
+            )))
+        );
+
+        let doors = door_states_from_node(&Node::from(json!([
+            { "exit": { "room": 4, "direction": "East" }, "locked": true }
+        ])))
+        .expect("door states parse");
+        assert_eq!(doors[0].exit.room, RoomNumber(4));
+        assert_eq!(doors[0].exit.direction, ExitDirection::East);
+        assert_eq!(doors[0].closed, None);
+        assert_eq!(doors[0].locked, Some(true));
+
+        let style = map_style_from_node(&Node::from(json!({
+            "roomStroke": "#ff00ff",
+            "connectionWidth": 2.0,
+        })))
+        .expect("style parses");
+        assert_eq!(style.room_stroke.as_deref(), Some("#ff00ff"));
+        assert_eq!(style.connection_width, Some(2.0));
+        assert_eq!(style.room_fill, None);
+    }
+
+    /// The `area` scope in both accepted spellings: the `[hi, lo]` pair and
+    /// the canonical UUID string resolve to the same internal id, and the
+    /// string spelling survives a JSON text round trip — the store-binding
+    /// wire, which the pair's BigInt halves cannot travel.
+    #[test]
+    fn map_view_apply_area_accepts_uuid_string_spelling() {
+        use serde_json::json;
+
+        let id: smudgy_cloud::Uuid = "67e55044-10b1-426f-9247-bb680e5fe0c8"
+            .parse()
+            .expect("literal uuid parses");
+        let (hi, lo) = id.as_u64_pair();
+        assert_eq!(id.to_string(), "67e55044-10b1-426f-9247-bb680e5fe0c8");
+
+        let apply = style_applications_from_node(&Node::from(json!([
+            { "style": "route", "rooms": [1], "area": id.to_string() },
+            { "style": "route", "rooms": [2], "area": [1, 2] },
+        ])))
+        .expect("both spellings parse");
+        assert_eq!(apply[0].area, Some(smudgy_cloud::AreaId(id)));
+        assert_eq!(
+            apply[0].area,
+            Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
+                hi, lo
+            ))),
+            "the string resolves to the same id as its own u64 halves"
+        );
+        assert_eq!(
+            apply[1].area,
+            Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
+                1, 2
+            )))
+        );
+
+        // Round trip through JSON text, simulating a store-bound apply array.
+        let wire = serde_json::to_string(&json!([
+            { "style": "route", "rooms": [3], "area": id.to_string() }
+        ]))
+        .expect("wire form serializes");
+        let node = Node::from(
+            serde_json::from_str::<serde_json::Value>(&wire).expect("wire form deserializes"),
+        );
+        let bound = style_applications_from_node(&node).expect("wire form parses");
+        assert_eq!(bound[0].area, Some(smudgy_cloud::AreaId(id)));
+    }
+
+    /// A string-scoped entry behaves like the pair form end-to-end: its rooms
+    /// are styled when the view resolves that area and ignored elsewhere.
+    #[test]
+    fn map_view_string_scoped_apply_resolves_and_scopes() {
+        use serde_json::json;
+        use smudgy_cloud::{AreaId, RoomNumber, Uuid};
+
+        let id: Uuid = "67e55044-10b1-426f-9247-bb680e5fe0c8"
+            .parse()
+            .expect("literal uuid parses");
+        let apply = style_applications_from_node(&Node::from(json!([
+            { "style": "route", "rooms": [1], "area": id.to_string() },
+        ])))
+        .expect("string-scoped entry parses");
+
+        let presentation = smudgy_map_widget::MapViewPresentation {
+            styles: std::collections::HashMap::from([(
+                "route".to_string(),
+                smudgy_map_widget::MapStyle {
+                    room_fill: Some("#111111".to_string()),
+                    ..smudgy_map_widget::MapStyle::default()
+                },
+            )]),
+            apply,
+            ..smudgy_map_widget::MapViewPresentation::default()
+        };
+        let scoped = presentation.resolve(AreaId(id));
+        assert!(scoped.rooms.contains_key(&RoomNumber(1)));
+        let elsewhere = presentation.resolve(AreaId(Uuid::from_u64_pair(0, 9)));
+        assert!(!elsewhere.rooms.contains_key(&RoomNumber(1)));
+    }
+
+    /// An `area` string that is not a UUID cannot resolve a scope, so that
+    /// entry is dropped (with a warn-once report) while its siblings survive.
+    /// A wrong-typed `area` remains a loud whole-parse error.
+    #[test]
+    fn map_view_malformed_area_string_skips_only_that_entry() {
+        use serde_json::json;
+        use smudgy_cloud::RoomNumber;
+
+        let apply = style_applications_from_node(&Node::from(json!([
+            { "style": "route", "rooms": [1], "area": "not-a-uuid" },
+            { "style": "route", "rooms": [2] },
+        ])))
+        .expect("the list still parses");
+        assert_eq!(apply.len(), 1, "the unresolvable entry is skipped");
+        assert_eq!(apply[0].rooms, vec![RoomNumber(2)]);
+
+        assert!(
+            style_applications_from_node(&Node::from(json!([
+                { "style": "route", "area": 5 }
+            ])))
+            .is_err(),
+            "a non-string, non-pair area is a shape error, not a degradable value"
+        );
+    }
+
+    /// Malformed structured values surface as `Err` (reported to the log by
+    /// the callers), never as a silently-empty parse.
+    #[test]
+    fn map_view_negative_parses_error_instead_of_nulling() {
+        use serde_json::json;
+
+        // A wrong-typed field inside one entry fails that parse loudly.
+        assert!(
+            style_applications_from_node(&Node::from(json!([
+                { "style": "route", "rooms": "not-an-array" }
+            ])))
+            .is_err()
+        );
+        // A missing required field (the style name) fails.
+        assert!(style_applications_from_node(&Node::from(json!([{ "rooms": [1] }]))).is_err());
+        // An unknown direction spelling fails the exit ref.
+        assert!(
+            door_states_from_node(&Node::from(json!([
+                { "exit": { "room": 1, "direction": "Norf" } }
+            ])))
+            .is_err()
+        );
+        // The whole prop having the wrong shape fails.
+        assert!(style_applications_from_node(&Node::from(json!({ "style": "route" }))).is_err());
+        assert!(map_style_from_node(&Node::from(json!("gold"))).is_err());
+    }
+
+    /// The bound-prop memo: an unchanged store snapshot must not re-parse
+    /// (same `Arc`, cached value back), and a changed one must.
+    #[test]
+    fn serde_prop_caches_parses_on_snapshot_identity() {
+        use serde_json::json;
+
+        let prop = SerdeProp::Bound {
+            prop: bound(json!([{ "style": "route", "rooms": [1] }])),
+            name: "apply",
+            parse: style_applications_from_node,
+            cache: RefCell::new(None),
+        };
+
+        let first = prop.get().expect("initial snapshot parses");
+        assert_eq!(first[0].rooms, vec![smudgy_cloud::RoomNumber(1)]);
+
+        // Same snapshot: the memo must hit (observable as the same cached
+        // Arc snapshot rather than a fresh parse).
+        let _second = prop.get().expect("cached snapshot returns");
+        if let SerdeProp::Bound { prop: inner, cache, .. } = &prop {
+            let cached = cache.borrow();
+            let (snapshot, _) = cached.as_ref().expect("cache is populated");
+            assert!(
+                Arc::ptr_eq(snapshot, &inner.cell.load()),
+                "the memo must key on the live snapshot's identity"
+            );
+
+            drop(cached);
+            inner.cell.set(json!([{ "style": "route", "rooms": [2] }]));
+        }
+        let third = prop.get().expect("new snapshot parses");
+        assert_eq!(third[0].rooms, vec![smudgy_cloud::RoomNumber(2)]);
+
+        // A malformed replacement value degrades to None (with a warn-once
+        // report), not a stale cached value and not a panic.
+        if let SerdeProp::Bound { prop: inner, .. } = &prop {
+            inner.cell.set(json!([{ "rooms": "bad" }]));
+        }
+        assert_eq!(prop.get(), None);
     }
 
     fn link(label: &str, url: &str) -> MarkdownLink {
@@ -2840,7 +3594,11 @@ mod tests {
             "![alt](image.png)",
             "Compare x < y and a > b here.",
         ] {
-            assert_eq!(extract_markdown_links(src), vec![], "expected no links in `{src}`");
+            assert_eq!(
+                extract_markdown_links(src),
+                vec![],
+                "expected no links in `{src}`"
+            );
         }
         // An image nested in a link's label contributes no (invisible) alt text to the label.
         assert_eq!(

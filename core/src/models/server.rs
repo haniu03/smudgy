@@ -3,8 +3,11 @@
 use crate::get_smudgy_home;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
+use url::{Host, Url};
 use validator::Validate;
 
 use super::persistence::write_atomic;
@@ -21,7 +24,8 @@ pub struct ServerConfig {
     pub port: u16,
     /// Hosts the user has granted this MUD's OSC 8 hyperlinks permission to
     /// open in the browser without asking again (the "always allow links to
-    /// <host>" opt-in; compared case-insensitively).
+    /// <host>" opt-in. Legacy Unicode-domain and expanded-IPv6 entries are
+    /// canonicalized when compared and on the next grant write.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_link_hosts: Vec<String>,
     /// The "always trust links from this server" opt-in: every server-sent
@@ -81,30 +85,82 @@ impl ServerConfig {
         if self.trust_all_links {
             return true;
         }
-        host.is_some_and(|host| {
+        host.and_then(canonical_link_host).is_some_and(|host| {
             self.trusted_link_hosts
                 .iter()
-                .any(|trusted| trusted.eq_ignore_ascii_case(host))
+                .filter_map(|trusted| canonical_link_host(trusted))
+                .any(|trusted| trusted.eq_ignore_ascii_case(&host))
         })
+    }
+
+    /// Persist a per-host grant in the current canonical form, cleaning up
+    /// duplicate legacy spellings while preserving their authorization.
+    pub fn grant_link_host(&mut self, host: &str) {
+        let Some(host) = canonical_link_host(host) else {
+            return;
+        };
+        let mut canonical = Vec::with_capacity(self.trusted_link_hosts.len() + 1);
+        for trusted in self
+            .trusted_link_hosts
+            .drain(..)
+            .filter_map(|trusted| canonical_link_host(&trusted))
+            .chain(std::iter::once(host))
+        {
+            if !canonical
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&trusted))
+            {
+                canonical.push(trusted);
+            }
+        }
+        self.trusted_link_hosts = canonical;
     }
 }
 
-/// The host component of an http(s) URL, lowercased — the unit the per-host
-/// link grant is keyed by. `None` when the URL has no recognizable host.
+fn canonical_link_host(host: &str) -> Option<String> {
+    if let Ok(address) = host.parse::<Ipv6Addr>() {
+        return Some(address.to_string());
+    }
+    match Host::parse(host).ok()? {
+        Host::Domain(host) => Some(host),
+        Host::Ipv4(host) => Some(host.to_string()),
+        Host::Ipv6(host) => Some(host.to_string()),
+    }
+}
+
+/// The canonical host component of a browser URL — the unit the per-host link
+/// grant is keyed by. `None` when the scheme is unsupported, the written
+/// authority is empty, or the URL has no valid host.
 #[must_use]
 pub fn link_url_host(url: &str) -> Option<String> {
-    let rest = url.split_once("://")?.1;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    // Strip userinfo, then the port — mind IPv6 bracket forms.
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = if host.starts_with('[') {
-        host.split_once(']').map_or(host, |(h, _)| &h[1..])
+    // WHATWG parsing removes ASCII tab/newline characters before parsing. Do
+    // the same before checking the written authority so `https://\t/path`
+    // cannot recover into a host and bypass the stricter empty-authority rule.
+    let normalized = if url.contains(['\t', '\n', '\r']) {
+        Cow::Owned(
+            url.chars()
+                .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
+                .collect::<String>(),
+        )
     } else {
-        host.rsplit_once(':')
-            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
-            .map_or(host, |(h, _)| h)
+        Cow::Borrowed(url)
     };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    // `url` correctly follows browser recovery rules, under which
+    // `https:///path` becomes `https://path/`. Server-authored OSC links keep
+    // the stricter existing contract: an authority must actually be written.
+    let (_, raw_authority) = normalized.split_once("://")?;
+    if raw_authority.starts_with(['/', '\\', '?', '#']) {
+        return None;
+    }
+    let parsed = Url::parse(&normalized).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https" | "ftp") {
+        return None;
+    }
+    match parsed.host()? {
+        Host::Domain(host) => Some(host.to_string()),
+        Host::Ipv4(host) => Some(host.to_string()),
+        Host::Ipv6(host) => Some(host.to_string()),
+    }
 }
 
 /// Represents a server, including its configuration and associated directory path.
@@ -497,6 +553,30 @@ mod link_trust_tests {
     }
 
     #[test]
+    fn legacy_host_grants_survive_canonicalization_changes() {
+        let c = config(&["\u{4f8b}\u{3048}.test", "0:0:0:0:0:0:0:1"], false);
+        assert!(c.allows_server_link(Some("xn--r8jz45g.test")));
+        assert!(c.allows_server_link(Some("::1")));
+    }
+
+    #[test]
+    fn granting_a_host_migrates_and_deduplicates_legacy_entries() {
+        let mut c = config(
+            &[
+                "\u{4f8b}\u{3048}.test",
+                "xn--r8jz45g.test",
+                "0:0:0:0:0:0:0:1",
+            ],
+            false,
+        );
+        c.grant_link_host("[::1]");
+        assert_eq!(
+            c.trusted_link_hosts,
+            ["xn--r8jz45g.test".to_string(), "::1".to_string()]
+        );
+    }
+
+    #[test]
     fn ungranted_config_allows_nothing() {
         let c = config(&[], false);
         assert!(!c.allows_server_link(Some("wiki.example.org")));
@@ -522,7 +602,22 @@ mod link_trust_tests {
             Some("::1".to_string())
         );
         assert_eq!(link_url_host("https:///nohost"), None);
+        assert_eq!(link_url_host("https://\t/path"), None);
+        assert_eq!(link_url_host("https://\r\n/path"), None);
         assert_eq!(link_url_host("nonsense"), None);
+        assert_eq!(link_url_host("ssh://example.org/path"), None);
+    }
+
+    #[test]
+    fn url_host_extraction_matches_browser_backslash_and_idna_semantics() {
+        assert_eq!(
+            link_url_host(r"https://evil.example\@trusted.example/"),
+            Some("evil.example".to_string())
+        );
+        assert_eq!(
+            link_url_host("https://例え.test/path"),
+            Some("xn--r8jz45g.test".to_string())
+        );
     }
 
     #[test]

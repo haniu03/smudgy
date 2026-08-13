@@ -1,0 +1,57 @@
+
+╔══════════════════════════════════════════════════════════════════════╗
+║              OSC 8 Hyperlink Examples - Try them all!                ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+── FUNDAMENTALS ───────────────────────────────────────────────────────
+Basic: ]8;;send:look\[34mLook[0m]8;;\ ]8;;prompt:cast%20fireball\[33mCast Spell[0m]8;;\ ]8;;https://mudlet.org\[36mWebsite[0m]8;;\
+       send:CMD  prompt:CMD (editable)  https://URL (browser)
+URLs:  ]8;;https://mudlet.org/?id=42&lang=en\[36mWith params[0m]8;;\ ]8;;https://mudlet.org/?%63%6F%6E%66%69%67=value\[36mEncoded config[0m]8;;\
+       query params preserved (?id=42&lang=en)  percent-encoded reserved names kept
+
+── JSON CONFIG (append ?config={...} to URI) ───────────────────────────
+Structure: send:cmd?config={"style":{...},"menu":[...],"tooltip":"..."}
+Example:   ]8;;send:attack?config={"style":{"color":"red","bold":true}}\Attack]8;;\ ← {"style":{"color":"red","bold":true}}
+
+── STYLING ────────────────────────────────────────────────────────────
+Colors: ]8;;send:c1?config={"style":{"color":"red"}}\red]8;;\ ]8;;send:c2?config={"style":{"color":"#0066ff"}}\#0066ff]8;;\ ]8;;send:c3?config={"style":{"color":"rgb(0,200,100)"}}\rgb()]8;;\ ]8;;send:c4?config={"style":{"bg":"yellow","color":"black"}}\bg:yellow]8;;\
+Text:   ]8;;send:t1?config={"style":{"bold":true}}\bold]8;;\ ]8;;send:t2?config={"style":{"italic":true}}\italic]8;;\ ]8;;send:t3?config={"style":{"underline":true}}\underline]8;;\ ]8;;send:t4?config={"style":{"underline":"wavy","text-decoration-color":"red"}}\wavy-red]8;;\ ]8;;send:t5?config={"style":{"strikethrough":true}}\strike]8;;\
+States: ]8;;send:s1?config={"style":{"color":"blue","hover":{"color":"red"}}}\hover:red]8;;\ ]8;;send:s2?config={"style":{"bg":"green","active":{"bg":"darkgreen"}}}\active:dark]8;;\ ]8;;send:s3?config={"style":{"link":{"color":"blue"},"visited":{"color":"purple"}}}\visited:purple]8;;\
+
+── MENUS & TOOLTIPS ───────────────────────────────────────────────────
+Menu: ]8;;send:attack?config={"menu":[{"Strike":"send:strike"},{"Power":"send:power"},"-",{"Flee":"send:flee"}]}\⚔️ Combat]8;;\ ← right-click (left=primary, "-"=separator)
+Tip:  ]8;;send:item?config={"tooltip":"Legendary sword +5 damage","style":{"color":"orange"}}\🗡️ Flaming Blade]8;;\ ← hover for tooltip
+Both: ]8;;send:spell?config={"menu":[{"Fire":"send:fireball"},{"Ice":"send:icebolt"}],"tooltip":"Magic spells","style":{"color":"#9966ff"}}\✨ Magic]8;;\
+
+── VISIBILITY (auto-hide/reveal) ──────────────────────────────────────
+Click-hide: ]8;;send:h1?config={"style":{"color":"yellow"},"visibility":{"action":"conceal","delay":2000}}\I vanish 2s after click]8;;\
+Expire:     ]8;;send:h2?config={"style":{"color":"cyan"},"visibility":{"action":"conceal","expire":{"input":true}}}\Send any command to hide]8;;\
+Reveal:     Wait... ]8;;send:h3?config={"style":{"color":"lime","bold":true},"visibility":{"action":"reveal","delay":5000}}\I APPEAR!]8;;\ (5 seconds)
+Wide chars: ]8;;send:h4?config={"style":{"bg":"blue"},"visibility":{"action":"conceal","delay":2000}}\🎉🚀💎]8;;\ ← emojis handled correctly
+
+── SPOILERS (click-to-reveal) ─────────────────────────────────────────
+The answer is: ]8;;send:sp1?config={"spoiler":true,"disabled":true}\42]8;;\  Secret code: ]8;;https://www.mudlet.org?config={"spoiler":true,"style":{"color":"yellow"}}\XYZZY]8;;\  Emoji secret: ]8;;send:sp3?config={"spoiler":true,"disabled":true}\🔮💀🗝️]8;;\
+
+── DISABLED LINKS ─────────────────────────────────────────────────────
+]8;;send:d1?config={"disabled":true,"style":{"color":"gray","strikethrough":true}}\Locked]8;;\ ]8;;send:d2?config={"disabled":true,"style":{"color":"#666"},"tooltip":"Requires level 10"}\Premium]8;;\ ← click/right-click blocked, tooltip works
+
+── SELECTION (stateful toggles) ───────────────────────────────────────
+Radio:    ]8;;send:easy?config={"selection":{"group":"diff","value":"easy","exclusive":true},"style":{"color":"#8f8","selected":{"bg":"green","bold":true}}}\Easy]8;;\ ]8;;send:hard?config={"selection":{"group":"diff","value":"hard","exclusive":true},"style":{"color":"#f88","selected":{"bg":"red","bold":true}}}\Hard]8;;\ (one at a time)
+Checkbox: ]8;;send:b1?config={"selection":{"group":"buffs","value":"str","exclusive":false},"style":{"selected":{"bg":"#f60","bold":true}}}\[STR]]8;;\ ]8;;send:b2?config={"selection":{"group":"buffs","value":"dex","exclusive":false},"style":{"selected":{"bg":"#08f","bold":true}}}\[DEX]]8;;\ ]8;;send:b3?config={"selection":{"group":"buffs","value":"int","exclusive":false},"style":{"selected":{"bg":"#a0f","bold":true}}}\[INT]]8;;\ (multi-select)
+Server receives: &selected=true/false in callback
+
+── COMPACT SYNTAX (shorthand) ─────────────────────────────────────────
+Full:  {"style":{"color":"red","bold":true},"tooltip":"info"}
+Short: {"s":{"c":"red","b":true},"t":"info"}  ]8;;send:sh1?config={"s":{"c":"red","b":true},"t":"Shorthand!"}\Try me]8;;\
+Keys: s=style c=color bg=bg b=bold i=italic u=underline t=tooltip m=menu
+
+── PRESETS (define once, reuse) ───────────────────────────────────────
+]8;;preset:btn?config={"s":{"bg":"#07f","c":"white","b":true},"t":"Button preset"}\]8;;\]8;;preset:warn?config={"s":{"bg":"orange","c":"black","b":true}}\]8;;\]8;;preset:danger?config={"s":{"bg":"red","c":"white","b":true}}\]8;;\Define: preset:NAME?config={...}  Use: ?preset=NAME
+Usage:  ]8;;send:p1?preset=btn\Button]8;;\ ]8;;send:p2?preset=warn\Warning]8;;\ ]8;;send:p3?preset=danger\Danger]8;;\ ]8;;send:p4?preset=btn&config={"s":{"c":"yellow"}}\Override]8;;\
+
+── REAL-WORLD EXAMPLE ─────────────────────────────────────────────────
+Nav: ]8;;send:north?config={"s":{"c":"#0af","b":true,"h":{"u":true}}}\North]8;;\ ]8;;send:south?config={"s":{"c":"#0af","b":true,"h":{"u":true}}}\South]8;;\ ]8;;send:east?config={"s":{"c":"#0af","b":true,"h":{"u":true}}}\East]8;;\ ]8;;send:west?config={"s":{"c":"#0af","b":true,"h":{"u":true}}}\West]8;;\
+Item: ]8;;send:sword?config={"style":{"color":"#f80","bold":true,"hover":{"bg":"#fc9","color":"black"}},"menu":[{"Equip":"send:equip"},{"Examine":"send:exam"},"-",{"Drop":"send:drop"}],"tooltip":"+5 Fire Damage"}\🗡️ Flaming Sword]8;;\
+
+───────────────────────────────────────────────────────────────────────
+Docs: https://wiki.mudlet.org/w/Area_51#OSC_8:_Hyperlink_Protocol

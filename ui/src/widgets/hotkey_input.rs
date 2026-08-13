@@ -7,7 +7,7 @@ use iced::{
         widget::{Tree, tree},
     },
     keyboard::{Key, key::Named},
-    widget::{Text, text},
+    widget::{Id, Text, text},
 };
 
 use crate::keymap::MaybePhysicalKey;
@@ -23,6 +23,7 @@ where
     keys: &'a Vec<MaybePhysicalKey>,
     height: iced::Length,
     physical: bool,
+    id: Option<Id>,
     on_action: Option<Box<dyn Fn(Vec<MaybePhysicalKey>) -> Message>>,
     _p: PhantomData<(Message, Theme, Renderer)>,
 }
@@ -40,6 +41,7 @@ where
             keys,
             height: iced::Length::Shrink,
             physical,
+            id: None,
             on_action: None,
             _p: PhantomData,
         }
@@ -48,6 +50,12 @@ where
     /// Set the height of the widget
     pub fn height(mut self, height: impl Into<iced::Length>) -> Self {
         self.height = height.into();
+        self
+    }
+
+    /// Set the widget id used by focus operations.
+    pub fn id(mut self, id: impl Into<Id>) -> Self {
+        self.id = Some(id.into());
         self
     }
 
@@ -83,6 +91,20 @@ where
 #[derive(Default)]
 struct State {
     listening: bool,
+}
+
+impl iced::advanced::widget::operation::Focusable for State {
+    fn is_focused(&self) -> bool {
+        self.listening
+    }
+
+    fn focus(&mut self) {
+        self.listening = true;
+    }
+
+    fn unfocus(&mut self) {
+        self.listening = false;
+    }
 }
 
 impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -180,6 +202,20 @@ where
         }
     }
 
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: iced::advanced::Layout<'_>,
+        _renderer: &Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        operation.focusable(
+            self.id.as_ref(),
+            layout.bounds(),
+            tree.state.downcast_mut::<State>(),
+        );
+    }
+
     fn update(
         &mut self,
         tree: &mut Tree,
@@ -194,14 +230,14 @@ where
         let state = tree.state.downcast_mut::<State>();
 
         match event {
-            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
-                if cursor.is_over(layout.bounds()) =>
-            {
-                state.listening = true;
-                if let Some(f) = self.on_action.as_ref() {
-                    shell.publish(f(vec![]));
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
+                state.listening = cursor.is_over(layout.bounds());
+                if state.listening {
+                    if let Some(f) = self.on_action.as_ref() {
+                        shell.publish(f(vec![]));
+                    }
+                    shell.capture_event();
                 }
-                shell.capture_event();
             }
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key,
@@ -213,6 +249,13 @@ where
                 repeat: _,
             }) if state.listening => {
                 match key {
+                    // Tab is navigation, never a recordable shortcut. Leave
+                    // the event ignored so the automation window's focus
+                    // traversal subscription can move to the next/previous
+                    // input. Keep the recorder focused until the focus
+                    // operation runs so it can identify this widget as the
+                    // traversal starting point.
+                    Key::Named(Named::Tab) => {}
                     Key::Named(Named::Control)
                     | Key::Named(Named::Shift)
                     | Key::Named(Named::Alt)
@@ -266,5 +309,24 @@ where
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iced::advanced::widget::operation::Focusable;
+
+    use super::State;
+
+    #[test]
+    fn recorder_state_participates_in_focus_traversal() {
+        let mut state = State::default();
+        assert!(!state.is_focused());
+
+        state.focus();
+        assert!(state.is_focused());
+
+        state.unfocus();
+        assert!(!state.is_focused());
     }
 }

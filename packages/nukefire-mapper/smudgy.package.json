@@ -1,0 +1,44 @@
+{
+  "version": "0.17.1",
+  "description": "Maps NukeFire from its rich NukeFire.Map.Local GMCP snapshots.",
+  "entry": "index.ts",
+  "min_smudgy_version": "0.5.3",
+  "dependencies": [
+    "smudgy://kapusniak/nukefire-gmcp",
+    "smudgy://kapusniak/map-layout"
+  ],
+  "requires": [
+    "smudgy://kapusniak/nukefire-gmcp"
+  ],
+  "hosts": [
+    "tdome.nukefire.org"
+  ],
+  "params": [
+    {
+      "key": "debugMappingDecisions",
+      "label": "Log mapping decisions (debug)",
+      "type": "bool",
+      "default": false
+    }
+  ],
+  "permissions": {
+    "write": [
+      "$DATA"
+    ],
+    "smudgy": {
+      "session": [
+        "echo",
+        "reach-others"
+      ],
+      "mapper": [
+        "write"
+      ],
+      "interop": [
+        "read"
+      ],
+      "gmcp": [
+        "send"
+      ]
+    }
+  }
+}

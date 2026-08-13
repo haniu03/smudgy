@@ -926,7 +926,10 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
         }
     }
 
-    beta_tx.send(RuntimeAction::Disconnected).unwrap();
+    beta_tx.send(RuntimeAction::Disconnected {
+        connection_generation: 0,
+    })
+    .unwrap();
     beta_tx
         .send(RuntimeAction::Send(Arc::new("fire-cross-session".to_string())))
         .unwrap();

@@ -54,16 +54,20 @@ const MEMO_INLINE_MAX: usize = 512;
 
 /// One consented `net` grant, pre-parsed by `core` from the manifest allowlist so the
 /// per-src check is a cheap comparison. Mirrors deno's `NetDescriptor` containment:
-/// a bare host covers any port, `host:port` covers only that port, and `*.host` covers
-/// proper subdomains only. Hosts are stored IDNA/ASCII-lowercased without any trailing dot.
+/// a bare host covers any port, `host:port` covers only that port, `*.host` covers proper
+/// subdomains only, `*` covers every host/port, and `*:port` covers that port on every host.
+/// Named hosts are stored IDNA/ASCII-lowercased without any trailing dot.
 ///
 /// Unsupported grant spellings (CIDR subnets, malformed hosts) must be **dropped by the
 /// parser** ([`NetGrant::parse`] returns `None`) — fail-closed: the package simply cannot
 /// image-load those hosts (its own `fetch()` still can; divergence is logged at parse).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetGrant {
-    /// IDNA-normalized host (or IP literal, lowercased; IPv6 without brackets).
+    /// IDNA-normalized host (or IP literal, lowercased; IPv6 without brackets). Empty for the
+    /// special any-host `*` grant.
     host: String,
+    /// `true` for `*` / `*:port`: every host matches (the optional port still applies).
+    any_host: bool,
     /// `true` for a `*.host` grant: matches proper subdomains of `host`, not `host` itself.
     wildcard: bool,
     /// `Some(port)` restricts to that port; `None` covers any port.
@@ -71,8 +75,9 @@ pub struct NetGrant {
 }
 
 impl NetGrant {
-    /// Parse one manifest `net` entry (`host`, `host:port`, `*.host`, `*.host:port`, IP
-    /// literals, `[v6]:port`). Returns `None` for anything it cannot faithfully represent.
+    /// Parse one manifest `net` entry (`host`, `host:port`, `*.host`, `*.host:port`, `*`,
+    /// `*:port`, IP literals, `[v6]:port`). Returns `None` for anything it cannot faithfully
+    /// represent.
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim();
@@ -100,9 +105,15 @@ impl NetGrant {
         } else {
             (raw.to_string(), None)
         };
-        let host = normalize_host(&host_part)?;
+        let any_host = host_part == "*";
+        let host = if any_host {
+            String::new()
+        } else {
+            normalize_host(&host_part)?
+        };
         Some(Self {
             host,
+            any_host,
             wildcard,
             port,
         })
@@ -114,7 +125,9 @@ impl NetGrant {
         {
             return false;
         }
-        if self.wildcard {
+        if self.any_host {
+            true
+        } else if self.wildcard {
             // Proper subdomains only, matching deno: `*.example.com` covers
             // `a.example.com` but not `example.com`.
             host.len() > self.host.len() + 1
@@ -1177,6 +1190,21 @@ mod tests {
         // Unrelated hosts and IPs.
         assert!(!ok("https://evil.com/x.png"));
         assert!(ok("http://127.0.0.1:9000/x.png"));
+    }
+
+    #[test]
+    fn net_grants_support_any_host_with_optional_port() {
+        let (any, dropped) = NetGrants::parse(&["*".into()]);
+        assert!(dropped.is_empty());
+        assert!(any.allows_url(&Url::parse("https://example.com/x.png").unwrap()));
+        assert!(any.allows_url(&Url::parse("http://127.0.0.1:9876/x.png").unwrap()));
+
+        let (port_scoped, dropped) = NetGrants::parse(&["*:8443".into()]);
+        assert!(dropped.is_empty());
+        assert!(port_scoped.allows_url(&Url::parse("https://example.com:8443/x.png").unwrap()));
+        assert!(port_scoped.allows_url(&Url::parse("https://other.example:8443/x.png").unwrap()));
+        assert!(!port_scoped.allows_url(&Url::parse("https://example.com/x.png").unwrap()));
+        assert!(!port_scoped.allows_url(&Url::parse("http://127.0.0.1:8444/x.png").unwrap()));
     }
 
     #[test]

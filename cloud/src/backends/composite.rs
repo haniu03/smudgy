@@ -37,7 +37,7 @@ use uuid::Uuid;
 use super::{EphemeralBackend, LEGACY_ACCESS_FINGERPRINT, MapperBackend};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CloudError, CloudResult, CreateAreaRequest, SyncRow,
+    CloudError, CloudResult, CreateAreaRequest, MapStorage, SyncRow,
     mutation::{MutationEnvelope, MutationResult},
 };
 
@@ -194,6 +194,53 @@ impl MapperBackend for CompositeBackend {
             self.local_areas.write().insert(area.id);
         }
         Ok(area)
+    }
+
+    async fn create_area_at(
+        &self,
+        mut request: CreateAreaRequest,
+        storage: MapStorage,
+    ) -> CloudResult<Area> {
+        self.ensure_routing_seeded().await;
+        match storage {
+            MapStorage::Session => {
+                if request.atlas_id.is_some() {
+                    return Err(CloudError::InvalidInput(
+                        "session maps cannot be filed into atlases".to_string(),
+                    ));
+                }
+                request.ephemeral = true;
+                let area = self.ephemeral.create_area(request).await?;
+                self.ephemeral_areas.write().insert(area.id);
+                Ok(area)
+            }
+            MapStorage::Local => {
+                if request
+                    .atlas_id
+                    .is_some_and(|atlas_id| !self.is_local_atlas(atlas_id))
+                {
+                    return Err(CloudError::InvalidInput(
+                        "a local map can only be filed into a local atlas".to_string(),
+                    ));
+                }
+                request.ephemeral = false;
+                let area = self.local.create_area(request).await?;
+                self.local_areas.write().insert(area.id);
+                Ok(area)
+            }
+            MapStorage::Cloud => {
+                if request
+                    .atlas_id
+                    .is_some_and(|atlas_id| self.is_local_atlas(atlas_id))
+                {
+                    return Err(CloudError::InvalidInput(
+                        "a cloud map can only be filed into a cloud atlas".to_string(),
+                    ));
+                }
+                request.ephemeral = false;
+                self.cloud.create_area(request).await
+            }
+        }
     }
 
     async fn import_local_area(&self, details: AreaWithDetails) -> CloudResult<()> {
@@ -408,6 +455,22 @@ impl MapperBackend for CompositeBackend {
             self.cloud.create_atlas(name).await?
         };
         if go_local {
+            self.local_atlases.write().insert(atlas.id);
+        }
+        Ok(atlas)
+    }
+
+    async fn create_atlas_at(&self, name: &str, storage: MapStorage) -> CloudResult<Atlas> {
+        let atlas = match storage {
+            MapStorage::Session => {
+                return Err(CloudError::InvalidInput(
+                    "session maps cannot be filed into atlases".to_string(),
+                ));
+            }
+            MapStorage::Local => self.local.create_atlas(name).await?,
+            MapStorage::Cloud => self.cloud.create_atlas(name).await?,
+        };
+        if storage == MapStorage::Local {
             self.local_atlases.write().insert(atlas.id);
         }
         Ok(atlas)

@@ -2,7 +2,7 @@
 // (docs/gmcp-mapping.md section 5.3). Known rooms are followed; unknown rooms are
 // auto-created, one area per server-reported zone. A zone the player has never kept maps
 // into a session (ephemeral) area, so nothing a server sends can touch durable state
-// uninvited; `savemap` promotes those areas to local maps. A zone whose map was kept —
+// uninvited; `savemap` promotes those areas to explicit local or cloud storage. A zone whose map was kept —
 // this session or any earlier one (matched by name) — is adopted and mapped into
 // directly: opting in once keeps the zone durable.
 //
@@ -382,7 +382,7 @@ async function zoneArea(zone: string | null): Promise<AreaId> {
     for (const area of mapper.areas) {
         if (zoneKey(area.name) !== key) continue;
         if (rejectedAreas.some((rejected) => sameArea(rejected, area.id))) continue;
-        if (!area.isEphemeral) {
+        if (area.storage !== "session") {
             zoneAreas.set(key, area.id);
             return area.id;
         }
@@ -393,7 +393,7 @@ async function zoneArea(zone: string | null): Promise<AreaId> {
         return sessionArea;
     }
     const area = await mapper.createArea((zone ?? FALLBACK_ZONE).trim() || FALLBACK_ZONE, {
-        ephemeral: true,
+        storage: "session",
     });
     zoneAreas.set(key, area.id);
     return area.id;
@@ -609,14 +609,17 @@ async function createPlaceholder(
             x += (dx || 1) * GRID;
             y += dy * GRID;
         }
-        const number = await mapper.createRoom(fromAreaId, {
-            externalId: destId,
-            x,
-            y,
-            level,
-            color: PLACEHOLDER_COLOR,
-        });
-        await mapper.setRoomProperty(fromAreaId, number, "unvisited", "true");
+        let number!: RoomNumber;
+        await mapper.mutateArea(fromAreaId, async (mutation) => {
+            number = await mutation.createRoom({
+                externalId: destId,
+                x,
+                y,
+                level,
+                color: PLACEHOLDER_COLOR,
+            });
+            await mutation.setRoomProperty(number, "unvisited", "true");
+        }, { description: "Create GMCP map placeholder" });
         return mapper.getAreaById(fromAreaId).room(number);
     } catch {
         return undefined;
@@ -809,20 +812,22 @@ async function reconcileReportedExit(
 async function reconcileKnownRoom(room: Room, fix: RoomFix) {
     const areaId = room.area_id;
     const roomNumber = room.room_number;
-    if (fix.name && fix.name !== room.title) {
-        await mapper.updateRoom(areaId, roomNumber, { title: fix.name });
-    }
-    if (fix.coords) {
-        const at = placement(areaId, fix, null);
-        if (room.x !== at.x || room.y !== at.y || room.level !== at.level) {
-            await mapper.updateRoom(areaId, roomNumber, at);
+    await mapper.mutateArea(areaId, async (mutation) => {
+        if (fix.name && fix.name !== room.title) {
+            await mutation.updateRoom(roomNumber, { title: fix.name });
         }
-    }
-    if (fix.terrain && room.data("terrain") !== fix.terrain) {
-        await mapper.setRoomProperty(areaId, roomNumber, "terrain", fix.terrain);
-        const color = TERRAIN_COLORS[fix.terrain.toLowerCase()];
-        if (color) await mapper.setRoomColor(areaId, roomNumber, color);
-    }
+        if (fix.coords) {
+            const at = placement(areaId, fix, null);
+            if (room.x !== at.x || room.y !== at.y || room.level !== at.level) {
+                await mutation.updateRoom(roomNumber, at);
+            }
+        }
+        if (fix.terrain && room.data("terrain") !== fix.terrain) {
+            await mutation.setRoomProperty(roomNumber, "terrain", fix.terrain);
+            const color = TERRAIN_COLORS[fix.terrain.toLowerCase()];
+            if (color) await mutation.setRoomColor(roomNumber, color);
+        }
+    }, { description: "Refresh GMCP room metadata" });
     for (const [dir, dest] of Object.entries(fix.exits)) {
         await reconcileReportedExit(areaId, roomNumber, dir, dest, fix.doors?.[dir]);
     }
@@ -848,11 +853,13 @@ async function materialize(room: Room, fix: RoomFix, dir: string | null): Promis
     const id = fix.id!;
     const target = await zoneArea(fix.zone);
     if (sameArea(target, room.area_id)) {
-        if (fix.coords) {
-            const at = placement(room.area_id, fix, null);
-            await mapper.updateRoom(room.area_id, room.room_number, { x: at.x, y: at.y, level: at.level });
-        }
-        await mapper.setRoomProperty(room.area_id, room.room_number, "unvisited", "");
+        await mapper.mutateArea(room.area_id, async (mutation) => {
+            if (fix.coords) {
+                const at = placement(room.area_id, fix, null);
+                await mutation.updateRoom(room.room_number, { x: at.x, y: at.y, level: at.level });
+            }
+            await mutation.setRoomProperty(room.room_number, "unvisited", "");
+        }, { description: "Materialize GMCP map placeholder" });
         // Tracked exits already point at this room; they need no re-targeting.
         pendingLinks.delete(id);
         return mapper.findRoomByExternalId(id) ?? room;
@@ -898,8 +905,17 @@ async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir
             };
             const color = fix.terrain ? TERRAIN_COLORS[fix.terrain.toLowerCase()] : undefined;
             if (color) params.color = color;
-            room = await mapper.createRoom(areaId, params);
+            await mapper.mutateArea(areaId, async (mutation) => {
+                room = await mutation.createRoom(params);
+                if (fix.terrain) {
+                    await mutation.setRoomProperty(room, "terrain", fix.terrain);
+                }
+            }, { description: "Create GMCP map room" });
         } catch (err) {
+            // The draft number resolves before submission, so a failed submit
+            // leaves `room` pointing at a room that never existed; clear it or
+            // the retry is skipped and links/current-location bind the phantom.
+            room = null;
             if (attempt === 1) throw err;
             // The bound map refused the write: an adopted map we cannot write (a
             // read-only share), or an area deleted mid-session. Detach it for good and
@@ -911,8 +927,6 @@ async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir
         }
     }
     if (room === null) return;
-    if (fix.terrain) await mapper.setRoomProperty(areaId, room, "terrain", fix.terrain);
-
     // Every exit of the new room: a real link when the destination is mapped, a fresh
     // unvisited placeholder when only its id is known, a dangling stub when even the id
     // was withheld (docs/gmcp-mapping.md section 5.3). The exit we arrived THROUGH
@@ -948,47 +962,94 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
     const centerX = center.x;
     const centerY = center.y;
     const centerLevel = center.level;
-    for (const reported of fix.rooms) {
-        const x = centerX + reported.offset.x * GRID;
-        const y = centerY + reported.offset.y * GRID;
-        const level = centerLevel + Math.round(reported.offset.z);
-        let room = mapper.findRoomByExternalId(reported.id);
-        if (!room) {
-            try {
-                const params: CreateRoomParams = {
-                    externalId: reported.id,
-                    title: reported.name ?? "",
-                    x,
-                    y,
-                    level,
-                    color: reported.terrain
-                        ? TERRAIN_COLORS[reported.terrain.toLowerCase()]
-                        : PLACEHOLDER_COLOR,
-                };
-                const roomNumber = await mapper.createRoom(areaId, params);
-                await mapper.setRoomProperty(areaId, roomNumber, "unvisited", "true");
-                if (reported.terrain) {
-                    await mapper.setRoomProperty(areaId, roomNumber, "terrain", reported.terrain);
+    const missingBefore = new Set(
+        fix.rooms
+            .filter((reported) => !mapper.findRoomByExternalId(reported.id))
+            .map((reported) => reported.id),
+    );
+    const drafted = new Set<string>();
+    const offAreaTerrain = new Map<string, {
+        areaId: AreaId;
+        roomNumber: RoomNumber;
+        terrain: string;
+        color?: string;
+    }[]>();
+    try {
+        await mapper.mutateArea(areaId, async (mutation) => {
+            for (const reported of fix.rooms) {
+                const x = centerX + reported.offset.x * GRID;
+                const y = centerY + reported.offset.y * GRID;
+                const level = centerLevel + Math.round(reported.offset.z);
+                const room = mapper.findRoomByExternalId(reported.id);
+                if (room && !sameArea(room.area_id, areaId)) {
+                    if (isUnvisited(room) && reported.terrain) {
+                        const key = `${room.area_id[0]}:${room.area_id[1]}`;
+                        const group = offAreaTerrain.get(key) ?? [];
+                        group.push({
+                            areaId: room.area_id,
+                            roomNumber: room.room_number,
+                            terrain: reported.terrain,
+                            color: TERRAIN_COLORS[reported.terrain.toLowerCase()],
+                        });
+                        offAreaTerrain.set(key, group);
+                    }
+                    continue;
                 }
-                room = mapper.getAreaById(areaId).room(roomNumber);
-                await resolvePending(reported.id, areaId, roomNumber);
-            } catch (err) {
-                warnUnwritable(areaId, err);
-                continue;
-            }
-        } else if (
-            sameArea(room.area_id, areaId)
-            && room.level === level
-            && (room.x !== x || room.y !== y)
-        ) {
-            await mapper.updateRoom(areaId, room.room_number, { x, y });
-            room = mapper.getAreaById(areaId).room(room.room_number) ?? room;
-        }
 
-        if (room && isUnvisited(room) && reported.terrain) {
-            await mapper.setRoomProperty(room.area_id, room.room_number, "terrain", reported.terrain);
-            const color = TERRAIN_COLORS[reported.terrain.toLowerCase()];
-            if (color) await mapper.setRoomColor(room.area_id, room.room_number, color);
+                if (!room) {
+                    if (drafted.has(reported.id)) continue;
+                    drafted.add(reported.id);
+                    const params: CreateRoomParams = {
+                        externalId: reported.id,
+                        title: reported.name ?? "",
+                        x,
+                        y,
+                        level,
+                        color: reported.terrain
+                            ? TERRAIN_COLORS[reported.terrain.toLowerCase()]
+                            : PLACEHOLDER_COLOR,
+                    };
+                    const roomNumber = await mutation.createRoom(params);
+                    await mutation.setRoomProperty(roomNumber, "unvisited", "true");
+                    if (reported.terrain) {
+                        await mutation.setRoomProperty(roomNumber, "terrain", reported.terrain);
+                    }
+                    continue;
+                }
+
+                if (room.level === level && (room.x !== x || room.y !== y)) {
+                    await mutation.updateRoom(room.room_number, { x, y });
+                }
+                if (isUnvisited(room) && reported.terrain) {
+                    await mutation.setRoomProperty(room.room_number, "terrain", reported.terrain);
+                    const color = TERRAIN_COLORS[reported.terrain.toLowerCase()];
+                    if (color) await mutation.setRoomColor(room.room_number, color);
+                }
+            }
+        }, { description: "Apply GMCP neighborhood rooms" });
+    } catch (err) {
+        warnUnwritable(areaId, err);
+    }
+    for (const group of offAreaTerrain.values()) {
+        try {
+            await mapper.mutateArea(group[0].areaId, async (mutation) => {
+                for (const update of group) {
+                    await mutation.setRoomProperty(update.roomNumber, "terrain", update.terrain);
+                    if (update.color) await mutation.setRoomColor(update.roomNumber, update.color);
+                }
+            }, { description: "Refresh GMCP neighborhood terrain" });
+        } catch (err) {
+            warnUnwritable(group[0].areaId, err);
+        }
+    }
+
+    // Resolve only identities that were absent before this update. Re-query the
+    // host after acknowledgement so oversized best-effort batches are handled
+    // correctly even if a later envelope failed.
+    for (const id of missingBefore) {
+        const room = mapper.findRoomByExternalId(id);
+        if (room) {
+            await resolvePending(id, room.area_id, room.room_number);
         }
     }
 
@@ -1070,19 +1131,19 @@ function enqueue(task: () => Promise<void>) {
 // ---------------------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------------------
-// savemap: promote session areas to local maps and keep mapping into them.
+// savemap: promote session areas to local/cloud maps and keep mapping into them.
 // Runs THROUGH the fix queue: promoting an area out from under an in-flight room
 // creation would race it.
 // ---------------------------------------------------------------------------------------
 
-async function doSavemap(zone: string | undefined) {
+async function doSavemap(storage: "local" | "cloud", zone: string | undefined) {
     const filter = zone ? zoneKey(zone) : null;
     // Only session maps need promotion: a zone bound to an adopted saved map is already
     // durable, and "promoting" it would duplicate the map and delete the original.
     const chosen = [...zoneAreas.entries()].filter(([key, areaId]) => {
         if (filter !== null && key !== filter) return false;
         try {
-            return mapper.getAreaById(areaId).isEphemeral;
+            return mapper.getAreaById(areaId).storage === "session";
         } catch {
             return false;
         }
@@ -1093,33 +1154,31 @@ async function doSavemap(zone: string | undefined) {
             : `[auto-mapper] no session map for "${zone}".`);
         return;
     }
-    const exports = [];
-    for (const [, areaId] of chosen) {
-        exports.push(await mapper.exportArea(areaId));
+    const moved = await mapper.moveAreas(
+        chosen.map(([, areaId]) => areaId),
+        { storage },
+    );
+    const destinationIds = moved.map((area) => area.id);
+    // Rebind so mapping continues seamlessly into the acknowledged durable copies.
+    for (const [index, [key]] of chosen.entries()) {
+        const destinationId = destinationIds[index];
+        if (destinationId) zoneAreas.set(key, destinationId);
     }
-    const importedIds = await mapper.importAreas(exports);
-    // Rebind so mapping continues seamlessly into the saved copies, and drop the session
-    // originals so each room id resolves to exactly one room again.
-    for (const [index, [key, areaId]] of chosen.entries()) {
-        const importedId = importedIds[index];
-        if (importedId) zoneAreas.set(key, importedId);
-        await mapper.deleteArea(areaId);
-    }
-    // Re-key tracked exits into the imported copies: the deleted originals took their
-    // exit ids with them, but import preserves room numbers, so each waiter's exit is
+    // Re-key tracked exits into the relocated copies: the deleted originals took their
+    // exit ids with them, but relocation preserves room numbers, so each waiter's exit is
     // recoverable in the promoted area by (room, direction) — whether it links to an
-    // in-set placeholder (import remapped it) or went dangling. A waiter that cannot
+    // in-set placeholder (relocation remapped it) or went dangling. A waiter that cannot
     // be recovered is dropped rather than left pointing into a dead area.
     for (const [id, waiters] of [...pendingLinks]) {
         const remapped = waiters.flatMap((waiter) => {
             const index = chosen.findIndex(([, areaId]) => sameArea(areaId, waiter.areaId));
             if (index === -1) return [waiter];
-            const importedId = importedIds[index];
-            if (!importedId) return [];
-            const owner = mapper.getAreaById(importedId).room(waiter.room);
+            const destinationId = destinationIds[index];
+            if (!destinationId) return [];
+            const owner = mapper.getAreaById(destinationId).room(waiter.room);
             const exit = owner ? exitFor(owner, waiter.dir) : undefined;
             return exit
-                ? [{ areaId: importedId, room: waiter.room, exitId: exit.id, dir: waiter.dir }]
+                ? [{ areaId: destinationId, room: waiter.room, exitId: exit.id, dir: waiter.dir }]
                 : [];
         });
         if (remapped.length === 0) pendingLinks.delete(id);
@@ -1128,7 +1187,7 @@ async function doSavemap(zone: string | undefined) {
     if (lastRoom && chosen.some(([, areaId]) => sameArea(areaId, lastRoom!.areaId))) {
         lastRoom = null;
     }
-    echo(`[auto-mapper] saved ${importedIds.length} map(s).`);
+    echo(`[auto-mapper] saved ${destinationIds.length} map(s) to ${storage}.`);
 }
 
 function start() {
@@ -1176,8 +1235,15 @@ function start() {
 
     if (enableRoomModule) gmcpCtl.enableModule("Room");
 
-    createAlias(/^savemap(?:\s+(?<zone>.+))?$/, (matches: { zone?: string }) => {
-        enqueue(() => doSavemap(matches.zone));
+    // The first word parses as a tier when it is `local` or `cloud`, shadowing
+    // zones literally named that; such a zone is reachable through the
+    // two-word form (`savemap local cloud`).
+    createAlias(/^savemap(?:\s+(?<args>.+))?$/, (matches: { args?: string }) => {
+        const args = matches.args?.trim();
+        const tier = args?.match(/^(local|cloud)(?:\s+(.*))?$/i);
+        const storage = (tier?.[1]?.toLowerCase() ?? "local") as "local" | "cloud";
+        const zone = tier ? tier[2]?.trim() || undefined : args;
+        enqueue(() => doSavemap(storage, zone));
     });
     createAlias(/^mapprune(?:\s+(?<state>on|off))?$/, (matches: { state?: string }) => {
         if (matches.state) pruneStale = matches.state === "on";
