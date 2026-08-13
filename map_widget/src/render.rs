@@ -23,8 +23,8 @@ use smudgy_cloud::{
     },
 };
 
+use crate::ResolvedRoomStyle;
 use crate::viewport::Region;
-use crate::{MapViewStyle, RoomOverlay};
 
 /// The default exit gray — the rendered form of
 /// [`smudgy_cloud::DEFAULT_CONNECTION_COLOR`]; a drift test asserts the two
@@ -825,13 +825,13 @@ pub fn draw_room(frame: &mut canvas::Frame, room: &RoomCache, opacity: f32, show
         room.get_y(),
         opacity,
         show_secrets,
-        &MapViewStyle::default(),
-        None,
+        &ResolvedRoomStyle::default(),
     );
 }
 
-/// Draw a room at a presentation-adjusted coordinate with view-local style.
-#[allow(clippy::too_many_arguments)]
+/// Draw a room at a presentation-adjusted coordinate with resolved
+/// view-local paint. `None` channels take the renderer defaults: the room's
+/// stored color and the faint outline.
 pub fn draw_room_styled(
     frame: &mut canvas::Frame,
     room: &RoomCache,
@@ -839,8 +839,7 @@ pub fn draw_room_styled(
     y: f32,
     opacity: f32,
     show_secrets: bool,
-    style: &MapViewStyle,
-    overlay: Option<&RoomOverlay>,
+    paint: &ResolvedRoomStyle,
 ) {
     let room_shape = canvas::Path::rounded_rectangle(
         Point {
@@ -848,26 +847,16 @@ pub fn draw_room_styled(
             y: y - MAP_ROOM_SIZE / 2.0,
         },
         MAP_ROOM_SIZE_AS_SIZE,
-        style
-            .room_border_radius
+        paint
+            .border_radius
             .unwrap_or(MAP_ROOM_BORDER_RADIUS)
             .into(),
     );
 
-    let fill = overlay
-        .and_then(|overlay| overlay.fill.as_deref())
-        .and_then(parse_color)
-        .unwrap_or_else(|| room.get_iced_color());
+    let fill = paint.fill.unwrap_or_else(|| room.get_iced_color());
     frame.fill(&room_shape, apply_opacity(fill, opacity));
-    let stroke_color = overlay
-        .and_then(|overlay| overlay.stroke.as_deref())
-        .or(style.room_stroke.as_deref())
-        .and_then(parse_color)
-        .unwrap_or_else(|| Color::from_rgba8(0, 0, 0, 0.1));
-    let stroke_width = overlay
-        .and_then(|overlay| overlay.stroke_width)
-        .or(style.room_stroke_width)
-        .unwrap_or(2.0);
+    let stroke_color = paint.stroke.unwrap_or(Color::from_rgba8(0, 0, 0, 0.1));
+    let stroke_width = paint.stroke_width.unwrap_or(2.0);
     frame.stroke(
         &room_shape,
         solid_stroke(apply_opacity(stroke_color, opacity), stroke_width),

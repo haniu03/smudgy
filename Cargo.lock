@@ -10597,6 +10597,7 @@ version = "0.5.3-rc"
 dependencies = [
  "iced",
  "iced_anim",
+ "log",
  "smudgy_cloud",
  "smudgy_theme",
  "tokio",

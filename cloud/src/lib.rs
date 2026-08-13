@@ -156,7 +156,7 @@ pub(crate) fn versioned_http_client() -> reqwest::Client {
 }
 
 /// Exit direction enum matching the backend
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Display)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, Display)]
 pub enum ExitDirection {
     North,
     East,
