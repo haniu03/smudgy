@@ -82,6 +82,8 @@ pub enum RuntimeAction {
     Connect {
         host: Arc<String>,
         port: u16,
+        /// Profile text to send after the first fully processed inbound packet
+        /// containing at least one non-empty terminal line.
         send_on_connect: Option<Arc<String>>,
         /// Literal substrings of `send_on_connect` to mask from the client's echo
         /// and the session log (e.g. a substituted `$PASSWORD`). Empty ⇒ the
@@ -584,6 +586,17 @@ pub enum RuntimeAction {
         script_settings: Box<crate::models::settings::ScriptSettings>,
     },
     RequestRepaint,
+    /// The connection reader finished one inbound read batch. Ordered after
+    /// every protocol message and text line decoded from that batch (and after
+    /// its [`Self::RequestRepaint`]), so dispatching this means the packet's
+    /// trigger/script/line-routing work and display flush have completed.
+    ///
+    /// `connection_generation` prevents a late marker from a replaced socket
+    /// from releasing the new connection's deferred profile send.
+    IncomingPacketProcessed {
+        connection_generation: u64,
+        has_displayable_text: bool,
+    },
     /// A tooltip callback published into its shared result cell; wake the UI
     /// even though no terminal-buffer mutation was needed.
     LinkTooltipChanged,

@@ -598,6 +598,8 @@ impl Runtime {
                 catalogue_cadence: CatalogueCadence::default(),
                 catalogue_resend_at: None,
                 connection: None,
+                connection_generation: 0,
+                pending_send_on_connect: None,
                 window_size: Arc::new(std::sync::atomic::AtomicU32::new(
                     super::connection::responders::pack_dims(
                         super::connection::responders::DEFAULT_DIMS.0,
@@ -668,6 +670,8 @@ impl Runtime {
                 debug_assert!(!inner.replacing_main_open_line);
                 let old_open_line = inner.open_line.take();
                 let old_connection = inner.connection.take();
+                let old_connection_generation = inner.connection_generation;
+                let old_pending_send_on_connect = inner.pending_send_on_connect.take();
                 // The window-size cell is session-lifetime like the connection: the
                 // surviving connection's socket task was seeded from this cell, and
                 // the UI only re-reports on actual grid changes.
@@ -889,6 +893,8 @@ impl Runtime {
                     catalogue_cadence: CatalogueCadence::default(),
                     catalogue_resend_at: None,
                     connection: old_connection, // Preserve the connection
+                    connection_generation: old_connection_generation,
+                    pending_send_on_connect: old_pending_send_on_connect,
                     window_size: old_window_size,
                     pending_buffer_updates: Vec::new(),
                     pending_line_operations: pending_line_operations.clone(), // Preserve the shared operations
@@ -1032,6 +1038,13 @@ struct Inner<'a> {
     /// window instead of waiting for the 500 ms safety tick.
     catalogue_resend_at: Option<tokio::time::Instant>,
     connection: Option<Connection>,
+    /// Monotonic id assigned to each connection attempt. Inbound packet
+    /// completion markers carry this id so a late marker from a replaced
+    /// socket cannot affect the current connection.
+    connection_generation: u64,
+    /// Profile text held until the current connection's first fully processed
+    /// inbound packet containing non-empty terminal text.
+    pending_send_on_connect: Option<RuntimeAction>,
     /// The session's current main-pane character grid, packed with
     /// `connection::responders::pack_dims`. Updated by
     /// `RuntimeAction::WindowSizeChanged` and handed to every [`Connection`] this

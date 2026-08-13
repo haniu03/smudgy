@@ -754,6 +754,9 @@ pub struct Connection {
     ui_tx: mpsc::Sender<TaggedSessionEvent>,
     socket_tx: Arc<RwLock<Option<WeakSender<OutboundFrame>>>>,
     on_connect: Option<Box<dyn FnOnce() + Send>>,
+    /// Monotonic session-local id used to reject late packet markers from a
+    /// socket that was replaced by a reconnect.
+    generation: u64,
     /// The trigger manager's "any trigger has a raw pattern" flag; each connect
     /// task hands it to its [`VtProcessor`] so per-line raw capture only runs
     /// while something can match on it.
@@ -786,6 +789,7 @@ impl std::fmt::Debug for Connection {
             .field("ui_tx", &self.ui_tx)
             .field("socket_tx", &self.socket_tx)
             .field("on_connect", &self.on_connect.is_some())
+            .field("generation", &self.generation)
             .field("raw_wanted", &self.raw_wanted)
             .field("window_size", &self.window_size)
             .field("write_stall_timeout", &self.write_stall_timeout)
@@ -801,12 +805,24 @@ impl Connection {
         raw_wanted: Arc<std::sync::atomic::AtomicBool>,
         window_size: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
+        Self::with_generation(runtime_tx, ui_tx, raw_wanted, window_size, 0)
+    }
+
+    #[must_use]
+    pub(crate) fn with_generation(
+        runtime_tx: UnboundedSender<RuntimeAction>,
+        ui_tx: futures::channel::mpsc::Sender<TaggedSessionEvent>,
+        raw_wanted: Arc<std::sync::atomic::AtomicBool>,
+        window_size: Arc<std::sync::atomic::AtomicU32>,
+        generation: u64,
+    ) -> Self {
         Self {
             disconnect: None,
             runtime_tx,
             ui_tx,
             socket_tx: Arc::new(RwLock::new(None)),
             on_connect: None,
+            generation,
             raw_wanted,
             window_size,
             write_stall_timeout: WRITE_STALL_TIMEOUT,
@@ -925,13 +941,15 @@ impl Connection {
         let socket_tx = self.socket_tx.clone();
 
         let on_connect = self.on_connect.take();
+        let generation = self.generation;
         let raw_wanted = self.raw_wanted.clone();
         let window_size = self.window_size.clone();
         let write_stall_timeout = self.write_stall_timeout;
 
         spawn_io_task(async move {
             let mut vt_parser = VTParser::new();
-            let mut vt_processor = VtProcessor::new(runtime_tx.clone());
+            let mut vt_processor =
+                VtProcessor::with_connection_generation(runtime_tx.clone(), generation);
             vt_processor.set_raw_wanted_flag(raw_wanted);
             // Telnet/IAC preprocessor: consumes negotiation + prompt markers so the VT parser only
             // ever sees pure game text. Persists across reads (a sequence may straddle a read).
