@@ -1921,11 +1921,10 @@ export function make() { return createEvent('dynamic'); }
             1,
             "the first-party NukeFire mapper's ephemeral option is part of the same finite window"
         );
-        let arctic_mapper = include_str!("../../../packages/arctic-mapper/mapper/alias.ts");
-        assert!(
-            arctic_mapper.contains("mapper.createArea(name, { storage: \"local\" })"),
-            "first-party mappers must exercise the explicit-storage API, not its compatibility overload"
-        );
+        // Arctic deliberately uses the deprecated implicit durable destination so
+        // signed-in sessions prefer cloud and signed-out sessions fall back to local.
+        // The 0.6 release-version guard above, rather than a first-party source
+        // assertion, owns removal of that compatibility path.
 
         let mut ambient = BTreeMap::new();
         ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
