@@ -383,34 +383,135 @@ impl<T: Clone> DynProp<T> {
     }
 }
 
-fn serde_from_node<T: DeserializeOwned>(node: &Node) -> Option<T> {
-    serde_json::to_value(node)
-        .ok()
-        .and_then(|value| serde_json::from_value(value).ok())
+fn serde_from_node<T: DeserializeOwned>(node: &Node) -> Result<T, serde_json::Error> {
+    serde_json::to_value(node).and_then(serde_json::from_value)
+}
+
+/// Log a widget prop diagnostic once per distinct message. Bound props re-read
+/// per frame and static props re-build per mount, so an unconditional warn on a
+/// malformed value would repeat for as long as the value stays bad.
+fn warn_once(message: String) {
+    use std::sync::{LazyLock, Mutex};
+    static WARNED: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+    let mut warned = match WARNED.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if warned.insert(message.clone()) {
+        log::warn!("{message}");
+    }
+}
+
+/// A structured prop resolved through serde: a build-time constant, or a store
+/// binding whose parse result is memoized on the snapshot's `Arc` identity —
+/// an unchanged store node is never re-parsed on later renders
+/// (`serde_json::to_value` deep-copies the tree, so the memo is what keeps
+/// bound structured props off the per-frame hot path). Used by MapView's
+/// defaultStyle/apply/doors objects.
+enum SerdeProp<T> {
+    Static(T),
+    Bound {
+        prop: BoundProp,
+        name: &'static str,
+        parse: fn(&Node) -> Result<T, serde_json::Error>,
+        cache: RefCell<Option<(Arc<Node>, Option<T>)>>,
+    },
+}
+
+impl<T: Clone> SerdeProp<T> {
+    fn get(&self) -> Option<T> {
+        match self {
+            Self::Static(value) => Some(value.clone()),
+            Self::Bound {
+                prop,
+                name,
+                parse,
+                cache,
+            } => {
+                let loaded = prop.cell.load();
+                if let Some((snapshot, parsed)) = cache.borrow().as_ref()
+                    && Arc::ptr_eq(snapshot, &loaded)
+                {
+                    return parsed.clone();
+                }
+                let parsed = Self::parse_snapshot(&loaded, prop, name, *parse);
+                *cache.borrow_mut() = Some((loaded, parsed.clone()));
+                parsed
+            }
+        }
+    }
+
+    /// Parse a fresh snapshot. A null snapshot (unset store path) silently
+    /// takes the token's `fallback`; a malformed one is reported once and
+    /// then also falls back.
+    fn parse_snapshot(
+        loaded: &Node,
+        prop: &BoundProp,
+        name: &str,
+        parse: fn(&Node) -> Result<T, serde_json::Error>,
+    ) -> Option<T> {
+        if !loaded.is_null() {
+            match parse(loaded) {
+                Ok(parsed) => return Some(parsed),
+                Err(err) => warn_once(format!(
+                    "smudgy widgets: bound `{name}` value failed to parse: {err}"
+                )),
+            }
+        }
+        let fallback = prop.fallback.as_ref()?;
+        match parse(fallback) {
+            Ok(parsed) => Some(parsed),
+            Err(err) => {
+                warn_once(format!(
+                    "smudgy widgets: `{name}` binding fallback failed to parse: {err}"
+                ));
+                None
+            }
+        }
+    }
 }
 
 /// Resolve a structured prop from either a static JS value or a live store
-/// binding. Used by MapView's style/overlay objects.
-fn get_dyn_serde_prop<T: Clone + DeserializeOwned>(
+/// binding. `P` is the wire shape (parsed directly by serde_v8, which keeps
+/// BigInt-carried u64 halves intact on the static path), `T` the widget-side
+/// value cached per snapshot; `parse` is `T`'s from-store-node reading. A
+/// malformed static value is reported once and dropped rather than silently
+/// nulled.
+fn get_serde_prop<P, T>(
     scope: &mut v8::PinScope,
     state: &OpState,
     props: v8::Local<v8::Object>,
     name: &'static str,
-) -> Option<DynProp<T>> {
+    parse: fn(&Node) -> Result<T, serde_json::Error>,
+    convert: fn(P) -> T,
+) -> Option<SerdeProp<T>>
+where
+    P: DeserializeOwned,
+    T: Clone,
+{
     let key = v8::String::new(scope, name)?.into();
     let value = props.get(scope, key)?;
     if value.is_null_or_undefined() {
         return None;
     }
     if is_binding_token(scope, value) {
-        return bound_prop_from_v8(scope, state, value).map(|prop| DynProp::Bound {
+        return bound_prop_from_v8(scope, state, value).map(|prop| SerdeProp::Bound {
             prop,
-            parse: serde_from_node::<T>,
+            name,
+            parse,
+            cache: RefCell::new(None),
         });
     }
-    deno_core::serde_v8::from_v8::<T>(scope, value)
-        .ok()
-        .map(DynProp::Static)
+    match deno_core::serde_v8::from_v8::<P>(scope, value) {
+        Ok(parsed) => Some(SerdeProp::Static(convert(parsed))),
+        Err(err) => {
+            warn_once(format!(
+                "smudgy widgets: `{name}` prop failed to parse: {err}"
+            ));
+            None
+        }
+    }
 }
 
 // The `DynProp::Bound` parse fns: how a store value lands in each prop type. Truncating
@@ -1825,8 +1926,38 @@ fn op_smudgy_widget_build_map_view(
     props: v8::Local<v8::Object>,
 ) -> Element {
     let mapper = state.borrow::<Option<Mapper>>().clone();
-    let style = get_dyn_serde_prop::<MapViewStyleProp>(scope, state, props, "style");
-    let overlay = get_dyn_serde_prop::<MapViewOverlayProp>(scope, state, props, "overlay");
+    // View-global knobs are plain bindable scalars. The style surface is a
+    // static named palette (`styles`) plus bindable structured props:
+    // `defaultStyle`, the per-item `apply` associations (the dynamic hot
+    // path), and semantic `doors` state.
+    let room_spacing = get_dyn_f32_prop!(scope, state, props, "roomSpacing");
+    let player_color = get_dyn_string_prop!(scope, state, props, "playerColor");
+    let show_doors = get_dyn_bool_prop!(scope, state, props, "showDoors");
+    let default_style = get_serde_prop::<MapStyleProp, smudgy_map_widget::MapStyle>(
+        scope,
+        state,
+        props,
+        "defaultStyle",
+        map_style_from_node,
+        Into::into,
+    );
+    let styles = get_static_styles(scope, props);
+    let apply = get_serde_prop::<Vec<MapStyleApplicationProp>, Vec<smudgy_map_widget::MapStyleApplication>>(
+        scope,
+        state,
+        props,
+        "apply",
+        style_applications_from_node,
+        convert_style_applications,
+    );
+    let doors = get_serde_prop::<Vec<MapDoorStateProp>, Vec<smudgy_map_widget::MapDoorState>>(
+        scope,
+        state,
+        props,
+        "doors",
+        door_states_from_node,
+        convert_door_states,
+    );
     let widget_id = NEXT_MAP_WIDGET_ID.fetch_add(1, Ordering::Relaxed);
 
     // The reap guard rides inside the render closure: the closure is the only
@@ -1845,16 +1976,19 @@ fn op_smudgy_widget_build_map_view(
             crate::map::with_active_store(|store| {
                 let widget_id = reap.id();
                 let presentation = smudgy_map_widget::MapViewPresentation {
-                    style: style
+                    room_spacing: room_spacing
                         .as_ref()
                         .and_then(DynProp::get)
-                        .map(Into::into)
-                        .unwrap_or_default(),
-                    overlay: overlay
+                        .unwrap_or(1.0),
+                    player_color: player_color.as_ref().and_then(DynProp::get),
+                    show_doors: show_doors.as_ref().and_then(DynProp::get).unwrap_or(true),
+                    default_style: default_style
                         .as_ref()
-                        .and_then(DynProp::get)
-                        .map(Into::into)
+                        .and_then(SerdeProp::get)
                         .unwrap_or_default(),
+                    styles: styles.clone(),
+                    apply: apply.as_ref().and_then(SerdeProp::get).unwrap_or_default(),
+                    doors: doors.as_ref().and_then(SerdeProp::get).unwrap_or_default(),
                 };
                 let handle = store.ensure_map(mapper.clone(), widget_id, presentation);
                 Some(
@@ -1874,121 +2008,157 @@ fn op_smudgy_widget_build_map_view(
     })
 }
 
-#[derive(Clone, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct MapViewStyleProp {
-    room_spacing: Option<f32>,
-    room_border_radius: Option<f32>,
-    room_stroke: Option<String>,
-    room_stroke_width: Option<f32>,
-    connection_color: Option<String>,
-    connection_width: Option<f32>,
-    player_color: Option<String>,
-    route_color: Option<String>,
-    route_width: Option<f32>,
-    door_color: Option<String>,
-    show_doors: Option<bool>,
+/// The `styles` palette: a static prop by design (`apply` entries change per
+/// route step; the palette does not), read once at build. A binding token or
+/// malformed record is reported and treated as an empty palette.
+fn get_static_styles(
+    scope: &mut v8::PinScope,
+    props: v8::Local<v8::Object>,
+) -> std::collections::HashMap<String, smudgy_map_widget::MapStyle> {
+    let Some(key) = v8::String::new(scope, "styles") else {
+        return std::collections::HashMap::new();
+    };
+    let Some(value) = props.get(scope, key.into()) else {
+        return std::collections::HashMap::new();
+    };
+    if value.is_null_or_undefined() {
+        return std::collections::HashMap::new();
+    }
+    match deno_core::serde_v8::from_v8::<std::collections::HashMap<String, MapStyleProp>>(
+        scope, value,
+    ) {
+        Ok(styles) => styles
+            .into_iter()
+            .map(|(name, style)| (name, style.into()))
+            .collect(),
+        Err(err) => {
+            warn_once(format!(
+                "smudgy widgets: `styles` prop failed to parse (it must be a static record of \
+                 named styles): {err}"
+            ));
+            std::collections::HashMap::new()
+        }
+    }
 }
 
-impl From<MapViewStyleProp> for smudgy_map_widget::MapViewStyle {
-    fn from(value: MapViewStyleProp) -> Self {
-        let mut style = Self::default();
-        if let Some(field) = value.room_spacing {
-            style.room_spacing = field;
+/// Per-item paint channels, camelCase from JS. Absent fields inherit
+/// `defaultStyle`, then the widget default.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct MapStyleProp {
+    room_fill: Option<String>,
+    room_stroke: Option<String>,
+    room_stroke_width: Option<f32>,
+    room_border_radius: Option<f32>,
+    connection_color: Option<String>,
+    connection_width: Option<f32>,
+    door_color: Option<String>,
+}
+
+impl From<MapStyleProp> for smudgy_map_widget::MapStyle {
+    fn from(value: MapStyleProp) -> Self {
+        Self {
+            room_fill: value.room_fill,
+            room_stroke: value.room_stroke,
+            room_stroke_width: value.room_stroke_width,
+            room_border_radius: value.room_border_radius,
+            connection_color: value.connection_color,
+            connection_width: value.connection_width,
+            door_color: value.door_color,
         }
-        style.room_border_radius = value.room_border_radius;
-        style.room_stroke = value.room_stroke;
-        style.room_stroke_width = value.room_stroke_width;
-        style.connection_color = value.connection_color;
-        style.connection_width = value.connection_width;
-        style.player_color = value.player_color;
-        if let Some(field) = value.route_color {
-            style.route_color = field;
+    }
+}
+
+fn map_style_from_node(node: &Node) -> Result<smudgy_map_widget::MapStyle, serde_json::Error> {
+    serde_from_node::<MapStyleProp>(node).map(Into::into)
+}
+
+/// One Connection selected from either endpoint by room + direction (never a
+/// ConnectionId: its u64 halves exceed `Number.MAX_SAFE_INTEGER` and cannot
+/// travel the JSON store-binding path).
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MapExitRefProp {
+    room: i32,
+    direction: smudgy_cloud::ExitDirection,
+}
+
+impl From<MapExitRefProp> for smudgy_map_widget::MapExitRef {
+    fn from(value: MapExitRefProp) -> Self {
+        Self {
+            room: smudgy_cloud::RoomNumber(value.room),
+            direction: value.direction,
         }
-        if let Some(field) = value.route_width {
-            style.route_width = field;
-        }
-        if let Some(field) = value.door_color {
-            style.door_color = field;
-        }
-        if let Some(field) = value.show_doors {
-            style.show_doors = field;
-        }
-        style.normalized()
     }
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MapViewRoomOverlayProp {
-    room: i32,
+struct MapStyleApplicationProp {
+    style: String,
     #[serde(default)]
-    fill: Option<String>,
+    rooms: Vec<i32>,
     #[serde(default)]
-    stroke: Option<String>,
+    exits: Vec<MapExitRefProp>,
+    /// `[hi, lo]` area id halves; entries scoped to another area are ignored
+    /// at resolution.
     #[serde(default)]
-    stroke_width: Option<f32>,
+    area: Option<(u64, u64)>,
+}
+
+impl From<MapStyleApplicationProp> for smudgy_map_widget::MapStyleApplication {
+    fn from(value: MapStyleApplicationProp) -> Self {
+        Self {
+            style: value.style,
+            rooms: value.rooms.into_iter().map(smudgy_cloud::RoomNumber).collect(),
+            exits: value.exits.into_iter().map(Into::into).collect(),
+            area: value
+                .area
+                .map(|(hi, lo)| smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(hi, lo))),
+        }
+    }
+}
+
+fn style_applications_from_node(
+    node: &Node,
+) -> Result<Vec<smudgy_map_widget::MapStyleApplication>, serde_json::Error> {
+    serde_from_node::<Vec<MapStyleApplicationProp>>(node).map(convert_style_applications)
+}
+
+fn convert_style_applications(
+    entries: Vec<MapStyleApplicationProp>,
+) -> Vec<smudgy_map_widget::MapStyleApplication> {
+    entries.into_iter().map(Into::into).collect()
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MapViewDoorOverlayProp {
-    connection: (u64, u64),
+struct MapDoorStateProp {
+    exit: MapExitRefProp,
     #[serde(default)]
     closed: Option<bool>,
     #[serde(default)]
     locked: Option<bool>,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MapViewRouteExitOverlayProp {
-    room: i32,
-    direction: smudgy_cloud::ExitDirection,
-}
-
-#[derive(Clone, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct MapViewOverlayProp {
-    route: Vec<i32>,
-    route_exits: Vec<MapViewRouteExitOverlayProp>,
-    rooms: Vec<MapViewRoomOverlayProp>,
-    doors: Vec<MapViewDoorOverlayProp>,
-}
-
-impl From<MapViewOverlayProp> for smudgy_map_widget::MapViewOverlay {
-    fn from(value: MapViewOverlayProp) -> Self {
+impl From<MapDoorStateProp> for smudgy_map_widget::MapDoorState {
+    fn from(value: MapDoorStateProp) -> Self {
         Self {
-            route: value.route,
-            route_exits: value
-                .route_exits
-                .into_iter()
-                .map(|exit| smudgy_map_widget::RouteExitOverlay {
-                    room: exit.room,
-                    direction: exit.direction,
-                })
-                .collect(),
-            rooms: value
-                .rooms
-                .into_iter()
-                .map(|room| smudgy_map_widget::RoomOverlay {
-                    room: room.room,
-                    fill: room.fill,
-                    stroke: room.stroke,
-                    stroke_width: room.stroke_width,
-                })
-                .collect(),
-            doors: value
-                .doors
-                .into_iter()
-                .map(|door| smudgy_map_widget::ConnectionDoorOverlay {
-                    connection: door.connection,
-                    closed: door.closed,
-                    locked: door.locked,
-                })
-                .collect(),
+            exit: value.exit.into(),
+            closed: value.closed,
+            locked: value.locked,
         }
     }
+}
+
+fn door_states_from_node(
+    node: &Node,
+) -> Result<Vec<smudgy_map_widget::MapDoorState>, serde_json::Error> {
+    serde_from_node::<Vec<MapDoorStateProp>>(node).map(convert_door_states)
+}
+
+fn convert_door_states(entries: Vec<MapDoorStateProp>) -> Vec<smudgy_map_widget::MapDoorState> {
+    entries.into_iter().map(Into::into).collect()
 }
 
 /// Parse an author-written scene (a static `scene` value or a binding fallback) with
@@ -3072,25 +3242,123 @@ mod tests {
     }
 
     #[test]
-    fn map_view_overlay_parses_from_store_node() {
+    fn map_view_apply_and_doors_parse_from_store_nodes() {
         use serde_json::json;
-        let node = Node::from(json!({
-            "route": [1, 2, 3],
-            "routeExits": [{ "room": 3, "direction": "Up" }],
-            "rooms": [{ "room": 2, "stroke": "#ff00ff" }],
-            "doors": [{ "connection": [12, 34], "locked": true }]
-        }));
-        let prop = serde_from_node::<MapViewOverlayProp>(&node).expect("overlay parses");
-        let overlay: smudgy_map_widget::MapViewOverlay = prop.into();
-        assert_eq!(overlay.route, vec![1, 2, 3]);
-        assert_eq!(overlay.route_exits[0].room, 3);
+        use smudgy_cloud::{ExitDirection, RoomNumber};
+
+        let apply = style_applications_from_node(&Node::from(json!([
+            {
+                "style": "route",
+                "rooms": [1, 2, 3],
+                "exits": [{ "room": 3, "direction": "Up" }],
+            },
+            {
+                "style": "visited",
+                "rooms": [9],
+                "area": [1, 2],
+            }
+        ])))
+        .expect("apply entries parse");
+        assert_eq!(apply[0].style, "route");
         assert_eq!(
-            overlay.route_exits[0].direction,
-            smudgy_cloud::ExitDirection::Up
+            apply[0].rooms,
+            vec![RoomNumber(1), RoomNumber(2), RoomNumber(3)]
         );
-        assert_eq!(overlay.rooms[0].room, 2);
-        assert_eq!(overlay.doors[0].connection, (12, 34));
-        assert_eq!(overlay.doors[0].locked, Some(true));
+        assert_eq!(apply[0].exits[0].room, RoomNumber(3));
+        assert_eq!(apply[0].exits[0].direction, ExitDirection::Up);
+        assert_eq!(apply[0].area, None);
+        assert_eq!(
+            apply[1].area,
+            Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
+                1, 2
+            )))
+        );
+
+        let doors = door_states_from_node(&Node::from(json!([
+            { "exit": { "room": 4, "direction": "East" }, "locked": true }
+        ])))
+        .expect("door states parse");
+        assert_eq!(doors[0].exit.room, RoomNumber(4));
+        assert_eq!(doors[0].exit.direction, ExitDirection::East);
+        assert_eq!(doors[0].closed, None);
+        assert_eq!(doors[0].locked, Some(true));
+
+        let style = map_style_from_node(&Node::from(json!({
+            "roomStroke": "#ff00ff",
+            "connectionWidth": 2.0,
+        })))
+        .expect("style parses");
+        assert_eq!(style.room_stroke.as_deref(), Some("#ff00ff"));
+        assert_eq!(style.connection_width, Some(2.0));
+        assert_eq!(style.room_fill, None);
+    }
+
+    /// Malformed structured values surface as `Err` (reported to the log by
+    /// the callers), never as a silently-empty parse.
+    #[test]
+    fn map_view_negative_parses_error_instead_of_nulling() {
+        use serde_json::json;
+
+        // A wrong-typed field inside one entry fails that parse loudly.
+        assert!(
+            style_applications_from_node(&Node::from(json!([
+                { "style": "route", "rooms": "not-an-array" }
+            ])))
+            .is_err()
+        );
+        // A missing required field (the style name) fails.
+        assert!(style_applications_from_node(&Node::from(json!([{ "rooms": [1] }]))).is_err());
+        // An unknown direction spelling fails the exit ref.
+        assert!(
+            door_states_from_node(&Node::from(json!([
+                { "exit": { "room": 1, "direction": "Norf" } }
+            ])))
+            .is_err()
+        );
+        // The whole prop having the wrong shape fails.
+        assert!(style_applications_from_node(&Node::from(json!({ "style": "route" }))).is_err());
+        assert!(map_style_from_node(&Node::from(json!("gold"))).is_err());
+    }
+
+    /// The bound-prop memo: an unchanged store snapshot must not re-parse
+    /// (same `Arc`, cached value back), and a changed one must.
+    #[test]
+    fn serde_prop_caches_parses_on_snapshot_identity() {
+        use serde_json::json;
+
+        let prop = SerdeProp::Bound {
+            prop: bound(json!([{ "style": "route", "rooms": [1] }])),
+            name: "apply",
+            parse: style_applications_from_node,
+            cache: RefCell::new(None),
+        };
+
+        let first = prop.get().expect("initial snapshot parses");
+        assert_eq!(first[0].rooms, vec![smudgy_cloud::RoomNumber(1)]);
+
+        // Same snapshot: the memo must hit (observable as the same cached
+        // Arc snapshot rather than a fresh parse).
+        let _second = prop.get().expect("cached snapshot returns");
+        if let SerdeProp::Bound { prop: inner, cache, .. } = &prop {
+            let cached = cache.borrow();
+            let (snapshot, _) = cached.as_ref().expect("cache is populated");
+            assert!(
+                Arc::ptr_eq(snapshot, &inner.cell.load()),
+                "the memo must key on the live snapshot's identity"
+            );
+
+            drop(cached);
+            inner.cell.set(json!([{ "style": "route", "rooms": [2] }]));
+        }
+        let third = prop.get().expect("new snapshot parses");
+        assert_eq!(third[0].rooms, vec![smudgy_cloud::RoomNumber(2)]);
+
+        // A malformed replacement value degrades to None (with a warn-once
+        // report), not a stale cached value and not a panic.
+        if let SerdeProp::Bound { prop: inner, .. } = &prop {
+            inner.cell.set(json!([{ "rooms": "bad" }]));
+        }
+        assert_eq!(prop.get(), None);
     }
 
     fn link(label: &str, url: &str) -> MarkdownLink {
