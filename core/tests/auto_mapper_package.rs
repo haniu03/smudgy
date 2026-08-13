@@ -1532,3 +1532,157 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
 
     tx.send(RuntimeAction::Shutdown).ok();
 }
+
+/// The unwritable-map fallback: an adopted durable zone map whose backend
+/// refuses the write must be detached and the SAME fix retried into a fresh
+/// session area. The mutator's draft room number resolves before submission,
+/// so a failed submit must not leave the retry loop believing a room exists —
+/// that phantom would end the loop early and links/current-location would
+/// bind a room number the fallback area never held.
+#[tokio::test]
+async fn auto_mapper_retries_into_a_session_area_when_the_bound_map_refuses_writes() {
+    const RETRY_SERVER: &str = "AutoMapperRetry";
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    std::fs::create_dir_all(smudgy_home.join(RETRY_SERVER).join("modules")).unwrap();
+    std::fs::create_dir_all(smudgy_home.join(RETRY_SERVER).join("logs")).unwrap();
+    copy_package_source(RETRY_SERVER);
+    shared_packages::install_package(
+        RETRY_SERVER,
+        "smudgy://local/auto-mapper",
+        UpdateMode::Auto,
+        true,
+    )
+    .unwrap();
+
+    let map_root = smudgy_home.join("map-test-retry");
+    let local = Arc::new(LocalBackend::new(map_root.join("local")));
+    let cloud = Arc::new(CloudMapper::new(
+        "http://127.0.0.1:0".to_string(),
+        "test-key".to_string(),
+    ));
+    let backend: Arc<dyn MapperBackend + Send + Sync> =
+        Arc::new(CompositeBackend::new(local, cloud));
+    let mapper = Mapper::new(backend, map_root.join("cache"));
+
+    // A saved local map the package will adopt by folded name.
+    let bound = mapper
+        .create_area_at(
+            "walledgarden".to_string(),
+            MapDestination::loose(MapStorage::Local),
+        )
+        .await
+        .expect("create the bound local area");
+    let seed = mapper
+        .upsert_room(
+            RoomKey::new(bound, RoomNumber(1)),
+            RoomUpdates {
+                title: Some("Garden Gate".to_string()),
+                external_id: Some(Some("700".to_string())),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("seed room should enqueue");
+    if let Some(operation_id) = seed.operation_id() {
+        mapper
+            .wait_for_mutation(operation_id)
+            .await
+            .expect("seed room acknowledged");
+    }
+
+    // Make the local tier refuse further writes to the area document: the
+    // atomic rewrite cannot replace a read-only file (Windows) or create its
+    // temp in a read-only directory (Unix).
+    let areas_dir = map_root.join("local").join("areas-v2");
+    for entry in std::fs::read_dir(&areas_dir).expect("list local area files") {
+        let path = entry.expect("area file entry").path();
+        if path.extension().is_some_and(|extension| extension == "json") {
+            let mut permissions = std::fs::metadata(&path).expect("area file metadata").permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&path, permissions).expect("set area file read-only");
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&areas_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("set areas dir read-only");
+    }
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(9341_u32),
+        server_name: Arc::new(RETRY_SERVER.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: Some(mapper.clone()),
+        package_client: Some(PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        )),
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+
+    // A NEW room in the adopted zone: the first attempt drafts into the bound
+    // local map and fails at submit; the retry must land a REAL room in a
+    // fresh session area.
+    tx.send(RuntimeAction::GmcpEnabled).unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 701, "name": "Overgrown Path", "zone": "walledgarden", "terrain": "field",
+             "exits": {} }"#,
+    ))
+    .unwrap();
+
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+
+    assert!(
+        lines.iter().any(|line| line.contains("not writable")),
+        "the unwritable adoption is announced once.\n{transcript}"
+    );
+    let session_areas = mapper.session_area_ids();
+    assert_eq!(
+        session_areas.len(),
+        1,
+        "the fallback opens exactly one session area.\n{transcript}"
+    );
+    let fallback = *session_areas.iter().next().expect("fallback area id");
+    let atlas = mapper.get_current_atlas();
+    let fallback_area = atlas.get_area(&fallback).expect("fallback area");
+    assert_eq!(
+        fallback_area.room_count(),
+        1,
+        "the retry created a real room in the fallback area — a phantom draft \
+         number would have left it empty.\n{transcript}"
+    );
+    let fallback_room = fallback_area
+        .get_rooms()
+        .first()
+        .expect("the retried room exists");
+    assert_eq!(fallback_room.get_external_id(), Some("701"));
+    assert_eq!(fallback_room.get_title(), "Overgrown Path");
+
+    tx.send(RuntimeAction::Shutdown).ok();
+}
