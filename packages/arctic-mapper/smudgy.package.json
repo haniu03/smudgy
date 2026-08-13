@@ -1,8 +1,8 @@
 {
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "An auto-mapper for ArcticMUD",
   "entry": "index.ts",
-  "min_smudgy_version": "0.5.1",
+  "min_smudgy_version": "0.5.3",
   "dependencies": [
     "smudgy://kapusniak/map-layout"
   ],
