@@ -3393,7 +3393,17 @@ impl MapEditorWindow {
                         mapper
                             .relocate_atlas(atlas_id, destination, RelocationMode::Move)
                             .await
-                            .map_err(|error| display_error(&error))
+                            .map_err(|failure| match &failure.completed {
+                                // The copied atlas is complete: name it, so the
+                                // user resolves the duplicate rather than
+                                // retrying (which would mint another copy).
+                                Some(completed) => crate::i18n::t!(
+                                    "mapper-relocation-duplicate-notice",
+                                    "error" => display_error(&failure.error),
+                                    "name" => completed.destination_atlas_name.clone()
+                                ),
+                                None => display_error(&failure.error),
+                            })
                     },
                     Message::MoveAtlasStorageCompleted,
                 ))
@@ -3587,15 +3597,38 @@ impl MapEditorWindow {
                     let mapper = self.mapper.clone();
                     return Update::with_task(Task::perform(
                         async move {
-                            mapper
+                            match mapper
                                 .relocate_areas(vec![area], destination, RelocationMode::Move)
                                 .await
-                                .and_then(|result| {
+                            {
+                                Ok(result) => {
                                     result.destination_ids.into_iter().next().ok_or_else(|| {
-                                        CloudError::InvalidInput("move returned no map".into())
+                                        display_error(&CloudError::InvalidInput(
+                                            "move returned no map".into(),
+                                        ))
                                     })
-                                })
-                                .map_err(|error| display_error(&error))
+                                }
+                                // The copy at the destination is complete: name
+                                // it, so the user resolves the duplicate rather
+                                // than retrying (which would mint another copy).
+                                Err(failure) => Err(match failure.completed {
+                                    Some(completed) => {
+                                        let atlas = mapper.get_current_atlas();
+                                        let name = completed
+                                            .destination_ids
+                                            .first()
+                                            .and_then(|id| atlas.get_area(id))
+                                            .map(|area| area.get_name().to_string())
+                                            .unwrap_or_default();
+                                        crate::i18n::t!(
+                                            "mapper-relocation-duplicate-notice",
+                                            "error" => display_error(&failure.error),
+                                            "name" => name
+                                        )
+                                    }
+                                    None => display_error(&failure.error),
+                                }),
+                            }
                         },
                         Message::MoveAreaCompleted,
                     ));

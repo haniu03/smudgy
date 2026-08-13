@@ -37,7 +37,7 @@ pub use package_api::{
     ResolvedDependency, ResolvedModuleWire, ResolvedPackageWire, SearchCategory, ShareClosureItem,
     StaleDependencyView, VersionListItem, highest_satisfying_version,
 };
-pub use relocation::{AtlasRelocation, MapRelocation, RelocationMode};
+pub use relocation::{AtlasRelocation, MapRelocation, RelocationError, RelocationMode};
 pub use store_bindings::{StoreBindingCell, StoreBindings};
 pub use store_node::{ArrayNode, Node, ObjectNode, Usage};
 

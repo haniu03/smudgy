@@ -467,6 +467,7 @@ mapper-folder-maps-move = Its { $count } maps will move to Loose maps.
 mapper-loose-maps = Loose maps
 mapper-move-area-to = Move “{ $name }” to:
 mapper-move-to-folder = Move to folder
+mapper-relocation-duplicate-notice = { $error } — “{ $name }” was fully copied to the destination and the original remains. Remove one of the two instead of retrying the move.
 mapper-share-folder-title = Share folder “{ $name }”
 mapper-loading = Loading…
 mapper-no-secrets = No secrets in this area.

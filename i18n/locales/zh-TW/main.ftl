@@ -466,6 +466,7 @@ mapper-folder-maps-move = 其中的 { $count } 張地圖將移至「未分類地
 mapper-loose-maps = 未分類地圖
 mapper-move-area-to = 將「{ $name }」移至：
 mapper-move-to-folder = 移至資料夾
+mapper-relocation-duplicate-notice = { $error }——「{ $name }」已完整複製到目的地，原始版本仍保留。請移除其中一份，而不要重試搬移。
 mapper-share-folder-title = 分享資料夾「{ $name }」
 mapper-loading = 正在載入…
 mapper-no-secrets = 此區域沒有隱藏項目。
