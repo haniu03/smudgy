@@ -912,6 +912,10 @@ async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir
                 }
             }, { description: "Create GMCP map room" });
         } catch (err) {
+            // The draft number resolves before submission, so a failed submit
+            // leaves `room` pointing at a room that never existed; clear it or
+            // the retry is skipped and links/current-location bind the phantom.
+            room = null;
             if (attempt === 1) throw err;
             // The bound map refused the write: an adopted map we cannot write (a
             // read-only share), or an area deleted mid-session. Detach it for good and

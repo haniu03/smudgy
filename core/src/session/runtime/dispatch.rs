@@ -1128,8 +1128,16 @@ impl Inner<'_> {
                     .await?;
                 Ok(self.run_host_event("sys:connect", "{}"))
             }
-            RuntimeAction::Disconnected => {
-                self.pending_send_on_connect = None;
+            RuntimeAction::Disconnected {
+                connection_generation,
+            } => {
+                // Only the live socket's own teardown may clear the deferred
+                // profile send: a replaced socket's late `Disconnected` would
+                // otherwise erase the NEW connection's pending send before its
+                // first displayable packet releases it.
+                if connection_generation == self.connection_generation {
+                    self.pending_send_on_connect = None;
+                }
                 if self
                     .connected
                     .swap(false, std::sync::atomic::Ordering::AcqRel)

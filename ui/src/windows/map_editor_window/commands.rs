@@ -3046,6 +3046,9 @@ pub fn paste_clipboard(
     clipboard: &EntityClipboard,
     level: i32,
     offset: Vector,
+    // Reservation-aware allocation base from the Mapper (skips numbers held
+    // by open scripted mutators); `None` falls back to the cache maximum.
+    next_room_number: Option<RoomNumber>,
 ) -> (Option<Command>, Vec<RoomNumber>, usize) {
     if clipboard.is_empty() {
         return (None, Vec::new(), 0);
@@ -3086,7 +3089,7 @@ pub fn paste_clipboard(
         mapping = remap_room_numbers(
             &source_numbers,
             &occupied,
-            area.next_room_number(),
+            next_room_number.unwrap_or_else(|| area.next_room_number()),
             !same_area,
         );
 
@@ -4330,6 +4333,7 @@ mod tests {
             &clipboard,
             0,
             Vector::new(0.0, 0.0),
+            None,
         );
         assert!(pasted.is_empty());
         assert_eq!(skipped, 0);
@@ -4354,6 +4358,7 @@ mod tests {
             &clipboard,
             0,
             Vector::new(0.0, 0.0),
+            None,
         );
         assert!(command.is_none(), "nothing pastes");
         assert_eq!(skipped, 1);
@@ -4402,6 +4407,7 @@ mod tests {
             &clipboard,
             3,
             Vector::new(1.0, 1.0),
+            None,
         );
         let command = command.expect("command");
         assert!(pasted_rooms.is_empty());
@@ -4495,6 +4501,7 @@ mod tests {
             &clipboard,
             0,
             Vector::new(1.0, 1.0),
+            None,
         );
         let command = command.expect("paste command");
         let Mutation::CreateLabel { args, .. } = command.redo[0].clone() else {
@@ -4771,6 +4778,7 @@ mod tests {
             &clipboard,
             0,
             Vector::new(0.0, 0.0),
+            None,
         );
         let command = command.expect("command");
         // Room 1 keeps its number (vacant in the target); room 2 collides
@@ -4875,6 +4883,7 @@ mod tests {
             &clipboard,
             0,
             Vector::new(1.0, 1.0),
+            None,
         );
         let command = command.expect("command");
         assert_eq!(

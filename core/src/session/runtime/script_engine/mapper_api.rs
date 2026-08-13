@@ -16,7 +16,10 @@ use smudgy_cloud::{
     MapDestination, MapPoint, MapStorage, Mapper, PortMode, RelocationMode, RoomNumber, RoomSide,
     RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId, ShapeType, ShapeUpdates, Uuid,
     VerticalAlignment,
-    mapper::{MutationSubmission, RoomKey, area_cache::AreaCache, room_cache::RoomCache},
+    mapper::{
+        AreaMutationBatch, MutationSubmission, RoomKey, area_cache::AreaCache,
+        room_cache::RoomCache,
+    },
     mutation::{AreaMutation, MAX_MUTATION_OPERATIONS},
 };
 
@@ -46,6 +49,8 @@ deno_core::extension!(
       op_smudgy_mapper_get_area_room_by_number,
       op_smudgy_mapper_get_area_property,
       op_smudgy_mapper_get_area_next_room_number,
+      op_smudgy_mapper_reserve_room_number,
+      op_smudgy_mapper_release_room_reservations,
       op_smudgy_mapper_get_room_area_id,
       op_smudgy_mapper_get_room_number,
       op_smudgy_mapper_get_room_title,
@@ -666,10 +671,59 @@ fn op_smudgy_mapper_get_area_property<'a>(
     }
 }
 
+/// Reservation-aware: consults the live allocator (which skips numbers held
+/// by open `mutateArea` drafts) and falls back to the wrapper's snapshot when
+/// the session has no mapper attached.
 #[op2(fast)]
 #[smi]
-fn op_smudgy_mapper_get_area_next_room_number(#[cppgc] area_wrapper: &JSArea) -> i32 {
-    area_wrapper.0.get_max_room_number().0 + 1
+fn op_smudgy_mapper_get_area_next_room_number(
+    state: &OpState,
+    #[cppgc] area_wrapper: &JSArea,
+) -> i32 {
+    state
+        .try_borrow::<Mapper>()
+        .and_then(|mapper| mapper.next_room_number(area_wrapper.0.get_id()))
+        .map_or_else(|| area_wrapper.0.get_max_room_number().0 + 1, |number| number.0)
+}
+
+/// Reserve the next free room number for an open scripted mutator. Ambient
+/// creation skips the number until every reservation under `token` is
+/// released; releasing without committing returns it to the allocator.
+#[op2]
+#[smi]
+fn op_smudgy_mapper_reserve_room_number(
+    state: &OpState,
+    #[serde] area_id: (u64, u64),
+    #[serde] token: (u64, u64),
+) -> Result<i32, MapperError> {
+    ensure_mapper(state, true)?;
+    let mapper = state
+        .try_borrow::<Mapper>()
+        .ok_or(MapperError::MapperNotEnabled)?;
+    let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
+    let token = Uuid::from_u64_pair(token.0, token.1);
+    mapper
+        .reserve_room_number(&area_id, token)
+        .map(|number| number.0)
+        .map_err(|_| MapperError::AreaNotFound)
+}
+
+/// Release every room-number reservation held under `token` for an area.
+/// Idempotent; called when a mutator finishes or aborts.
+#[op2]
+fn op_smudgy_mapper_release_room_reservations(
+    state: &OpState,
+    #[serde] area_id: (u64, u64),
+    #[serde] token: (u64, u64),
+) -> Result<(), MapperError> {
+    ensure_mapper(state, true)?;
+    if let Some(mapper) = state.try_borrow::<Mapper>() {
+        mapper.release_room_reservations(
+            &AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+            Uuid::from_u64_pair(token.0, token.1),
+        );
+    }
+    Ok(())
 }
 
 /// ROOM WRAPPER METHODS
@@ -1209,27 +1263,25 @@ async fn op_smudgy_mapper_create_room(
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-        let current_atlas = mapper.get_current_atlas();
-        let area = current_atlas.get_area(&area_id);
+        // Reservation-aware allocation: numbers drafted by an open
+        // `mutateArea` callback are skipped, so an ambient create landing
+        // mid-callback cannot silently merge with a draft.
+        let Some(room_number) = mapper.next_room_number(&area_id) else {
+            return Err(MapperError::AreaNotFound);
+        };
 
-        if let Some(area) = area {
-            let room_number = area.get_max_room_number().0 + 1;
-
-            let submission = mapper
-                .upsert_room(
-                    RoomKey {
-                        area_id,
-                        room_number: RoomNumber(room_number),
-                    },
-                    params.into(),
-                )
-                .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
-            drop(state);
-            await_mapper_submission(&mapper, submission).await?;
-            Ok(room_number)
-        } else {
-            Err(MapperError::AreaNotFound)
-        }
+        let submission = mapper
+            .upsert_room(
+                RoomKey {
+                    area_id,
+                    room_number,
+                },
+                params.into(),
+            )
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        drop(state);
+        await_mapper_submission(&mapper, submission).await?;
+        Ok(room_number.0)
     } else {
         Err(MapperError::MapperNotEnabled)
     }
@@ -1811,9 +1863,24 @@ fn op_smudgy_mapper_generate_id(state: &OpState) -> Result<(u64, u64), MapperErr
     Ok(Uuid::new_v4().as_u64_pair())
 }
 
-/// Best-effort single-area batching for the script API. Author operations are
-/// packed without splitting an individual high-level operation; oversized
-/// work becomes ordered envelopes, each independently atomic and durable.
+/// The host outcome of a scripted `mutateArea`: the acknowledged envelope
+/// operation ids in submission order, plus the failure message when a later
+/// envelope failed after earlier ones were already accepted. The TS layer
+/// shapes a non-`null` `error` into the thrown `Error` and attaches
+/// `committed` as its `committedOperations` property.
+#[derive(Serialize)]
+struct JsMutateAreaOutcome {
+    committed: Vec<(u64, u64)>,
+    error: Option<String>,
+}
+
+/// Single-area batching for the script API. Author operations are packed
+/// without splitting an individual high-level operation; oversized work
+/// becomes ordered envelopes staged all-or-nothing (a local validation
+/// failure in any envelope publishes none of them). Each envelope remains
+/// independently atomic at the backend; acknowledged envelopes are never
+/// rolled back, so a mid-sequence backend failure reports the committed
+/// prefix instead of discarding it.
 #[op2(async(lazy))]
 #[serde]
 async fn op_smudgy_mapper_mutate_area(
@@ -1821,7 +1888,7 @@ async fn op_smudgy_mapper_mutate_area(
     #[serde] area_id: (u64, u64),
     #[serde] operations: Vec<JSAreaBatchOperation>,
     #[string] description: String,
-) -> Result<Vec<(u64, u64)>, MapperError> {
+) -> Result<JsMutateAreaOutcome, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     let mapper = state
@@ -1833,21 +1900,39 @@ async fn op_smudgy_mapper_mutate_area(
     let chunks = pack_area_batch_operations(operations)?;
     let chunk_count = chunks.len();
     let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
-    let mut operation_ids = Vec::with_capacity(chunk_count);
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        let chunk_description = if chunk_count > 1 {
-            format!("{description} ({}/{chunk_count})", index + 1)
-        } else {
-            description.clone()
-        };
-        let submission = mapper
-            .mutate_area(area_id, chunk, chunk_description)
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
-        if let Some(operation_id) = await_mapper_submission(&mapper, submission).await? {
-            operation_ids.push(operation_id);
+    let batches = chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let chunk_description = if chunk_count > 1 {
+                format!("{description} ({}/{chunk_count})", index + 1)
+            } else {
+                description.clone()
+            };
+            AreaMutationBatch::strict(area_id, chunk, chunk_description)
+        })
+        .collect();
+    let submissions = mapper
+        .mutate_batches(batches)
+        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+
+    let mut committed = Vec::with_capacity(chunk_count);
+    for submission in submissions {
+        match await_mapper_submission(&mapper, submission).await {
+            Ok(Some(operation_id)) => committed.push(operation_id),
+            Ok(None) => {}
+            Err(error) => {
+                return Ok(JsMutateAreaOutcome {
+                    committed,
+                    error: Some(error.to_string()),
+                });
+            }
         }
     }
-    Ok(operation_ids)
+    Ok(JsMutateAreaOutcome {
+        committed,
+        error: None,
+    })
 }
 
 #[op2]

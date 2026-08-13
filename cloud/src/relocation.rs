@@ -45,6 +45,44 @@ pub struct AtlasRelocation {
     pub areas: MapRelocation,
 }
 
+/// A failed relocation. When the failure struck after the destination copy
+/// was fully created and acknowledged (the source-delete commit phase),
+/// `completed` carries that result so callers can point the user at the
+/// existing copy — retrying the whole relocation would mint a second one.
+#[derive(Debug)]
+pub struct RelocationError<T> {
+    pub error: CloudError,
+    /// The fully created destination, or `None` when the failure preceded
+    /// destination completion (partially created objects are cleaned up
+    /// best-effort and a retry is safe).
+    pub completed: Option<T>,
+}
+
+impl<T> From<CloudError> for RelocationError<T> {
+    fn from(error: CloudError) -> Self {
+        Self {
+            error,
+            completed: None,
+        }
+    }
+}
+
+impl<T> std::fmt::Display for RelocationError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.completed.is_some() {
+            write!(
+                f,
+                "{}. The copy at the destination is complete; the source was left in place — remove it there instead of retrying the move",
+                self.error
+            )
+        } else {
+            self.error.fmt(f)
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::error::Error for RelocationError<T> {}
+
 impl Mapper {
     /// Copy or move a set of areas to one explicit storage/folder destination.
     /// Cross-area exits whose targets are also in `source_ids` are remapped to
@@ -55,18 +93,20 @@ impl Mapper {
         source_ids: Vec<AreaId>,
         destination: MapDestination,
         mode: RelocationMode,
-    ) -> CloudResult<MapRelocation> {
+    ) -> Result<MapRelocation, RelocationError<MapRelocation>> {
         if destination.storage == MapStorage::Session && destination.atlas_id.is_some() {
             return Err(CloudError::InvalidInput(
                 "session maps cannot be filed into atlases".to_string(),
-            ));
+            )
+            .into());
         }
         if let Some(atlas_id) = destination.atlas_id
             && self.atlas_storage(&atlas_id) != destination.storage
         {
             return Err(CloudError::InvalidInput(
                 "the destination atlas belongs to a different storage tier".to_string(),
-            ));
+            )
+            .into());
         }
         if source_ids.is_empty() {
             return Ok(MapRelocation {
@@ -80,7 +120,8 @@ impl Mapper {
         if source_ids.iter().any(|id| !seen.insert(*id)) {
             return Err(CloudError::InvalidInput(
                 "a map relocation cannot contain the same area twice".to_string(),
-            ));
+            )
+            .into());
         }
 
         let atlas = self.get_current_atlas();
@@ -93,13 +134,15 @@ impl Mapper {
                 return Err(CloudError::InvalidInput(format!(
                     "map '{}' cannot be copied with the current access",
                     area.get_name()
-                )));
+                ))
+                .into());
             }
             if mode == RelocationMode::Move && !access.is_owner {
                 return Err(CloudError::InvalidInput(format!(
                     "map '{}' is shared with you and cannot be moved",
                     area.get_name()
-                )));
+                ))
+                .into());
             }
         }
 
@@ -136,6 +179,15 @@ impl Mapper {
         for snapshot in &snapshots {
             validate_import_document(snapshot)?;
         }
+        // The backend revision each move snapshot stands on: the last
+        // acknowledged revision when one is known, else the cached document
+        // revision (queued-but-unsent optimistic bumps ride the copy and are
+        // discarded with the source, so they must not inflate the guard).
+        let expected_revs: Vec<i64> = source_ids
+            .iter()
+            .zip(&snapshots)
+            .map(|(id, snapshot)| self.confirmed_area_rev(*id).unwrap_or(snapshot.area.rev))
+            .collect();
         let mut destination_ids = Vec::with_capacity(snapshots.len());
         for snapshot in &snapshots {
             match self
@@ -145,7 +197,7 @@ impl Mapper {
                 Ok(id) => destination_ids.push(id),
                 Err(error) => {
                     cleanup_areas(self, &destination_ids).await;
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }
@@ -163,15 +215,29 @@ impl Mapper {
 
         if let Err(error) = self.populate_documents(&documents).await {
             cleanup_areas(self, &destination_ids).await;
-            return Err(error);
+            return Err(error.into());
         }
 
         if mode == RelocationMode::Move {
             // Destination content is fully acknowledged before the first
-            // source delete. A delete failure leaves complete copies on both
-            // sides, which is recoverable and never data loss.
-            for fence in move_fences.take().expect("move mode creates source fences") {
-                self.commit_area_move(fence).await?;
+            // source delete. A delete failure (including the rev-drift
+            // refusal) leaves complete copies on both sides — recoverable and
+            // never data loss — so the error carries the completed result:
+            // the remedy is pointing at the existing copy, not a retry that
+            // would mint another one. Fences not yet committed are dropped
+            // here, which reopens their sources for editing.
+            let fences = move_fences.take().expect("move mode creates source fences");
+            for (fence, expected_rev) in fences.into_iter().zip(expected_revs) {
+                if let Err(error) = self.commit_area_move(fence, Some(expected_rev)).await {
+                    return Err(RelocationError {
+                        error,
+                        completed: Some(MapRelocation {
+                            source_ids: source_ids.clone(),
+                            destination_ids: destination_ids.clone(),
+                            destination,
+                        }),
+                    });
+                }
             }
         }
 
@@ -190,18 +256,20 @@ impl Mapper {
         source_atlas_id: AtlasId,
         destination_storage: MapStorage,
         mode: RelocationMode,
-    ) -> CloudResult<AtlasRelocation> {
+    ) -> Result<AtlasRelocation, RelocationError<AtlasRelocation>> {
         if destination_storage == MapStorage::Session {
             return Err(CloudError::InvalidInput(
                 "session storage does not support atlases".to_string(),
-            ));
+            )
+            .into());
         }
         if mode == RelocationMode::Move
             && self.atlas_storage(&source_atlas_id) == destination_storage
         {
             return Err(CloudError::InvalidInput(
                 "the atlas is already in that storage tier".to_string(),
-            ));
+            )
+            .into());
         }
 
         let source = self
@@ -213,7 +281,8 @@ impl Mapper {
         if !source.is_owner {
             return Err(CloudError::InvalidInput(
                 "a shared atlas cannot be copied or moved".to_string(),
-            ));
+            )
+            .into());
         }
         let member_ids: Vec<_> = self
             .get_current_atlas()
@@ -236,7 +305,8 @@ impl Mapper {
             return Err(CloudError::PendingOperations(
                 "not every map in this atlas is loaded; refresh maps before copying or moving the atlas"
                     .to_string(),
-            ));
+            )
+            .into());
         }
 
         let mut move_fences = if mode == RelocationMode::Move {
@@ -246,6 +316,19 @@ impl Mapper {
         } else {
             None
         };
+
+        // The backend revision each member's copy stands on, captured after
+        // quiescence and before the copy (see `relocate_areas`).
+        let member_cache = self.get_current_atlas();
+        let expected_revs: Vec<i64> = member_ids
+            .iter()
+            .map(|id| {
+                self.confirmed_area_rev(*id)
+                    .or_else(|| member_cache.get_area(id).map(|area| area.get_rev()))
+                    .unwrap_or(1)
+            })
+            .collect();
+        drop(member_cache);
 
         let destination_atlas_name = source.name;
         let destination_atlas = self
@@ -257,25 +340,43 @@ impl Mapper {
             .await
         {
             Ok(areas) => areas,
-            Err(error) => {
+            Err(failure) => {
                 if let Err(cleanup_error) = self.delete_atlas(destination_atlas.id).await {
                     warn!(
                         "failed to clean up destination atlas {} after relocation error: {cleanup_error}",
                         destination_atlas.id
                     );
                 }
-                return Err(error);
+                // Copy mode never reaches the source-delete phase, so no
+                // completed destination survives the cleanup above.
+                return Err(failure.error.into());
             }
         };
 
         if mode == RelocationMode::Move {
-            for fence in move_fences
+            let completed = || AtlasRelocation {
+                source_atlas_id,
+                destination_atlas_id: destination_atlas.id,
+                destination_atlas_name: destination_atlas_name.clone(),
+                areas: areas.clone(),
+            };
+            let fences = move_fences
                 .take()
-                .expect("atlas move mode creates source fences")
-            {
-                self.commit_area_move(fence).await?;
+                .expect("atlas move mode creates source fences");
+            for (fence, expected_rev) in fences.into_iter().zip(expected_revs) {
+                if let Err(error) = self.commit_area_move(fence, Some(expected_rev)).await {
+                    return Err(RelocationError {
+                        error,
+                        completed: Some(completed()),
+                    });
+                }
             }
-            self.delete_atlas(source_atlas_id).await?;
+            if let Err(error) = self.delete_atlas(source_atlas_id).await {
+                return Err(RelocationError {
+                    error,
+                    completed: Some(completed()),
+                });
+            }
         }
 
         Ok(AtlasRelocation {
@@ -725,6 +826,110 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// C1: the source delete of a cross-tier move is guarded by the revision
+    /// the move snapshot stood on. A behind-cache client whose source moved
+    /// on the backend refuses the delete and fails safe into the documented
+    /// harmless-duplicate outcome — and the error carries the completed
+    /// destination copy so callers can point at it instead of retrying.
+    #[tokio::test]
+    async fn move_commit_refuses_a_source_rev_it_never_saw() {
+        let root = temp_root("rev-guard");
+        let make_mapper = || {
+            Mapper::new(
+                Arc::new(CompositeBackend::new(
+                    Arc::new(LocalBackend::new(root.join("local"))),
+                    Arc::new(LocalBackend::new(root.join("cloud"))),
+                )),
+                root.join(format!("cache-{}", Uuid::new_v4())),
+            )
+        };
+        let stale = make_mapper();
+        stale.load_all_areas().await.expect("load stale mapper");
+        let source = stale
+            .create_area_at(
+                "Contested".to_string(),
+                MapDestination::loose(MapStorage::Local),
+            )
+            .await
+            .expect("create source");
+        wait(
+            &stale,
+            stale
+                .upsert_room(
+                    RoomKey::new(source, RoomNumber(1)),
+                    RoomUpdates {
+                        title: Some("Seen by both".to_string()),
+                        ..RoomUpdates::default()
+                    },
+                )
+                .expect("enqueue room"),
+        )
+        .await;
+
+        // Another client edits the source after this client's cache was
+        // built; the backend revision moves past the snapshot's.
+        let other = make_mapper();
+        other.load_all_areas().await.expect("load other mapper");
+        wait(
+            &other,
+            other
+                .upsert_room(
+                    RoomKey::new(source, RoomNumber(2)),
+                    RoomUpdates {
+                        title: Some("Unseen edit".to_string()),
+                        ..RoomUpdates::default()
+                    },
+                )
+                .expect("enqueue unseen edit"),
+        )
+        .await;
+
+        let failure = stale
+            .relocate_areas(
+                vec![source],
+                MapDestination::loose(MapStorage::Cloud),
+                RelocationMode::Move,
+            )
+            .await
+            .expect_err("the stale move must refuse the delete");
+        assert!(
+            matches!(failure.error, CloudError::RevisionConflict { .. }),
+            "refusal names the revision drift, got {:?}",
+            failure.error
+        );
+        let completed = failure
+            .completed
+            .expect("the destination copy is complete and reported");
+        assert_eq!(completed.destination_ids.len(), 1);
+        let destination = completed.destination_ids[0];
+        assert_eq!(stale.area_storage(&destination), MapStorage::Cloud);
+        assert!(
+            stale.get_current_atlas().get_area(&destination).is_some(),
+            "the harmless duplicate exists at the destination"
+        );
+
+        // The unseen edit survives on the backend: a fresh cache sees the
+        // source area with both rooms.
+        let fresh = make_mapper();
+        fresh.load_all_areas().await.expect("load fresh mapper");
+        let atlas = fresh.get_current_atlas();
+        assert!(atlas.get_area(&source).is_some(), "source survives");
+        assert!(
+            atlas
+                .get_room(&RoomKey::new(source, RoomNumber(2)))
+                .is_some(),
+            "the edit the stale client never saw survives"
+        );
+
+        // The refused move dropped its fence: the source reopens for edits
+        // (a fenced area would refuse the enqueue outright).
+        let _submission = stale
+            .upsert_room(RoomKey::new(source, RoomNumber(3)), RoomUpdates::default())
+            .expect("source reopened after the refusal");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn relocation_rejects_duplicate_source_ids() {
         let (mapper, root) = mapper("duplicate-source").await;
@@ -743,7 +948,13 @@ mod tests {
                 RelocationMode::Copy,
             )
             .await;
-        assert!(matches!(result, Err(CloudError::InvalidInput(_))));
+        assert!(matches!(
+            result,
+            Err(RelocationError {
+                error: CloudError::InvalidInput(_),
+                completed: None,
+            })
+        ));
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -789,7 +1000,13 @@ mod tests {
         let result = first
             .relocate_atlas(atlas.id, MapStorage::Cloud, RelocationMode::Move)
             .await;
-        assert!(matches!(result, Err(CloudError::PendingOperations(_))));
+        assert!(matches!(
+            result,
+            Err(RelocationError {
+                error: CloudError::PendingOperations(_),
+                completed: None,
+            })
+        ));
         assert!(
             first
                 .list_atlases()

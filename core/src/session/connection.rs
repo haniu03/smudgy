@@ -1440,7 +1440,9 @@ impl Connection {
                 // Silently ignore errors here; when a session is closing the runtime may already be gone by the time
                 // we get here
                 runtime_tx
-                    .send(RuntimeAction::Disconnected)
+                    .send(RuntimeAction::Disconnected {
+                        connection_generation: generation,
+                    })
                     .map(|()| {
                         let notice = if graceful {
                             "Disconnected."
@@ -2027,7 +2029,7 @@ mod tests {
             loop {
                 let action = runtime_rx.recv().await.expect("runtime action");
                 match action {
-                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Disconnected { .. } => disconnected = true,
                     RuntimeAction::Echo(text) if text.as_str() == "Disconnected." => {
                         reported_disconnect = true;
                     }
@@ -2070,7 +2072,7 @@ mod tests {
             loop {
                 let action = runtime_rx.recv().await.expect("runtime action");
                 match action {
-                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Disconnected { .. } => disconnected = true,
                     RuntimeAction::Echo(text) if text.as_str() == "Connection lost" => {
                         reported_loss = true;
                     }
@@ -2117,7 +2119,7 @@ mod tests {
                     RuntimeAction::HandleIncomingLine(line) if line.text == "hello" => {
                         received_line = true;
                     }
-                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Disconnected { .. } => disconnected = true,
                     RuntimeAction::Echo(text) if text.as_str() == "Connection lost" => {
                         reported_loss = true;
                     }
@@ -2171,7 +2173,7 @@ mod tests {
             loop {
                 let action = runtime_rx.recv().await.expect("runtime action");
                 match action {
-                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Disconnected { .. } => disconnected = true,
                     RuntimeAction::Echo(text) if text.as_str() == "Disconnected." => {
                         reported_disconnect = true;
                     }

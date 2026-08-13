@@ -1413,7 +1413,11 @@ impl MapEditorWindow {
             ));
             return;
         };
-        let new_number = area.next_room_number();
+        // Reservation-aware: skips numbers held by open scripted mutators.
+        let new_number = self
+            .mapper
+            .next_room_number(&draft.area_id)
+            .unwrap_or_else(|| area.next_room_number());
         let Some((_, mut draft, old_number)) = self.recovering_new_room_link.take() else {
             return;
         };
@@ -1460,7 +1464,12 @@ impl MapEditorWindow {
                 let Some(area) = atlas.get_area(&area_id) else {
                     return Update::none();
                 };
-                let room_number = area.next_room_number();
+                // Reservation-aware: skips numbers held by open scripted
+                // mutators.
+                let room_number = self
+                    .mapper
+                    .next_room_number(&area_id)
+                    .unwrap_or_else(|| area.next_room_number());
                 let update = self.push_command(Some(commands::create_room(
                     area_id,
                     room_number,
@@ -1501,7 +1510,10 @@ impl MapEditorWindow {
                             return Update::none();
                         };
                         commands::NewExitTarget::NewRoom {
-                            room_number: area.next_room_number(),
+                            room_number: self
+                                .mapper
+                                .next_room_number(&area_id)
+                                .unwrap_or_else(|| area.next_room_number()),
                             at,
                             level: self.editor.level(),
                         }
@@ -1781,6 +1793,9 @@ impl MapEditorWindow {
             &clipboard,
             self.editor.level(),
             offset,
+            // Reservation-aware allocation base: skips numbers held by open
+            // scripted mutators.
+            self.mapper.next_room_number(&area_id),
         );
         if skipped_connections > 0 {
             self.editor_notice = Some((
@@ -3393,7 +3408,17 @@ impl MapEditorWindow {
                         mapper
                             .relocate_atlas(atlas_id, destination, RelocationMode::Move)
                             .await
-                            .map_err(|error| display_error(&error))
+                            .map_err(|failure| match &failure.completed {
+                                // The copied atlas is complete: name it, so the
+                                // user resolves the duplicate rather than
+                                // retrying (which would mint another copy).
+                                Some(completed) => crate::i18n::t!(
+                                    "mapper-relocation-duplicate-notice",
+                                    "error" => display_error(&failure.error),
+                                    "name" => completed.destination_atlas_name.clone()
+                                ),
+                                None => display_error(&failure.error),
+                            })
                     },
                     Message::MoveAtlasStorageCompleted,
                 ))
@@ -3587,15 +3612,38 @@ impl MapEditorWindow {
                     let mapper = self.mapper.clone();
                     return Update::with_task(Task::perform(
                         async move {
-                            mapper
+                            match mapper
                                 .relocate_areas(vec![area], destination, RelocationMode::Move)
                                 .await
-                                .and_then(|result| {
+                            {
+                                Ok(result) => {
                                     result.destination_ids.into_iter().next().ok_or_else(|| {
-                                        CloudError::InvalidInput("move returned no map".into())
+                                        display_error(&CloudError::InvalidInput(
+                                            "move returned no map".into(),
+                                        ))
                                     })
-                                })
-                                .map_err(|error| display_error(&error))
+                                }
+                                // The copy at the destination is complete: name
+                                // it, so the user resolves the duplicate rather
+                                // than retrying (which would mint another copy).
+                                Err(failure) => Err(match failure.completed {
+                                    Some(completed) => {
+                                        let atlas = mapper.get_current_atlas();
+                                        let name = completed
+                                            .destination_ids
+                                            .first()
+                                            .and_then(|id| atlas.get_area(id))
+                                            .map(|area| area.get_name().to_string())
+                                            .unwrap_or_default();
+                                        crate::i18n::t!(
+                                            "mapper-relocation-duplicate-notice",
+                                            "error" => display_error(&failure.error),
+                                            "name" => name
+                                        )
+                                    }
+                                    None => display_error(&failure.error),
+                                }),
+                            }
                         },
                         Message::MoveAreaCompleted,
                     ));

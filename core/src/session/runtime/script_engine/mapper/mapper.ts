@@ -26,6 +26,8 @@ import {
     op_smudgy_mapper_get_area_room_by_number,
     op_smudgy_mapper_get_area_property,
     op_smudgy_mapper_get_area_next_room_number,
+    op_smudgy_mapper_reserve_room_number,
+    op_smudgy_mapper_release_room_reservations,
     op_smudgy_mapper_get_room_number,
     op_smudgy_mapper_get_room_area_id,
     op_smudgy_mapper_get_room_title,
@@ -264,9 +266,13 @@ const mapper = {
     },
 
     /** Collect related writes to one area and submit them in the fewest practical
-     * ordered envelopes. Each emitted envelope is atomic; an oversized callback may
-     * become several envelopes, and acknowledged earlier envelopes are not rolled back
-     * if a later one fails. */
+     * ordered envelopes. The whole callback is validated and durably staged before
+     * anything is published, so a locally invalid batch submits nothing even across
+     * an envelope split. Each emitted envelope is atomic at the backend; if a later
+     * envelope fails after earlier ones were acknowledged, the thrown Error carries
+     * the acknowledged prefix as `committedOperations` (acknowledged envelopes are
+     * never rolled back). Draft room numbers are reserved host-side for the life of
+     * the callback (see AreaMutator.createRoom). */
     async mutateArea(
         area: Area | AreaId,
         callback: (mutation: AreaMutator) => void | Promise<void>,
@@ -278,14 +284,23 @@ const mapper = {
         const mutation = new AreaMutator(target);
         try {
             await callback(mutation);
-            return await op_smudgy_mapper_mutate_area(
-                target.id,
-                mutation.finish(),
-                options?.description ?? "Scripted area mutation",
-            );
+            const outcome: { committed: OperationId[]; error: string | null } =
+                await op_smudgy_mapper_mutate_area(
+                    target.id,
+                    mutation.finish(),
+                    options?.description ?? "Scripted area mutation",
+                );
+            if (outcome.error !== null && outcome.error !== undefined) {
+                const failure = new Error(outcome.error);
+                (failure as any).committedOperations = outcome.committed;
+                throw failure;
+            }
+            return outcome.committed;
         } catch (error) {
             mutation.abort();
             throw error;
+        } finally {
+            mutation.release();
         }
     },
 
@@ -708,16 +723,18 @@ function roomNumberInArea(areaId: AreaId, room: Room | RoomNumber): RoomNumber {
 
 /** A callback-scoped write collector. Its methods preserve the familiar async
  * mapper shape, but only record draft operations; the host is touched once the
- * callback completes. */
+ * callback completes. Draft room numbers are reserved against the host's live
+ * allocator under a per-mutator token, so ambient creates cannot collide with
+ * a draft; the reservation is released when the mutator finishes or aborts. */
 class AreaMutator {
     readonly #areaId: AreaId;
-    #nextRoomNumber: RoomNumber;
+    readonly #token: readonly [number, number];
     #operations: AreaBatchOperation[] = [];
     #open = true;
 
     constructor(area: Area) {
         this.#areaId = area.id;
-        this.#nextRoomNumber = area.next_room_number;
+        this.#token = op_smudgy_mapper_generate_id();
     }
 
     #record(operation: AreaBatchOperation): void {
@@ -726,7 +743,11 @@ class AreaMutator {
     }
 
     async createRoom(params: CreateRoomParams): Promise<RoomNumber> {
-        const roomNumber = this.#nextRoomNumber++;
+        if (!this.#open) throw new TypeError("this mutateArea callback has finished");
+        const roomNumber: RoomNumber = op_smudgy_mapper_reserve_room_number(
+            this.#areaId,
+            this.#token,
+        );
         this.#record({
             upsert_room: { room_number: roomNumber, body: { ...params } },
         });
@@ -868,6 +889,13 @@ class AreaMutator {
     abort(): void {
         this.#open = false;
         this.#operations = [];
+    }
+
+    /** Return this mutator's reserved room numbers to the allocator.
+     * Idempotent; committed drafts already occupy their numbers by the time
+     * this runs, so releasing after submission frees nothing in use. */
+    release(): void {
+        op_smudgy_mapper_release_room_reservations(this.#areaId, this.#token);
     }
 }
 
