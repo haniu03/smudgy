@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  areaForObservedRoom,
   findAreaByNukeFireId,
   findCompatibleAreaByName,
+  isAdoptableStorage,
   NUKEFIRE_AREA_ID_PROPERTY,
   type NukeFireAreaCandidate,
 } from "./area-resolution.ts";
@@ -36,11 +38,31 @@ test("area identity wins over duplicate display names", () => {
   assert.equal(findAreaByNukeFireId([sameName, exact], "local", 42), exact);
 });
 
-test("area identity matching stays within the configured storage tier", () => {
+test("area identity matching prefers the configured storage tier", () => {
   const cloud = candidate("cloud", "Central Plaza", "cloud", 42);
   const local = candidate("local", "Central Plaza", "local", 42);
 
   assert.equal(findAreaByNukeFireId([cloud, local], "local", 42), local);
+});
+
+test("an existing cloud area is adopted when the configured storage is local", () => {
+  const cloud = candidate("cloud", "Central Plaza", "cloud", 42);
+
+  assert.equal(findAreaByNukeFireId([cloud], "local", 42), cloud);
+  assert.equal(findCompatibleAreaByName([cloud], "local", 42, "Central Plaza"), cloud);
+});
+
+test("session areas are never adopted by a durable-storage mapper", () => {
+  const session = candidate("session", "Central Plaza", "session", 42);
+
+  assert.equal(findAreaByNukeFireId([session], "local", 42), undefined);
+  assert.equal(findCompatibleAreaByName([session], "local", 42, "Central Plaza"), undefined);
+});
+
+test("a session-storage mapper only pairs with session areas", () => {
+  assert.equal(isAdoptableStorage("session", "session"), true);
+  assert.equal(isAdoptableStorage("local", "session"), false);
+  assert.equal(isAdoptableStorage("cloud", "session"), false);
 });
 
 test("name fallback does not reuse an area tagged for another identity", () => {
@@ -48,4 +70,14 @@ test("name fallback does not reuse an area tagged for another identity", () => {
   const unclaimed = candidate("unclaimed", "central plaza", "local");
 
   assert.equal(findCompatibleAreaByName([wrong, unclaimed], "local", 42, "Central Plaza"), unclaimed);
+});
+
+test("a border or re-zoned vnum keeps its existing room's area", () => {
+  const home = candidate("home", "Old Central Plaza", "local", 5);
+  const zone = candidate("zone", "Central Plaza", "local", 6);
+
+  // The server now reports the vnum under zone 6, but the room already lives
+  // in the zone-5 area: re-creating it there would duplicate its externalId.
+  assert.equal(areaForObservedRoom(zone, home), home);
+  assert.equal(areaForObservedRoom(zone, undefined), zone);
 });

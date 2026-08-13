@@ -728,17 +728,21 @@ const commands = {
 
         const offset = options.moveCoordinates[intent as Direction];
 
+        const updates: [RoomNumber, UpdateRoomParams][] = [];
         for (const roomNumber of rooms) {
             const room = state.area.room(roomNumber);
             echo(`Pushing room ${room.title} to ${intent}`);
 
-            if (offset[0] !== 0) {
-                await mapper.setRoomX(state.area.id, roomNumber, room.x + offset[0]);
-            }
-
-            if (offset[1] !== 0) {
-                await mapper.setRoomY(state.area.id, roomNumber, room.y + offset[1]);
-            }
+            const fields: UpdateRoomParams = {
+                ...(offset[0] !== 0 ? { x: room.x + offset[0] } : {}),
+                ...(offset[1] !== 0 ? { y: room.y + offset[1] } : {}),
+            };
+            if (Object.keys(fields).length > 0) updates.push([roomNumber, fields]);
+        }
+        if (updates.length > 0) {
+            await mapper.mutateArea(state.area.id, (mutation) => mutation.updateRooms(updates), {
+                description: "Push Arctic rooms",
+            });
         }
 
         state.refreshRoomAndArea();
@@ -1189,7 +1193,8 @@ async function createNewRoomInDirection(roomEvent: RoomEvent, direction: Directi
     });
     const placement = layout.patch.placements.find((value) => value.id === PROPOSED_ROOM_ID);
     if (!placement) throw new Error("layout did not place the new Arctic room");
-    let newRoomNumber: RoomNumber;
+    // Definitely assigned inside the mutateArea callback before any later use.
+    let newRoomNumber!: RoomNumber;
     const exitIds: ExitId[] = [];
     await mapper.mutateArea(areaId, async (mutation) => {
         await applyLayoutMoves(areaId, layout, mutation);

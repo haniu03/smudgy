@@ -76,7 +76,7 @@ function refreshGpsRoute(): void {
   }
 }
 
-watchMessage("Char.GPS", (gps) => {
+function updateGps(gps: Readonly<CharGps> | undefined): void {
   latestGps = gps;
   if (gps?.active) {
     gpsView.set({
@@ -87,7 +87,13 @@ watchMessage("Char.GPS", (gps) => {
     gpsView.set({ line: "no route set", color: UI.faint });
   }
   refreshGpsRoute();
-});
+}
+
+watchMessage("Char.GPS", updateGps);
+// State watches are write-triggered rather than replaying retained state.
+// Seed the GPS strip and route accent immediately when scripts reload after
+// Char.GPS arrived, so a stationary player still sees the active route.
+updateGps(nukefire.value?.Char?.GPS);
 
 // NukeFire's mapper may finish applying a newly discovered room after the
 // Char.GPS message. Refresh again when Smudgy commits the new current room.
