@@ -2100,22 +2100,102 @@ struct MapStyleApplicationProp {
     rooms: Vec<i32>,
     #[serde(default)]
     exits: Vec<MapExitRefProp>,
-    /// `[hi, lo]` area id halves; entries scoped to another area are ignored
-    /// at resolution.
+    /// Area scope in either accepted spelling (see [`MapAreaIdProp`]);
+    /// entries scoped to another area are ignored at resolution.
     #[serde(default)]
-    area: Option<(u64, u64)>,
+    area: Option<MapAreaIdProp>,
 }
 
-impl From<MapStyleApplicationProp> for smudgy_map_widget::MapStyleApplication {
-    fn from(value: MapStyleApplicationProp) -> Self {
-        Self {
-            style: value.style,
-            rooms: value.rooms.into_iter().map(smudgy_cloud::RoomNumber).collect(),
-            exits: value.exits.into_iter().map(Into::into).collect(),
-            area: value
-                .area
-                .map(|(hi, lo)| smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(hi, lo))),
+/// An apply entry's `area` scope in either accepted spelling: the `[hi, lo]`
+/// u64 id halves (BigInt-carried on the static prop path) or the canonical
+/// hyphenated UUID string. The string is the JSON-safe spelling: real id
+/// halves exceed `Number.MAX_SAFE_INTEGER` and surface as `BigInt`, which
+/// `JSON.stringify` rejects, so store-bound apply arrays carry the string.
+#[derive(Clone)]
+enum MapAreaIdProp {
+    Pair(u64, u64),
+    Text(String),
+}
+
+impl<'de> Deserialize<'de> for MapAreaIdProp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct AreaIdVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for AreaIdVisitor {
+            type Value = MapAreaIdProp;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an `[hi, lo]` area id pair or a UUID string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(MapAreaIdProp::Text(value.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(MapAreaIdProp::Text(value))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let hi = seq
+                    .next_element::<u64>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let lo = seq
+                    .next_element::<u64>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(3, &self));
+                }
+                Ok(MapAreaIdProp::Pair(hi, lo))
+            }
         }
+
+        deserializer.deserialize_any(AreaIdVisitor)
+    }
+}
+
+impl MapAreaIdProp {
+    /// Resolve either spelling to the internal id. A string that is not a
+    /// UUID reports once and yields `None`; the caller drops that entry —
+    /// an entry whose scope cannot be resolved must not widen to every area.
+    fn resolve(&self) -> Option<smudgy_cloud::AreaId> {
+        match self {
+            Self::Pair(hi, lo) => Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
+                *hi, *lo,
+            ))),
+            Self::Text(text) => match text.parse::<smudgy_cloud::Uuid>() {
+                Ok(uuid) => Some(smudgy_cloud::AreaId(uuid)),
+                Err(_) => {
+                    warn_once(format!(
+                        "smudgy widgets: apply entry `area` {text:?} is not a UUID; entry skipped"
+                    ));
+                    None
+                }
+            },
+        }
+    }
+}
+
+impl MapStyleApplicationProp {
+    /// Convert to the widget-side entry; `None` when the `area` scope fails
+    /// to resolve.
+    fn resolve(self) -> Option<smudgy_map_widget::MapStyleApplication> {
+        let area = match &self.area {
+            None => None,
+            Some(area) => Some(area.resolve()?),
+        };
+        Some(smudgy_map_widget::MapStyleApplication {
+            style: self.style,
+            rooms: self.rooms.into_iter().map(smudgy_cloud::RoomNumber).collect(),
+            exits: self.exits.into_iter().map(Into::into).collect(),
+            area,
+        })
     }
 }
 
@@ -2128,7 +2208,10 @@ fn style_applications_from_node(
 fn convert_style_applications(
     entries: Vec<MapStyleApplicationProp>,
 ) -> Vec<smudgy_map_widget::MapStyleApplication> {
-    entries.into_iter().map(Into::into).collect()
+    entries
+        .into_iter()
+        .filter_map(MapStyleApplicationProp::resolve)
+        .collect()
 }
 
 #[derive(Clone, Deserialize)]
@@ -3291,6 +3374,109 @@ mod tests {
         assert_eq!(style.room_stroke.as_deref(), Some("#ff00ff"));
         assert_eq!(style.connection_width, Some(2.0));
         assert_eq!(style.room_fill, None);
+    }
+
+    /// The `area` scope in both accepted spellings: the `[hi, lo]` pair and
+    /// the canonical UUID string resolve to the same internal id, and the
+    /// string spelling survives a JSON text round trip — the store-binding
+    /// wire, which the pair's BigInt halves cannot travel.
+    #[test]
+    fn map_view_apply_area_accepts_uuid_string_spelling() {
+        use serde_json::json;
+
+        let id: smudgy_cloud::Uuid = "67e55044-10b1-426f-9247-bb680e5fe0c8"
+            .parse()
+            .expect("literal uuid parses");
+        let (hi, lo) = id.as_u64_pair();
+        assert_eq!(id.to_string(), "67e55044-10b1-426f-9247-bb680e5fe0c8");
+
+        let apply = style_applications_from_node(&Node::from(json!([
+            { "style": "route", "rooms": [1], "area": id.to_string() },
+            { "style": "route", "rooms": [2], "area": [1, 2] },
+        ])))
+        .expect("both spellings parse");
+        assert_eq!(apply[0].area, Some(smudgy_cloud::AreaId(id)));
+        assert_eq!(
+            apply[0].area,
+            Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
+                hi, lo
+            ))),
+            "the string resolves to the same id as its own u64 halves"
+        );
+        assert_eq!(
+            apply[1].area,
+            Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
+                1, 2
+            )))
+        );
+
+        // Round trip through JSON text, simulating a store-bound apply array.
+        let wire = serde_json::to_string(&json!([
+            { "style": "route", "rooms": [3], "area": id.to_string() }
+        ]))
+        .expect("wire form serializes");
+        let node = Node::from(
+            serde_json::from_str::<serde_json::Value>(&wire).expect("wire form deserializes"),
+        );
+        let bound = style_applications_from_node(&node).expect("wire form parses");
+        assert_eq!(bound[0].area, Some(smudgy_cloud::AreaId(id)));
+    }
+
+    /// A string-scoped entry behaves like the pair form end-to-end: its rooms
+    /// are styled when the view resolves that area and ignored elsewhere.
+    #[test]
+    fn map_view_string_scoped_apply_resolves_and_scopes() {
+        use serde_json::json;
+        use smudgy_cloud::{AreaId, RoomNumber, Uuid};
+
+        let id: Uuid = "67e55044-10b1-426f-9247-bb680e5fe0c8"
+            .parse()
+            .expect("literal uuid parses");
+        let apply = style_applications_from_node(&Node::from(json!([
+            { "style": "route", "rooms": [1], "area": id.to_string() },
+        ])))
+        .expect("string-scoped entry parses");
+
+        let presentation = smudgy_map_widget::MapViewPresentation {
+            styles: std::collections::HashMap::from([(
+                "route".to_string(),
+                smudgy_map_widget::MapStyle {
+                    room_fill: Some("#111111".to_string()),
+                    ..smudgy_map_widget::MapStyle::default()
+                },
+            )]),
+            apply,
+            ..smudgy_map_widget::MapViewPresentation::default()
+        };
+        let scoped = presentation.resolve(AreaId(id));
+        assert!(scoped.rooms.contains_key(&RoomNumber(1)));
+        let elsewhere = presentation.resolve(AreaId(Uuid::from_u64_pair(0, 9)));
+        assert!(!elsewhere.rooms.contains_key(&RoomNumber(1)));
+    }
+
+    /// An `area` string that is not a UUID cannot resolve a scope, so that
+    /// entry is dropped (with a warn-once report) while its siblings survive.
+    /// A wrong-typed `area` remains a loud whole-parse error.
+    #[test]
+    fn map_view_malformed_area_string_skips_only_that_entry() {
+        use serde_json::json;
+        use smudgy_cloud::RoomNumber;
+
+        let apply = style_applications_from_node(&Node::from(json!([
+            { "style": "route", "rooms": [1], "area": "not-a-uuid" },
+            { "style": "route", "rooms": [2] },
+        ])))
+        .expect("the list still parses");
+        assert_eq!(apply.len(), 1, "the unresolvable entry is skipped");
+        assert_eq!(apply[0].rooms, vec![RoomNumber(2)]);
+
+        assert!(
+            style_applications_from_node(&Node::from(json!([
+                { "style": "route", "area": 5 }
+            ])))
+            .is_err(),
+            "a non-string, non-pair area is a shape error, not a degradable value"
+        );
     }
 
     /// Malformed structured values surface as `Err` (reported to the log by
