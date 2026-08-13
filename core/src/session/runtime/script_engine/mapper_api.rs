@@ -207,7 +207,7 @@ fn op_smudgy_mapper_list_area_ids(state: &mut OpState) -> Result<Vec<(u64, u64)>
 
 #[op2(async(lazy))]
 #[cppgc]
-#[allow(deprecated)] // Implements the documented createArea compatibility overload through 0.7.x.
+#[allow(deprecated)] // Implements the documented createArea compatibility overload through 0.5.x.
 async fn op_smudgy_mapper_create_area(
     state: Rc<RefCell<OpState>>,
     #[string] name: String,
@@ -270,7 +270,7 @@ struct JsCreateAreaOptions {
 
 /// Resolve the two pre-storage-model creation forms. `None` deliberately
 /// preserves the old recording-target default. This compatibility branch is
-/// supported through 0.7.x and must be removed in 0.8.0 along with the legacy
+/// supported through 0.5.x and must be removed in 0.6.0 along with the legacy
 /// TypeScript overload.
 fn resolve_compat_create_storage(
     explicit: Option<MapStorage>,

@@ -1093,7 +1093,7 @@ impl Mapper {
 
     #[deprecated(
         since = "0.5.3",
-        note = "use create_area_at with an explicit MapDestination; supported through Smudgy 0.7.x and removed in 0.8.0"
+        note = "use create_area_at with an explicit MapDestination; supported through Smudgy 0.5.x and removed in 0.6.0"
     )]
     pub fn create_area(&self, name: String) -> impl Future<Output = CloudResult<AreaId>> {
         self.inner.create_area(name)
@@ -1110,7 +1110,7 @@ impl Mapper {
     /// its default create path).
     #[deprecated(
         since = "0.5.3",
-        note = "use create_area_at with MapStorage::Session; supported through Smudgy 0.7.x and removed in 0.8.0"
+        note = "use create_area_at with MapStorage::Session; supported through Smudgy 0.5.x and removed in 0.6.0"
     )]
     pub fn create_area_ephemeral(&self, name: String) -> impl Future<Output = CloudResult<AreaId>> {
         self.create_area_at(name, MapDestination::loose(MapStorage::Session))
@@ -1119,8 +1119,8 @@ impl Mapper {
     /// Create an area at an explicit storage + folder destination.
     ///
     /// This is the canonical creation surface. The deprecated `create_area*`
-    /// compatibility helpers delegate here only through 0.7.x and are removed
-    /// in 0.8.0.
+    /// compatibility helpers delegate here only through 0.5.x and are removed
+    /// in 0.6.0.
     pub fn create_area_at(
         &self,
         name: String,
@@ -1133,7 +1133,7 @@ impl Mapper {
     #[must_use]
     #[deprecated(
         since = "0.5.3",
-        note = "use area_storage(area_id) == MapStorage::Session; supported through Smudgy 0.7.x and removed in 0.8.0"
+        note = "use area_storage(area_id) == MapStorage::Session; supported through Smudgy 0.5.x and removed in 0.6.0"
     )]
     pub fn is_ephemeral(&self, area_id: &AreaId) -> bool {
         self.area_storage(area_id) == MapStorage::Session
@@ -1172,7 +1172,7 @@ impl Mapper {
     #[must_use]
     #[deprecated(
         since = "0.5.3",
-        note = "use session_area_ids; supported through Smudgy 0.7.x and removed in 0.8.0"
+        note = "use session_area_ids; supported through Smudgy 0.5.x and removed in 0.6.0"
     )]
     pub fn ephemeral_area_ids(&self) -> HashSet<AreaId> {
         self.session_area_ids()
@@ -1185,7 +1185,7 @@ impl Mapper {
     /// Propagates the backend's create error (e.g. unauthorized, network).
     #[deprecated(
         since = "0.5.3",
-        note = "use create_area_at with an explicit MapDestination; supported through Smudgy 0.7.x and removed in 0.8.0"
+        note = "use create_area_at with an explicit MapDestination; supported through Smudgy 0.5.x and removed in 0.6.0"
     )]
     pub fn create_area_in(
         &self,
@@ -1328,7 +1328,7 @@ impl Mapper {
     /// Propagates the backend's create error (e.g. unauthorized, network).
     #[deprecated(
         since = "0.5.3",
-        note = "use create_atlas_at with an explicit MapStorage; supported through Smudgy 0.7.x and removed in 0.8.0"
+        note = "use create_atlas_at with an explicit MapStorage; supported through Smudgy 0.5.x and removed in 0.6.0"
     )]
     pub fn create_atlas(&self, name: String) -> impl Future<Output = CloudResult<Atlas>> {
         let backend = self.inner.backend.clone();
@@ -1343,7 +1343,7 @@ impl Mapper {
     /// Propagates the backend's create error (e.g. unauthorized, network).
     #[deprecated(
         since = "0.5.3",
-        note = "use create_atlas_at with an explicit MapStorage; supported through Smudgy 0.7.x and removed in 0.8.0"
+        note = "use create_atlas_at with an explicit MapStorage; supported through Smudgy 0.5.x and removed in 0.6.0"
     )]
     pub fn create_atlas_in(
         &self,

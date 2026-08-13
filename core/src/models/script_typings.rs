@@ -1879,29 +1879,29 @@ export function make() { return createEvent('dynamic'); }
     }
 
     /// The compatibility catalog is deliberately finite. These assertions do
-    /// three jobs together: old scripts still type-check during 0.5-0.7, every
+    /// three jobs together: old scripts still type-check during 0.5.x, every
     /// compatibility member carries an editor-visible deprecation, and the
-    /// test itself blocks the first 0.8 build until the shims are removed.
+    /// test itself blocks the first 0.6 build until the shims are removed.
     #[test]
-    fn map_storage_compatibility_is_deprecated_and_expires_in_0_8() {
+    fn map_storage_compatibility_is_deprecated_and_expires_in_0_6() {
         use std::collections::BTreeMap;
 
-        const DEPRECATION: &str = "@deprecated Supported through Smudgy 0.7.x; removed in 0.8.0.";
+        const DEPRECATION: &str = "@deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.";
 
         assert_eq!(
             smudgy_cloud::MAP_STORAGE_COMPATIBILITY_LAST_RELEASE,
-            "0.7.x"
+            "0.5.x"
         );
         assert_eq!(
             smudgy_cloud::MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION,
-            "0.8.0"
+            "0.6.0"
         );
         let running = semver::Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("Cargo package versions are valid semver");
         assert!(
-            (running.major, running.minor) < (0, 8),
+            (running.major, running.minor) < (0, 6),
             "remove the legacy mapper creation overload, `ephemeral`, and `isEphemeral` \
-             before building the 0.8 release line"
+             before building the 0.6 release line"
         );
 
         assert_eq!(
@@ -1948,7 +1948,7 @@ export function make() { return createEvent('dynamic'); }
             .expect("compile legacy and canonical mapper creation forms");
         assert!(
             out.diagnostics.is_empty(),
-            "0.7 compatibility forms or their canonical replacements stopped type-checking:\n{:#?}",
+            "0.5 compatibility forms or their canonical replacements stopped type-checking:\n{:#?}",
             out.diagnostics
         );
     }

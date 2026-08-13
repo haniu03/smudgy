@@ -128,13 +128,13 @@ impl MapDestination {
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Final release line that carries the pre-storage-model mapper compatibility
-/// shims. They are intentionally unavailable starting with 0.8.0.
-pub const MAP_STORAGE_COMPATIBILITY_LAST_RELEASE: &str = "0.7.x";
+/// shims. They are intentionally unavailable starting with 0.6.0.
+pub const MAP_STORAGE_COMPATIBILITY_LAST_RELEASE: &str = "0.5.x";
 
 /// First release in which the pre-storage-model mapper compatibility shims
 /// must be removed. A test below trips as soon as the crate reaches this
 /// version, preventing an accidental extra compatibility cycle.
-pub const MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION: &str = "0.8.0";
+pub const MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION: &str = "0.6.0";
 
 /// Header carrying [`CLIENT_VERSION`] on every cloud request.
 pub(crate) const CLIENT_VERSION_HEADER: &str = "x-smudgy-client-version";
@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn map_storage_compatibility_window_expires_before_0_8() {
+    fn map_storage_compatibility_window_expires_before_0_6() {
         let running = semver::Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("Cargo package versions are valid semver");
         let removal = semver::Version::parse(MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION)
@@ -1032,10 +1032,10 @@ mod tests {
         assert!(
             (running.major, running.minor) < (removal.major, removal.minor),
             "remove the map-storage compatibility shims before releasing {running}; \
-             they are supported only through 0.7.x"
+             they are supported only through 0.5.x"
         );
 
-        const RUST_DEPRECATION: &str = "supported through Smudgy 0.7.x and removed in 0.8.0";
+        const RUST_DEPRECATION: &str = "supported through Smudgy 0.5.x and removed in 0.6.0";
         let mapper_source = include_str!("mapper.rs");
         assert_eq!(
             mapper_source.matches(RUST_DEPRECATION).count(),

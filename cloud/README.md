@@ -26,7 +26,7 @@ This crate embraces simplicity over complex synchronization. Both UI and JavaScr
 5. **Eventual Consistency**: Simplicity over complex rollback mechanisms
 6. **Storage Is Explicit**: session lifetime, durable local files, and cloud sync are named destinations; atlas placement is a separate field, not an overloaded boolean
 7. **Cross-Tier Moves Are Recoverable**: copy-then-delete can leave a duplicate after a delete failure, but never a partial destination with the only source already gone
-8. **Compatibility Has a Deadline**: pre-storage-model creation helpers and the script-facing `ephemeral` / `isEphemeral` names are deprecated through 0.7.x and removed in 0.8.0; release assertions enforce the cutoff
+8. **Compatibility Has a Deadline**: pre-storage-model creation helpers and the script-facing `ephemeral` / `isEphemeral` names are deprecated through 0.5.x and removed in 0.6.0; release assertions enforce the cutoff
 
 ## Current Status
 

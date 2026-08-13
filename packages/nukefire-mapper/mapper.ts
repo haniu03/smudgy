@@ -53,7 +53,7 @@ export interface NukeFireMapperOptions {
   /** Explicit storage for newly managed areas. Defaults to local. */
   storage?: MapStorage;
   /**
-   * @deprecated Supported through Smudgy 0.7.x; removed in 0.8.0.
+   * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
    * Use `storage: "session"` instead.
    */
   ephemeral?: boolean;

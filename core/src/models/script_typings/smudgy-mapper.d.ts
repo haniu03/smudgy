@@ -387,7 +387,7 @@ interface Area {
     /**
      * Whether this is a session map: it lives only for this session and is
      * discarded when the session closes.
-     * @deprecated Supported through Smudgy 0.7.x; removed in 0.8.0.
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
      * Use `storage === "session"` instead.
      */
     readonly isEphemeral: boolean;
@@ -427,7 +427,7 @@ interface LegacyCreateAreaOptions {
      * Create a session map: it lives only for this session, is never saved
      * or synced, and is discarded when the session closes. Use this for maps
      * built automatically from server data.
-     * @deprecated Supported through Smudgy 0.7.x; removed in 0.8.0.
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
      * Use `storage: "session"` instead.
      */
     ephemeral?: boolean;
@@ -461,7 +461,7 @@ interface Mapper {
     createArea(name: string, options: CreateAreaOptions): Promise<Area>;
     /**
      * Create using the old implicit default tier or `ephemeral` flag.
-     * @deprecated Supported through Smudgy 0.7.x; removed in 0.8.0.
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
      * Pass a {@link CreateAreaOptions} object with explicit `storage` instead.
      */
     createArea(name: string, options?: LegacyCreateAreaOptions): Promise<Area>;
