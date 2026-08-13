@@ -629,6 +629,13 @@ impl MapView {
                     }
                 }
 
+                // Connections draw in spatial-query order; a style accent
+                // changes a connection's paint, not its z-order, so a
+                // later-drawn unaccented neighbor can still cross over an
+                // accented stroke. Accepted: rooms (and their accents) draw
+                // on top of all connections, and route accents read fine in
+                // practice; a second accent-only pass would fix full
+                // stacking if it ever matters.
                 let connections_drawn = Cell::new(0_usize);
                 area.with_room_connections_in(min_x, min_y, max_x, max_y, |connection| {
                     if connection.from_level == self.level {
