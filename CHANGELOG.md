@@ -185,6 +185,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   number into an exit's destination with no map picked selects the map
   you're editing automatically — the dropdown shows its name dimmed as
   the placeholder, so the default is visible before you type.
+- **Maps choose where they live.** Every map and map folder (atlas) now
+  has an explicit storage tier: session (this session only, discarded
+  when it closes), on this device, or cloud. The New area and New folder
+  dialogs gain a "Save in" choice — folders can now live on this device,
+  not only in the cloud — and signed out, new maps and folders save on
+  this device. Scripts choose the same way:
+  `mapper.createArea(name, { storage: "session" | "local" | "cloud" })`,
+  optionally with an `atlas` to create into, and `listAtlases` /
+  `createAtlas` cover folders.
+- **Maps and atlases move and copy between tiers.** A map's Move… dialog
+  now lists every destination in one place — each of your folders with
+  its tier, plus loose maps on this device or in the cloud — so filing a
+  map into a folder and moving it to another tier are the same gesture,
+  and a folder's own Move… relocates it with every map inside. Maps
+  relocated together keep their links to each other, across tiers
+  included. Scripts get the same operations — `copyArea`/`moveArea`,
+  the multi-area `copyAreas`/`moveAreas`, and `copyAtlas`/`moveAtlas` —
+  each taking a destination of tier plus optional folder. A cross-tier
+  move copies everything to the destination before deleting the source,
+  so a failure partway can leave the complete copy alongside the
+  original — a duplicate to clean up, never lost work — and the editor
+  then points at the existing copy instead of inviting a retry. A map
+  with an unresolved sync conflict refuses to move until the conflict is
+  settled.
+- **Batched map edits for scripts.** `mapper.mutateArea(area, callback)`
+  collects a run of related writes — creating rooms and exits, updating
+  fields, linking — and submits them together when the callback
+  finishes, in as few operations as the batch allows. Room numbers
+  drafted inside the batch are reserved, so a room created meanwhile by
+  a trigger or the map editor can't collide with them. If the callback
+  throws, nothing is submitted; if a submission fails partway, the
+  error reports the operations that had already committed.
+- **Scripts style the map view.** `MapView` gains view-local
+  presentation: a `styles` palette names each look once (room fill,
+  stroke, and corner radius; connection color and width; door color),
+  `apply` associates palette entries with rooms and exits — later
+  entries win field-by-field over earlier ones and over `defaultStyle` —
+  and `doors` overrides an exit's closed or locked state on screen.
+  Top-level knobs set room spacing, the player marker's color, and
+  whether doors draw at all. Exits are named by room and direction, and
+  one reference styles both halves of a cross-level connection. All of
+  it stays in the view: the shared map is never modified, nothing syncs,
+  and a style update keeps the view's zoom and pan.
 
 ### Changed
 
@@ -263,6 +306,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unset, so a production `smudgy.log` carries operational events rather
   than the debug stream; debug builds keep their `debug` default, and an
   explicit `SMUDGY_LOG` still overrides either.
+- **On-connect text waits for the server to speak.** A profile's
+  auto-send text now goes out when the first real server output arrives
+  instead of the moment the connection opens, so triggers matching the
+  greeting run before it and login commands no longer race the banner. A
+  server that never prints anything does not receive the text.
+
+### Deprecated
+
+- Creating a map with the `ephemeral` flag — or with no storage choice
+  at all, the old implicit default — is deprecated in favor of an
+  explicit `storage` tier (`"session"` replaces `ephemeral: true`), as
+  is the `isEphemeral` read (use `storage === "session"`). The old forms
+  keep working through 0.5.x and are removed in 0.6.0.
 
 ### Fixed
 
@@ -314,6 +370,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route's line converts it (only handle drags and Ctrl+click do), Stub
   routing explains why there's nothing to edit, and a selected port
   advertises its arrow-key wall slide.
+- **One command input holds focus at a time.** Keyboard focus over
+  command inputs is now reconciled across every smudgy window: exactly
+  one input is focused, and switching to another application and back
+  counts as a real focus loss and return. Previously the loss went
+  unnoticed — an input in a background window still counted as focused —
+  so focus-driven behavior, from hotkey routing to scripts' input focus
+  events, could follow an input in a window you had left.
 
 ## [0.4.1] - 2026-07-14
 
