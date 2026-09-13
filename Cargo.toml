@@ -53,7 +53,10 @@ kamadak-exif = "0.6"
 # confinement checks in the ui fetcher.
 dunce = "1"
 iced_anim = "0.3.1"
-iced_runtime = "0.14"
+iced_runtime = "=0.14.0"
+# Not used directly: an exact pin so the patch-crate resolution below keeps the
+# version patches/iced_winit+0.14.0.patch was written for (see the note there).
+iced_winit = "=0.14.0"
 # Pluggable span/metrics API (comet). A no-op unless the app is built with smudgy_ui's
 # `iced-debug` feature, whose `iced/debug` unifies `iced_debug/enable` workspace-wide.
 iced_debug = "0.14"
@@ -77,7 +80,7 @@ validator = { version = "0.20.0", features = ["derive"] }
 cfg-if = "1.0.0"
 futures = "0.3"
 regex = "1"
-regex-filtered = "0.2"
+regex-filtered = "=0.2.1"
 regex-syntax = "0.8"
 aho-corasick = "1.1"
 ordered-float = { version = "4.0", default-features = false }
@@ -104,12 +107,12 @@ pretty_env_logger = "0.5.0"
 # `SMUDGY_LOG` defaults to `debug` there, so the telnet negotiation transcript and the
 # trigger timing lines print to the dev console; `SMUDGY_LOG=info` quiets them.
 log = { version = "0.4.27", features = ["release_max_level_info"] }
-vtparse = "0.7.0"
+vtparse = "=0.7.0"
 # Embedded Deno v2.9.5 crate family, frozen from the official latest-stable endpoint on
 # 2026-08-16. deno_core is workspace-wide because core + smudgy_widgets also use it directly
 # (`links = "v8"` forbids two versions). The engine path is deno_core 0.410 -> deno_v8 0.2 ->
 # rusty_v8 150.4; keep the V8 backend and do not enable deno_v8's experimental `quickjs` feature.
-deno_core = { version = "0.410", features = [
+deno_core = { version = "=0.410.0", features = [
     "unsafe_use_unprotected_platform",
 ] }
 pathfinding = "4.14.0"
@@ -127,6 +130,13 @@ unic-langid = "0.9.6"
 # Source patches managed by patch-crate (https://crates.io/crates/patch-crate).
 # After a fresh clone (or a `cargo clean`), run `cargo install patch-crate &&
 # cargo patch-crate` once to materialize target/patch/ before building.
+#
+# Every patched crate is pinned to an exact version wherever it is declared.
+# patch-crate resolves the workspace against the registry, not the lockfile
+# (the lock records the patched copies as path sources it cannot reuse), so a
+# semver-compatible upstream release would otherwise win the resolution and
+# no longer match the `name+version.patch` file. iced_winit 0.14.1 broke every
+# CI run that way on 2026-09-13.
 #
 # - `iced_graphics` (patches/iced_graphics+0.14.0.patch): runtime per-family
 #   OpenType feature control that upstream iced lacks — the terminal opts its

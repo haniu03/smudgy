@@ -26,11 +26,13 @@ iced = { workspace = true }
 iced-code-editor = { workspace = true }
 iced_anim = { workspace = true }
 iced_runtime = { workspace = true }
+# Exact pin only; see the workspace manifest's patch-crate note.
+iced_winit = { workspace = true }
 # The (patch-crate patched) shaping registry: the terminal font family opts out
 # of ligatures at shaping time (see patches/iced_graphics+0.14.0.patch and the
 # workspace manifest's [workspace.metadata.patch] note). Same version iced pins,
 # so it resolves to the single patched copy.
-iced_graphics = "0.14"
+iced_graphics = "=0.14.0"
 log = { workspace = true }
 smudgy_widgets = { workspace = true }
 # Zero-copy upload of the CRT-cat shader's uniform block (see widgets/crt_cat.rs).
@@ -56,7 +58,7 @@ fontdb = "0.23"
 # unification on the copy iced_graphics links, so missing-glyph fallback in
 # monospace text stays on monospace faces (matching advance width) instead of
 # grabbing any face and wrecking terminal-grid column alignment.
-cosmic-text = { version = "0.15", default-features = false, features = ["monospace_fallback"] }
+cosmic-text = { version = "=0.15.0", default-features = false, features = ["monospace_fallback"] }
 # Open the download page in the system browser when the cloud reports this
 # client is out of date (HTTP 426).
 open = "5"
