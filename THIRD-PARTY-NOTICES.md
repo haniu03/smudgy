@@ -14250,7 +14250,7 @@ Used by:
 - iced-code-editor 0.5.1
 - iced_graphics 0.14.0
 - iced_runtime 0.14.0
-- iced_winit 0.14.0
+- iced_winit 0.14.1
 - accesskit 0.24.1
 - accesskit_atspi_common 0.19.1
 - accesskit_consumer 0.38.0

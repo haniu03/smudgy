@@ -55,8 +55,8 @@ dunce = "1"
 iced_anim = "0.3.1"
 iced_runtime = "=0.14.0"
 # Not used directly: an exact pin so the patch-crate resolution below keeps the
-# version patches/iced_winit+0.14.0.patch was written for (see the note there).
-iced_winit = "=0.14.0"
+# version patches/iced_winit+0.14.1.patch was written for (see the note there).
+iced_winit = "=0.14.1"
 # Pluggable span/metrics API (comet). A no-op unless the app is built with smudgy_ui's
 # `iced-debug` feature, whose `iced/debug` unifies `iced_debug/enable` workspace-wide.
 iced_debug = "0.14"
@@ -170,7 +170,7 @@ unic-langid = "0.9.6"
 #   regular ops, so Smudgy's worker-realm allowlist is a complete boundary.
 # - `iced_runtime` (patches/iced_runtime+0.14.0.patch): adds the narrow
 #   per-window announcement action used by the audio control panel.
-# - `iced_winit` (patches/iced_winit+0.14.0.patch): owns the matching bounded
+# - `iced_winit` (patches/iced_winit+0.14.1.patch): owns the matching bounded
 #   AccessKit live-region bridge and native-window retirement ordering.
 # - `iced-code-editor` (patches/iced-code-editor+0.5.1.patch): keeps the
 #   search input mounted when sticky headers appear or disappear on scroll.
@@ -191,7 +191,7 @@ crates = [
 [patch.crates-io]
 iced_graphics = { path = "./target/patch/iced_graphics-0.14.0" }
 iced_runtime = { path = "./target/patch/iced_runtime-0.14.0" }
-iced_winit = { path = "./target/patch/iced_winit-0.14.0" }
+iced_winit = { path = "./target/patch/iced_winit-0.14.1" }
 cosmic-text = { path = "./target/patch/cosmic-text-0.15.0" }
 vtparse = { path = "./target/patch/vtparse-0.7.0" }
 deno_permissions = { path = "./target/patch/deno_permissions-0.116.0" }
