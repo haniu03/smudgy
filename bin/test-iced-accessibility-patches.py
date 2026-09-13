@@ -12,7 +12,7 @@ import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PATCH_ROOT = ROOT / "target" / "patch"
-CRATES = ("iced_runtime-0.14.0", "iced_winit-0.14.0", "iced-code-editor")
+CRATES = ("iced_runtime-0.14.0", "iced_winit-0.14.1", "iced-code-editor")
 SUPPORT_PATCHES = ("cosmic-text-0.15.0", "iced_graphics-0.14.0")
 
 
@@ -110,12 +110,12 @@ def main() -> None:
         (workspace / "Cargo.toml").write_text(
             """\
 [workspace]
-members = ["iced_runtime-0.14.0", "iced_winit-0.14.0", "iced-code-editor"]
+members = ["iced_runtime-0.14.0", "iced_winit-0.14.1", "iced-code-editor"]
 resolver = "2"
 
 [patch.crates-io]
 iced_runtime = { path = "iced_runtime-0.14.0" }
-iced_winit = { path = "iced_winit-0.14.0" }
+iced_winit = { path = "iced_winit-0.14.1" }
 cosmic-text = { path = "../cosmic-text-0.15.0" }
 iced_graphics = { path = "../iced_graphics-0.14.0" }
 """,
