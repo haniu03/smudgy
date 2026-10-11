@@ -47,10 +47,10 @@ pub use package_api::{
     BundleBody, CheckUpdatesEntry, CheckUpdatesHave, CheckUpdatesResponse, CheckUpdatesResult,
     CommentView, DependencyKind, ModuleMetaView, PackageApiClient, PackageDetail, PackageGrantView,
     PackageOwnerKind, PackageSearchResult, PackageView, PublishDependency, PublishModule,
-    PublishedVersionView, ResolvedDependency, ResolvedModuleWire, ResolvedPackageWire,
-    SearchCategory, ShareClosureItem, StaleDependencyView, UpdateCheckClosureNode,
-    UpdateCheckDependency, UpdateCheckInstalled, UpdateCheckLatest, VersionListItem,
-    highest_satisfying_version,
+    PublishProgress, PublishStep, PublishedVersionView, ResolvedDependency, ResolvedModuleWire,
+    ResolvedPackageWire, SearchCategory, ShareClosureItem, StaleDependencyView,
+    UpdateCheckClosureNode, UpdateCheckDependency, UpdateCheckInstalled, UpdateCheckLatest,
+    VersionListItem, highest_satisfying_version,
 };
 pub use relocation::{
     AtlasRelocation, MapRelocation, PartialRelocation, RelocationError, RelocationMode,
@@ -182,6 +182,27 @@ pub(crate) fn versioned_http_client() -> reqwest::Client {
         // Bound a stalled response, while allowing large package transfers
         // to keep running as long as bytes continue to arrive.
         .read_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("a reqwest client with a static version header is always valid")
+}
+
+/// Build the `reqwest::Client` that uploads package bundles: the same version
+/// header and connect timeout as [`versioned_http_client`], and no read
+/// timeout. An upload sends its whole body and then hears nothing until the
+/// service has verified, and stored, every frame in it, which takes longer
+/// the more bodies the bundle carries; a flat read timeout would give up on a
+/// large bundle the service is still accepting. Each upload sets its own
+/// deadline from its size instead.
+#[must_use]
+pub(crate) fn bundle_upload_http_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        CLIENT_VERSION_HEADER,
+        reqwest::header::HeaderValue::from_static(CLIENT_VERSION),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("a reqwest client with a static version header is always valid")
 }
