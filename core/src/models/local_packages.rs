@@ -172,6 +172,26 @@ fn package_snapshot_digest(package: &LocalPackage) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// What a publish is doing, reported as it happens so a console can follow a publish that
+/// takes a while. Reporting changes nothing about the publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishEvent {
+    /// TypeScript declarations are being generated for the package's `modules` modules.
+    GeneratingTypings { modules: usize },
+    /// Declaration generation finished with `generated` files and `warnings` diagnostics.
+    TypingsGenerated { generated: usize, warnings: usize },
+    /// Every dependency range is locked to a version.
+    DependenciesLocked { count: usize },
+    /// The namespace is ready: `address` is the package's `owner/name` (a clan's package goes
+    /// by name alone) and `version` the number about to be published.
+    Namespace { address: String, version: String },
+    /// A step of the version upload itself.
+    Version(smudgy_cloud::PublishStep),
+}
+
+/// Receives each [`PublishEvent`] of a publish as it happens.
+pub type PublishProgress<'a> = &'a (dyn Fn(PublishEvent) + Send + Sync);
+
 /// What a successful publish reports back: the published version plus the outcome of the
 /// publish-time TypeScript declaration generation. Declaration generation is **best-effort
 /// and never fatal** — a package always publishes even if typings can't be produced.
@@ -1739,6 +1759,9 @@ async fn confirm_ambiguous_publish(
 /// therefore be renamed before publish when that leaf is already owned by another account; the
 /// backend remains authoritative and returns a conflict if the name is unavailable.
 ///
+/// Each step is reported to `progress` as it happens ([`PublishEvent`]), for a console that
+/// follows a publish of many modules.
+///
 /// # Errors
 /// Returns an error if the package is missing/invalid, or the backend rejects the publish (e.g. a
 /// duplicate version → 409).
@@ -1748,6 +1771,7 @@ pub async fn publish_local_package(
     name: &str,
     publisher: &UserProfile,
     owner: PublishOwner,
+    progress: PublishProgress<'_>,
 ) -> Result<PublishSummary> {
     if publisher.id.is_nil() {
         bail!("the signed-in account has no stable identity; sign in again");
@@ -1797,14 +1821,24 @@ pub async fn publish_local_package(
 
     // Publish-time TypeScript declarations (best-effort — a package always publishes even
     // if typings fail). The generated `.d.ts` ride as ordinary, non-entry modules.
+    progress(PublishEvent::GeneratingTypings {
+        modules: authored_count,
+    });
     let (dts_modules, typings_warnings) = generate_publish_typings(&package.modules).await;
     let modules = merge_published_modules(authored, dts_modules);
     let typings_generated = modules.len() - authored_count;
+    progress(PublishEvent::TypingsGenerated {
+        generated: typings_generated,
+        warnings: typings_warnings.len(),
+    });
 
     let manifest_value =
         serde_json::to_value(&package.manifest).context("serialize package manifest")?;
 
     let (dependencies, dependency_warnings) = lock_dependencies(client, &package.manifest).await?;
+    progress(PublishEvent::DependenciesLocked {
+        count: dependencies.len(),
+    });
     let locked_dependencies = dependencies
         .iter()
         .map(|d| {
@@ -1922,6 +1956,10 @@ pub async fn publish_local_package(
     // A clan's package has no owner nickname: it is addressed, and resolves, by name alone.
     let address_owner = clan_id.is_none().then_some(publisher_nickname.as_str());
     let target_version = semver::Version::parse(&package.manifest.version)?.to_string();
+    progress(PublishEvent::Namespace {
+        address: smudgy_script::package_address(address_owner.unwrap_or(""), &package.name),
+        version: target_version.clone(),
+    });
     // The README is part of the same initial snapshot as the manifest and modules.
     let readme = package.readme.as_deref();
     let request = PublishRequestSnapshot {
@@ -1968,7 +2006,7 @@ pub async fn publish_local_package(
         (existing.version, existing.published_at)
     } else {
         let publish_result = client
-            .publish_version_checked(
+            .publish_version_reporting(
                 view.id,
                 &target_version,
                 &manifest_value,
@@ -1984,6 +2022,7 @@ pub async fn publish_local_package(
                         },
                     )
                 },
+                &|step| progress(PublishEvent::Version(step)),
             )
             .await;
 

@@ -721,6 +721,12 @@ pub enum Message {
     },
     RevertManifest,
     PublishOwned,
+    PublishProgress {
+        server_name: String,
+        name: String,
+        operation_id: PackageOperationId,
+        event: smudgy_core::models::local_packages::PublishEvent,
+    },
     PublishFinished {
         server_name: String,
         name: String,
@@ -3165,6 +3171,12 @@ impl AutomationsWindow {
             } => self.owned_content_compared(seq, fence, snapshot, result),
             Message::RevertManifest => self.revert_manifest(),
             Message::PublishOwned => self.publish_owned(),
+            Message::PublishProgress {
+                server_name,
+                name,
+                operation_id,
+                event,
+            } => self.publish_progress(&server_name, &name, operation_id, &event),
             Message::PublishFinished {
                 server_name,
                 name,
@@ -3259,13 +3271,12 @@ impl AutomationsWindow {
                                 self.share_grants.clear();
                             }
                         }
-                        let mut feedback = format!(
-                            "smudgy> publish {name}\n{}",
-                            crate::i18n::t!(
-                                "automation-published",
-                                "version" => &summary.version
-                            )
-                        );
+                        // The outcome follows the progress the console showed while publishing.
+                        let mut feedback = self.publish_console_prefix(&name);
+                        feedback.push_str(&crate::i18n::t!(
+                            "automation-published",
+                            "version" => &summary.version
+                        ));
                         if summary.typings_generated > 0 {
                             let typings_generated =
                                 i64::try_from(summary.typings_generated).unwrap_or(i64::MAX);
@@ -3417,15 +3428,14 @@ impl AutomationsWindow {
                         ]))
                     }
                     Err(e) => {
+                        let mut text = self.publish_console_prefix(&name);
+                        text.push_str(&crate::i18n::t!(
+                            "automation-publish-failed",
+                            "error" => e.to_string()
+                        ));
                         self.publish_output = Some(PublishOutput {
                             package: name.clone(),
-                            text: format!(
-                                "smudgy> publish {name}\n{}",
-                                crate::i18n::t!(
-                                    "automation-publish-failed",
-                                    "error" => e.to_string()
-                                )
-                            ),
+                            text,
                         });
                         // Namespace creation/finalize can commit before a response is lost. Always
                         // reconcile server truth after an error so Rename stays locked if the cloud

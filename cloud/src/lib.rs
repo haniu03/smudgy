@@ -47,10 +47,10 @@ pub use package_api::{
     BundleBody, CheckUpdatesEntry, CheckUpdatesHave, CheckUpdatesResponse, CheckUpdatesResult,
     CommentView, DependencyKind, ModuleMetaView, PackageApiClient, PackageDetail, PackageGrantView,
     PackageOwnerKind, PackageSearchResult, PackageView, PublishDependency, PublishModule,
-    PublishedVersionView, ResolvedDependency, ResolvedModuleWire, ResolvedPackageWire,
-    SearchCategory, ShareClosureItem, StaleDependencyView, UpdateCheckClosureNode,
-    UpdateCheckDependency, UpdateCheckInstalled, UpdateCheckLatest, VersionListItem,
-    highest_satisfying_version,
+    PublishProgress, PublishStep, PublishedVersionView, ResolvedDependency, ResolvedModuleWire,
+    ResolvedPackageWire, SearchCategory, ShareClosureItem, StaleDependencyView,
+    UpdateCheckClosureNode, UpdateCheckDependency, UpdateCheckInstalled, UpdateCheckLatest,
+    VersionListItem, highest_satisfying_version,
 };
 pub use relocation::{
     AtlasRelocation, MapRelocation, PartialRelocation, RelocationError, RelocationMode,

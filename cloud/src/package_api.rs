@@ -337,6 +337,42 @@ pub struct ResolvedDependency {
     pub kind: DependencyKind,
 }
 
+/// One step of a version publish, reported as it happens so a progress display can follow a
+/// publish that takes a while: compression body by body, the bundle begun and uploaded, the
+/// wait for the service to verify the frames, and the commit. Reporting changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishStep {
+    /// Compression starts: `modules` modules carrying `bodies` distinct bodies.
+    Compressing { modules: usize, bodies: usize },
+    /// One body is compressed: the subpath of the first module with it, its size and its
+    /// frame's.
+    Compressed {
+        subpath: String,
+        bytes: u64,
+        frame_bytes: u64,
+    },
+    /// Every body is compressed into a bundle of `frames` frames and `bytes` bytes.
+    Bundled { frames: usize, bytes: u64 },
+    /// `begin` accepted the version; the bundle upload starts.
+    UploadStarted { frames: usize, bytes: u64 },
+    /// The upload has had no answer yet after `elapsed`; reported every few seconds while the
+    /// service verifies and stores the frames.
+    Waiting { elapsed: std::time::Duration },
+    /// The service accepted every frame, `elapsed` after the upload started.
+    Uploaded { elapsed: std::time::Duration },
+    /// The service refused the upload because one body is being garbage-collected; the
+    /// publish begins again after a pause.
+    RetryingAfterCollection,
+    /// `finalize` is committing the version.
+    Finalizing,
+}
+
+/// Receives each [`PublishStep`] of a publish as it happens.
+pub type PublishProgress<'a> = &'a (dyn Fn(PublishStep) + Send + Sync);
+
+/// How often an upload still waiting for its answer is reported.
+const UPLOAD_WAIT_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One module within a [`ResolvedPackageWire`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedModuleWire {
@@ -971,24 +1007,41 @@ impl PackageApiClient {
     where
         F: FnOnce() -> CloudResult<()>,
     {
-        // Hash every module, then gather the distinct bodies in canonical order (first
-        // appearance in the module list): the bundle's frame order.
+        self.publish_version_reporting(
+            package_id,
+            version,
+            manifest,
+            modules,
+            dependencies,
+            readme,
+            pre_finalize,
+            &|_| {},
+        )
+        .await
+    }
+
+    /// [`Self::publish_version_checked`], reporting each [`PublishStep`] to `progress` as it
+    /// happens, for a progress display. Reporting changes nothing about the publish.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::publish_version_checked`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_version_reporting<F>(
+        &self,
+        package_id: Uuid,
+        version: &str,
+        manifest: &Value,
+        modules: &[PublishModule],
+        dependencies: &[PublishDependency],
+        readme: Option<&str>,
+        pre_finalize: F,
+        progress: PublishProgress<'_>,
+    ) -> CloudResult<PublishedVersionView>
+    where
+        F: FnOnce() -> CloudResult<()>,
+    {
         let hashes: Vec<String> = modules.iter().map(|m| sha256_hex(&m.content)).collect();
-        let mut body_index: HashMap<&str, usize> = HashMap::new();
-        let mut sources: Vec<Vec<u8>> = Vec::new();
-        for (module, hash) in modules.iter().zip(&hashes) {
-            if !body_index.contains_key(hash.as_str()) {
-                body_index.insert(hash, sources.len());
-                sources.push(module.content.clone());
-            }
-        }
-        // Level-19 compression of a large package takes seconds; it runs on the blocking
-        // pool, never on the caller's executor thread.
-        let compressed = tokio::task::spawn_blocking(move || compress_bodies(&sources))
-            .await
-            .map_err(|error| {
-                CloudError::InternalError(format!("package body compression stopped: {error}"))
-            })??;
+        let (body_index, compressed) = compress_publish_bodies(modules, &hashes, progress).await?;
 
         let metas: Vec<PublishModuleMeta> = modules
             .iter()
@@ -1016,6 +1069,10 @@ impl PackageApiClient {
         // such refusal begins the publish again.
         let bundle_len = u64::try_from(compressed.bundle.len()).unwrap_or(u64::MAX);
         let frames = compressed.frame_sizes.len();
+        progress(PublishStep::Bundled {
+            frames,
+            bytes: bundle_len,
+        });
         let mut bundle = compressed.bundle;
         let mut retried = false;
         loop {
@@ -1037,10 +1094,18 @@ impl PackageApiClient {
             } else {
                 bundle.clone()
             };
-            match self.upload_bundle(&begin.bundle, attempt, frames).await {
+            progress(PublishStep::UploadStarted {
+                frames,
+                bytes: bundle_len,
+            });
+            match self
+                .upload_bundle(&begin.bundle, attempt, frames, progress)
+                .await
+            {
                 Ok(()) => break,
                 Err(CloudError::BodyBeingCollected) if !retried => {
                     retried = true;
+                    progress(PublishStep::RetryingAfterCollection);
                     tokio::time::sleep(COLLECTION_RETRY_DELAY).await;
                 }
                 Err(error) => return Err(error),
@@ -1049,6 +1114,7 @@ impl PackageApiClient {
 
         // 3. finalize — commit the bodies the bundle recorded.
         pre_finalize()?;
+        progress(PublishStep::Finalizing);
         self.post(
             &format!("/packages/{package_id}/versions/finalize"),
             Some(&body),
@@ -1059,12 +1125,14 @@ impl PackageApiClient {
     /// PUTs a publish's bundle of `frames` frames to its signed URL with exactly the headers
     /// `begin` named. No `Authorization` and no registry headers: the URL itself carries the
     /// grant. The service answers only once it has verified and stored every frame, so the
-    /// request's deadline grows with the bundle ([`bundle_upload_deadline`]).
+    /// request's deadline grows with the bundle ([`bundle_upload_deadline`]), and the wait is
+    /// reported to `progress` every [`UPLOAD_WAIT_TICK`].
     async fn upload_bundle(
         &self,
         upload: &BundleUpload,
         bundle: Vec<u8>,
         frames: usize,
+        progress: PublishProgress<'_>,
     ) -> CloudResult<()> {
         let bytes = u64::try_from(bundle.len()).unwrap_or(u64::MAX);
         let deadline = bundle_upload_deadline(frames, bytes);
@@ -1076,7 +1144,22 @@ impl PackageApiClient {
         for (name, value) in &upload.headers {
             request = request.header(name, value);
         }
-        let response = request.send().await.map_err(|error| {
+        let started = std::time::Instant::now();
+        let sending = request.send();
+        tokio::pin!(sending);
+        let mut ticks = tokio::time::interval_at(
+            tokio::time::Instant::now() + UPLOAD_WAIT_TICK,
+            UPLOAD_WAIT_TICK,
+        );
+        let sent = loop {
+            tokio::select! {
+                outcome = &mut sending => break outcome,
+                _ = ticks.tick() => progress(PublishStep::Waiting {
+                    elapsed: started.elapsed(),
+                }),
+            }
+        };
+        let response = sent.map_err(|error| {
             if error.is_timeout() {
                 CloudError::NetworkError(format!(
                     "the package bundle ({frames} frames, {bytes} bytes) was uploaded, but the \
@@ -1089,6 +1172,9 @@ impl PackageApiClient {
         })?;
         let status = response.status();
         if status.is_success() {
+            progress(PublishStep::Uploaded {
+                elapsed: started.elapsed(),
+            });
             return Ok(());
         }
         // A refused frame is a 400 naming the module's subpath; keep that message. A body
@@ -1653,10 +1739,63 @@ fn sha256_hex(bytes: &[u8]) -> String {
     })
 }
 
+/// Gathers the distinct bodies of `modules` (whose hashes are `hashes`, in order) in canonical
+/// order, first appearance in the module list, and compresses them into the bundle, reporting
+/// each frame to `progress` as it is written. Returns each hash's index among the bodies with
+/// the bundle. Level-19 compression of a large package takes seconds; it runs on the blocking
+/// pool, never on the caller's executor thread.
+async fn compress_publish_bodies<'h>(
+    modules: &[PublishModule],
+    hashes: &'h [String],
+    progress: PublishProgress<'_>,
+) -> CloudResult<(HashMap<&'h str, usize>, CompressedBodies)> {
+    let mut body_index: HashMap<&str, usize> = HashMap::new();
+    let mut sources: Vec<Vec<u8>> = Vec::new();
+    // The first module with each body names it in progress reports.
+    let mut body_subpaths: Vec<String> = Vec::new();
+    for (module, hash) in modules.iter().zip(hashes) {
+        if !body_index.contains_key(hash.as_str()) {
+            body_index.insert(hash, sources.len());
+            sources.push(module.content.clone());
+            body_subpaths.push(module.subpath.clone());
+        }
+    }
+    progress(PublishStep::Compressing {
+        modules: modules.len(),
+        bodies: sources.len(),
+    });
+    let body_sizes: Vec<u64> = sources
+        .iter()
+        .map(|source| u64::try_from(source.len()).unwrap_or(u64::MAX))
+        .collect();
+    // The channel closes with the blocking task, however it ends.
+    let (frames_written, mut written) = tokio::sync::mpsc::unbounded_channel::<(usize, u64)>();
+    let compressing = tokio::task::spawn_blocking(move || {
+        compress_bodies(&sources, &mut |index, frame_bytes| {
+            let _ = frames_written.send((index, frame_bytes));
+        })
+    });
+    while let Some((index, frame_bytes)) = written.recv().await {
+        progress(PublishStep::Compressed {
+            subpath: body_subpaths[index].clone(),
+            bytes: body_sizes[index],
+            frame_bytes,
+        });
+    }
+    let compressed = compressing.await.map_err(|error| {
+        CloudError::InternalError(format!("package body compression stopped: {error}"))
+    })??;
+    Ok((body_index, compressed))
+}
+
 /// Compresses each body into one zstd frame at [`BODY_COMPRESSION_LEVEL`], with a content
 /// checksum and no dictionary, and lays the frames end to end. Single-shot compression
-/// pledges the whole source, so every frame records its content size.
-fn compress_bodies(sources: &[Vec<u8>]) -> CloudResult<CompressedBodies> {
+/// pledges the whole source, so every frame records its content size. `written` hears each
+/// body's index and frame length as its frame is laid down.
+fn compress_bodies(
+    sources: &[Vec<u8>],
+    written: &mut dyn FnMut(usize, u64),
+) -> CloudResult<CompressedBodies> {
     let compression_error = |error: std::io::Error| {
         CloudError::InternalError(format!("package body compression: {error}"))
     };
@@ -1670,10 +1809,12 @@ fn compress_bodies(sources: &[Vec<u8>]) -> CloudResult<CompressedBodies> {
         .map_err(compression_error)?;
     let mut bundle = Vec::new();
     let mut frame_sizes = Vec::with_capacity(sources.len());
-    for source in sources {
+    for (index, source) in sources.iter().enumerate() {
         let frame = compressor.compress(source).map_err(compression_error)?;
-        frame_sizes.push(u64::try_from(frame.len()).unwrap_or(u64::MAX));
+        let frame_bytes = u64::try_from(frame.len()).unwrap_or(u64::MAX);
+        frame_sizes.push(frame_bytes);
         bundle.extend_from_slice(&frame);
+        written(index, frame_bytes);
     }
     Ok(CompressedBodies {
         bundle,
@@ -1841,7 +1982,7 @@ mod tests {
         // 100 ms per frame: the service verifies and stores each one before answering.
         assert_eq!(
             bundle_upload_deadline(330, 0),
-            Duration::from_secs(30) + Duration::from_millis(33_000)
+            Duration::from_secs(30) + Duration::from_secs(33)
         );
         // One second per MiB sent.
         assert_eq!(
@@ -2429,7 +2570,19 @@ mod tests {
             vec![0, 159, 146, 150, 255],
             b"lorem ipsum ".repeat(40_000),
         ];
-        let compressed = compress_bodies(&sources).unwrap();
+        let mut written = Vec::new();
+        let compressed = compress_bodies(&sources, &mut |index, frame_bytes| {
+            written.push((index, frame_bytes));
+        })
+        .unwrap();
+        assert_eq!(
+            written.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>(),
+            compressed.frame_sizes
+        );
+        assert_eq!(
+            written.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            (0..sources.len()).collect::<Vec<_>>()
+        );
         assert_eq!(compressed.frame_sizes.len(), sources.len());
         assert_eq!(
             compressed.frame_sizes.iter().sum::<u64>(),

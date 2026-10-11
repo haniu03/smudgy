@@ -68,6 +68,20 @@ pub(super) struct PublishOutput {
     pub(super) text: String,
 }
 
+/// What a running publish yields: each step as it happens, then the outcome.
+enum PublishItem {
+    Progress(local_packages::PublishEvent),
+    Finished(
+        PackageOperationCompletion,
+        Result<local_packages::PublishSummary, String>,
+    ),
+}
+
+/// The publish console's scrollable, so a new line can scroll it to the end.
+fn publish_output_id() -> iced::widget::Id {
+    iced::widget::Id::new("package-publish-output")
+}
+
 /// What the local folder can prove about its cloud publication history. Rename must fail closed:
 /// a transient cloud failure or a damaged durable binding must never make a published name look
 /// editable.
@@ -5635,16 +5649,55 @@ impl AutomationsWindow {
         let result_publisher_id = publisher.id;
         let owner = self.publish_target();
         let clan_names = self.clan_names();
-        Update::with_task(Task::perform(
-            async move {
-                let result = local_packages::publish_local_package(
-                    &client, &server, &name, &publisher, owner,
+        // Each step reaches the console as the publish reports it; the outcome follows them.
+        let publishing = iced::stream::channel(
+            64,
+            async move |mut output: iced::futures::channel::mpsc::Sender<PublishItem>| {
+                let (events, mut received) = iced::futures::channel::mpsc::unbounded();
+                let report = move |event: local_packages::PublishEvent| {
+                    let _ = events.unbounded_send(event);
+                };
+                let mut publish = Box::pin(async {
+                    local_packages::publish_local_package(
+                        &client, &server, &name, &publisher, owner, &report,
+                    )
+                    .await
+                    .map_err(|error| super::clan_publish::publish_error(&error, &clan_names))
+                });
+                let result = loop {
+                    tokio::select! {
+                        event = iced::futures::StreamExt::next(&mut received) => {
+                            if let Some(event) = event {
+                                let _ = iced::futures::SinkExt::send(
+                                    &mut output,
+                                    PublishItem::Progress(event),
+                                )
+                                .await;
+                            }
+                        }
+                        result = &mut publish => break result,
+                    }
+                };
+                // Steps reported in the publish's last moments are still queued.
+                while let Ok(Some(event)) = received.try_next() {
+                    let _ = iced::futures::SinkExt::send(&mut output, PublishItem::Progress(event))
+                        .await;
+                }
+                let _ = iced::futures::SinkExt::send(
+                    &mut output,
+                    PublishItem::Finished(operation.into_completion(), result),
                 )
-                .await
-                .map_err(|error| super::clan_publish::publish_error(&error, &clan_names));
-                (operation.into_completion(), result)
+                .await;
             },
-            move |(completion, result)| Message::PublishFinished {
+        );
+        Update::with_task(Task::run(publishing, move |item| match item {
+            PublishItem::Progress(event) => Message::PublishProgress {
+                server_name: result_server.clone(),
+                name: result_name.clone(),
+                operation_id,
+                event,
+            },
+            PublishItem::Finished(completion, result) => Message::PublishFinished {
                 server_name: result_server.clone(),
                 name: result_name.clone(),
                 operation_id,
@@ -5653,7 +5706,41 @@ impl AutomationsWindow {
                 publisher_id: result_publisher_id,
                 result,
             },
-        ))
+        }))
+    }
+
+    /// Appends the console line for a step the running publish reported, and scrolls the
+    /// console to its end so the newest line shows. Steps of another pane operation, or for a
+    /// package the console no longer shows, are dropped.
+    pub(super) fn publish_progress(
+        &mut self,
+        server_name: &str,
+        name: &str,
+        operation_id: PackageOperationId,
+        event: &local_packages::PublishEvent,
+    ) -> Update<Message, Event> {
+        if self.server_name != server_name || self.authoring_operation != Some(operation_id) {
+            return Update::none();
+        }
+        let Some(output) = self
+            .publish_output
+            .as_mut()
+            .filter(|output| output.package == name)
+        else {
+            return Update::none();
+        };
+        output.text.push('\n');
+        output.text.push_str(&publish_step_line(event));
+        Update::with_task(iced::widget::operation::snap_to_end(publish_output_id()))
+    }
+
+    /// The console text a publish outcome for `name` follows: the steps shown while it ran, or
+    /// a fresh command line when the console shows something else.
+    pub(super) fn publish_console_prefix(&self, name: &str) -> String {
+        match &self.publish_output {
+            Some(output) if output.package == name => format!("{}\n", output.text),
+            _ => format!("smudgy> publish {name}\n"),
+        }
     }
 
     pub(super) fn delete_owned(&mut self) -> Update<Message, Event> {
@@ -9518,6 +9605,77 @@ fn code_block<'a>(content: &str) -> Elem<'a> {
         .into()
 }
 
+/// The console line for one step of a running publish.
+fn publish_step_line(event: &local_packages::PublishEvent) -> String {
+    use local_packages::PublishEvent;
+    use smudgy_cloud::PublishStep;
+    let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    let seconds =
+        |elapsed: std::time::Duration| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX);
+    match event {
+        PublishEvent::GeneratingTypings { modules } => crate::i18n::t!(
+            "package-publish-step-typings",
+            "count" => count(*modules)
+        ),
+        PublishEvent::TypingsGenerated {
+            generated,
+            warnings,
+        } => crate::i18n::t!(
+            "package-publish-step-typings-done",
+            "count" => count(*generated),
+            "warnings" => count(*warnings)
+        ),
+        PublishEvent::DependenciesLocked { count: locked } => crate::i18n::t!(
+            "package-publish-step-dependencies",
+            "count" => count(*locked)
+        ),
+        PublishEvent::Namespace { address, version } => crate::i18n::t!(
+            "package-publish-step-namespace",
+            "address" => address,
+            "version" => version
+        ),
+        PublishEvent::Version(step) => match step {
+            PublishStep::Compressing { modules, bodies } => crate::i18n::t!(
+                "package-publish-step-compressing",
+                "bodies" => count(*bodies),
+                "modules" => count(*modules)
+            ),
+            PublishStep::Compressed {
+                subpath,
+                bytes,
+                frame_bytes,
+            } => crate::i18n::t!(
+                "package-publish-step-compressed",
+                "subpath" => subpath,
+                "size" => human_size(*bytes),
+                "frame" => human_size(*frame_bytes)
+            ),
+            PublishStep::Bundled { frames, bytes } => crate::i18n::t!(
+                "package-publish-step-bundled",
+                "frames" => count(*frames),
+                "size" => human_size(*bytes)
+            ),
+            PublishStep::UploadStarted { frames, bytes } => crate::i18n::t!(
+                "package-publish-step-upload-started",
+                "frames" => count(*frames),
+                "size" => human_size(*bytes)
+            ),
+            PublishStep::Waiting { elapsed } => crate::i18n::t!(
+                "package-publish-step-waiting",
+                "seconds" => seconds(*elapsed)
+            ),
+            PublishStep::Uploaded { elapsed } => crate::i18n::t!(
+                "package-publish-step-uploaded",
+                "seconds" => seconds(*elapsed)
+            ),
+            PublishStep::RetryingAfterCollection => {
+                crate::i18n::t!("package-publish-step-retrying")
+            }
+            PublishStep::Finalizing => crate::i18n::t!("package-publish-step-finalizing"),
+        },
+    }
+}
+
 /// A bounded publish console using the user's actual terminal font and palette. Diagnostics can be
 /// arbitrarily long, so both axes scroll inside this surface instead of pushing the pane around.
 pub(super) fn publish_output_panel<'a>(output: &str) -> Elem<'a> {
@@ -9543,6 +9701,7 @@ pub(super) fn publish_output_panel<'a>(output: &str) -> Elem<'a> {
 
     container(
         scrollable(output)
+            .id(publish_output_id())
             .direction(scrollable::Direction::Both {
                 vertical: scrollbar(),
                 horizontal: scrollbar(),
