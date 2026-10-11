@@ -186,6 +186,27 @@ pub(crate) fn versioned_http_client() -> reqwest::Client {
         .expect("a reqwest client with a static version header is always valid")
 }
 
+/// Build the `reqwest::Client` that uploads package bundles: the same version
+/// header and connect timeout as [`versioned_http_client`], and no read
+/// timeout. An upload sends its whole body and then hears nothing until the
+/// service has verified, and stored, every frame in it, which takes longer
+/// the more bodies the bundle carries; a flat read timeout would give up on a
+/// large bundle the service is still accepting. Each upload sets its own
+/// deadline from its size instead.
+#[must_use]
+pub(crate) fn bundle_upload_http_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        CLIENT_VERSION_HEADER,
+        reqwest::header::HeaderValue::from_static(CLIENT_VERSION),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("a reqwest client with a static version header is always valid")
+}
+
 /// Exit direction enum matching the backend
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, Display)]
 pub enum ExitDirection {

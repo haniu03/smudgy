@@ -1182,6 +1182,86 @@ async fn package_bundles(
     Ok(())
 }
 
+/// How long a bundle of many bodies takes to publish against the live
+/// service: a first version whose every body is new to it, then a second
+/// whose bodies, one apart, it already holds. `SMUDGY_LIVE_MODULES` sets the
+/// module count (default 330, the official text-effects package's size; the
+/// cap is 4096). The package is deleted after, whatever the outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "talks to a live cloud service; see the module docs"]
+async fn package_bundle_timing() {
+    let Some((base_url, token)) = live_env() else {
+        eprintln!("SMUDGY_LIVE_STAGING / SMUDGY_LIVE_TOKEN unset; skipping");
+        return;
+    };
+    assert!(
+        !base_url.contains("api.smudgy.org"),
+        "refusing to run against production"
+    );
+    let count = std::env::var("SMUDGY_LIVE_MODULES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(330)
+        .max(1);
+    let credentials = CredentialSource::new(Some(Credential::Session(token)));
+    let api = PackageApiClient::new(base_url, credentials);
+    let name = format!("live-bundle-timing-{}", Uuid::new_v4().simple());
+    let package = api
+        .create_package(&name, "live staging bundle timing")
+        .await
+        .expect("create package");
+    let outcome = bundle_timing(&api, package.id, &name, count).await;
+    api.delete_package(package.id)
+        .await
+        .expect("delete the test package");
+    if let Err(failure) = outcome {
+        panic!("{failure}");
+    }
+}
+
+async fn bundle_timing(
+    api: &PackageApiClient,
+    package_id: Uuid,
+    name: &str,
+    count: usize,
+) -> Result<(), String> {
+    let module = |subpath: String, content: String, is_entry: bool| PublishModule {
+        subpath,
+        content: content.into_bytes(),
+        media_type: "application/typescript".to_string(),
+        is_entry,
+    };
+    // Distinct bodies the service has never seen.
+    let run = Uuid::new_v4().simple();
+    let mut modules: Vec<PublishModule> = (0..count)
+        .map(|index| {
+            module(
+                format!("m{index}.ts"),
+                format!("export const m{index} = \"{run}-{index}\";\n"),
+                index == 0,
+            )
+        })
+        .collect();
+    let manifest = |version: &str| serde_json::json!({ "name": name, "version": version });
+    let started = std::time::Instant::now();
+    api.publish_version(package_id, "1.0.0", &manifest("1.0.0"), &modules, &[], None)
+        .await
+        .map_err(|e| format!("publish 1.0.0 ({count} new bodies): {e}"))?;
+    let fresh = started.elapsed();
+
+    // The same bodies again, one apart: the service holds all but one.
+    modules[count - 1].content = format!("export const changed = \"{run}\";\n").into_bytes();
+    let started = std::time::Instant::now();
+    api.publish_version(package_id, "1.0.1", &manifest("1.0.1"), &modules, &[], None)
+        .await
+        .map_err(|e| format!("publish 1.0.1 ({count} bodies, one new): {e}"))?;
+    let held = started.elapsed();
+    eprintln!(
+        "bundle timing, {count} modules: {fresh:.1?} with every body new, {held:.1?} with all but one held"
+    );
+    Ok(())
+}
+
 /// Clan Secrets with one account, the clan's founder and only member: a
 /// Member-owned and a Clan-owned Secret on a clan map, who has access, and an
 /// offer that makes the Clan-owned one the founder's own. The clan, its

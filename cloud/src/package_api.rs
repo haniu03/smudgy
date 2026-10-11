@@ -57,6 +57,28 @@ const BODY_COMPRESSION_LEVEL: i32 = 19;
 /// again. A collection deletes the body's frame in the same sweep that marks it.
 const COLLECTION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// A bundle upload's deadline: this much for the request itself, plus
+/// [`UPLOAD_DEADLINE_PER_FRAME`] for every frame the service verifies and
+/// stores after the body has arrived, plus [`UPLOAD_DEADLINE_PER_MIB`] for
+/// every MiB of bundle to send. The service stores frames several at a time,
+/// so a healthy upload finishes well inside this; the deadline is for one
+/// that will never answer.
+const UPLOAD_DEADLINE_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+const UPLOAD_DEADLINE_PER_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
+const UPLOAD_DEADLINE_PER_MIB: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The deadline for uploading a bundle of `frames` frames and `bytes` bytes.
+fn bundle_upload_deadline(frames: usize, bytes: u64) -> std::time::Duration {
+    const MIB: u64 = 1024 * 1024;
+    let frames =
+        UPLOAD_DEADLINE_PER_FRAME.saturating_mul(u32::try_from(frames).unwrap_or(u32::MAX));
+    let millis_per_mib = u64::try_from(UPLOAD_DEADLINE_PER_MIB.as_millis()).unwrap_or(u64::MAX);
+    let transfer = std::time::Duration::from_millis(bytes.saturating_mul(millis_per_mib) / MIB);
+    UPLOAD_DEADLINE_BASE
+        .saturating_add(frames)
+        .saturating_add(transfer)
+}
+
 /// The standard zstd frame magic number (`0xFD2FB528`) as it opens every body frame.
 /// Skippable and legacy frames start with anything else.
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -723,6 +745,9 @@ enum Auth {
 #[derive(Debug, Clone)]
 pub struct PackageApiClient {
     client: Client,
+    /// Bundle uploads only: no read timeout, each upload sets its own deadline
+    /// ([`bundle_upload_deadline`]).
+    uploads: Client,
     base_url: String,
     credentials: CredentialSource,
     upgrade_available: Arc<ArcSwap<Option<String>>>,
@@ -737,6 +762,7 @@ impl PackageApiClient {
         base_url.truncate(base_url.trim_end_matches('/').len());
         Self {
             client: crate::versioned_http_client(),
+            uploads: crate::bundle_upload_http_client(),
             base_url,
             credentials,
             upgrade_available: Arc::new(ArcSwap::from_pointee(None)),
@@ -989,6 +1015,7 @@ impl PackageApiClient {
         // and once the collection finishes a fresh begin stores that body anew, so the first
         // such refusal begins the publish again.
         let bundle_len = u64::try_from(compressed.bundle.len()).unwrap_or(u64::MAX);
+        let frames = compressed.frame_sizes.len();
         let mut bundle = compressed.bundle;
         let mut retried = false;
         loop {
@@ -1010,7 +1037,7 @@ impl PackageApiClient {
             } else {
                 bundle.clone()
             };
-            match self.upload_bundle(&begin.bundle, attempt).await {
+            match self.upload_bundle(&begin.bundle, attempt, frames).await {
                 Ok(()) => break,
                 Err(CloudError::BodyBeingCollected) if !retried => {
                     retried = true;
@@ -1029,15 +1056,37 @@ impl PackageApiClient {
         .await
     }
 
-    /// PUTs a publish's bundle to its signed URL with exactly the headers `begin` named. No
-    /// `Authorization` and no registry headers: the URL itself carries the grant.
-    async fn upload_bundle(&self, upload: &BundleUpload, bundle: Vec<u8>) -> CloudResult<()> {
-        debug!("PUT <package bundle>");
-        let mut request = self.client.put(&upload.url).body(bundle);
+    /// PUTs a publish's bundle of `frames` frames to its signed URL with exactly the headers
+    /// `begin` named. No `Authorization` and no registry headers: the URL itself carries the
+    /// grant. The service answers only once it has verified and stored every frame, so the
+    /// request's deadline grows with the bundle ([`bundle_upload_deadline`]).
+    async fn upload_bundle(
+        &self,
+        upload: &BundleUpload,
+        bundle: Vec<u8>,
+        frames: usize,
+    ) -> CloudResult<()> {
+        let bytes = u64::try_from(bundle.len()).unwrap_or(u64::MAX);
+        let deadline = bundle_upload_deadline(frames, bytes);
+        debug!(
+            "PUT <package bundle> ({frames} frames, {bytes} bytes, {}s deadline)",
+            deadline.as_secs()
+        );
+        let mut request = self.uploads.put(&upload.url).timeout(deadline).body(bundle);
         for (name, value) in &upload.headers {
             request = request.header(name, value);
         }
-        let response = request.send().await?;
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                CloudError::NetworkError(format!(
+                    "the package bundle ({frames} frames, {bytes} bytes) was uploaded, but the \
+                     service gave no answer within {}s",
+                    deadline.as_secs()
+                ))
+            } else {
+                CloudError::from(error)
+            }
+        })?;
         let status = response.status();
         if status.is_success() {
             return Ok(());
@@ -1784,6 +1833,30 @@ fn decode_body_frame(frame: &[u8], body: &BundleBody) -> CloudResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_upload_deadline_grows_with_frames_and_bytes() {
+        use std::time::Duration;
+        assert_eq!(bundle_upload_deadline(0, 0), Duration::from_secs(30));
+        // 100 ms per frame: the service verifies and stores each one before answering.
+        assert_eq!(
+            bundle_upload_deadline(330, 0),
+            Duration::from_secs(30) + Duration::from_millis(33_000)
+        );
+        // One second per MiB sent.
+        assert_eq!(
+            bundle_upload_deadline(0, 2 * 1024 * 1024),
+            Duration::from_secs(32)
+        );
+        assert_eq!(
+            bundle_upload_deadline(4096, 95_000_000),
+            Duration::from_secs(30)
+                + Duration::from_millis(409_600)
+                + Duration::from_millis(95_000_000 * 1000 / (1024 * 1024))
+        );
+        // Absurd sizes saturate rather than overflow.
+        assert!(bundle_upload_deadline(usize::MAX, u64::MAX) >= Duration::from_secs(30));
+    }
 
     #[test]
     fn resolved_package_parses() {
