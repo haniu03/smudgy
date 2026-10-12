@@ -951,11 +951,13 @@ impl CloudApiClient {
     }
 
     /// `PATCH /me` — sets the caller's globally-unique nickname (which is the
-    /// handle). Returns the updated profile.
+    /// handle). Active clan names are also unavailable, ignoring ASCII case.
+    /// Returns the updated profile.
     ///
     /// # Errors
-    /// A `409 Conflict` (the nickname is already taken) surfaces via
-    /// [`CloudError::from_status`]; other non-2xx statuses likewise; transport
+    /// A `409 Conflict` (the nickname is held by a user or active clan, or is
+    /// reserved) surfaces as [`CloudError::NameUnavailable`]; other non-2xx
+    /// statuses via [`CloudError::from_status`]; transport
     /// failures as [`CloudError::NetworkError`].
     pub async fn set_nickname(&self, nickname: &str) -> CloudResult<UserProfile> {
         let body = json!({ "nickname": nickname });

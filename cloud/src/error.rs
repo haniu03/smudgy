@@ -177,8 +177,8 @@ pub enum CloudError {
     /// 409 `already_member` — the invited user is already a member.
     AlreadyMember,
 
-    /// 409 `name_in_use` — the clan already has a group with that name,
-    /// ignoring case.
+    /// 409 `name_in_use` — a clan name conflicts with a user nickname, or the
+    /// clan already has a group with that name, ignoring case.
     NameInUse,
 
     /// 409 `transfer_already_pending` — the map or folder already has an

@@ -467,7 +467,9 @@ impl CloudApiClient {
     ///
     /// # Errors
     /// [`CloudError::InvalidInput`](crate::CloudError::InvalidInput) for a
-    /// blank, overlong, or control-character name; other failures via
+    /// blank, overlong, or control-character name;
+    /// [`CloudError::NameInUse`](crate::CloudError::NameInUse) if a user holds
+    /// that nickname (ignoring ASCII case); other failures via
     /// [`CloudError::from_status`](crate::CloudError::from_status).
     pub async fn create_clan(&self, name: &str) -> CloudResult<ClanSummary> {
         let body = json!({ "name": name });
@@ -478,7 +480,8 @@ impl CloudApiClient {
     ///
     /// # Errors
     /// [`CloudError::NotFoundOrNoAccess`](crate::CloudError::NotFoundOrNoAccess)
-    /// without that action; other failures via
+    /// without that action; [`CloudError::NameInUse`](crate::CloudError::NameInUse)
+    /// if a user holds that nickname (ignoring ASCII case); other failures via
     /// [`CloudError::from_status`](crate::CloudError::from_status).
     pub async fn rename_clan(&self, clan_id: Uuid, name: &str) -> CloudResult<ClanSummary> {
         let body = json!({ "name": name });
