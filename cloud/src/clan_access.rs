@@ -327,7 +327,9 @@ impl CloudApiClient {
     /// # Errors
     /// [`CloudError::NotFoundOrNoAccess`](crate::CloudError::NotFoundOrNoAccess)
     /// without that action; [`CloudError::InvalidInput`](crate::CloudError::InvalidInput)
-    /// for a blank or overlong name or description; other failures via
+    /// for a blank or overlong name or description;
+    /// [`CloudError::NameInUse`](crate::CloudError::NameInUse) if a user holds
+    /// that nickname (ignoring ASCII case); other failures via
     /// [`CloudError::from_status`](crate::CloudError::from_status).
     pub async fn update_clan_profile(
         &self,

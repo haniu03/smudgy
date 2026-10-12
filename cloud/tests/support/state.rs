@@ -694,8 +694,8 @@ impl MockState {
     }
 
     /// Claim `requested` as this user's nickname (the handle). Nicknames are
-    /// globally unique, case-insensitive; returns `false` if it is already taken
-    /// by another user (the caller surfaces that as "needs another nickname").
+    /// globally unique, case-insensitive; returns `false` if another user or
+    /// active clan holds it (the caller surfaces that as "needs another nickname").
     pub fn claim_nickname(&mut self, user_id: Uuid, requested: &str) -> bool {
         let taken = self.users.iter().any(|u| {
             u.id != user_id
@@ -703,7 +703,10 @@ impl MockState {
                     .as_deref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(requested))
         });
-        if taken {
+        let clan_taken = self.clans.clans.values().any(|clan| {
+            (!clan.dissolved || clan.unrecorded) && clan.name.eq_ignore_ascii_case(requested)
+        });
+        if taken || clan_taken {
             return false;
         }
         let Some(user) = self.user_mut(user_id) else {

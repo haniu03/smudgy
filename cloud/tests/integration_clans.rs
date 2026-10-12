@@ -136,6 +136,87 @@ async fn a_clan_is_created_listed_renamed_and_dissolved() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clan_names_and_user_nicknames_cannot_collide() {
+    let server = MockServer::spawn().await;
+    let (_, owner) = user(&server, "NameHolder");
+    let (_, outsider) = user(&server, "Outsider");
+
+    for creator in [&owner, &outsider] {
+        for name in ["NameHolder", "nameholder", "NAMEHOLDER"] {
+            assert!(matches!(
+                creator.create_clan(name).await,
+                Err(CloudError::NameInUse)
+            ));
+        }
+        assert!(creator.clans().await.unwrap().clans.is_empty());
+    }
+    let clan = owner.create_clan("Lanterns").await.unwrap();
+    assert!(matches!(
+        owner.rename_clan(clan.id, "OUTSIDER").await,
+        Err(CloudError::NameInUse)
+    ));
+    assert!(is_not_found(
+        &outsider.rename_clan(clan.id, "NameHolder").await
+    ));
+    assert_eq!(owner.clan(clan.id).await.unwrap().name, "Lanterns");
+
+    for claimant in [&owner, &outsider] {
+        for name in ["Lanterns", "lanterns", "LANTERNS"] {
+            assert!(matches!(claimant.set_nickname(name).await,
+                Err(CloudError::NameUnavailable(message)) if message == "That nickname is taken; please choose another."));
+        }
+    }
+    assert_eq!(
+        outsider.me().await.unwrap().nickname.as_deref(),
+        Some("Outsider")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn names_are_released_after_rename_and_completed_dissolution() {
+    let server = MockServer::spawn().await;
+    let (_, owner) = user(&server, "FormerNickname");
+    let (_, claimant) = user(&server, "Claimant");
+    owner.set_nickname("NewNickname").await.unwrap();
+    let clan = owner.create_clan("formernickname").await.unwrap();
+    let duplicate = owner.create_clan("FORMERNICKNAME").await.unwrap();
+    owner.rename_clan(clan.id, "AfterRename").await.unwrap();
+    assert!(matches!(
+        claimant.set_nickname("FormerNickname").await,
+        Err(CloudError::NameUnavailable(_))
+    ));
+    owner.delete_clan(duplicate.id).await.unwrap();
+    claimant.set_nickname("FormerNickname").await.unwrap();
+
+    server.lose_next_dissolution_answers(1);
+    assert!(owner.delete_clan(clan.id).await.is_err());
+    assert!(matches!(
+        claimant.set_nickname("afterrename").await,
+        Err(CloudError::NameUnavailable(_))
+    ));
+    owner.delete_clan(clan.id).await.unwrap();
+    claimant.set_nickname("afterrename").await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_verification_leaves_a_clan_name_unclaimed() {
+    let server = MockServer::spawn().await;
+    let (_, owner) = user(&server, "OwnerName");
+    let pending = server.create_user("pending@example.com", "firstclaim", false);
+    owner.create_clan("FirstClaim").await.unwrap();
+    let pending = client(&server, &pending);
+    pending.login("pending@example.com").await.unwrap();
+    let code = server.verify_code_for("pending@example.com").unwrap();
+    let signed_in = pending
+        .verify_email("pending@example.com", &code)
+        .await
+        .unwrap();
+    assert!(signed_in.needs_nickname);
+    assert!(signed_in.user.nickname.is_none());
+    assert!(signed_in.user.email_verified_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_owner_repeating_a_dissolution_whose_answer_was_lost_gets_null() {
     let server = MockServer::spawn().await;
     let (_, mira) = user(&server, "mira");

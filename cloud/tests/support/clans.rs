@@ -1425,6 +1425,17 @@ fn description(value: String) -> Result<String, Response> {
     Ok(value)
 }
 
+fn check_clan_name(st: &MockState, name: &str) -> Result<(), Response> {
+    if st.users.iter().any(|user| {
+        user.nickname
+            .as_deref()
+            .is_some_and(|nickname| nickname.eq_ignore_ascii_case(name))
+    }) {
+        return Err(conflict("name_in_use"));
+    }
+    Ok(())
+}
+
 /// `#rrggbb`, stored in lowercase. `None`: absent (keep); `Some(None)`:
 /// null (clear).
 fn color(fields: &Map<String, Value>) -> Result<Option<Option<String>>, Response> {
@@ -1561,6 +1572,7 @@ pub async fn create_clan(
         let fields = json_object(&body)?;
         let name = clan_name(required_string(&fields, "name")?)?;
         let about = description(optional_string(&fields, "description")?.unwrap_or_default())?;
+        check_clan_name(&st, &name)?;
         let seq = st.next_seq();
         let id = Uuid::new_v4();
         let now = Utc::now();
@@ -1657,10 +1669,12 @@ pub async fn patch_clan(
         let about = optional_string(&fields, "description")?
             .map(description)
             .transpose()?;
-        let clan = active_clan_mut(&mut st, clan_id)?;
+        let clan = active_clan(&st, clan_id)?;
         if !clan.may(caller, "clan.edit_profile") {
             return Err(not_found());
         }
+        check_clan_name(&st, name.as_deref().unwrap_or(&clan.name))?;
+        let clan = active_clan_mut(&mut st, clan_id)?;
         if let Some(name) = name {
             clan.name = name;
         }
