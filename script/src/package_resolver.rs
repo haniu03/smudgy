@@ -2180,7 +2180,9 @@ pub fn core_module_url(referrer: &str) -> ModuleSpecifier {
     {
         let path = format!(
             "/pkg/{}/{}/{}",
-            coords.key.owner, coords.key.name, coords.version
+            owner_segment(&coords.key.owner),
+            coords.key.name,
+            coords.version
         );
         return ModuleSpecifier::parse(&format!("{CORE_SCHEME}://{path}"))
             .expect("core package URL is well-formed for validated components");
@@ -2229,7 +2231,7 @@ fn creator_json_from_path(url: &ModuleSpecifier) -> Option<String> {
         ["user"] => serde_json::json!({ "kind": "user" }),
         ["pkg", owner, name, version] => serde_json::json!({
             "kind": "package",
-            "owner": owner,
+            "owner": owner_from_segment(owner),
             "name": name,
             "version": version,
         }),
@@ -2348,7 +2350,9 @@ pub fn widgets_module_url(referrer: &str) -> ModuleSpecifier {
     {
         let path = format!(
             "/pkg/{}/{}/{}",
-            coords.key.owner, coords.key.name, coords.version
+            owner_segment(&coords.key.owner),
+            coords.key.name,
+            coords.version
         );
         let mut url = ModuleSpecifier::parse(&format!("{WIDGETS_SCHEME}://{path}"))
             .expect("widgets package URL is well-formed for validated components");
@@ -3840,6 +3844,43 @@ mod tests {
             "no package -> empty spec"
         );
         assert!(code.as_str().contains("available only to packages"));
+    }
+
+    #[test]
+    fn ownerless_core_module_preserves_the_package_creator() {
+        let key = spec("smudgy:@map-layout").package_key();
+        let referrer = canonical_url(&key, "0.2.9", "index.ts");
+        let url = core_module_url(referrer.as_str());
+        assert_eq!(url.as_str(), "smudgy-core:///pkg/@/map-layout/0.2.9");
+        load_core_module(&url).expect("an ownerless package can import smudgy:core");
+        let creator: serde_json::Value =
+            serde_json::from_str(&core_creator_json(&url).unwrap()).unwrap();
+        assert_eq!(
+            creator,
+            serde_json::json!({
+                "kind": "package", "owner": "", "name": "map-layout", "version": "0.2.9"
+            })
+        );
+    }
+
+    #[test]
+    fn ownerless_widgets_module_preserves_the_package_creator() {
+        let key = spec("smudgy:@mapper").package_key();
+        let referrer = canonical_url(&key, "1.0.0", "lib/panel.tsx");
+        let url = widgets_module_url(referrer.as_str());
+        load_widgets_module(&url).expect("an ownerless package can import smudgy:widgets");
+        let creator: serde_json::Value =
+            serde_json::from_str(&creator_json_from_path(&url).unwrap()).unwrap();
+        assert_eq!(
+            creator,
+            serde_json::json!({
+                "kind": "package", "owner": "", "name": "mapper", "version": "1.0.0"
+            })
+        );
+        assert_eq!(
+            module_subpath_from_url(&url).as_deref(),
+            Some("lib/panel.tsx")
+        );
     }
 
     #[test]

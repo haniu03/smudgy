@@ -458,9 +458,16 @@ impl AutomationsWindow {
         col = col.push(
             row![
                 iced::widget::space::horizontal(),
-                button(text(crate::i18n::t!("package-keep-current-version")).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::DismissUpdate),
+                button(
+                    text(if delta.current_version.is_some() {
+                        crate::i18n::t!("package-keep-current-version")
+                    } else {
+                        crate::i18n::t!("action-dismiss")
+                    })
+                    .size(12.0),
+                )
+                .style(button_style::secondary)
+                .on_press(Message::DismissUpdate),
                 button(text(crate::i18n::t!("package-grant-update")).size(12.0))
                     .style(button_style::primary)
                     .on_press(Message::GrantUpdate),

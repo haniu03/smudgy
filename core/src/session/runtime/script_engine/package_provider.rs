@@ -1075,9 +1075,9 @@ impl SmudgyPackageProvider {
     /// Persistence is an entry-level read-modify-write against the **on-disk** lock — never a
     /// flush of this session's whole in-memory view, which can be seconds stale by the time a
     /// resolve completes and would silently clobber concurrent Automations-window writes (an
-    /// uninstalled entry would resurrect; a fresh enable/disable would revert). An entry that
-    /// was installed when this session loaded but is gone from disk was uninstalled meanwhile:
-    /// its resolution metadata dies with it.
+    /// uninstalled entry would resurrect; a fresh enable/disable would revert). Only existing
+    /// installs receive metadata. Importing a library from a user module must never install
+    /// its standalone entry point, including after the user has uninstalled it.
     ///
     /// One write is refused outright: an on-disk entry staging a DIFFERENT version with
     /// `integrity` unstamped is a background stage this load did not serve (staging
@@ -1086,12 +1086,6 @@ impl SmudgyPackageProvider {
     /// the pending stage, so the entry — disk and in-memory view alike — is left
     /// exactly as staged. A stamped entry records as always, downgrades included.
     fn record_resolution(&self, specifier: &str, version: &str, verified_integrity: Option<&str>) {
-        let fresh_entry = || {
-            let mut entry = LockedPackage::new(specifier.to_string(), UpdateMode::Auto);
-            entry.last_resolved_version = Some(version.to_string());
-            entry.integrity = verified_integrity.map(str::to_string);
-            entry
-        };
         // How an existing entry adopts this resolution: the version always lands; the
         // integrity stamp only from a verified load. An unverified serve that MOVES
         // the version clears the old version's stamp rather than letting it lie
@@ -1105,7 +1099,6 @@ impl SmudgyPackageProvider {
                 None => {}
             }
         };
-        let known_install = self.lock.borrow().find(specifier).is_some();
         let mut stage_pending = false;
         let persisted = shared_packages::mutate_lock(&self.server_name, |disk| {
             if disk.has_ambiguous_identity(specifier) {
@@ -1125,21 +1118,10 @@ impl SmudgyPackageProvider {
                 }
                 apply(entry);
                 Ok(((), true))
-            } else if known_install {
-                // Uninstalled since this session loaded — don't resurrect it just to stamp
-                // resolution metadata on it.
-                Ok(((), false))
             } else {
-                // Not an install at all (a top-level resolve outside the lockfile): record it
-                // on disk the same way it is recorded in memory. A fresh row must not inherit
-                // coordinate-keyed settings that cleanup left behind for a retired install.
-                shared_packages::ensure_new_package_rows_have_no_retired_parameter_state(
-                    &self.server_name,
-                    disk,
-                    std::iter::once(specifier),
-                )?;
-                disk.upsert(fresh_entry())?;
-                Ok(((), true))
+                // A code import is not an install, whether absent at session start or
+                // uninstalled while this resolution was in flight.
+                Ok(((), false))
             }
         });
         if let Err(err) = persisted {
@@ -1163,8 +1145,6 @@ impl SmudgyPackageProvider {
                 ));
             }
             apply(entry);
-        } else if let Err(error) = lock.upsert(fresh_entry()) {
-            warn!("Failed to record package resolution for {specifier}: {error:#}");
         }
     }
 
@@ -1740,10 +1720,8 @@ impl SmudgyPackageProvider {
     //
     // `track` separates a code load from a kind-scheme stub fetch: a code load records the
     // instance in `cache` (whose keys are `loaded_packages()`) and, top-level, reports the
-    // resolution into the lockfile; a stub fetch
-    // (`track == false`) must leave no code-load or install footprint — notably,
-    // `record_resolution` would UPSERT a lock entry for an unknown package, silently
-    // installing a producer someone merely consumed.
+    // resolution into an existing install's lockfile entry. A stub fetch
+    // (`track == false`) must leave no code-load or install-metadata footprint.
     #[allow(clippy::too_many_lines)]
     async fn resolve_impl(
         &self,
@@ -1782,6 +1760,20 @@ impl SmudgyPackageProvider {
                 )));
             }
             let entry = lock.find(&state_specifier);
+            // User scripts may import published packages only while they are installed.
+            // Check before either cache path or network discovery: cached code is not an
+            // installation. Package-to-package imports use their declared dependency edges;
+            // authored local packages and declaration-only stub reads have separate lifecycles.
+            if track
+                && referrer.is_none()
+                && entry.is_none()
+                && !self.is_local_override(requested_key)
+            {
+                return Err(PackageError::Other(format!(
+                    "package {} is not installed. Install it in Automations before importing it.",
+                    key.name
+                )));
+            }
             (
                 entry.and_then(|p| p.pinned_version().map(str::to_string)),
                 entry.and_then(|p| p.staged_version().map(str::to_string)),
@@ -2463,6 +2455,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_dependency_does_not_authorize_an_uninstalled_user_import() {
+        let registry = spawn_registry(&[
+            MockPackage {
+                owner: "wbk",
+                name: "app",
+                version: "1.0.0",
+                manifest_extra: r#", "dependencies":["smudgy:@util@^1"]"#,
+                deps: &[("wbk", "util", "^1", "1.0.0")],
+                body: "export const app = true;",
+            },
+            MockPackage {
+                owner: "wbk",
+                name: "util",
+                version: "1.0.0",
+                manifest_extra: "",
+                deps: &[],
+                body: "export const utility = true;",
+            },
+        ]);
+        let provider = provider_for(&registry);
+        persist_installed_entry(
+            &provider,
+            LockedPackage::new("smudgy:@app", UpdateMode::Auto),
+        );
+        provider
+            .resolve_package(&pkg_key("app"), None)
+            .await
+            .unwrap();
+        let dependency = provider
+            .resolve_package(&pkg_key("util"), Some(&referrer("app", "1.0.0")))
+            .await
+            .expect("the installed package can load its declared dependency");
+        assert_eq!(dependency.resolved_version, "1.0.0");
+        assert!(provider.get_cached(&pkg_key("util"), "1.0.0").is_some());
+        let resolve_hits = registry.resolve_hits.load(Ordering::SeqCst);
+
+        for owner in ["wbk", ""] {
+            let key = PackageKey {
+                owner: owner.into(),
+                name: "util".into(),
+            };
+            let error = provider.resolve_package(&key, None).await.unwrap_err();
+            assert!(
+                error.to_string().contains("util is not installed"),
+                "{error}"
+            );
+        }
+        assert_eq!(registry.resolve_hits.load(Ordering::SeqCst), resolve_hits);
+        assert!(
+            shared_packages::load_lock(&provider.server_name)
+                .unwrap()
+                .find("smudgy:@util")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn mixed_case_import_reuses_one_cached_instance_and_module_identity() {
         let registry = spawn_registry(&[MockPackage {
             owner: "Rich_E",
@@ -2473,6 +2522,10 @@ mod tests {
             body: "export const version = 1;",
         }]);
         let provider = provider_for(&registry);
+        persist_installed_entry(
+            &provider,
+            LockedPackage::new("smudgy:@Speedwalks", UpdateMode::Auto),
+        );
         let key = PackageKey {
             owner: "Rich_E".into(),
             name: "Speedwalks".into(),
@@ -3426,6 +3479,10 @@ mod tests {
             body: "throw new Error('must not run natively');",
         }]);
         let provider = provider_for(&registry);
+        persist_installed_entry(
+            &provider,
+            LockedPackage::new("smudgy:@webapp", UpdateMode::Auto),
+        );
         assert_eq!(
             provider
                 .cap_version("smudgy://wbk/webapp", &PackagePermissions::default())
@@ -3476,7 +3533,20 @@ mod tests {
         // per-fork copies, each `record_resolution` would persist a stale snapshot missing the
         // other's entry (`PACKAGE-ISOLATES-RESOLUTION.md`). Disk persistence itself
         // (`save_lock` / `load_lock`) is covered in `shared_packages`.
-        let main = test_provider();
+        use_temp_smudgy_home();
+        let server = "ForkedResolutionLockTest";
+        let packages = vec![
+            LockedPackage::new("smudgy://wbk/mapper", UpdateMode::Auto),
+            LockedPackage::new("smudgy://cor/combat", UpdateMode::Auto),
+        ];
+        shared_packages::save_lock(
+            server,
+            &SharedPackageLock {
+                packages: packages.clone(),
+            },
+        )
+        .expect("seed installed packages");
+        let main = provider_with_view(server, packages);
         let sandbox = main.fork();
 
         main.record_resolution("smudgy://wbk/mapper", "1.4.0", Some("main-integrity"));
@@ -3573,6 +3643,26 @@ mod tests {
         let provider = SmudgyPackageProvider::new(client, Arc::new(server.to_string()));
         provider.lock.borrow_mut().packages = packages;
         provider
+    }
+
+    #[test]
+    fn record_resolution_does_not_install_an_imported_library() {
+        use_temp_smudgy_home();
+        let server = "RecordImportedLibraryTest";
+        let specifier = "smudgy:@text-effects";
+        let provider = provider_with_view(server, Vec::new());
+
+        // Both cache-first loads and network-verified loads can resolve a user import.
+        for integrity in [None, Some("verified-library")] {
+            provider.record_resolution(specifier, "0.1.1", integrity);
+            assert!(
+                shared_packages::load_lock(server)
+                    .unwrap()
+                    .find(specifier)
+                    .is_none()
+            );
+            assert!(provider.lock.borrow().find(specifier).is_none());
+        }
     }
 
     #[test]

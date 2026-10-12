@@ -728,8 +728,8 @@ pub struct UpdateDelta {
     pub name: String,
     /// The newest (held-back) version — the one that demands more than was granted.
     pub version: String,
-    /// The version actually loaded/running (the highest that fits the grant), from the lockfile's
-    /// last-resolved record. `None` if it hasn't loaded yet.
+    /// A previously selected version with a saved grant, distinct from the blocked candidate.
+    /// This lockfile record does not prove that the package is currently running.
     pub current_version: Option<String>,
     /// The per-field additions over the consented baseline (`PackagePermissions::added_since`).
     pub added: PackagePermissions,
@@ -3539,7 +3539,11 @@ impl AutomationsWindow {
         };
         let expected = open.clone();
         let specifier = open.specifier.clone();
-        let current_version = open.last_resolved_version.clone();
+        let current_version = open
+            .last_resolved_version
+            .as_ref()
+            .filter(|current| **current != version && open.consented_permissions.is_some())
+            .cloned();
 
         // A version floor applies to trusted packages too: no permission grant can make an
         // incompatible build run.
@@ -10251,6 +10255,38 @@ mod tests {
             crate::cloud_account::test_handles(),
             smudgy_core::session::SessionId::from(1),
         )
+    }
+
+    #[test]
+    fn permission_review_does_not_offer_the_blocked_version_as_a_running_fallback() {
+        for (staged, consented, expected_current) in [
+            ("0.1.1", false, None),
+            ("0.1.1", true, None),
+            ("0.1.0", false, None),
+            ("0.1.0", true, Some("0.1.0")),
+        ] {
+            let mut window = test_window("permission-review-version-test");
+            let mut open = LockedPackage::new("smudgy:@text-effects", UpdateMode::Auto);
+            open.last_resolved_version = Some(staged.to_string());
+            open.consented_permissions = consented.then(PackagePermissions::default);
+            window.installed_open = Some(Box::new(open));
+            let permissions = PackagePermissions {
+                net: vec!["example.org".to_string()],
+                ..PackagePermissions::default()
+            };
+
+            window.apply_update_comparison(
+                "0.1.1".to_string(),
+                permissions.clone(),
+                shared_packages::SmudgyVersionFloor::default(),
+                false,
+            );
+
+            let delta = window.update_delta.as_ref().expect("permission review");
+            assert_eq!(delta.current_version.as_deref(), expected_current);
+            assert_eq!(delta.added, permissions);
+            drop(window.view_installed_package());
+        }
     }
 
     fn resolution_for(
