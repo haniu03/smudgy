@@ -99,21 +99,50 @@ fn cache_package(
     index_src: &str,
     deps: &[ResolvedDependency],
 ) -> String {
+    cache_package_modules(
+        owner,
+        name,
+        version,
+        manifest_json,
+        &[("index.ts", index_src)],
+        deps,
+    )
+}
+
+fn cache_package_modules(
+    owner: &str,
+    name: &str,
+    version: &str,
+    manifest_json: &str,
+    sources: &[(&str, &str)],
+    deps: &[ResolvedDependency],
+) -> String {
     let cache = PackageCache::new().expect("package cache under smudgy home");
-    let hash = sha256_hex(index_src);
-    cache.write_blob(&hash, index_src).expect("write blob");
-    let integrity = format!("index.ts={hash}");
+    let modules = sources
+        .iter()
+        .map(|(subpath, source)| {
+            let hash = sha256_hex(source);
+            cache.write_blob(&hash, source).expect("write blob");
+            CachedModule {
+                subpath: (*subpath).to_string(),
+                content_hash: hash,
+                media_type: "application/typescript".to_string(),
+                byte_size: i64::try_from(source.len()).expect("fixture module size fits i64"),
+                is_entry: *subpath == "index.ts",
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut hashes = modules
+        .iter()
+        .map(|module| format!("{}={}", module.subpath, module.content_hash))
+        .collect::<Vec<_>>();
+    hashes.sort();
+    let integrity = hashes.join(";");
     let meta = CachedResolution {
         version: version.to_string(),
         integrity: integrity.clone(),
         manifest: PackageManifest::parse(manifest_json).expect("valid manifest"),
-        modules: vec![CachedModule {
-            subpath: "index.ts".to_string(),
-            content_hash: hash,
-            media_type: "application/typescript".to_string(),
-            byte_size: index_src.len() as i64,
-            is_entry: true,
-        }],
+        modules,
         dependencies: deps.to_vec(),
         owner: None,
     };
@@ -200,6 +229,109 @@ fn has_line(lines: &[String], needle: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn local_import_requires_the_package_to_remain_installed() {
+    let server = "ImportedPackageUninstall";
+    prepare_server(server);
+    let cloud = spawn_dead_cloud();
+    let effects = "smudgy:@text-effects";
+    let mapper = "smudgy:@arctic-mapper";
+    let manifest = r#"{"version":"0.1.1","permissions":{"smudgy":{"session":["echo"]}}}"#;
+    let effects_integrity = cache_package_modules(
+        "",
+        "text-effects",
+        "0.1.1",
+        manifest,
+        &[
+            (
+                "index.ts",
+                "import { echo } from 'smudgy:core'; echo('EFFECTS:STANDALONE');",
+            ),
+            ("possession.ts", "export const effect = 'EFFECTS:IMPORTED';"),
+        ],
+        &[],
+    );
+    let mapper_integrity = cache_package(
+        "",
+        "arctic-mapper",
+        "0.1.1",
+        manifest,
+        "import { echo } from 'smudgy:core'; echo('MAPPER:LOADED');",
+        &[],
+    );
+    let install_mapper = || {
+        shared_packages::install_package(server, mapper, UpdateMode::Auto, true).unwrap();
+        shared_packages::record_resolution(server, mapper, "0.1.1", &mapper_integrity).unwrap();
+        record_consent(server, mapper, manifest);
+    };
+    install_mapper();
+    let install_effects = || {
+        shared_packages::install_package(server, effects, UpdateMode::Auto, true).unwrap();
+        shared_packages::record_resolution(server, effects, "0.1.1", &effects_integrity).unwrap();
+        record_consent(server, effects, manifest);
+    };
+    install_effects();
+    std::fs::write(
+        smudgy_core::get_smudgy_home()
+            .unwrap()
+            .join(server)
+            .join("modules/test-effects.ts"),
+        "import { effect } from '@text-effects/possession';\n\
+         import { echo } from 'smudgy:core'; echo(effect);",
+    )
+    .unwrap();
+    let lines = run_session(9910, server, cloud.client()).await;
+    assert!(has_line(&lines, "EFFECTS:STANDALONE"), "{lines:?}");
+    assert!(has_line(&lines, "EFFECTS:IMPORTED"), "{lines:?}");
+
+    let lock = shared_packages::load_lock(server).unwrap();
+    shared_packages::commit_uninstall_if_unchanged(server, &lock, effects, true).unwrap();
+    let lines = run_session(9911, server, cloud.client()).await;
+    assert!(
+        has_line(&lines, "text-effects is not installed"),
+        "{lines:?}"
+    );
+    assert!(!has_line(&lines, "EFFECTS:IMPORTED"), "{lines:?}");
+    assert!(!has_line(&lines, "EFFECTS:STANDALONE"), "{lines:?}");
+    assert!(
+        shared_packages::load_lock(server)
+            .unwrap()
+            .find(effects)
+            .is_none(),
+        "a local module import must not recreate the removed standalone install"
+    );
+
+    let lock = shared_packages::load_lock(server).unwrap();
+    shared_packages::commit_uninstall_if_unchanged(server, &lock, mapper, true).unwrap();
+    install_mapper();
+    for session in [9912, 9913] {
+        let lines = run_session(session, server, cloud.client()).await;
+        assert!(has_line(&lines, "MAPPER:LOADED"), "{lines:?}");
+        assert!(
+            has_line(&lines, "text-effects is not installed"),
+            "{lines:?}"
+        );
+        assert!(!has_line(&lines, "EFFECTS:IMPORTED"), "{lines:?}");
+        assert!(!has_line(&lines, "EFFECTS:STANDALONE"), "{lines:?}");
+        assert!(!has_line(&lines, "text-effects not loaded"), "{lines:?}");
+        assert!(
+            shared_packages::load_lock(server)
+                .unwrap()
+                .find(effects)
+                .is_none()
+        );
+    }
+    install_effects();
+    let lines = run_session(9914, server, cloud.client()).await;
+    assert!(has_line(&lines, "EFFECTS:IMPORTED"), "{lines:?}");
+    assert!(has_line(&lines, "EFFECTS:STANDALONE"), "{lines:?}");
+    assert_eq!(
+        cloud.hits(),
+        0,
+        "an uninstalled import must not contact the registry"
+    );
+}
 
 /// The marquee offline start, strict form: a sandboxed Auto install **with a locked
 /// dependency** (staged via `last_resolved_version`, closure consented), a trusted

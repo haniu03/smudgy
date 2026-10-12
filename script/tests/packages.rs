@@ -140,6 +140,72 @@ fn package_loads_and_evaluates() -> Result<()> {
 }
 
 #[test]
+fn ownerless_dependency_loads_core_and_widgets_on_a_clean_install() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut dependency = resolved(
+        "map-layout",
+        "0.2.9",
+        &[
+            (
+                "index.ts",
+                "import { createAlias } from 'smudgy:core';\n\
+                 export const creator = createAlias();\n\
+                 export { widget } from './lib/panel.ts';",
+            ),
+            (
+                "lib/panel.ts",
+                "import { createWidget } from 'smudgy:widgets';\n\
+                 export const widget = createWidget();",
+            ),
+        ],
+    );
+    dependency.key.owner.clear();
+    let mut root = resolved(
+        "arctic-mapper",
+        "1.0.0",
+        &[(
+            "index.ts",
+            "import { creator, widget } from 'smudgy:@map-layout';\n\
+             globalThis.__dependency = { creator, widget };",
+        )],
+    );
+    root.key.owner.clear();
+    root.manifest = PackageManifest::parse(
+        r#"{"version":"1.0.0","dependencies":["smudgy:@map-layout@^0.2.9"]}"#,
+    )?;
+    let (tokio, mut rt) = runtime_with_packages(temp.path(), vec![dependency, root])?;
+    // Supply the host hooks so the real loader can synthesize and evaluate both virtual modules.
+    rt.deno_runtime().execute_script(
+        "<test-host-hooks>",
+        r#"
+        globalThis.__smudgy_create_api = creator => ({ createAlias: () => creator });
+        globalThis.__smudgy_make_widgets = (creator, module) => ({
+            createWidget: () => ({ creator, module }),
+        });
+        "#,
+    )?;
+    let set = ModuleSet {
+        local_modules: Vec::new(),
+        packages: vec!["smudgy:@arctic-mapper".into()],
+    };
+    tokio.block_on(async { rt.load_modules(&set).await })?;
+    assert!(eval_module_ok(
+        &tokio,
+        &mut rt,
+        temp.path(),
+        "verify_ownerless_dependency.js",
+        r#"
+        const { creator, widget } = globalThis.__dependency;
+        const isDependency = value => value.kind === 'package' && value.owner === ''
+            && value.name === 'map-layout' && value.version === '0.2.9';
+        export const ok = isDependency(creator) && isDependency(widget.creator)
+            && widget.module === 'lib/panel.ts';
+        "#,
+    )?);
+    Ok(())
+}
+
+#[test]
 fn shorthand_imports_and_reexports_share_the_explicit_package_instance() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let package = resolved(
