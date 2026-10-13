@@ -1339,6 +1339,15 @@ async fn a_write_refused_by_a_dissolving_clan_parks_with_its_refusal() {
         dir.join("cloud-cache"),
     );
     let mapper = Mapper::new(std::sync::Arc::new(cloud), dir.join("cache"));
+    // Loading maps does not establish the pending queue's viewer identity.
+    // Settle the startup sync before changing server state or submitting a write.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while mapper.sync_status().last_sync.is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("initial sync resolves cloud identity");
     mapper.load_all_areas().await.expect("loads");
     assert!(mapper.get_current_atlas().get_area(&grove).is_some());
 

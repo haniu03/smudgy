@@ -107,7 +107,7 @@ fn runtime(host: Arc<AudioHost>, limits: AudioLimits, fixtures: Option<&Fixtures
     }
     runtime
 }
-async fn run(runtime: &mut JsRuntime, script: &'static str) {
+async fn run(runtime: &mut JsRuntime, script: &str) {
     runtime.execute_script("file_source.js", format!("globalThis.done = false; (async () => {{ const {{ createFileSource, AudioFileSourceNode, Audio }} = globalThis.__testMedia; {script}\n globalThis.done = true; }})();")).unwrap();
     tokio::time::timeout(
         Duration::from_secs(15),
@@ -267,19 +267,42 @@ async fn media_player_load_errors_are_observable_and_retry_requires_load() {
             .max_streaming_jobs(Some(1)),
     ));
     let mut runtime = runtime(Arc::clone(&host), AudioLimits::default(), Some(&fixtures));
-    run(&mut runtime, r"
-        const audio = new Audio();
+    runtime
+        .execute_script(
+            "load_error_player.js",
+            r"
+        const audio = new __testMedia.Audio();
         let endedCount = 0;
         audio.onended = () => endedCount++;
-        for (const source of ['denied', 'bad']) {
-            const failed = new Promise(resolve => { audio.onerror = resolve; });
-            audio.src = source;
+    ",
+        )
+        .unwrap();
+    for source in ["denied", "bad"] {
+        run(
+            &mut runtime,
+            &format!(
+                r"
+            const failed = new Promise(resolve => {{ audio.onerror = resolve; }});
+            audio.src = {source:?};
             await failed;
             if (!audio.error || !audio.paused || audio.ended) throw new Error('bad error state');
+            if (audio.error.name === 'QuotaExceededError') throw audio.error;
             let rejected = false;
-            try { await audio.play(); } catch (e) { rejected = e === audio.error; }
+            try {{ await audio.play(); }} catch (e) {{ rejected = e === audio.error; }}
             if (!rejected) throw new Error('failed play did not reject with load error');
-        }
+        "
+            ),
+        )
+        .await;
+        // The error event and close receipt can precede the observer threads'
+        // quota release. Keep the same player and its error state, but wait for
+        // its context and decoder allowance before testing another load.
+        assert_usage_settles(&host, |usage| {
+            usage.online_contexts() == 0 && usage.streaming_jobs() == 0
+        })
+        .await;
+    }
+    run(&mut runtime, r"
         audio.src = 'short';
         audio.load();
         const ended = new Promise(resolve => { audio.onended = resolve; });
