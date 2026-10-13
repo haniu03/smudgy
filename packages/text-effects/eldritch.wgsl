@@ -9,8 +9,8 @@ fn power() -> f32 { return min(params.intensity * params.amplitude * text.effect
 fn quiet() -> bool { return params.speed <= 0.0 || power() <= 0.0 || envelope(phase()) < 0.0001 || glyphsTruncated(); }
 fn wave(p: f32, x: f32) -> f32 { return sin(p * 6.2831853 + x * 2.3) * envelope(p); }
 fn effect(p: vec2f) -> vec4f { if quiet() { return sampleText(p); } return vec4f(0); }
-fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
-    if quiet() { return SmudgyFragment(vec2f(0),vec2f(0),1.0,0.0); }
+fn textVertex(instance: u32, corner: vec2f) -> Fragment {
+    if quiet() { return Fragment(vec2f(0),vec2f(0),1.0,0.0); }
     let index = instance / TEXT_FRAGMENTS;
     let piece = instance % TEXT_FRAGMENTS;
     let glyph = glyphAt(index);
@@ -49,7 +49,7 @@ fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
     var local = source-pivot;
     local.x += local.y*shear;
     let rotated = vec2f(local.x*cos(angle)-local.y*sin(angle),local.x*sin(angle)+local.y*cos(angle));
-    return SmudgyFragment(pivot+rotated+offset,source,1.0,opacity);
+    return Fragment(pivot+rotated+offset,source,1.0,opacity);
 }
 fn textFragment(color: vec4f, source: vec2f, instance: u32) -> vec4f {
     if params.variant<0.5 && instance%TEXT_FRAGMENTS<3u {

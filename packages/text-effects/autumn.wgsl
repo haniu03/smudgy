@@ -27,10 +27,10 @@ fn cellBounds(index: u32) -> vec4f {
     let tile=vec2f(f32(index%3u),f32((index%9u)/3u));
     return vec4f(lo+tile*size,size);
 }
-fn textVertex(index: u32, corner: vec2f) -> SmudgyFragment {
+fn textVertex(index: u32, corner: vec2f) -> Fragment {
     let d=dispersion();
     if d<0.0001 || (glyphsTruncated() && index/9u>0u) {
-        return SmudgyFragment(vec2f(0),vec2f(0),1.0,0.0);
+        return Fragment(vec2f(0),vec2f(0),1.0,0.0);
     }
     let bounds=cellBounds(index);let center=bounds.xy+bounds.zw*0.5;
     let seed=f32(index)+13.0;let power=min(params.intensity*params.amplitude*text.effect_scale,3.0);
@@ -49,7 +49,7 @@ fn textVertex(index: u32, corner: vec2f) -> SmudgyFragment {
     for(var y=0u;y<3u;y++){for(var x=0u;x<3u;x++){
         ink=max(ink,coverage(bounds.xy+bounds.zw*(vec2f(f32(x),f32(y))+vec2f(0.5))/3.0));
     }}
-    return SmudgyFragment(center+offset+rotated,source,1.0,mix(1.0,ink,smoothstep(0.05,0.55,d)));
+    return Fragment(center+offset+rotated,source,1.0,mix(1.0,ink,smoothstep(0.05,0.55,d)));
 }
 fn textFragment(color: vec4f, source: vec2f, index: u32) -> vec4f {
     let bounds=cellBounds(index);let uv=(source-bounds.xy)/bounds.zw*2.0-1.0;

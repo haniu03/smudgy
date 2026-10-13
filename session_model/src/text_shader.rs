@@ -29,6 +29,43 @@ pub const HOST: &str = concat!(
     include_str!("text_shader.wgsl")
 );
 
+const RESOURCE_NAMES: [&str; 6] = [
+    "text",
+    "textTexture",
+    "textSampler",
+    "glyphTable",
+    "noiseTexture",
+    "noiseSampler",
+];
+const LEGACY_RESOURCE_NAMES: [&str; 6] = [
+    "text",
+    "smudgy_glyphs",
+    "smudgy_sampler",
+    "smudgy_geometry",
+    "smudgy_noise",
+    "smudgy_noise_sampler",
+];
+
+/// Try the neutral interface first, then the previous resource vocabulary.
+/// Only host declarations change: author identifiers, parameters and line numbers
+/// remain intact. WGSL type aliases handle the previous struct names in both paths.
+fn parse_declarations(label: &str, source: &str) -> Result<(naga::Module, String, bool), String> {
+    let declarations = format!("{source}\n{COMMON}");
+    match naga::front::wgsl::parse_str(&declarations) {
+        Ok(module) => Ok((module, declarations, false)),
+        Err(error) => {
+            let mut common = COMMON.to_owned();
+            for (name, legacy) in RESOURCE_NAMES.iter().zip(LEGACY_RESOURCE_NAMES).skip(1) {
+                common = common.replace(name, legacy);
+            }
+            let legacy = format!("{source}\n{common}");
+            naga::front::wgsl::parse_str(&legacy)
+                .map(|module| (module, legacy, true))
+                .map_err(|_| format!("{label}: {}", error.emit_to_string(&declarations)))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     pub name: String,
@@ -65,9 +102,7 @@ impl Shader {
             return Err("WGSL source exceeds 64 KiB".into());
         }
         // Author source comes first so reported lines match the imported file.
-        let declarations = format!("{source}\n{COMMON}");
-        let declarations = naga::front::wgsl::parse_str(&declarations)
-            .map_err(|e| format!("{label}: {}", e.emit_to_string(&declarations)))?;
+        let (declarations, linked_source, legacy_resources) = parse_declarations(label, source)?;
         let instanced = declarations
             .functions
             .iter()
@@ -98,11 +133,11 @@ impl Shader {
         };
         let source = if instanced {
             format!(
-                "{source}\n{COMMON}\n{}",
+                "{linked_source}\n{}",
                 include_str!("text_shader_fragments.wgsl")
             )
         } else {
-            format!("{source}\n{HOST}")
+            format!("{linked_source}\n{}", include_str!("text_shader.wgsl"))
         };
         let module = naga::front::wgsl::parse_str(&source)
             .map_err(|e| format!("{label}: {}", e.emit_to_string(&source)))?;
@@ -116,7 +151,7 @@ impl Shader {
             || module
                 .entry_points
                 .iter()
-                .any(|e| !["smudgy_vs", "smudgy_fs"].contains(&e.name.as_str()))
+                .any(|e| !["te_host_vs", "te_host_fs"].contains(&e.name.as_str()))
         {
             return Err(format!(
                 "{label}: supply effect(position: vec2f) -> vec4f, without entry points"
@@ -130,23 +165,18 @@ impl Shader {
         let mut fields = Vec::new();
         let mut parameters_seen = false;
         let mut uniform_size = 16;
+        let resource_names = if legacy_resources {
+            LEGACY_RESOURCE_NAMES
+        } else {
+            RESOURCE_NAMES
+        };
         for (_, global) in module.global_variables.iter() {
             let Some(binding) = &global.binding else {
                 continue;
             };
             if binding.group == 0
                 && binding.binding <= 5
-                && global.name.as_deref()
-                    == Some(
-                        [
-                            "text",
-                            "smudgy_glyphs",
-                            "smudgy_sampler",
-                            "smudgy_geometry",
-                            "smudgy_noise",
-                            "smudgy_noise_sampler",
-                        ][binding.binding as usize],
-                    )
+                && global.name.as_deref() == Some(resource_names[binding.binding as usize])
             {
                 continue;
             }

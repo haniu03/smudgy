@@ -45,13 +45,13 @@ fn effect(p:vec2f)->vec4f{
     if power()<0.0001{return sampleText(p);}
     return vec4f(0);
 }
-fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment{
-    if power()<0.0001 || (glyphsTruncated() && instance/12u>0u){return SmudgyFragment(vec2f(0),vec2f(0),1,0);}
+fn textVertex(instance:u32,corner:vec2f)->Fragment{
+    if power()<0.0001 || (glyphsTruncated() && instance/12u>0u){return Fragment(vec2f(0),vec2f(0),1,0);}
     let box=bounds(instance);let source=box.xy+corner*box.zw;let loss=lost(instance);
     let doubt=loss*(1.0-loss)*4.0*smoothstep(0.43,0.60,phase());
     let seed=hash(f32(instance)+11.0);
     let offset=vec2f(seed-0.5,hash(f32(instance)+15.0)-0.5)*doubt*1.8*text.effect_scale;
-    return SmudgyFragment(source+offset,source,1,1);
+    return Fragment(source+offset,source,1,1);
 }
 fn textFragment(original:vec4f,p:vec2f,instance:u32)->vec4f{
     let loss=lost(instance);

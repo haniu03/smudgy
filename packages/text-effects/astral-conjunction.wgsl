@@ -69,9 +69,9 @@ fn effect(p:vec2f)->vec4f {
     let tint=mix(mix(params.bright.rgb,params.accent.rgb,conjunction),params.base.rgb*0.48,lightBackground);
     return vec4f(tint*a,a);
 }
-fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment {
+fn textVertex(instance:u32,corner:vec2f)->Fragment {
     let index=instance/3u;let plane=instance%3u;
-    if power()<0.0001 || (glyphsTruncated() && index>0u) { return SmudgyFragment(vec2f(0),vec2f(0),1,0); }
+    if power()<0.0001 || (glyphsTruncated() && index>0u) { return Fragment(vec2f(0),vec2f(0),1,0); }
     let box=column(index);let source=box.xy+corner*box.zw;
     let word=vec2f(text.text_size.x*0.5,textBaseline());let local=source-word;
     let side=select(-1.0,1.0,plane==1u);let o=orbit();
@@ -85,7 +85,7 @@ fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment {
     let camera=max(text.text_size.x*1.5,240.0);let w=max(0.65,1.0+depth/camera);
     let position=pivot()+rotated*zoom()/w;
     let alpha=select(1.0,o*0.34,plane>0u);
-    return SmudgyFragment(position,source,w,alpha);
+    return Fragment(position,source,w,alpha);
 }
 fn textFragment(ink:vec4f,p:vec2f,instance:u32)->vec4f {
     let plane=instance%3u;

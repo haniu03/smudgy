@@ -1,5 +1,101 @@
 use super::*;
 
+const NEUTRAL_SHADER: &str = r"
+const TEXT_EFFECT_VERSION: u32 = 1u;
+fn effect(position: vec2f) -> vec4f {
+    let frame: TextFrame = text;
+    let table: GlyphTable = glyphTable;
+    let glyph: Glyph = glyphAt(0u);
+    let uv = (position - frame.capture_offset) * frame.scale / frame.texture_size;
+    let color = textureSampleLevel(textTexture, textSampler, uv, 0.0);
+    let noise = textureSampleLevel(noiseTexture, noiseSampler, uv, 0.0).r;
+    return color * noise + vec4f(f32(table.info.x) + glyph.advance.x) * 0.0;
+}
+";
+const NEUTRAL_QUADS: &str = r"
+const TEXT_FRAGMENTS: u32 = 2u;
+fn textVertex(instance: u32, corner: vec2f) -> Fragment {
+    let glyph: Glyph = glyphAt(instance / TEXT_FRAGMENTS);
+    let source = glyph.advance.xy + corner * glyph.advance.zw;
+    return Fragment(source, source, 1.0, 1.0);
+}
+fn textFragment(color: vec4f, source: vec2f, instance: u32) -> vec4f {
+    return color;
+}
+";
+
+#[test]
+fn neutral_types_and_resources_work_in_both_shader_paths() {
+    for quads in ["", NEUTRAL_QUADS] {
+        let source = format!("{NEUTRAL_SHADER}{quads}");
+        let shader = Shader::compile("neutral.wgsl", &source).unwrap();
+        assert_eq!(
+            shader.fragments_per_glyph,
+            if quads.is_empty() { 0 } else { 2 }
+        );
+        assert!(shader.source.starts_with(&source));
+    }
+}
+
+#[test]
+fn legacy_type_aliases_and_resource_names_preserve_existing_shader_sources() {
+    let neutral = format!("{NEUTRAL_SHADER}{NEUTRAL_QUADS}");
+    let old_types = neutral
+        .replace("TextFrame", "SmudgyTextFrame")
+        .replace("GlyphTable", "SmudgyGlyphTable")
+        .replace(": Glyph", ": SmudgyGlyph")
+        .replace("-> Fragment", "-> SmudgyFragment")
+        .replace("return Fragment(", "return SmudgyFragment(");
+    // Exercise aliases with neutral resources, then an entirely legacy shader.
+    let old_resources = old_types
+        .replace("textTexture", "smudgy_glyphs")
+        .replace("textSampler", "smudgy_sampler")
+        .replace("glyphTable", "smudgy_geometry")
+        .replace("noiseTexture", "smudgy_noise")
+        .replace("noiseSampler", "smudgy_noise_sampler");
+    for source in [old_types, old_resources] {
+        // Names in the author's parameter schema must not be rewritten.
+        let source = format!(
+            "struct Parameters {{ textTexture: f32, smudgy_glyphs: f32 }}\n\
+             @group(1) @binding(0) var<uniform> params: Parameters;\n{source}"
+        );
+        let shader = Shader::compile("existing.wgsl", &source).unwrap();
+        assert!(shader.source.starts_with(&source));
+        assert_eq!(shader.fragments_per_glyph, 2);
+        let values = serde_json::json!({"textTexture": 0.5, "smudgy_glyphs": 0.75});
+        let bytes = shader.uniforms(values.as_object().unwrap()).unwrap();
+        assert_eq!(&bytes[..4], &0.5_f32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0.75_f32.to_le_bytes());
+    }
+}
+
+#[test]
+fn legacy_resources_do_not_allow_additional_host_bindings() {
+    let source = "@group(0) @binding(1) var extra: texture_2d<f32>; \
+        fn effect(p: vec2f) -> vec4f { \
+        return textureSampleLevel(smudgy_glyphs, smudgy_sampler, p, 0.0); }";
+    assert!(Shader::compile("legacy-extra.wgsl", source).is_err());
+}
+
+#[test]
+fn bundled_shader_catalogue_compiles_with_the_shared_interface() {
+    let catalogue =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../packages/text-effects");
+    let mut count = 0;
+    for entry in std::fs::read_dir(catalogue).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "wgsl")
+        {
+            let source = std::fs::read_to_string(&path).unwrap();
+            Shader::compile(&path.display().to_string(), &source).unwrap();
+            count += 1;
+        }
+    }
+    assert!(count > 0, "the catalogue must contain shaders");
+}
+
 #[test]
 fn source_and_uniform_buffers_obey_their_byte_limits() {
     let mut source = "fn effect(p: vec2f) -> vec4f { return sampleText(p); }".to_owned();
@@ -92,7 +188,7 @@ fn scale_and_finite_envelopes_are_bounded_and_finish_cleanly() {
 
 #[test]
 fn fragment_abi_requires_a_bounded_constant_and_valid_signatures() {
-    let functions = "fn effect(p:vec2f)->vec4f{return vec4f(0);} fn textVertex(i:u32,c:vec2f)->SmudgyFragment{return SmudgyFragment(c,c,1.0,1.0);} fn textFragment(c:vec4f,p:vec2f,i:u32)->vec4f{return c;}";
+    let functions = "fn effect(p:vec2f)->vec4f{return vec4f(0);} fn textVertex(i:u32,c:vec2f)->Fragment{return Fragment(c,c,1.0,1.0);} fn textFragment(c:vec4f,p:vec2f,i:u32)->vec4f{return c;}";
     for (count, expected) in [("1u", 1), ("16u", 16), ("64u", 64), ("8u*8u", 64)] {
         let shader = Shader::compile(
             "quads",

@@ -143,18 +143,18 @@ fn effect(p: vec2f) -> vec4f {
     if condensation() >= 0.9999 { return sampleText(p); }
     return sampleText(p) * (1.0 - min(params.intensity, 1.0));
 }
-fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
+fn textVertex(instance: u32, corner: vec2f) -> Fragment {
     let gather = condensation();
-    if gather >= 0.9999 { return SmudgyFragment(vec2f(0), vec2f(0), 1.0, 0.0); }
+    if gather >= 0.9999 { return Fragment(vec2f(0), vec2f(0), 1.0, 0.0); }
     let body = bodyAt(instance, gather);
-    if body.hi <= body.lo { return SmudgyFragment(vec2f(0), vec2f(0), 1.0, 0.0); }
+    if body.hi <= body.lo { return Fragment(vec2f(0), vec2f(0), 1.0, 0.0); }
     let scatter = 1.0 - gather;
     let s = text.effect_scale;
     let opening = 1.0 - smoothstep(0.08, 0.55, gather);
     let extent = length(vec2f(body.hi - body.lo, text.text_size.y + 4.0) * body.stretch * 0.5)
         + (62.0 + 48.0 * opening) * s * scatter;
     let position = body.root + body.drift + (corner * 2.0 - 1.0) * extent;
-    return SmudgyFragment(position, position, 1.0, min(params.intensity, 1.0));
+    return Fragment(position, position, 1.0, min(params.intensity, 1.0));
 }
 fn textFragment(unused: vec4f, p: vec2f, instance: u32) -> vec4f {
     let gather = condensation();

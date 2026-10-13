@@ -36,9 +36,9 @@ fn effect(p:vec2f)->vec4f{
     // Reduce premultiplied colour and opacity together, on light as well as dark terminals.
     return vec4f(truth,ink.a)*mix(1.0,0.22,(1.0-seeing)*strength);
 }
-fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment{
+fn textVertex(instance:u32,corner:vec2f)->Fragment{
     let strength=power();let index=instance/2u;
-    if strength<0.0001 || (glyphsTruncated() && index>0u){return SmudgyFragment(vec2f(0),vec2f(0),1,0);}
+    if strength<0.0001 || (glyphsTruncated() && index>0u){return Fragment(vec2f(0),vec2f(0),1,0);}
     let box=column(index);let source=box.xy+corner*box.zw;let center=box.xy+box.zw*0.5;
     let seed=hash(f32(instance)+2.0);let side=select(-1.0,1.0,instance%2u==0u);
     let reveal=cleared(center.x/max(text.text_size.x,1.0));
@@ -47,7 +47,7 @@ fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment{
     let local=(source-center)*vec2f(1.0+side*0.20*strength,1.0);
     let rotated=vec2f(local.x*cos(angle)-local.y*sin(angle),local.x*sin(angle)+local.y*cos(angle));
     let offset=vec2f(side*(2.3+away*(8.0+seed*7.0)),side*(0.7+away*6.0))*strength*s;
-    return SmudgyFragment(center+rotated+offset,source,1.0+away*0.18,
+    return Fragment(center+rotated+offset,source,1.0+away*0.18,
         strength*(1.0-away)*0.70);
 }
 fn textFragment(original:vec4f,p:vec2f,instance:u32)->vec4f{

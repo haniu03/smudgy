@@ -49,14 +49,14 @@ fn effect(p: vec2f) -> vec4f {
     let a=energy*tint.a*(1.0-source.a);
     return source+vec4f(tint.rgb*a,a);
 }
-fn textVertex(index:u32,corner:vec2f) -> SmudgyFragment {
+fn textVertex(index:u32,corner:vec2f) -> Fragment {
     if params.variant<0.5 || power()<0.0001 || index+1u>=glyphCount() || glyphsTruncated() {
-        return SmudgyFragment(vec2f(0),vec2f(0),1.0,0.0);
+        return Fragment(vec2f(0),vec2f(0),1.0,0.0);
     }
     let a=anchor(index);let b=anchor(index+1u);let h=text.text_size.y*text.effect_scale;
     let lo=min(a,b)-vec2f(5,h*0.72);let hi=max(a,b)+vec2f(5,h*0.72);
     let p=mix(lo,hi,corner);
-    return SmudgyFragment(p,p,1.0,1.0);
+    return Fragment(p,p,1.0,1.0);
 }
 fn textFragment(unused:vec4f,p:vec2f,index:u32) -> vec4f {
     let a=anchor(index);let b=anchor(index+1u);let s=text.effect_scale;

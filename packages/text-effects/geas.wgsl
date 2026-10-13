@@ -31,15 +31,15 @@ fn tension(index:u32)->f32 {
     return bound(index)*(0.7+struggle*0.3);
 }
 fn effect(p:vec2f)->vec4f { return sampleText(p)*(1.0-power()); }
-fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment {
+fn textVertex(instance:u32,corner:vec2f)->Fragment {
     let index=instance/2u;let thread=instance%2u==1u;
-    if power()<0.0001 || (glyphsTruncated() && index>0u) { return SmudgyFragment(vec2f(0),vec2f(0),1,0); }
+    if power()<0.0001 || (glyphsTruncated() && index>0u) { return Fragment(vec2f(0),vec2f(0),1,0); }
     let box=column(index);let pad=select(0.0,4.0*text.effect_scale,thread);
     let source=box.xy-vec2f(pad)+(box.zw+vec2f(pad*2.0))*corner;
     let pivot=vec2f(box.x+box.z*0.5,glyphBaseline(index));
     let local=source-pivot;let tight=tension(index)*min(text.effect_scale,2.0)*sqrt(params.intensity);
     let position=pivot+vec2f(local.x*(1.0-tight*0.15)+local.y*tight*0.055,local.y);
-    return SmudgyFragment(position,source,1,power());
+    return Fragment(position,source,1,power());
 }
 fn textFragment(ink:vec4f,p:vec2f,instance:u32)->vec4f {
     let index=instance/2u;let g=glyphAt(index);let tight=bound(index);let s=text.effect_scale;

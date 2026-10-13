@@ -20,12 +20,12 @@ fn effect(p: vec2f) -> vec4f {
     if dispersion() <= 0.0001 || params.amplitude <= 0.0 { return sampleText(p); }
     return vec4f(0);
 }
-fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
+fn textVertex(instance: u32, corner: vec2f) -> Fragment {
     let glyphIndex = instance / TEXT_FRAGMENTS;
     let piece = instance % TEXT_FRAGMENTS;
     let d = dispersion();
     if d <= 0.0001 || params.amplitude <= 0.0 || (glyphsTruncated() && glyphIndex > 0u) {
-        return SmudgyFragment(vec2f(0), vec2f(0), 1.0, 0.0);
+        return Fragment(vec2f(0), vec2f(0), 1.0, 0.0);
     }
     let glyph = glyphAt(glyphIndex);
     var lo = vec2f(glyph.advance.x, -2);
@@ -69,7 +69,7 @@ fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
     }
     let local = (source - center) * scale;
     let rotated = vec2f(local.x * cos(angle) - local.y * sin(angle), local.x * sin(angle) + local.y * cos(angle));
-    return SmudgyFragment(center + offset + rotated, source, 1.0, 1.0);
+    return Fragment(center + offset + rotated, source, 1.0, 1.0);
 }
 fn textFragment(color: vec4f, source: vec2f, instance: u32) -> vec4f {
     // Shade the pile enough to read its granular relief, keeping the source hue.

@@ -53,8 +53,8 @@ fn effect(p:vec2f)->vec4f {
     let rgb=vec3f(0.003,0.002,0.007)*hole*(1.0-glow)+shade.rgb*glow;
     return vec4f(min(rgb,vec3f(max(alpha,glow))),max(alpha,glow));
 }
-fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment {
-    if energy()<0.0001 || glyphsTruncated(){return SmudgyFragment(vec2f(0),vec2f(0),1,0);}
+fn textVertex(instance:u32,corner:vec2f)->Fragment {
+    if energy()<0.0001 || glyphsTruncated(){return Fragment(vec2f(0),vec2f(0),1,0);}
     let index=instance/32u;let piece=instance%16u;let trail=instance%32u>=16u;
     let g=glyphAt(index);
     var lo=g.advance.xy-vec2f(0,2);var hi=g.advance.xy+g.advance.zw+vec2f(0,2);
@@ -84,7 +84,7 @@ fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment {
     let position=mix(source,destination+stretched,flight);
     let swallowed=ease(0.44,0.64,t)*(1.0-ease(0.67,0.90,t));
     let opacity=(1.0-swallowed)*select(1.0,flight*0.27,trail);
-    return SmudgyFragment(position,source,1.0,opacity);
+    return Fragment(position,source,1.0,opacity);
 }
 fn textFragment(ink:vec4f,p:vec2f,instance:u32)->vec4f {
     let tint=ease(0.12,0.48,hp())*(1.0-ease(0.72,0.99,hp()))*energy()*params.accent.a;

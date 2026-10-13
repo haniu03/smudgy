@@ -361,13 +361,13 @@ impl Programs {
                 layout: Some(&layout),
                 vertex: wgpu::VertexState {
                     module: &module,
-                    entry_point: Some("smudgy_vs"),
+                    entry_point: Some("te_host_vs"),
                     buffers: &[],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
-                    entry_point: Some("smudgy_fs"),
+                    entry_point: Some("te_host_fs"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: self.format,
                         blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),

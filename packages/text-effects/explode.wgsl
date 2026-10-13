@@ -32,14 +32,14 @@ fn effect(p: vec2f) -> vec4f {
     let alpha = min(ring, 0.7) * params.accent.a;
     return vec4f(params.accent.rgb * alpha + color.rgb * (1.0 - alpha), alpha + color.a * (1.0 - alpha));
 }
-fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
+fn textVertex(instance: u32, corner: vec2f) -> Fragment {
     let glyphIndex = instance / TEXT_FRAGMENTS;
     let piece = instance % TEXT_FRAGMENTS;
     let side = u32(clamp(params.pieces, 2.0, 4.0));
     let phase = explodePhase();
     if piece >= side * side || phase < 0.18 || phase >= 0.91 || params.intensity <= 0.0
         || (glyphsTruncated() && glyphIndex > 0u) {
-        return SmudgyFragment(vec2f(0), vec2f(0), 1.0, 0.0);
+        return Fragment(vec2f(0), vec2f(0), 1.0, 0.0);
     }
     let glyph = glyphAt(glyphIndex);
     var lo = vec2f(glyph.advance.x, -2.0);
@@ -65,7 +65,7 @@ fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
     let camera = max(text.text_size.y * 8.0, 180.0);
     let travel = flight * (0.55 + explodeHash(seed + 4.0) * 0.7);
     let depth = direction.z * camera * params.depth * travel;
-    if -depth / camera >= 0.90 { return SmudgyFragment(vec2f(0), vec2f(0), 1.0, 0.0); }
+    if -depth / camera >= 0.90 { return Fragment(vec2f(0), vec2f(0), 1.0, 0.0); }
     let xy = direction.xy * max(min(text.surface.x, text.surface.y) * 0.60, 90.0) * travel * params.spread;
     let angle = (vec3f(explodeHash(seed + 6.0), explodeHash(seed + 7.0), explodeHash(seed + 8.0)) * 2.0 - 1.0)
         * travel * params.spin * 9.0;
@@ -82,7 +82,7 @@ fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
     let visible = piece < side * side && phase >= 0.18 && phase < 0.98 && params.intensity > 0.0
         && (!glyphsTruncated() || glyphIndex == 0u);
     // Fade fragments before the near plane; perspective never becomes unbounded.
-    return SmudgyFragment(position, source, w, select(0.0, fade, visible));
+    return Fragment(position, source, w, select(0.0, fade, visible));
 }
 fn textFragment(color: vec4f, source: vec2f, instance: u32) -> vec4f {
     let phase = explodePhase();

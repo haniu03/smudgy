@@ -42,10 +42,10 @@ fn effect(p:vec2f)->vec4f{
     return vec4f(0);
 }
 fn turn(p:vec2f,a:f32)->vec2f{return vec2f(p.x*cos(a)-p.y*sin(a),p.x*sin(a)+p.y*cos(a));}
-fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment{
+fn textVertex(instance:u32,corner:vec2f)->Fragment{
     let knot=power();
     if knot<0.0001 || (glyphsTruncated() && instance/12u>0u){
-        return SmudgyFragment(vec2f(0),vec2f(0),1,0);
+        return Fragment(vec2f(0),vec2f(0),1,0);
     }
     let box=bounds(instance);let source=box.xy+corner*box.zw;
     let center=box.xy+box.zw*0.5;
@@ -75,7 +75,7 @@ fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment{
         position=glyphCenter+turn(shear,angle);
         depth=1.0+wrong*0.15;
     }
-    return SmudgyFragment(position,source,depth,1.0);
+    return Fragment(position,source,depth,1.0);
 }
 fn textFragment(original:vec4f,p:vec2f,instance:u32)->vec4f{
     let knot=power();let ink=original;

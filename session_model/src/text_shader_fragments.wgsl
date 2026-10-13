@@ -1,25 +1,25 @@
 // Instanced text-fragment ABI. Instance zero paints the ordinary effect surface;
 // each remaining instance is an author-controlled, perspective-correct quad.
-struct SmudgyFragmentOutput {
+struct te_host_FragmentOutput {
     @builtin(position) position: vec4f,
     @location(0) source: vec2f,
     @location(1) opacity: f32,
     @location(2) @interpolate(flat) instance: u32,
 }
-@vertex fn smudgy_vs(@builtin(vertex_index) vertex: u32,
-    @builtin(instance_index) instance: u32) -> SmudgyFragmentOutput {
+@vertex fn te_host_vs(@builtin(vertex_index) vertex: u32,
+    @builtin(instance_index) instance: u32) -> te_host_FragmentOutput {
     let corners = array<vec2f, 6>(vec2f(0,0), vec2f(1,0), vec2f(0,1),
         vec2f(0,1), vec2f(1,0), vec2f(1,1));
     let corner = corners[vertex];
-    var fragment = SmudgyFragment(text.paint_offset + corner * text.surface,
+    var fragment = Fragment(text.paint_offset + corner * text.surface,
         vec2f(0), 1.0, 1.0);
     if instance > 0u { fragment = textVertex(instance - 1u, corner); }
     let position = (fragment.position - text.paint_offset) / text.surface;
     let w = max(fragment.perspective, 0.05);
-    return SmudgyFragmentOutput(vec4f((position * vec2f(2,-2) + vec2f(-1,1)) * w,
+    return te_host_FragmentOutput(vec4f((position * vec2f(2,-2) + vec2f(-1,1)) * w,
         0.0, w), fragment.source, fragment.opacity, instance);
 }
-@fragment fn smudgy_fs(v: SmudgyFragmentOutput) -> @location(0) vec4f {
+@fragment fn te_host_fs(v: te_host_FragmentOutput) -> @location(0) vec4f {
     let p = (v.position.xy - text.origin) / text.resolution * text.surface + text.paint_offset;
     var color = vec4f(0);
     if v.instance == 0u {

@@ -48,10 +48,10 @@ fn column(index:u32)->vec4f{
     return vec4f(lo,hi-lo);
 }
 fn bounds(index:u32)->vec4f{return column(index/3u);}
-fn textVertex(index:u32,corner:vec2f)->SmudgyFragment{
+fn textVertex(index:u32,corner:vec2f)->Fragment{
     let debt=drain();
     if debt<0.0001 || (glyphsTruncated() && index/3u>0u){
-        return SmudgyFragment(vec2f(0),vec2f(0),1,0);
+        return Fragment(vec2f(0),vec2f(0),1,0);
     }
     let box=bounds(index);let center=box.xy+box.zw*0.5;
     let source=box.xy+corner*box.zw;let seed=sh(f32(index)+2.0);
@@ -66,7 +66,7 @@ fn textVertex(index:u32,corner:vec2f)->SmudgyFragment{
     let local=(source-center)/depth;
     let rotated=vec2f(local.x*cos(angle)-local.y*sin(angle),local.x*sin(angle)+local.y*cos(angle));
     let opacity=smoothstep(0.03,0.20,t)*(1.0-smoothstep(0.64,0.98,t))*0.28;
-    return SmudgyFragment(position+rotated,source,depth,opacity*min(params.intensity,1.0));
+    return Fragment(position+rotated,source,depth,opacity*min(params.intensity,1.0));
 }
 fn textFragment(unused:vec4f,source:vec2f,index:u32)->vec4f{
     let box=bounds(index);

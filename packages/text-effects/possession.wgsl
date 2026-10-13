@@ -34,9 +34,9 @@ fn effect(p:vec2f)->vec4f{
     if power()<0.0001{return sampleText(p);}
     return vec4f(0);
 }
-fn textVertex(index:u32,corner:vec2f)->SmudgyFragment{
+fn textVertex(index:u32,corner:vec2f)->Fragment{
     let strength=power();
-    if strength<0.0001 || (glyphsTruncated() && index>0u){return SmudgyFragment(vec2f(0),vec2f(0),1,0);}
+    if strength<0.0001 || (glyphsTruncated() && index>0u){return Fragment(vec2f(0),vec2f(0),1,0);}
     let box=column(index);let padding=vec2f(3.5*text.effect_scale,0);
     let source=box.xy-padding+corner*(box.zw+padding*2.0);
     let center=box.xy+box.zw*0.5;
@@ -48,7 +48,7 @@ fn textVertex(index:u32,corner:vec2f)->SmudgyFragment{
     let lean=(hash(f32(index)+7.0)-0.5)*beat*0.22*resisting;
     let local=(source-pivot)*mix(vec2f(1),size,clamp(text.effect_scale,0.25,2.0));
     let position=pivot+vec2f(local.x+local.y*lean,local.y);
-    return SmudgyFragment(position,source,1,1);
+    return Fragment(position,source,1,1);
 }
 fn textFragment(original:vec4f,p:vec2f,index:u32)->vec4f{
     let strength=power();let box=column(index);let glyph=glyphAt(index);
