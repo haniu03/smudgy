@@ -142,6 +142,7 @@ deno_core::extension!(
     op_smudgy_widget_build_span,
     op_smudgy_widget_join_spans,
     op_smudgy_widget_compile_text_shader,
+    op_smudgy_widget_prepare_text_effect,
     op_smudgy_widget_build_text_effect,
     op_smudgy_widget_export_inline,
     op_smudgy_widget_terminal_metadata,
@@ -4173,6 +4174,9 @@ mod shader_permission_tests {
             .err()
             .expect("even an existing handle needs permission to build an effect");
         assert!(error.to_string().contains("widgets:shaders"));
+        let error = prepare_text_effect(&state, &shader, &spec, 0..0)
+            .expect_err("direct highlighting also needs current shader permission");
+        assert!(error.to_string().contains("widgets:shaders"));
     }
 }
 
@@ -4205,15 +4209,39 @@ struct TextEffectSpec {
     overflow: String,
     scale: f32,
     capture_scale: f32,
+    #[serde(deserialize_with = "deserialize_effect_integer")]
     fade_in: u32,
+    #[serde(deserialize_with = "deserialize_effect_integer")]
     fade_out: u32,
     uniforms: serde_json::Map<String, serde_json::Value>,
+    #[serde(deserialize_with = "deserialize_effect_integer")]
     duration: u32,
+    #[serde(deserialize_with = "deserialize_effect_integer")]
     outset: u16,
     composite: String,
     finish: String,
     animated: bool,
 }
+
+// serde_v8's integer conversion truncates fractions and saturates negatives/NaN.
+// Read the original number before conversion so every effect entry point rejects
+// invalid timing and outset values instead of silently changing their meaning.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn deserialize_effect_integer<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: TryFrom<u32>,
+{
+    let value = f64::deserialize(deserializer)?;
+    if !value.is_finite() || !(0.0..=f64::from(u32::MAX)).contains(&value) || value.fract() != 0.0 {
+        return Err(serde::de::Error::custom(
+            "TextEffect requires a nonnegative whole number",
+        ));
+    }
+    T::try_from(value as u32)
+        .map_err(|_| serde::de::Error::custom("TextEffect integer is out of range"))
+}
+
 #[op2]
 #[cppgc]
 #[allow(clippy::needless_pass_by_value)] // The serde op boundary owns its input.
@@ -4232,10 +4260,6 @@ fn build_text_effect(
     shader: &TextShaderHandle,
     spec: &TextEffectSpec,
 ) -> Result<Element, InlineError> {
-    use smudgy_session_model::{
-        inline_content::{InlineDecoration, TextEffect},
-        text_shader::ShaderEffect,
-    };
     ensure_widget_shaders(state)?;
     let content = child
         .inline
@@ -4246,6 +4270,37 @@ fn build_text_effect(
             "TextEffect's Span may contain styled text, but not widgets or nested effects".into(),
         );
     }
+    let effect = prepare_text_effect(state, shader, spec, 0..content.text_len())?;
+    let mut content = (**content).clone();
+    Arc::make_mut(&mut content.decorations).push(effect);
+    Ok(Element::from_inline(Arc::new(content)))
+}
+
+#[op2]
+#[allow(clippy::needless_pass_by_value)] // The serde op boundary owns its input.
+fn op_smudgy_widget_prepare_text_effect(
+    state: &mut OpState,
+    #[cppgc] shader: &TextShaderHandle,
+    #[serde] spec: TextEffectSpec,
+) -> Result<u32, InlineError> {
+    let effect = prepare_text_effect(state, shader, &spec, 0..0)?;
+    state
+        .borrow_mut::<smudgy_session_model::inline_content::InlineContentExchange>()
+        .put_effect(effect)
+        .map_err(Into::into)
+}
+
+fn prepare_text_effect(
+    state: &OpState,
+    shader: &TextShaderHandle,
+    spec: &TextEffectSpec,
+    range: std::ops::Range<usize>,
+) -> Result<smudgy_session_model::inline_content::InlineDecoration, InlineError> {
+    use smudgy_session_model::{
+        inline_content::{InlineDecoration, TextEffect},
+        text_shader::ShaderEffect,
+    };
+    ensure_widget_shaders(state)?;
     if spec.fade_in > 3_600_000
         || spec.fade_out > 3_600_000
         || spec.duration > 3_600_000
@@ -4260,8 +4315,8 @@ fn build_text_effect(
         .0
         .uniforms(&spec.uniforms)
         .map_err(InlineError::from)?;
-    let effect = InlineDecoration::new(
-        0..content.text_len(),
+    Ok(InlineDecoration::new(
+        range,
         TextEffect {
             shader: Arc::new(ShaderEffect {
                 pane: spec.overflow == "pane",
@@ -4282,10 +4337,7 @@ fn build_text_effect(
             outset: spec.outset,
         },
         state.borrow::<InlineLifetime>().0.clone(),
-    );
-    let mut content = (**content).clone();
-    Arc::make_mut(&mut content.decorations).push(effect);
-    Ok(Element::from_inline(Arc::new(content)))
+    ))
 }
 
 #[op2(fast)]

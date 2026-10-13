@@ -33,6 +33,7 @@ const {
     op_smudgy_widget_build_span,
     op_smudgy_widget_join_spans,
     op_smudgy_widget_compile_text_shader,
+    op_smudgy_widget_prepare_text_effect,
     op_smudgy_widget_build_text_effect,
     op_smudgy_widget_export_inline,
     op_smudgy_widget_terminal_metadata,
@@ -69,6 +70,22 @@ const spanElements = new WeakSet<object>();
 const terminalMetadata = new WeakMap<object, {text: string, outset: number}>();
 // One default for the effect op and the terminal metadata its ancestors inherit.
 const TEXT_EFFECT_DEFAULT_OUTSET = 32;
+
+// WGSL imports produce native handles, branded here only for overload dispatch.
+// Native ops still validate the handle and permissions independently.
+const textShaders = new WeakSet<object>();
+Object.defineProperty(globalThis, "__smudgy_is_text_shader", { value: (value: unknown) => textShaders.has(value as object) });
+function textEffectSpec(p: any = {}) {
+    return {
+        uniforms: p.uniforms ?? {}, duration: p.duration ?? 0, outset: p.outset ?? TEXT_EFFECT_DEFAULT_OUTSET,
+        overflow: p.overflow ?? "bounds", scale: p.scale ?? 1, fadeIn: p.fadeIn ?? 0, fadeOut: p.fadeOut ?? 0,
+        captureScale: p.captureScale ?? 1,
+        composite: p.composite ?? "underlay", finish: p.finish ?? "remove", animated: p.animated ?? true,
+    };
+}
+Object.defineProperty(globalThis, "__smudgy_prepare_text_effect", { value: (shader: any, options: any) =>
+    op_smudgy_widget_prepare_text_effect(shader, textEffectSpec(options ?? {}))
+});
 // Ordinary template literals coerce interpolations to strings. Keep a bounded,
 // isolate-local bridge so echo/line edits can recover the genuine native element.
 // Saved strings remain reusable while their references are in this LRU; retain a
@@ -137,6 +154,14 @@ function terminalElement(element: any) {
     return metadata ? op_smudgy_widget_terminal_metadata(element, metadata.text, metadata.outset) : element;
 }
 function markInline(element: any) { inlineElements.add(element); return element; }
+// Core snapshots rich terminal fragments natively. Brand the resulting Span in
+// this isolate so it is accepted by TextEffect just like an authored Span.
+Object.defineProperty(globalThis, "__smudgy_span_from_native", { value: (token: number) => {
+    const span = markInline(op_smudgy_widget_build_span(token));
+    spanElements.add(span);
+    Object.defineProperty(span, Symbol.toPrimitive, { value: () => interpolateElement(span) });
+    return span;
+} });
 Object.defineProperty(globalThis, "__smudgy_inline_content", { value: (element: any, values: any[] = []) => {
     if (Array.isArray(element) && Array.isArray(element.raw)) {
         const children = element.flatMap((text: string, index: number) => index < values.length ? [text, values[index]] : [text]);
@@ -341,12 +366,7 @@ function makeWidgets(creator: { kind: string } | string, module?: string) {
     const TextEffect = (props: any, children: any) => {
         const p = props ?? {};
         const child = textEffectChild(children);
-        return markInline(op_smudgy_widget_build_text_effect(child, p.shader, {
-            uniforms: p.uniforms ?? {}, duration: p.duration ?? 0, outset: p.outset ?? TEXT_EFFECT_DEFAULT_OUTSET,
-            overflow: p.overflow ?? "bounds", scale: p.scale ?? 1, fadeIn: p.fadeIn ?? 0, fadeOut: p.fadeOut ?? 0,
-            captureScale: p.captureScale ?? 1,
-            composite: p.composite ?? "underlay", finish: p.finish ?? "remove", animated: p.animated ?? true,
-        }));
+        return markInline(op_smudgy_widget_build_text_effect(child, p.shader, textEffectSpec(p)));
     };
 
     const Text = (props: Record<string, any>, children: any) =>
@@ -661,4 +681,8 @@ if ((globalThis as any).__smudgy_user_api) {
     });
 }
 
-Object.defineProperty(globalThis, "__smudgy_compile_text_shader", { value: op_smudgy_widget_compile_text_shader });
+Object.defineProperty(globalThis, "__smudgy_compile_text_shader", { value: (label: string, source: string) => {
+    const shader = op_smudgy_widget_compile_text_shader(label, source);
+    textShaders.add(shader);
+    return shader;
+} });

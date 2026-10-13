@@ -41,6 +41,16 @@ The host applies `fadeIn`/`fadeOut` after the shader. Underlays fade to transpar
 
 Use `composite="underlay"` to keep readable native text on top, or `composite="replace"` to supply its foreground. `finish="hold"` retains the final shader output; `finish="remove"` restores ordinary text. `animated={false}` disables continuous motion requests; finite lifetimes and fade-in still request frames until they finish. Glyph geometry and shader pipelines are cached; animation uses native presentation-frame requests and does not execute per-frame JavaScript. Software renderers retain ordinary text without running an effect.
 
+To apply an imported shader to existing terminal output, use
+`line.highlight("text", shader, { uniforms: { strength: 0.8 }, duration: 2000 })`
+or `line.highlightAt(begin, end, shader, options)` from `smudgy:core`. Both also
+work on `buffer.line(number)`. Options use the same validation and defaults as
+`TextEffect`. Each match preserves its existing styles, fonts and links, with one
+effect across the whole range. The direct overload batches matches natively and
+shares the validated shader settings; it creates no Span fragments. See the
+[highlighting guide](../packages/text-effects/README.md#highlight-existing-output)
+for examples and permissions.
+
 ## Host bindings and memory layout
 
 Group 0 belongs to the host. Authors may add one uniform struct at group 1, binding 0; its fields must be 32-bit numeric scalars or vectors. Every field must be supplied. Matrices, arrays, nested structs, booleans, pipeline overrides, custom textures and storage buffers are not supported.

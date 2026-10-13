@@ -45,6 +45,12 @@ use smudgy_cloud::{AreaId, WidgetIsolate, WidgetShadersEnabled, WidgetsEnabled};
 use super::script_uuid::ScriptUuid;
 use smudgy_script::SmudgyCapabilities;
 
+mod highlight;
+use highlight::{
+    op_smudgy_highlight_begin, op_smudgy_highlight_finish, op_smudgy_highlight_next,
+    op_smudgy_highlight_shader, op_smudgy_highlight_stage,
+};
+
 deno_core::extension!(
   smudgy_ops,
   ops = [
@@ -57,6 +63,11 @@ deno_core::extension!(
     op_smudgy_prepare_span,
     op_smudgy_echo_inline,
     op_smudgy_splice_inline,
+    op_smudgy_highlight_begin,
+    op_smudgy_highlight_next,
+    op_smudgy_highlight_stage,
+    op_smudgy_highlight_finish,
+    op_smudgy_highlight_shader,
     op_smudgy_session_reload,
     op_smudgy_session_connect,
     op_smudgy_session_disconnect,

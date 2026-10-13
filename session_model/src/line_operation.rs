@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+mod rich_highlight;
+pub use rich_highlight::RichHighlight;
+
 #[cfg(test)]
 use crate::LinkAction;
 use crate::{Color, LinkSpan, Style, StyleUpdate, StyledLine, StyledLink, TextAttributesUpdate};
@@ -35,6 +38,16 @@ pub enum LinkUpdate {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum LineOperation {
+    /// One prepared shader shared by sorted, non-overlapping text ranges.
+    HighlightShader {
+        ranges: Arc<Vec<std::ops::Range<usize>>>,
+        effect: Arc<crate::inline_content::InlineDecoration>,
+    },
+    /// Text-preserving callback highlights, ordered and non-overlapping. Apply
+    /// the complete batch without routing each run through a text splice.
+    HighlightRich {
+        highlights: Arc<Vec<RichHighlight>>,
+    },
     /// One atomic text splice with optional native visual decorations.
     SpliceRich {
         content: Arc<crate::inline_content::InlineContent>,
@@ -103,7 +116,9 @@ impl LineOperation {
     #[doc(hidden)]
     pub fn preserves_text_before(&self, boundary: usize) -> bool {
         match self {
-            Self::Highlight { .. } => true,
+            Self::Highlight { .. } | Self::HighlightRich { .. } | Self::HighlightShader { .. } => {
+                true
+            }
             Self::Insert { begin, .. }
             | Self::Replace { begin, .. }
             | Self::Remove { begin, .. }
@@ -115,6 +130,10 @@ impl LineOperation {
     #[must_use]
     pub fn apply(&self, line: &Arc<StyledLine>) -> Arc<StyledLine> {
         match self {
+            Self::HighlightShader { ranges, effect } => {
+                rich_highlight::apply_shader(line, ranges, effect)
+            }
+            Self::HighlightRich { highlights } => rich_highlight::apply(line, highlights),
             Self::SpliceRich {
                 content,
                 begin,

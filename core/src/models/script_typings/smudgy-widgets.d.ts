@@ -131,30 +131,12 @@ declare module "smudgy:widgets" {
     export type TextEffectChildren = TextEffectText | TextEffectText[] | SmudgyElement | [SmudgyElement];
     /** Opaque validated WGSL module, produced by importing a .wgsl file.
      *  Sandboxed packages require permissions.smudgy.widgets: ["shaders"]. */
-    export interface TextShader { readonly __textShader: unique symbol; }
-    export type ShaderUniforms = Record<string, number | readonly number[]>;
+    export type TextShader = import("smudgy:core").TextShader;
+    export type ShaderUniforms = import("smudgy:core").ShaderUniforms;
+    export type TextEffectOptions = import("smudgy:core").TextEffectOptions;
     /** A text-only GPU shader. Its Span supplies typography, links and selection. */
-    export interface TextEffectProps {
+    export interface TextEffectProps extends TextEffectOptions {
         shader: TextShader;
-        /** Pane paints across the containing viewport while the anchor is visible. */
-        overflow?: "bounds" | "pane";
-        /** Named parameters must match the WGSL uniform struct exactly. */
-        uniforms?: ShaderUniforms;
-        /** Milliseconds, 0..3600000. Zero continues until removed. */
-        duration?: number;
-        /** Effect geometry, 0.25..4; shaders read text.effect_scale. Does not alter native text layout. */
-        scale?: number;
-        /** Glyph resolution multiplier, 1..8, default 1. Cached once and capped by the input texture budget. */
-        captureScale?: number;
-        /** Attack/release in milliseconds. Overlapping fades are shortened to fit duration. */
-        fadeIn?: number;
-        fadeOut?: number;
-        /** Logical pixels, 0..2048, default 32. Does not enlarge line layout. */
-        outset?: number;
-        composite?: "underlay" | "replace";
-        finish?: "hold" | "remove";
-        /** Continuous motion; finite lifetimes and fade-in still schedule frames. */
-        animated?: boolean;
         children?: TextEffectChildren;
     }
     export type InlineElement = SmudgyElement & SmudgyInlineElement;
