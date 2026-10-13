@@ -1018,6 +1018,17 @@ pub(crate) struct PendingActions {
 }
 
 impl PendingActions {
+    /// Pending edits used when snapshotting a stored line for a rich highlight.
+    pub(crate) fn line_operations(&self, number: usize) -> impl Iterator<Item = &LineOperation> {
+        self.actions.iter().filter_map(move |action| match action {
+            RuntimeAction::PerformLineOperation {
+                line_number,
+                operation,
+            } if *line_number == number => Some(operation.as_ref()),
+            _ => None,
+        })
+    }
+
     #[cfg(feature = "bench-api")]
     pub(crate) fn len(&self) -> usize {
         self.actions.len()

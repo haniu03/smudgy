@@ -67,6 +67,11 @@ const {
     op_smudgy_prepare_span,
     op_smudgy_echo_inline,
     op_smudgy_splice_inline,
+    op_smudgy_highlight_begin,
+    op_smudgy_highlight_next,
+    op_smudgy_highlight_stage,
+    op_smudgy_highlight_finish,
+    op_smudgy_highlight_shader,
     op_smudgy_session_reload,
     op_smudgy_session_connect,
     op_smudgy_session_disconnect,
@@ -1671,6 +1676,28 @@ function __styled_splice_args(
 // runtime never needs to load widget ops. The adapter returns a single-use native
 // exchange token only for genuine elements with terminal metadata.
 interface InlineElementLike { readonly __smudgyWidgetElement: true; }
+interface TextShaderLike { readonly __textShader: symbol; }
+interface TextEffectOptions {
+    uniforms?: Record<string, number | readonly number[]>;
+    duration?: number;
+    scale?: number;
+    captureScale?: number;
+    fadeIn?: number;
+    fadeOut?: number;
+    outset?: number;
+    overflow?: "bounds" | "pane";
+    composite?: "underlay" | "replace";
+    finish?: "hold" | "remove";
+    animated?: boolean;
+}
+function __is_text_shader(value: unknown): value is TextShaderLike {
+    return typeof value === "object" && value !== null
+        && ((globalThis as any).__smudgy_is_text_shader?.(value) ?? false);
+}
+type HighlightTransform = (span: InlineElementLike & { [Symbol.toPrimitive](hint: string): string }) => InlineElementLike;
+function __is_highlight_transform(value: unknown): value is HighlightTransform {
+    return typeof value === "function" && !__is_style_builder(value) && !__is_link_tag(value);
+}
 
 function __inline_content_token(value: unknown, values: unknown[] = []): number | undefined {
     if (typeof value === "string") {
@@ -4917,8 +4944,34 @@ class Line {
     highlightAt(
         begin: number,
         end: number,
-        options: HighlightOptions | StyleBuilder | LinkTagLike = {},
+        shader: TextShaderLike,
+        options?: TextEffectOptions,
+    ): void;
+    highlightAt(
+        begin: number,
+        end: number,
+        transform: HighlightTransform,
+    ): void;
+    highlightAt(
+        begin: number,
+        end: number,
+        options?: HighlightOptions | StyleBuilder | LinkTagLike,
+    ): void;
+    highlightAt(
+        begin: number,
+        end: number,
+        options: HighlightOptions | StyleBuilder | LinkTagLike | HighlightTransform | TextShaderLike = {},
+        effectOptions?: TextEffectOptions,
     ): void {
+        if (__is_text_shader(options)) {
+            this._highlightShader(null, begin, end, options, effectOptions);
+            return;
+        }
+        if (effectOptions !== undefined) throw new TypeError("Text effect options require an imported shader");
+        if (__is_highlight_transform(options)) {
+            this._highlightTransform(null, begin, end, options);
+            return;
+        }
         const resolved = __line_options(options, true);
         if (resolved.link !== undefined) {
             this._highlightLinked(Uint32Array.of(begin, end), resolved);
@@ -4975,7 +5028,13 @@ class Line {
 
     /** Restyles every occurrence of `str` (plain options, a style chain, or a
      *  link tag; see `highlightAt`). Returns whether anything matched. */
-    highlight(str: string, options: HighlightOptions | StyleBuilder | LinkTagLike = {}): boolean {
+    highlight(str: string, shader: TextShaderLike, options?: TextEffectOptions): boolean;
+    highlight(str: string, transform: HighlightTransform): boolean;
+    highlight(str: string, options?: HighlightOptions | StyleBuilder | LinkTagLike): boolean;
+    highlight(str: string, options: HighlightOptions | StyleBuilder | LinkTagLike | HighlightTransform | TextShaderLike = {}, effectOptions?: TextEffectOptions): boolean {
+        if (__is_text_shader(options)) return this._highlightShader(str, 0, 0, options, effectOptions);
+        if (effectOptions !== undefined) throw new TypeError("Text effect options require an imported shader");
+        if (__is_highlight_transform(options)) return this._highlightTransform(str, 0, 0, options);
         const resolved = __line_options(options, true);
         const ranges = __occurrenceByteRanges(this.text, str);
         if (ranges.length === 0) {
@@ -4995,6 +5054,35 @@ class Line {
             this._highlightAtResolved(range.begin, range.end, resolved);
         }
         return true;
+    }
+
+    _highlightShader(str: string | null, begin: number, end: number, shader: TextShaderLike, options?: TextEffectOptions): boolean {
+        const token = (globalThis as any).__smudgy_prepare_text_effect(shader, options);
+        return op_smudgy_highlight_shader(this._lineNumber, str, begin, end, token);
+    }
+
+    /** One synchronous callback per rich fragment; no writes until every result
+     *  has been validated. The native snapshot includes earlier queued edits. */
+    _highlightTransform(str: string | null, begin: number, end: number, transform: HighlightTransform): boolean {
+        const makeSpan = (globalThis as any).__smudgy_span_from_native;
+        if (typeof makeSpan !== "function") throw new TypeError("Highlight callbacks require the widgets extension");
+        const batch = op_smudgy_highlight_begin(this._lineNumber, str, begin, end);
+        try {
+            for (;;) {
+                const source = op_smudgy_highlight_next(batch);
+                if (source === null || source === undefined) break;
+                const result = transform(makeSpan(source));
+                if (result == null || typeof (result as any).then === "function") {
+                    throw new TypeError("Highlight callbacks must synchronously return inline content");
+                }
+                const token = __inline_content_token(result);
+                if (token === undefined) throw new TypeError("Highlight callbacks must return a Span or text effect");
+                op_smudgy_highlight_stage(batch, token);
+            }
+            return op_smudgy_highlight_finish(batch, true);
+        } finally {
+            op_smudgy_highlight_finish(batch, false);
+        }
     }
 
     /** Removes every occurrence of `str`. Returns whether anything matched. */

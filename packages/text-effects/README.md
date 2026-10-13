@@ -76,6 +76,65 @@ The panel starts with individual-import usage examples and provides all presets,
 
 Publication is separate from the source checkout. For local development, copy this directory into a server's `packages/text-effects` directory. Use the same `@text-effects` and `@text-effects/fire` imports; the local directory takes priority over the published package, so no import changes are needed.
 
+## Highlight existing output
+
+To decorate existing terminal output, pass a synchronous callback to
+`line.highlight` (or `buffer.line(n).highlight`):
+
+```tsx
+import Effect from "@text-effects/possession";
+import { createTrigger, line } from "smudgy:core";
+
+createTrigger(/Foo (.*)/, matches => {
+    line.highlight(matches[1], span => (
+        <Effect intensity={1} duration={2000} scale={2}
+            colors={['#00ff00', '#cceecc', '#ddeedd']}>
+            {span}
+        </Effect>
+    ));
+});
+```
+
+Each occurrence receives one composite Span containing all its original colors,
+attributes, links and fonts. One effect wraps the entire matched fragment across
+style boundaries. `highlightAt(begin, end, callback)` selects a UTF-8 byte range.
+The callback forms include earlier queued edits in their snapshots. They must
+return inline content with unchanged text; promises and embedded widgets are
+rejected. Empty matches do not invoke the callback. Existing effects overlapping
+the range are replaced. All results are checked before this call applies any
+highlights; callback side effects are not rolled back. Do not edit the target
+line from inside its callback.
+
+For a custom shader, pass the imported handle directly. The optional third
+argument accepts `TextEffectOptions`, the same controls as `TextEffect` except
+`shader` and `children`:
+
+```ts
+import shader from "./foo.wgsl";
+import { createTrigger, line } from "smudgy:core";
+
+createTrigger(/bar/, () => {
+    line.highlight("bar", shader);
+    // For a shader declaring a `strength` uniform:
+    // line.highlight("bar", shader, { uniforms: { strength: 0.8 }, duration: 2000 });
+});
+```
+
+`highlightAt(begin, end, shader, options)` and both stored-line forms work the
+same way. Each match spans all its original styles, links and fonts. Settings are
+validated once per call and shared across matches; one native batch attaches the
+effects without creating Span fragments or invoking a callback per match. Earlier
+queued edits are included, overlapping effects are replaced, and embedded widgets
+are rejected before any highlight is applied. The existing limit of 64 effects per
+line retains the last 64 matches. GPU rendering uses the same caches and budgets
+as `TextEffect`; shader complexity and painted area still determine drawing cost.
+
+Defaults match `TextEffect`: continuous duration, scale 1, outset 32, underlay
+compositing and no fades. A shader with custom uniforms requires all declared
+fields in `uniforms`. These are raw shader options; preset controls such as
+`intensity`, `speed` and `colors` belong to the component callback form above.
+Sandboxed packages need change-display, widget creation and shader permissions.
+
 ## Shared controls
 
 - `scale`: 0.25..4, default 1. Scales artwork dimensions, turbulence, particles and travel distances; emphasis scales painted growth. Native font metrics, layout, selection and particle count stay unchanged. Automatic paint outset grows with scale; explicit outset is a final authored bound.

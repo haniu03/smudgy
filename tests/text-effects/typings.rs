@@ -99,6 +99,24 @@ fn text_effects_sources_and_published_declarations_keep_component_types() {
                 target.insert(<Span fontSize={20}>suffix</Span>, 0, 3);
                 target.replaceAt(hot, 0, 3);
                 target.replaceAt(`${hot}`, 0, 3);
+                const matched: boolean = target.highlight("foo", span => <Fire>{span}</Fire>);
+                target.highlightAt(0, 3, span => <Effects.possession>{span}</Effects.possession>);
+                target.highlight("foo", span => span);
+                target.highlight("foo", style.red);
+                target.highlight("foo", link("look"));
+                const shaderMatch: boolean = target.highlight("foo", customShader);
+                target.highlight("foo", customShader, { duration: 2000, scale: 2, uniforms: { amount: 1, tint: [1, 0, 0, 1] } });
+                target.highlightAt(0, 3, customShader, { animated: false, composite: "replace", finish: "hold" });
+                // @ts-expect-error Effect options do not accept children.
+                target.highlight("foo", customShader, { children: "text" });
+                // @ts-expect-error Effect duration is numeric.
+                target.highlightAt(0, 3, customShader, { duration: "fast" });
+                // @ts-expect-error The third argument is only for a shader handle.
+                target.highlight("foo", style.red, { duration: 1000 });
+                // @ts-expect-error Highlight transforms must be synchronous.
+                target.highlight("foo", async span => <Fire>{span}</Fire>);
+                // @ts-expect-error Return inline content, not plain replacement text.
+                target.highlight("foo", span => "different");
             }
             createWidget("inline", <Container>{hot}</Container>);
         "#

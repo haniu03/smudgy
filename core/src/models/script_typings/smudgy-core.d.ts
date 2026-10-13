@@ -2961,6 +2961,44 @@ declare module "smudgy:core" {
     link?: LinkTag | null;
   }
 
+  /** Opaque validated WGSL module, produced by importing a .wgsl file.
+   * Sandboxed packages require permissions.smudgy.widgets: ["shaders"]. */
+  export interface TextShader { readonly __textShader: unique symbol; }
+  export type ShaderUniforms = Record<string, number | readonly number[]>;
+  /** Shared settings for TextEffect and direct shader highlighting. */
+  export interface TextEffectOptions {
+    /** Pane paints across the containing viewport while the anchor is visible. */
+    overflow?: "bounds" | "pane";
+    /** Named parameters must match the WGSL uniform struct exactly. */
+    uniforms?: ShaderUniforms;
+    /** Whole milliseconds, 0..3600000. Default 0 continues until removed. */
+    duration?: number;
+    /** Effect geometry, 0.25..4, default 1. Does not alter native text layout. */
+    scale?: number;
+    /** Glyph resolution multiplier, 1..8, default 1. Capped by the texture budget. */
+    captureScale?: number;
+    /** Attack/release in whole milliseconds, default 0. Overlapping fades fit duration. */
+    fadeIn?: number;
+    fadeOut?: number;
+    /** Whole logical pixels, 0..2048, default 32. Does not enlarge line layout. */
+    outset?: number;
+    /** Default underlay preserves ordinary text over the effect. */
+    composite?: "underlay" | "replace";
+    /** Default remove restores ordinary text when duration expires. */
+    finish?: "hold" | "remove";
+    /** Default true. Finite lifetimes and fade-in still schedule frames when false. */
+    animated?: boolean;
+  }
+
+  /** Synchronous presentation transform for one matched fragment. The supplied
+   * Span contains every original style run, link and font in that fragment.
+   * Return a Span or text effect with the same text. Existing overlapping effects
+   * are replaced; fragments containing embedded widgets are rejected.
+   * Do not edit the target line inside the callback. */
+  export type HighlightTransform = (
+    span: SmudgyInlineElement & { [Symbol.toPrimitive](hint: string): string },
+  ) => SmudgyInlineElement;
+
   /**
    * A line of output you can read and edit. Inside a trigger, {@link line} is
    * the line being processed right now; `buffer.line(n)` reaches an
@@ -3006,6 +3044,20 @@ declare module "smudgy:core" {
     /** Replace the byte range `[begin, end)` with `text`. Styled text keeps its
      *  own colors and links; its unstyled parts blend into the surrounding style. */
     replaceAt(text: string | StyledText | SmudgyInlineElement, begin: number, end: number): void;
+    /** Attach a shader to the UTF-8 byte range `[begin, end)`, preserving styles,
+     *  links and fonts. Includes earlier queued edits; overlapping effects are
+     *  replaced and embedded widgets rejected. Uses TextEffect defaults and
+     *  requires change-display, widget creation and shader permissions. */
+    highlightAt(begin: number, end: number, shader: TextShader, options?: TextEffectOptions): void;
+    /** Receive one composite Span, even across style boundaries:
+     *  `line.highlightAt(b, e, span => <Effect>{span}</Effect>)`.
+     *  Snapshots earlier queued edits and validates the result before applying
+     *  changes. Empty ranges do not call the callback. */
+    highlightAt(
+      begin: number,
+      end: number,
+      transform: HighlightTransform,
+    ): void;
     /** Restyle the byte range `[begin, end)`: what `options` sets changes,
      *  and everything it leaves unset keeps what each span already had — so
      *  `{ fg: "red" }` recolors without touching backgrounds or bold, and
@@ -3024,10 +3076,24 @@ declare module "smudgy:core" {
      *  text, or inline content; the search side is always plain text).
      *  Returns `true` if any was found. */
     replace(oldStr: string, newStr: string | StyledText | SmudgyInlineElement): boolean;
+    /** Attach one effect per occurrence, sharing the shader and uniforms.
+     *  Preserves styles, links and fonts. Includes earlier queued edits;
+     *  overlapping effects are replaced and embedded widgets rejected.
+     *  Returns whether any text matched; empty searches do nothing.
+     *  Uses TextEffect defaults and requires change-display, widget creation
+     *  and shader permissions. */
+    highlight(str: string, shader: TextShader, options?: TextEffectOptions): boolean;
+    /** A callback receives one composite Span per occurrence, from
+     *  left to right; it can wrap all of that occurrence's styles in one effect.
+     *  Callbacks must be synchronous and preserve the text. If any callback
+     *  throws or returns invalid content, none of this call's highlights apply
+     *  (callback side effects are not rolled back). Returns `true` if any was
+     *  found; an empty search string never invokes a callback. */
+    highlight(str: string, transform: HighlightTransform): boolean;
     /** Restyle every occurrence of `str` (see {@link Line.highlightAt}: unset
      *  options are left untouched, and a style chain like `style.red.bold`
-     *  or a link tag like `link("kill goblin")` works directly as the
-     *  options). Returns `true` if any was found. */
+     *  or a link tag like `link("kill goblin")` works directly as the options).
+     *  Returns whether any text matched. */
     highlight(str: string, options?: HighlightOptions | StyleBuilder | LinkTag): boolean;
     /** Remove every occurrence of `str`. Returns `true` if any was found. */
     remove(str: string): boolean;

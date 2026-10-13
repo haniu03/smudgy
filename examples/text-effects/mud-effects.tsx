@@ -21,7 +21,7 @@ createTimer({ name: "mud-effect-burst", intervalMs: 120, repeat: true }, () => {
     burst.drain(Date.now(), ({ target, full, text, Effect, duration }) => {
         // A gagged or redirected line hands its number to the next line, and a line removed
         // from scrollback reads as "". Only the line captured above gets the effect.
-        if (target.text === full) target.replace(text, <Effect duration={duration}>{text}</Effect>);
+        if (target.text === full) target.highlight(text, span => <Effect duration={duration}>{span}</Effect>);
     });
 });
 createTrigger(/^(.+) arrives from the (.+)\.$/, args => mark(`greeting:${args[1]}`, args[1], Greeting));

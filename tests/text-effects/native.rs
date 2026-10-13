@@ -17,10 +17,14 @@ use support::*;
 const SCRIPT: &str = include_str!("native/content.tsx");
 #[path = "native/content.rs"]
 mod content;
+#[path = "native/highlight.rs"]
+mod highlight;
 #[path = "native/imports.rs"]
 mod imports;
 #[path = "native/reload.rs"]
 mod reload;
+#[path = "native/shader_highlight.rs"]
+mod shader_highlight;
 fn effects_package_provider() -> smudgy_core::session::PackageProviderFactory {
     effects_package_provider_with_entry(None, true)
 }

@@ -256,6 +256,97 @@ pub struct InlineContent {
 }
 
 impl InlineContent {
+    /// Snapshot a text range, retaining every style, link and font boundary.
+    /// Existing effects are deliberately omitted so a new effect can wrap the
+    /// original text. Embedded widgets cannot be captured as text.
+    ///
+    /// # Errors
+    /// Rejects invalid byte ranges, embedded widgets and oversized fragments.
+    pub fn from_line_range(line: &StyledLine, range: Range<usize>) -> Result<Self, &'static str> {
+        let text = line
+            .text
+            .get(range.clone())
+            .ok_or("invalid highlight byte range")?;
+        if text.len() > MAX_INLINE_TEXT_BYTES {
+            return Err("highlight fragment exceeds its size limit");
+        }
+        if line
+            .objects
+            .iter()
+            .flat_map(|objects| objects.iter())
+            .any(|object| object.range.start < range.end && object.range.end > range.start)
+        {
+            return Err("highlight callbacks cannot wrap embedded widgets");
+        }
+        let mut boundaries = vec![range.start, range.end];
+        for (begin, end) in line
+            .spans
+            .iter()
+            .map(|span| (span.begin_pos, span.end_pos))
+            .chain(line.links.iter().map(|link| (link.begin_pos, link.end_pos)))
+        {
+            boundaries.extend(
+                [begin, end]
+                    .into_iter()
+                    .filter(|pos| range.start < *pos && *pos < range.end),
+            );
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        if boundaries.len() > 4097 {
+            return Err("highlight fragment exceeds its run limit");
+        }
+        let runs = boundaries
+            .windows(2)
+            .map(|pair| {
+                let (begin, end) = (pair[0], pair[1]);
+                let span = line
+                    .spans
+                    .get(line.spans.partition_point(|span| span.end_pos <= begin));
+                let style = span
+                    .filter(|span| span.begin_pos <= begin)
+                    .map_or(Style::DEFAULT, |span| span.style);
+                let link = line
+                    .links
+                    .get(line.links.partition_point(|link| link.end_pos <= begin))
+                    .filter(|link| link.begin_pos <= begin);
+                SpliceRun {
+                    text: line.text[begin..end].to_owned(),
+                    fg: Some(style.fg),
+                    bg: Some(style.bg),
+                    attributes: style.attributes.into(),
+                    link: link.map(|link| crate::StyledLink {
+                        action: link.action.clone(),
+                        tooltip: link.tooltip.clone(),
+                        style: link.style.clone(),
+                    }),
+                }
+            })
+            .collect();
+        let fonts: Vec<_> = line
+            .fonts
+            .iter()
+            .flat_map(|fonts| fonts.iter())
+            .filter_map(|font| {
+                let begin = font.range.start.max(range.start);
+                let end = font.range.end.min(range.end);
+                (begin < end).then(|| InlineFont {
+                    range: begin - range.start..end - range.start,
+                    options: font.options.clone(),
+                })
+            })
+            .collect();
+        if fonts.len() > 4096 {
+            return Err("highlight fragment exceeds its font limit");
+        }
+        Ok(Self {
+            runs: Arc::new(runs),
+            fonts: Arc::new(fonts),
+            decorations: Arc::default(),
+            objects: Arc::default(),
+        })
+    }
+
     pub fn text_len(&self) -> usize {
         self.runs.iter().map(|run| run.text.len()).sum()
     }
@@ -296,20 +387,53 @@ impl InlineContent {
 #[derive(Debug, Default)]
 pub struct InlineContentExchange {
     generation: u32,
-    pending: Option<(u32, Arc<InlineContent>)>,
+    pending: Option<(u32, InlineExchangeValue)>,
+}
+
+#[derive(Debug)]
+enum InlineExchangeValue {
+    Content(Arc<InlineContent>),
+    Effect(InlineDecoration),
 }
 
 impl InlineContentExchange {
     pub fn put(&mut self, content: Arc<InlineContent>) -> Result<u32, &'static str> {
+        self.publish(InlineExchangeValue::Content(content))
+    }
+
+    /// A validated effect prototype, with no text or Span allocation.
+    pub fn put_effect(&mut self, effect: InlineDecoration) -> Result<u32, &'static str> {
+        self.publish(InlineExchangeValue::Effect(effect))
+    }
+
+    fn publish(&mut self, value: InlineExchangeValue) -> Result<u32, &'static str> {
         self.generation = self
             .generation
             .checked_add(1)
             .ok_or("inline content exchange exhausted")?;
-        self.pending = Some((self.generation, content));
+        self.pending = Some((self.generation, value));
         Ok(self.generation)
     }
 
     pub fn take(&mut self, generation: u32) -> Result<Arc<InlineContent>, &'static str> {
+        match self.consume(generation)? {
+            InlineExchangeValue::Content(content) => Ok(content),
+            InlineExchangeValue::Effect(_) => {
+                Err("expected inline content, received a shader effect")
+            }
+        }
+    }
+
+    pub fn take_effect(&mut self, generation: u32) -> Result<InlineDecoration, &'static str> {
+        match self.consume(generation)? {
+            InlineExchangeValue::Effect(effect) => Ok(effect),
+            InlineExchangeValue::Content(_) => {
+                Err("expected a shader effect, received inline content")
+            }
+        }
+    }
+
+    fn consume(&mut self, generation: u32) -> Result<InlineExchangeValue, &'static str> {
         let pending = self
             .pending
             .take()
@@ -506,5 +630,31 @@ mod tests {
         let second = exchange.put(content).unwrap();
         assert!(exchange.take(first).is_err());
         assert!(exchange.take(second).is_err());
+    }
+
+    #[test]
+    fn exchange_preserves_effect_identity_and_rejects_payload_type_confusion() {
+        let mut exchange = InlineContentExchange::default();
+        let original = effect();
+        let token = exchange.put_effect(original.clone()).unwrap();
+        assert_eq!(exchange.take_effect(token).unwrap(), original);
+        assert!(exchange.take_effect(token).is_err());
+        let token = exchange.put_effect(effect()).unwrap();
+        assert!(exchange.take(token).unwrap_err().contains("shader effect"));
+        assert!(exchange.take_effect(token).is_err());
+        let content = Arc::new(InlineContent {
+            runs: Arc::default(),
+            decorations: Arc::default(),
+            objects: Arc::default(),
+            fonts: Arc::default(),
+        });
+        let token = exchange.put(content).unwrap();
+        assert!(
+            exchange
+                .take_effect(token)
+                .unwrap_err()
+                .contains("inline content")
+        );
+        assert!(exchange.take(token).is_err());
     }
 }
