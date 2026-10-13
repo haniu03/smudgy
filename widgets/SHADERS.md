@@ -2,6 +2,20 @@
 
 This reference describes the current TextEffect host contract (ABI v1). It covers source WGSL imports; compiled GPU pipelines and native handles are local to a running client. There is no shader ABI version negotiation. Compatible clients must implement the complete contract below, including sampling and compositing semantics. Matching uniform names alone is insufficient.
 
+Shader types use client-neutral names: `TextFrame`, `Glyph`, `GlyphTable`, and
+`Fragment`. The resource names are `text`, `textTexture`, `textSampler`,
+`glyphTable`, `noiseTexture`, and `noiseSampler`. These names let effects describe
+their inputs without referring to a particular client. The scripting primitives
+`Span` and `TextEffect` are separate from the WGSL interface.
+
+Existing shaders can still use the `SmudgyTextFrame`, `SmudgyGlyph`,
+`SmudgyGlyphTable`, and `SmudgyFragment` type aliases. Shaders using the previous
+resource names (`smudgy_glyphs`, `smudgy_sampler`, `smudgy_geometry`,
+`smudgy_noise`, and `smudgy_noise_sampler`) are loaded with compatibility host
+declarations. Use one resource vocabulary per file; new shaders should use the
+neutral names. Bindings, memory layouts, coordinates, and color handling are
+unchanged.
+
 See the [widget guide](README.md) for inline text and package permissions.
 
 ## A minimal effect
@@ -57,12 +71,12 @@ Group 0 belongs to the host. Authors may add one uniform struct at group 1, bind
 
 | Group / binding | Resource | Meaning |
 | --- | --- | --- |
-| 0 / 0 | `text: SmudgyTextFrame` | Frame and occurrence uniforms |
-| 0 / 1 | `smudgy_glyphs: texture_2d<f32>` | Premultiplied styled glyph RGBA, with mip levels |
-| 0 / 2 | `smudgy_sampler: sampler` | Linear glyph filtering |
-| 0 / 3 | `smudgy_geometry: SmudgyGlyphTable` | Shaped glyph metadata |
-| 0 / 4 | `smudgy_noise: texture_2d<f32>` | Shared 256×256 tiled noise atlas, with mip levels |
-| 0 / 5 | `smudgy_noise_sampler: sampler` | Linear, repeating noise filtering |
+| 0 / 0 | `text: TextFrame` | Frame and occurrence uniforms |
+| 0 / 1 | `textTexture: texture_2d<f32>` | Premultiplied styled glyph RGBA, with mip levels |
+| 0 / 2 | `textSampler: sampler` | Linear glyph filtering |
+| 0 / 3 | `glyphTable: GlyphTable` | Shaped glyph metadata |
+| 0 / 4 | `noiseTexture: texture_2d<f32>` | Shared 256×256 tiled noise atlas, with mip levels |
+| 0 / 5 | `noiseSampler: sampler` | Linear, repeating noise filtering |
 | 1 / 0 | Author-defined uniform struct | Reflected parameters, at most 1024 bytes |
 
 The frame occupies 112 bytes. Vectors use WGSL host-shareable alignment. Custom uniform buffers are rounded up to a multiple of 16 bytes, with a minimum of 16.
@@ -88,13 +102,13 @@ The frame occupies 112 bytes. Vectors use WGSL host-shareable alignment. Custom 
 | `paint_offset` | `vec2f` | 96 | Logical paint origin relative to the text anchor |
 | `capture_offset` | `vec2f` | 104 | Logical texture origin relative to the text anchor |
 
-`SmudgyGlyph` occupies 48 bytes: `advance: vec4f` at 0, `ink: vec4f` at 16, and `cluster: vec4u` at 32. `SmudgyGlyphTable` begins with `info: vec4u`, followed at byte 16 by 256 glyphs with a 48-byte stride (12304 bytes total). `info` contains the glyph count, truncation flag, first baseline as f32 bits, and a reserved zero word. Prefer the supplied geometry helpers over decoding these fields directly.
+`Glyph` occupies 48 bytes: `advance: vec4f` at 0, `ink: vec4f` at 16, and `cluster: vec4u` at 32. `GlyphTable` begins with `info: vec4u`, followed at byte 16 by 256 glyphs with a 48-byte stride (12304 bytes total). `info` contains the glyph count, truncation flag, first baseline as f32 bits, and a reserved zero word. Prefer the supplied geometry helpers over decoding these fields directly.
 
 ## Moving captured glyphs
 
-An imported WGSL module can opt into the same single-pass instanced-quad path. Declare a `u32` constant `const TEXT_FRAGMENTS: u32 = 1u;` (1..64) and implement both `textVertex(instance: u32, corner: vec2f) -> SmudgyFragment` and `textFragment(color: vec4f, source: vec2f, instance: u32) -> vec4f`, in addition to `effect(position)`. Constant arithmetic folded by WGSL is also accepted; the evaluated count must stay within that bound. Instances are 0..`glyphCount()*TEXT_FRAGMENTS`; instance / TEXT_FRAGMENTS identifies a shaped glyph. Corner ranges from (0,0) to (1,1). The host paints `effect` across the surface first, then the fragment quads in instance order within the same draw call.
+An imported WGSL module can opt into the same single-pass instanced-quad path. Declare a `u32` constant `const TEXT_FRAGMENTS: u32 = 1u;` (1..64) and implement both `textVertex(instance: u32, corner: vec2f) -> Fragment` and `textFragment(color: vec4f, source: vec2f, instance: u32) -> vec4f`, in addition to `effect(position)`. Constant arithmetic folded by WGSL is also accepted; the evaluated count must stay within that bound. Instances are 0..`glyphCount()*TEXT_FRAGMENTS`; instance / TEXT_FRAGMENTS identifies a shaped glyph. Corner ranges from (0,0) to (1,1). The host paints `effect` across the surface first, then the fragment quads in instance order within the same draw call.
 
-`SmudgyFragment(position, source, perspective, opacity)` takes a projected logical position relative to the text anchor, a logical source-sampling position, positive clip W for perspective-correct interpolation, and opacity. The host clamps W to at least 0.05 and opacity to 0..1, samples styled premultiplied glyph RGBA, and applies the shared envelope to the result. Authors must bound near-camera growth, preserve complete source coverage, and provide a `glyphsTruncated()` policy. Motion retains the complete ordinary word above 256 shaped glyphs; Explode uses a coarser whole-word grid. There are at most 16,384 quads per admitted fragment, six generated vertices each, no per-frame vertex upload, new texture, simulation buffer or CPU effect drawing. Glyph captures and geometry remain cached.
+`Fragment(position, source, perspective, opacity)` takes a projected logical position relative to the text anchor, a logical source-sampling position, positive clip W for perspective-correct interpolation, and opacity. The host clamps W to at least 0.05 and opacity to 0..1, samples styled premultiplied glyph RGBA, and applies the shared envelope to the result. Authors must bound near-camera growth, preserve complete source coverage, and provide a `glyphsTruncated()` policy. Motion retains the complete ordinary word above 256 shaped glyphs; Explode uses a coarser whole-word grid. There are at most 16,384 quads per admitted fragment, six generated vertices each, no per-frame vertex upload, new texture, simulation buffer or CPU effect drawing. Glyph captures and geometry remain cached.
 
 ## Implementing the contract in another client
 

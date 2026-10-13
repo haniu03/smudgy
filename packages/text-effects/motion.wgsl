@@ -16,10 +16,10 @@ fn effect(p: vec2f) -> vec4f {
     }
     return vec4f(0);
 }
-fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
+fn textVertex(instance: u32, corner: vec2f) -> Fragment {
     let phase = motionPhase();
     if phase <= 0.0 || phase >= 0.98 || motionStrength() <= 0.0 || glyphsTruncated() {
-        return SmudgyFragment(vec2f(0), vec2f(0), 1.0, 0.0);
+        return Fragment(vec2f(0), vec2f(0), 1.0, 0.0);
     }
     let glyph = glyphAt(instance);
     // Advance cells partition the captured paragraph, including italic overhangs
@@ -85,7 +85,7 @@ fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
     let rotated = vec2f(local.x * cos(angle) - local.y * sin(angle), local.x * sin(angle) + local.y * cos(angle));
     let position = destination + (center - word) * globalStretch + rotated * globalStretch + offset;
     let visible = phase > 0.0 && phase < 0.98 && motionStrength() > 0.0 && !glyphsTruncated();
-    return SmudgyFragment(position, source, 1.0, select(0.0, 1.0, visible));
+    return Fragment(position, source, 1.0, select(0.0, 1.0, visible));
 }
 fn textFragment(color: vec4f, source: vec2f, instance: u32) -> vec4f {
     // A restrained crest highlight, while preserving styled source ink.

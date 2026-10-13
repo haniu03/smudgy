@@ -19,11 +19,11 @@ fn effect(p: vec2f) -> vec4f {
         || (kp() >= 0.98 && params.mode > 1.5) || glyphsTruncated() { return sampleText(p); }
     return vec4f(0);
 }
-fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
+fn textVertex(instance: u32, corner: vec2f) -> Fragment {
     let phase = kp();
     if params.intensity * params.amplitude <= 0.0 || params.speed <= 0.0
         || (phase >= 0.98 && params.mode > 1.5) || glyphsTruncated() {
-        return SmudgyFragment(vec2f(0), vec2f(0), 1.0, 0.0);
+        return Fragment(vec2f(0), vec2f(0), 1.0, 0.0);
     }
     let glyph = glyphAt(instance);
     var lo = vec2f(glyph.advance.x, -2);
@@ -102,7 +102,7 @@ fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
     let rotated = vec2f(local.x * cos(angle) - local.y * sin(angle), local.x * sin(angle) + local.y * cos(angle));
     let position = hinge + offset + rotated / w;
     let opacity = select(1.0, smoothstep(0.0, 0.06, phase), params.mode < 0.5);
-    return SmudgyFragment(position, source, w, opacity);
+    return Fragment(position, source, w, opacity);
 }
 fn textFragment(color: vec4f, source: vec2f, instance: u32) -> vec4f {
     let glint = pow(max(0.0, sin(kp() * 6.283185 - source.x / max(text.text_size.x, 1.0) * 4.0)), 8.0)

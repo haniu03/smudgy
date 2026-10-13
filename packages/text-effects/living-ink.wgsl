@@ -91,9 +91,9 @@ fn piece(instance:u32)->vec4f{
     if instance%2u==0u{hi.x=cut;}else{lo.x=cut;}
     return vec4f(lo,hi-lo);
 }
-fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment{
+fn textVertex(instance:u32,corner:vec2f)->Fragment{
     if params.variant<0.5 || life()<0.0001 || (glyphsTruncated() && instance/2u>0u){
-        return SmudgyFragment(vec2f(0),vec2f(0),1,0);
+        return Fragment(vec2f(0),vec2f(0),1,0);
     }
     let index=instance/2u;let box=piece(instance);let source=box.xy+corner*box.zw;
     let hurt=wound(index);let side=select(-1.0,1.0,instance%2u==1u);
@@ -102,7 +102,7 @@ fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment{
     let local=source-pivot;
     let rotated=vec2f(local.x*cos(angle)-local.y*sin(angle),local.x*sin(angle)+local.y*cos(angle));
     let position=pivot+rotated+vec2f(side*hurt*2.2*text.effect_scale,0);
-    return SmudgyFragment(position,source,1,1);
+    return Fragment(position,source,1,1);
 }
 fn textFragment(original:vec4f,p:vec2f,instance:u32)->vec4f{
     if glyphsTruncated(){return original;}

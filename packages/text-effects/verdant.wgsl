@@ -27,9 +27,9 @@ fn growth(index:u32)->f32 {
     return smoothstep(0.025+x*0.24,0.35+x*0.24,phase());
 }
 fn effect(p:vec2f)->vec4f { return sampleText(p)*(1.0-power()); }
-fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment {
+fn textVertex(instance:u32,corner:vec2f)->Fragment {
     let index=instance/16u;
-    if power()<0.0001 || (glyphsTruncated() && index>0u) { return SmudgyFragment(vec2f(0),vec2f(0),1,0); }
+    if power()<0.0001 || (glyphsTruncated() && index>0u) { return Fragment(vec2f(0),vec2f(0),1,0); }
     let box=column(index);let band=f32(instance%16u);
     let source=box.xy+vec2f(corner.x,(band+corner.y)/16.0)*box.zw;
     let baseline=glyphBaseline(index);let height=max(baseline-box.y,1.0);
@@ -44,7 +44,7 @@ fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment {
     let width=1.0-(1.0-grown)*0.72*power();
     let reach=min(text.effect_scale,2.5);
     let position=vec2f(center+(source.x-center)*width+bend.x*reach,baseline+bend.y);
-    return SmudgyFragment(position,source,1,power());
+    return Fragment(position,source,1,power());
 }
 fn textFragment(ink:vec4f,p:vec2f,instance:u32)->vec4f {
     let index=instance/16u;let box=column(index);let grown=growth(index);

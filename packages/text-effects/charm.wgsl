@@ -35,8 +35,8 @@ fn closeness(index:u32)->f32 {
     return arrive*beat*power();
 }
 fn effect(p:vec2f)->vec4f { if power()<0.0001 { return sampleText(p); } return vec4f(0); }
-fn textVertex(index:u32,corner:vec2f)->SmudgyFragment {
-    if power()<0.0001 || (glyphsTruncated() && index>0u) { return SmudgyFragment(vec2f(0),vec2f(0),1,0); }
+fn textVertex(index:u32,corner:vec2f)->Fragment {
+    if power()<0.0001 || (glyphsTruncated() && index>0u) { return Fragment(vec2f(0),vec2f(0),1,0); }
     let box=column(index);let source=box.xy+corner*box.zw;
     let other=partner(index);let side=select(-1.0,1.0,other>index)*select(1.0,0.0,other==index);
     let pivot=vec2f(box.x+box.z*0.5,glyphBaseline(index));let local=source-pivot;
@@ -44,7 +44,7 @@ fn textVertex(index:u32,corner:vec2f)->SmudgyFragment {
     let lean=side*near*0.085;
     let rotated=vec2f(local.x*cos(lean)-local.y*sin(lean),local.x*sin(lean)+local.y*cos(lean));
     let position=pivot+rotated+vec2f(side*near*0.65,0);
-    return SmudgyFragment(position,source,1,1);
+    return Fragment(position,source,1,1);
 }
 fn textFragment(original:vec4f,p:vec2f,index:u32)->vec4f {
     let box=column(index);let g=glyphAt(index);let near=closeness(index);

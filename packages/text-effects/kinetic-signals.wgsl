@@ -13,10 +13,10 @@ fn ksHash(n: f32) -> f32 { return fract(sin(n*127.1+text.seed)*43758.5453); }
 fn effect(p: vec2f) -> vec4f { return vec4f(0); }
 
 // Shared by both stages so native ink can be protected at the projected position.
-fn ksPose(source: vec2f, instance: u32) -> SmudgyFragment {
+fn ksPose(source: vec2f, instance: u32) -> Fragment {
     let phase=ksPhase(); let power=ksPower(); let piece=instance%TEXT_FRAGMENTS;
     if phase<=0.0 || phase>=1.0 || power<=0.0 || params.speed<=0.0 {
-        return SmudgyFragment(vec2f(0),source,1.0,0.0);
+        return Fragment(vec2f(0),source,1.0,0.0);
     }
     let n=f32(piece); let age=phase-n*0.055;
     let multiline=glyphCount()>0u && glyphAt(glyphCount()-1u).cluster.z!=glyphAt(0u).cluster.z;
@@ -147,11 +147,11 @@ fn ksPose(source: vec2f, instance: u32) -> SmudgyFragment {
     let fitted=select(text.paint_offset.x+text.surface.x*0.5,clamp(center.x+offset.x,low,max(low,high)),low<=high);
     let destination=vec2f(fitted,center.y+offset.y);
     let position=destination+(pivot-center+vec2f(turned.x*cos(yaw),turned.y))*zoom/w;
-    return SmudgyFragment(position,source,w,opacity*min(params.intensity,1.0));
+    return Fragment(position,source,w,opacity*min(params.intensity,1.0));
 }
-fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
+fn textVertex(instance: u32, corner: vec2f) -> Fragment {
     let glyphIndex=instance/TEXT_FRAGMENTS;
-    if glyphsTruncated() && glyphIndex>0u { return SmudgyFragment(vec2f(0),vec2f(0),1.0,0.0); }
+    if glyphsTruncated() && glyphIndex>0u { return Fragment(vec2f(0),vec2f(0),1.0,0.0); }
     let glyph=glyphAt(glyphIndex);
     var lo=glyph.advance.xy-vec2f(0,2);
     var hi=glyph.advance.xy+glyph.advance.zw+vec2f(0,2);

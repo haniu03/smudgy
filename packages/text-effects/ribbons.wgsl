@@ -30,12 +30,12 @@ fn effect(p: vec2f) -> vec4f {
     if rd() <= 0.0001 { return sampleText(p); }
     return vec4f(0);
 }
-fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
+fn textVertex(instance: u32, corner: vec2f) -> Fragment {
     let d = rd();
     let piece = instance % TEXT_FRAGMENTS;
     if d <= 0.0001 || (glyphsTruncated() && instance / TEXT_FRAGMENTS > 0u)
         || (params.variant < 0.5 && piece >= 16u) {
-        return SmudgyFragment(vec2f(0), vec2f(0), 1.0, 0.0);
+        return Fragment(vec2f(0), vec2f(0), 1.0, 0.0);
     }
     let bounds = rb(instance);
     var tile = vec2f(f32((piece / 2u) % 4u), f32(piece / 8u));
@@ -68,7 +68,7 @@ fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
         position = center + vec2f(local.x * (1.0 + d * 0.35), local.y * (1.0 - d * 0.65))
             + drift * power + vec2f(sin(band * 1.7) * d * text.text_size.y * 0.4, band * d * 1.1);
     }
-    return SmudgyFragment(position, source, w, 1.0);
+    return Fragment(position, source, w, 1.0);
 }
 fn textFragment(color: vec4f, source: vec2f, instance: u32) -> vec4f {
     if params.variant < 0.5 {

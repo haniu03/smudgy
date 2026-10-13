@@ -70,14 +70,14 @@ fn effect(p: vec2f) -> vec4f {
     let tint = mix(params.bright.rgb,params.accent.rgb,min(light,1.0));
     return vec4f(tint * alpha,alpha);
 }
-fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
+fn textVertex(instance: u32, corner: vec2f) -> Fragment {
     let phase = hp(); let power = heroPower();
     let glyphIndex = instance / TEXT_FRAGMENTS; let piece = instance % TEXT_FRAGMENTS;
     let judgement = params.variant > 3.5 && params.variant < 4.5;
     let ascension = params.variant >= 4.5;
     if phase >= 0.98 || power <= 0.0 || params.speed <= 0.0 || (!judgement && !ascension && piece > 0u)
         || (glyphsTruncated() && glyphIndex > 0u) {
-        return SmudgyFragment(vec2f(0),vec2f(0),1.0,0.0);
+        return Fragment(vec2f(0),vec2f(0),1.0,0.0);
     }
     let glyph = glyphAt(glyphIndex);
     var lo = vec2f(glyph.advance.x,-2);
@@ -142,7 +142,7 @@ fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
     let camera = max(text.text_size.y*8.0,180.0);
     let w = max(0.5,1.0 - tilted.x*sin(yaw)/camera);
     let position = word + (center-word+vec2f(tilted.x*cos(yaw),tilted.y))*zoom/w + offset;
-    return SmudgyFragment(position,source,w,opacity);
+    return Fragment(position,source,w,opacity);
 }
 fn textFragment(color: vec4f, source: vec2f, instance: u32) -> vec4f {
     let phase = hp();

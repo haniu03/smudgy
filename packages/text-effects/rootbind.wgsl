@@ -20,17 +20,17 @@ fn attachment(index: u32) -> vec2f {
     return best;
 }
 fn effect(p: vec2f) -> vec4f { return sampleText(p); }
-fn textVertex(index: u32, corner: vec2f) -> SmudgyFragment {
+fn textVertex(index: u32, corner: vec2f) -> Fragment {
     let glyph = glyphAt(index);
     if growth()<=0.0001 || glyph.ink.z<=0.0 || glyph.ink.w<=0.0 {
-        return SmudgyFragment(vec2f(0),vec2f(0),1.0,0.0);
+        return Fragment(vec2f(0),vec2f(0),1.0,0.0);
     }
     let s=text.effect_scale;
     let width = max(glyph.advance.z,8.0);
     let lo=vec2f(-width-10.0,-5.0)*s;
     let hi=vec2f(width+10.0,20.0)*s;
     let local=mix(lo,hi,corner);
-    return SmudgyFragment(attachment(index)+local,local,1.0,min(params.intensity,1.0));
+    return Fragment(attachment(index)+local,local,1.0,min(params.intensity,1.0));
 }
 fn segment(p: vec2f, a: vec2f, b: vec2f) -> vec2f {
     let v=b-a;let t=clamp(dot(p-a,v)/max(dot(v,v),0.001),0.0,1.0);

@@ -76,9 +76,9 @@ fn effect(p:vec2f)->vec4f {
     let colour=mix(params.base.rgb,params.bright.rgb,0.4+heat*0.6);
     return vec4f(colour*a,a);
 }
-fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment {
+fn textVertex(instance:u32,corner:vec2f)->Fragment {
     let index=instance/64u;let piece=instance%32u;let trail=instance%64u>=32u;
-    if power()<0.0001 || (glyphsTruncated() && index>0u) { return SmudgyFragment(vec2f(0),vec2f(0),1,0); }
+    if power()<0.0001 || (glyphsTruncated() && index>0u) { return Fragment(vec2f(0),vec2f(0),1,0); }
     let box=column(index);let tile=vec2f(f32(piece%4u),f32(piece/4u));
     let size=box.zw/vec2f(4,8);let source=box.xy+(tile+corner)*size;
     let center=box.xy+(tile+vec2f(0.5))*size;
@@ -108,7 +108,7 @@ fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment {
     let sizePulse=1.0+flight*(0.4+hash(n+29.0)*0.8)*sqrt(params.intensity);
     let position=destination+vec2f(rotated.x*cos(yaw),rotated.y)*sizePulse/w;
     let opacity=select(1.0,flight*0.25,trail);
-    return SmudgyFragment(position,source,w,opacity);
+    return Fragment(position,source,w,opacity);
 }
 fn textFragment(ink:vec4f,p:vec2f,instance:u32)->vec4f {
     let n=f32(instance/64u*32u+instance%32u)+19.0;

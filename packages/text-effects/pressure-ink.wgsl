@@ -62,9 +62,9 @@ fn effect(p:vec2f)->vec4f {
     }
     return ink;
 }
-fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment {
+fn textVertex(instance:u32,corner:vec2f)->Fragment {
     if quiet() || params.variant<1.5 {
-        return SmudgyFragment(vec2f(0),vec2f(0),1.0,0.0);
+        return Fragment(vec2f(0),vec2f(0),1.0,0.0);
     }
     let g=glyphAt(instance);
     var lo=g.advance.xy-vec2f(0,2);
@@ -78,14 +78,14 @@ fn textVertex(instance:u32,corner:vec2f)->SmudgyFragment {
     let pivot=vec2f((lo.x+hi.x)*0.5,glyphBaseline(instance));
     let x=pivot.x/max(text.text_size.x,1.0);
     let gone=vanished(x);
-    if vanished(0.5)<0.0001{return SmudgyFragment(vec2f(0),vec2f(0),1.0,0.0);}
+    if vanished(0.5)<0.0001{return Fragment(vec2f(0),vec2f(0),1.0,0.0);}
     let v=source-pivot;
     let turn=pow(gone,1.0/clamp(params.amplitude*params.intensity*text.effect_scale,0.25,4.0));
     let squeeze=cos(turn*1.570796);
     let pivotX=mix(pivot.x,text.text_size.x*0.5,pow(gone,1.6));
     let position=vec2f(pivotX+v.x*max(squeeze,0.002),pivot.y+v.y*(1.0-gone*0.18*min(text.effect_scale,2.0)));
     let opacity=1.0-smoothstep(0.72,0.99,gone);
-    return SmudgyFragment(position,source,1.0,opacity);
+    return Fragment(position,source,1.0,opacity);
 }
 fn textFragment(color:vec4f,source:vec2f,instance:u32)->vec4f {
     return color;

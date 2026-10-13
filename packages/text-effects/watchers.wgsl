@@ -43,10 +43,10 @@ fn effect(p:vec2f)->vec4f{
     if waking()<0.0001{return sampleText(p);}
     return vec4f(0);
 }
-fn textVertex(index:u32,corner:vec2f)->SmudgyFragment{
-    if waking()<0.0001 || (glyphsTruncated() && index>0u){return SmudgyFragment(vec2f(0),vec2f(0),1,0);}
+fn textVertex(index:u32,corner:vec2f)->Fragment{
+    if waking()<0.0001 || (glyphsTruncated() && index>0u){return Fragment(vec2f(0),vec2f(0),1,0);}
     let box=bounds(index);let p=box.xy+corner*box.zw;
-    return SmudgyFragment(p,p,1.0,1.0);
+    return Fragment(p,p,1.0,1.0);
 }
 fn textFragment(original:vec4f,p:vec2f,index:u32)->vec4f{
     let seed=wh(f32(index)+5.0);let ink=glyphAt(index).ink;

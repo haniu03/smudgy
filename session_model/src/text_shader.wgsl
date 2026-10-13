@@ -1,9 +1,9 @@
 // Full-surface adapter for the shared TextEffect contract.
-@vertex fn smudgy_vs(@builtin(vertex_index) vertex: u32) -> @builtin(position) vec4f {
+@vertex fn te_host_vs(@builtin(vertex_index) vertex: u32) -> @builtin(position) vec4f {
     let p = vec2f(f32((vertex << 1u) & 2u), f32(vertex & 2u));
     return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
 }
-@fragment fn smudgy_fs(@builtin(position) pixel: vec4f) -> @location(0) vec4f {
+@fragment fn te_host_fs(@builtin(position) pixel: vec4f) -> @location(0) vec4f {
     let position = (pixel.xy - text.origin) / text.resolution * text.surface + text.paint_offset;
     var color = effect(position);
     // Replacement shaders fade against their original glyphs; underlays fade to transparent.

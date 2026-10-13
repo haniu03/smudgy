@@ -20,14 +20,14 @@ fn effect(p: vec2f) -> vec4f {
     let alpha = min(ring, 0.65) * params.accent.a;
     return vec4f(params.accent.rgb * alpha, alpha);
 }
-fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
+fn textVertex(instance: u32, corner: vec2f) -> Fragment {
     let phase = ip();
     let glyphIndex = instance / TEXT_FRAGMENTS;
     let piece = instance % TEXT_FRAGMENTS;
     let side = u32(clamp(params.pieces, 2.0, 4.0));
     if phase >= 0.90 || params.intensity <= 0.0 || piece >= side * side
         || (glyphsTruncated() && glyphIndex > 0u) {
-        return SmudgyFragment(vec2f(0), vec2f(0), 1.0, 0.0);
+        return Fragment(vec2f(0), vec2f(0), 1.0, 0.0);
     }
     let glyph = glyphAt(glyphIndex);
     var lo = vec2f(glyph.advance.x, -2);
@@ -57,7 +57,7 @@ fn textVertex(instance: u32, corner: vec2f) -> SmudgyFragment {
         * exp(-max(phase - 0.68, 0.0) * 9.0) * 0.48 * params.intensity * text.effect_scale;
     let pivot = vec2f(text.text_size.x * 0.5, textBaseline());
     let position = pivot + (center - pivot) * (1.0 + impact) + (rotated + drift + bend) * (1.0 + impact) / w;
-    return SmudgyFragment(position, source, w, smoothstep(0.0, 0.07, phase));
+    return Fragment(position, source, w, smoothstep(0.0, 0.07, phase));
 }
 fn textFragment(color: vec4f, source: vec2f, instance: u32) -> vec4f {
     let flash = exp(-max(ip() - 0.68, 0.0) * 30.0) * step(0.68, ip()) * 0.65;

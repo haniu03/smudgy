@@ -112,7 +112,7 @@ mod tests {
         let module = host();
         numeric_structure!(
             &module,
-            "SmudgyTextFrame",
+            "TextFrame",
             Uniforms,
             [
                 origin,
@@ -140,13 +140,8 @@ mod tests {
     #[test]
     fn cpu_glyph_geometry_and_array_stride_match_wgsl() {
         let module = host();
-        numeric_structure!(
-            &module,
-            "SmudgyGlyph",
-            GlyphGeometry,
-            [advance, ink, cluster]
-        );
-        let fields = structure(&module, "SmudgyGlyphTable", size_of::<GlyphTable>());
+        numeric_structure!(&module, "Glyph", GlyphGeometry, [advance, ink, cluster]);
+        let fields = structure(&module, "GlyphTable", size_of::<GlyphTable>());
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name.as_deref(), Some("info"));
         assert_eq!(fields[0].offset as usize, offset_of!(GlyphTable, info));
@@ -156,7 +151,7 @@ mod tests {
         let TypeInner::Array { base, size, stride } = module.types[fields[1].ty].inner else {
             panic!("glyph items must be a fixed-size array");
         };
-        assert_eq!(module.types[base].name.as_deref(), Some("SmudgyGlyph"));
+        assert_eq!(module.types[base].name.as_deref(), Some("Glyph"));
         assert_eq!(stride as usize, size_of::<GlyphGeometry>());
         let naga::ArraySize::Constant(count) = size else {
             panic!("glyph items must have a constant count");
