@@ -47,7 +47,7 @@
 
 use std::{borrow::Cow, cell::RefCell, rc::Rc, sync::Arc};
 
-use deno_core::{OpState, op2};
+use deno_core::{GarbageCollected, OpState, op2, v8};
 use serde::Serialize;
 
 use super::mapper_api::{
@@ -56,7 +56,8 @@ use super::mapper_api::{
 use super::ops::SmudgyGrants;
 use super::script_uuid::ScriptUuid;
 use smudgy_cloud::{
-    AreaId, MapStorage, Mapper, RoomNumber, SourceBundle, SourceId, Uuid,
+    AreaId, MapStorage, Mapper, MovedContent, RoomNumber, SourceBundle, SourceId, Uuid,
+    access_review::{AccessReview, ReviewRecipient, ReviewedMove},
     clan_secrets::{NewSecret, NewSecretOwner},
     cloud_api::{SecretChange, SecretColorChange, SecretSummary},
     mapper::{
@@ -822,6 +823,24 @@ pub(super) fn op_smudgy_mapper_check_place(
     }
 }
 
+/// `area.in(place).area`: the place's own rooms, including Private additions.
+#[op2]
+#[cppgc]
+pub(super) fn op_smudgy_mapper_place_area(
+    state: &OpState,
+    #[string] area_id: &str,
+    #[string] key: &str,
+) -> Result<JSArea, MapperError> {
+    ensure_mapper(state, false)?;
+    let (atlas, map, _, place) = read_place(state, AreaId(parse_id(area_id)?), key)?;
+    atlas
+        .get_area(&map)
+        .and_then(|map| map.place_area_id(place))
+        .and_then(|id| atlas.get_area(&id))
+        .map(JSArea)
+        .ok_or(MapperError::AreaNotFound)
+}
+
 /// `room.in(place).data(key)`: the value `place` keeps for this room, or `undefined`.
 #[op2]
 #[string]
@@ -1552,6 +1571,182 @@ pub(super) async fn op_smudgy_mapper_delete_secret(
         .delete_secret(map, &SourceId::Secret(id))
         .await
         .map_err(secret_failed("delete secret"))
+}
+
+/// A review stays in its originating isolate; scripts cannot change its request or token.
+pub(super) struct JsRoomMove {
+    map: AreaId,
+    from: SourceId,
+    to: SourceId,
+    room: RoomNumber,
+    review: RefCell<Option<ReviewedMove>>,
+}
+
+unsafe impl GarbageCollected for JsRoomMove {
+    fn get_name(&self) -> &'static std::ffi::CStr {
+        c"RoomMove"
+    }
+    fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct JsRoomMoveDetails {
+    requires_confirmation: bool,
+    messages: Vec<String>,
+}
+
+fn move_review_messages(review: &AccessReview) -> Vec<String> {
+    let mut messages = Vec::new();
+    if review.destination_notice {
+        messages.push("Moved content will follow the destination's permissions, including access you cannot inspect.".into());
+    }
+    for change in &review.changes {
+        for (effect, audiences) in [("gain", &change.may_gain), ("lose", &change.may_lose)] {
+            for audience in audiences {
+                let names = audience
+                    .iter()
+                    .map(|recipient| match recipient {
+                        ReviewRecipient::Group { name, .. } => format!("Group {name}"),
+                        ReviewRecipient::User { id, nickname } => {
+                            nickname.clone().unwrap_or_else(|| id.to_string())
+                        }
+                        ReviewRecipient::Members => "Members".into(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                messages.push(format!(
+                    "{}: {names} may {effect} {} permission.",
+                    change.name,
+                    change.action.replace('_', " ")
+                ));
+            }
+        }
+    }
+    if !review.changes.is_empty() {
+        messages.push("Overlapping grants can preserve access for some members.".into());
+    }
+    messages
+}
+
+fn spent_move() -> MapperError {
+    MapperError::OperationFailed {
+        operation: "move room",
+        message: "This move was already submitted. Prepare a new move before retrying.".into(),
+    }
+}
+
+#[op2(async(lazy), fast)]
+#[cppgc]
+pub(super) async fn op_smudgy_mapper_prepare_room_move(
+    state: Rc<RefCell<OpState>>,
+    #[string] area_id: String,
+    number: i32,
+    #[string] key: String,
+) -> Result<JsRoomMove, MapperError> {
+    let (mapper, map, from, to) = {
+        let state = state.borrow();
+        ensure_mapper(&state, true)?;
+        let to = writable_place(&state, &key)?;
+        let area_id = AreaId(parse_id(&area_id)?);
+        ensure_area_write(&state, area_id)?;
+        let mapper = state
+            .try_borrow::<Mapper>()
+            .cloned()
+            .ok_or(MapperError::MapperNotEnabled)?;
+        let atlas = mapper.get_current_atlas();
+        if hides_area(&state, area_id) {
+            return Err(MapperError::AreaNotFound);
+        }
+        let area = atlas.get_area(&area_id).ok_or(MapperError::AreaNotFound)?;
+        if area.get_room(&RoomNumber(number)).is_none() {
+            return Err(MapperError::OperationFailed {
+                operation: "prepare room move",
+                message: "Room not found".into(),
+            });
+        }
+        let (map, from) = place_of(&atlas, area_id);
+        ensure_place_write(&state, from)?;
+        resolve_place(&state, &atlas, map, to)?;
+        (mapper, map, from, to)
+    };
+    let review = mapper
+        .review_move_content(
+            map,
+            from,
+            to,
+            MovedContent {
+                rooms: vec![RoomNumber(number)],
+                ..MovedContent::default()
+            },
+        )
+        .await
+        .map_err(secret_failed("prepare room move"))?;
+    Ok(JsRoomMove {
+        map,
+        from,
+        to,
+        room: RoomNumber(number),
+        review: RefCell::new(Some(review)),
+    })
+}
+
+#[op2]
+#[serde]
+pub(super) fn op_smudgy_mapper_room_move_details(
+    #[cppgc] prepared: &JsRoomMove,
+) -> Result<JsRoomMoveDetails, MapperError> {
+    let held = prepared.review.borrow();
+    let review = &held.as_ref().ok_or_else(spent_move)?.review;
+    Ok(JsRoomMoveDetails {
+        requires_confirmation: review.requires_confirmation,
+        messages: move_review_messages(review),
+    })
+}
+
+#[op2]
+#[serde]
+pub(super) async fn op_smudgy_mapper_commit_room_move(
+    state: Rc<RefCell<OpState>>,
+    #[cppgc] prepared: &JsRoomMove,
+    confirmed: bool,
+) -> Result<JsRoomRef, MapperError> {
+    let mapper = {
+        let state = state.borrow();
+        ensure_mapper(&state, true)?;
+        ensure_place_write(&state, prepared.from)?;
+        ensure_place_write(&state, prepared.to)?;
+        state
+            .try_borrow::<Mapper>()
+            .cloned()
+            .ok_or(MapperError::MapperNotEnabled)?
+    };
+    let review = {
+        let mut held = prepared.review.borrow_mut();
+        let review = held.as_ref().ok_or_else(spent_move)?;
+        if review.review.requires_confirmation && !confirmed {
+            return Err(MapperError::OperationFailed {
+                operation: "move room",
+                message: "Read the move review and confirm it before committing.".into(),
+            });
+        }
+        held.take().ok_or_else(spent_move)?
+    };
+    let result = mapper
+        .commit_reviewed_move(review)
+        .await
+        .map_err(secret_failed("move room"))?;
+    let atlas = mapper.get_current_atlas();
+    let map = atlas
+        .get_area(&prepared.map)
+        .ok_or(MapperError::AreaNotFound)?;
+    let area = map
+        .place_area_id(prepared.to)
+        .ok_or(MapperError::AreaNotFound)?;
+    Ok((
+        ScriptUuid(area.0),
+        result.number_in_destination(prepared.room).0,
+    ))
 }
 
 #[cfg(test)]

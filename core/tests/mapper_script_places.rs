@@ -26,7 +26,10 @@ use smudgy_cloud::{
     CloudResult, CreateAreaRequest, Mapper, MapperBackend, Property, RoomData, RoomNumber,
     RoomWithDetails, SourceBundle, SourceId, Uuid,
     cloud_api::{SecretChange, SecretColorChange, SecretSummary},
-    mutation::{AreaMutation, MutationEnvelope, MutationResult, ResourceKind, VersionInfo},
+    mutation::{
+        AreaMutation, MoveRequest, MoveResult, MutationEnvelope, MutationResult, ResourceKind,
+        RoomRenumbering, VersionInfo,
+    },
 };
 use smudgy_core::models::shared_packages::{self, UpdateMode};
 use smudgy_core::session::runtime::RuntimeAction;
@@ -95,6 +98,11 @@ check("secret area", vault.id, bookcase.id);
 check("secret area mapId", vault.mapId, map.id);
 check("secret area place", vault.place === bookcase, true);
 check("secret area places", vault.places.length === 1 && vault.places[0] === bookcase, true);
+check("map view area", map.in("map").area.id, map.id);
+check("secret view area", map.in(bookcase).area.id, vault.id);
+check("private view area", map.in("private").area.id, "{private}");
+check("private view place", map.in("private").area.place, "private");
+check("private view parent", map.in("private").area.mapId, map.id);
 check("secret room place", vault.room(2).place === bookcase, true);
 check("secret room area", vault.room(2).areaId, bookcase.id);
 
@@ -354,6 +362,9 @@ await probe("getSecretById unknown", () => mapper.getSecretById(U).id);
 await probe("in secret", () => room.in(S));
 await probe("in unknown", () => room.in(U));
 await probe("in private", () => room.in("private"));
+await probe("move to secret", () => room.prepareMoveTo(S));
+await probe("move to unknown", () => room.prepareMoveTo(U));
+await probe("move to private", () => room.prepareMoveTo("private"));
 await probe("area in secret", () => map.in(S));
 for (const number of [1, 3, 4, 5]) {{
     const here = map.room(number);
@@ -518,6 +529,9 @@ const endpoint = {{ roomNumber: 2, side: "North", portOffset: 0.5, portMode: "Au
 const REFUSED = {refused};
 const writes = [
     ["setRoomTitle", () => mapper.setRoomTitle(S, 2, "x"), true],
+    ["prepareMoveTo Map", () => mapper.getAreaById(S).room(2).prepareMoveTo("map"), false],
+    ["prepareMoveTo Secret", () => room.prepareMoveTo(S), false],
+    ["prepareMoveTo Private", () => room.prepareMoveTo("private"), false],
     ["setRoomDescription", () => mapper.setRoomDescription(S, 2, "x"), true],
     ["setRoomColor", () => mapper.setRoomColor(S, 2, "#ffffff"), true],
     ["setRoomLevel", () => mapper.setRoomLevel(S, 2, 1), true],
@@ -1146,6 +1160,129 @@ fn apply(bundle: &mut SourceBundle, operation: &AreaMutation) {
 
 #[async_trait]
 impl MapperBackend for PlacesCloud {
+    async fn review_move_content(
+        &self,
+        _area_id: &AreaId,
+        request: &MoveRequest,
+        _generation: u64,
+    ) -> CloudResult<smudgy_cloud::access_review::AccessReview> {
+        if request.to == SourceId::Secret(LEDGER) {
+            return Err(CloudError::PermissionDenied("secret_view_only".into()));
+        }
+        Ok(smudgy_cloud::access_review::AccessReview {
+            token: "room-review".into(),
+            requires_confirmation: true,
+            destination_notice: true,
+            changes: vec![],
+            property_conflicts: vec![],
+            preserves_undo: true,
+        })
+    }
+
+    // Only unlinked own rooms are moved in this fixture; full graph preservation
+    // belongs to the cloud move integration tests.
+    async fn move_content(
+        &self,
+        area_id: &AreaId,
+        request: &MoveRequest,
+        _generation: u64,
+    ) -> CloudResult<MoveResult> {
+        assert_eq!(request.access_review.as_deref(), Some("room-review"));
+        assert_eq!(request.rooms.len(), 1);
+        let mut details = self.details.lock().unwrap();
+        for condition in &request.preconditions {
+            let current_rev = if condition.source.is_map() {
+                details.area.rev
+            } else {
+                details
+                    .sources
+                    .iter()
+                    .find(|s| s.source == condition.source)
+                    .unwrap()
+                    .rev
+            };
+            if current_rev != condition.expected_rev {
+                return Err(CloudError::RevisionConflict {
+                    id: area_id.0,
+                    expected_rev: condition.expected_rev,
+                    current_rev,
+                });
+            }
+        }
+        let number = request.rooms[0].room_number;
+        let source = if request.from.is_map() {
+            &mut details.rooms
+        } else {
+            &mut details
+                .sources
+                .iter_mut()
+                .find(|s| s.source == request.from)
+                .unwrap()
+                .rooms
+        };
+        let index = source.iter().position(|r| r.room_number == number).unwrap();
+        let mut room = source.remove(index);
+        assert!(
+            room.exits.is_empty(),
+            "the fixture only moves unlinked rooms"
+        );
+        let destination = if request.to.is_map() {
+            &mut details.rooms
+        } else {
+            &mut details
+                .sources
+                .iter_mut()
+                .find(|s| s.source == request.to)
+                .unwrap()
+                .rooms
+        };
+        if destination.iter().any(|r| r.room_number == number) {
+            room.room_number = RoomNumber(
+                destination
+                    .iter()
+                    .map(|r| r.room_number.0)
+                    .max()
+                    .unwrap_or(0)
+                    + 1,
+            );
+        }
+        let to = room.room_number;
+        destination.push(room);
+        let versions = [request.from, request.to]
+            .into_iter()
+            .map(|place| {
+                let rev = if place.is_map() {
+                    &mut details.area.rev
+                } else {
+                    &mut details
+                        .sources
+                        .iter_mut()
+                        .find(|s| s.source == place)
+                        .unwrap()
+                        .rev
+                };
+                *rev += 1;
+                VersionInfo {
+                    resource: ResourceKind::Source,
+                    id: area_id.0,
+                    source: place,
+                    rev: *rev,
+                    deleted: false,
+                }
+            })
+            .collect();
+        self.lifecycle.lock().unwrap().push("move room".into());
+        Ok(MoveResult {
+            operation_id: request.operation_id,
+            versions,
+            renumbered: if to == number {
+                vec![]
+            } else {
+                vec![RoomRenumbering { from: number, to }]
+            },
+        })
+    }
+
     async fn create_area(&self, _request: CreateAreaRequest) -> CloudResult<Area> {
         Err(CloudError::PermissionDenied(
             "scripted: no new maps".to_string(),
@@ -1583,6 +1720,156 @@ async fn scripts_reach_a_maps_places() {
         ],
         "each write reaches exactly its place, keyed by the map room; adding a tag the place \
          keeps sends nothing; each Secret numbers its own new rooms"
+    );
+}
+
+#[tokio::test]
+async fn scripts_record_into_private_before_it_has_any_content() {
+    const SERVER: &str = "MapperScriptEmptyPrivate";
+    let home = prepare_server(SERVER);
+    let cloud = Arc::new(PlacesCloud::without_sources());
+    let script = format!(
+        r#"{prelude}
+try {{
+    const destination = map.in("private").area;
+    check("private id", destination.id, "{private}");
+    check("private place", destination.place, "private");
+    check("private parent", destination.mapId, map.id);
+    check("empty rooms", destination.roomNumbers.length, 0);
+    check("first number", destination.nextRoomNumber, 1);
+    check("area resolves", mapper.getAreaById(destination.id).id, destination.id);
+    let number;
+    await mapper.mutateArea(destination.id, async (mutation) => {{
+        number = await mutation.createRoom({{ title: "First private room", x: 0, y: -1 }});
+        await mutation.createRoomExit(number, {{ fromDirection: "South", toAreaId: map.id, toRoomNumber: 1 }});
+    }});
+    const recorded = mapper.getAreaById(destination.id).room(number);
+    check("created number", number, 1);
+    check("created title", recorded?.title, "First private room");
+    check("created place", recorded?.place, "private");
+    check("link returns to map", recorded?.exits[0]?.toAreaId, map.id);
+    check("public room unchanged", mapper.getAreaById(map.id).room(1).title, room.title);
+    echo(failures.length ? `EMPTY_PRIVATE_FAIL ${{failures.join("; ")}}` : "EMPTY_PRIVATE_OK");
+}} catch (error) {{ echo(`EMPTY_PRIVATE_THROW ${{error}}`); }}
+"#,
+        prelude = prelude(),
+        private = private_area(),
+    );
+    std::fs::write(home.join(SERVER).join("modules").join("private.ts"), script)
+        .expect("write the module");
+    let mapper = Mapper::new(cloud.clone(), home.join("map-empty-private-cloud"));
+    let lines = run_until(
+        spawn(params(9_430, SERVER, mapper)),
+        "EMPTY_PRIVATE_",
+        Vec::new(),
+    )
+    .await;
+    assert!(
+        lines.iter().any(|line| line == "EMPTY_PRIVATE_OK"),
+        "{}",
+        lines.join("\n")
+    );
+    let envelopes = cloud.envelopes.lock().unwrap();
+    assert_eq!(
+        envelopes.len(),
+        1,
+        "reading an empty Private area writes nothing"
+    );
+    assert_eq!(envelopes[0].source, SourceId::Private);
+    assert_eq!(
+        envelopes[0].payload.len(),
+        2,
+        "only the room and its exit are written"
+    );
+}
+
+#[tokio::test]
+async fn scripts_move_rooms_between_places_after_review_and_follow_renumbering() {
+    const SERVER: &str = "MapperScriptRoomMove";
+    let home = prepare_server(SERVER);
+    let cloud = Arc::new(PlacesCloud::new());
+    {
+        let mut details = cloud.details.lock().unwrap();
+        let mut room = details
+            .rooms
+            .iter()
+            .find(|r| r.room_number == RoomNumber(3))
+            .unwrap()
+            .clone();
+        room.room_number = RoomNumber(10);
+        room.title = "Movable room".into();
+        room.properties.push(property("notes", "Own notes survive"));
+        details.rooms.push(room.clone());
+        room.title = "Occupied number".into();
+        details
+            .sources
+            .iter_mut()
+            .find(|s| s.source == SourceId::Secret(BOOKCASE))
+            .unwrap()
+            .rooms
+            .push(room);
+    }
+    let script = format!(
+        r#"{prelude}
+import {{ room as locationChanged }} from "smudgy:events/map";
+locationChanged.on((location) => echo(`ROOM_MOVE_MARKER ${{location.areaId}}:${{location.roomNumber}}`));
+try {{
+    const original = map.room(10);
+    const secret = map.secrets.get("{BOOKCASE}");
+    mapper.setCurrentLocation(map.id, 10);
+    const cancelled = await original.prepareMoveTo("private");
+    check("preparation changes nothing", map.room(10)?.title, "Movable room");
+    const move = await original.prepareMoveTo(secret);
+    check("review required", move.requiresConfirmation, true);
+    check("review notice", move.messages.some(s => s.includes("destination's permissions")), true);
+    check("unconfirmed refused", (await failure(() => move.commit())).includes("confirm"), true);
+    const moved = await move.commit({{ confirm: true }});
+    check("destination", moved.areaId, secret.id);
+    check("renumbered", moved.roomNumber, 11);
+    check("title", moved.title, "Movable room");
+    check("notes", moved.data("notes"), "Own notes survive");
+    check("source gone", !!mapper.getAreaById(map.id).room(10), false);
+    check("only once", (await failure(() => move.commit({{ confirm: true }}))).includes("already submitted"), true);
+    const privateMove = await moved.prepareMoveTo("private");
+    const mine = await privateMove.commit({{ confirm: true }});
+    check("private", mine.place, "private");
+    check("private parent", mapper.getAreaById(mine.areaId).mapId, map.id);
+    const back = await (await mine.prepareMoveTo("map")).commit({{ confirm: true }});
+    check("back on map", back.areaId, map.id);
+    check("back notes", back.data("notes"), "Own notes survive");
+    check("read-only destination", (await failure(() => back.prepareMoveTo("{LEDGER}"))).includes("secretViewOnly"), true);
+    const stale = await back.prepareMoveTo(secret);
+    await mapper.setRoomTitle(secret.area, 10, "Changed after review");
+    check("stale review refused", (await failure(() => stale.commit({{ confirm: true }}))) === "no error", false);
+    check("stale leaves source", mapper.getAreaById(map.id).room(back.roomNumber)?.title, "Movable room");
+}} catch (error) {{ failures.push(`threw ${{error?.stack ?? error}}`); }}
+echo(failures.length ? `ROOM_MOVE_FAIL ${{failures.join(" | ")}}` : "ROOM_MOVE_OK");
+"#,
+        prelude = prelude()
+    );
+    std::fs::write(home.join(SERVER).join("modules").join("move.ts"), script).unwrap();
+    let mapper = Mapper::new(cloud.clone(), home.join("map-script-room-move"));
+    let lines = run_until(
+        spawn(params(9_470, SERVER, mapper)),
+        "ROOM_MOVE_",
+        Vec::new(),
+    )
+    .await;
+    assert!(
+        lines.iter().any(|line| line == "ROOM_MOVE_OK"),
+        "{}",
+        lines.join("\n")
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == &format!("ROOM_MOVE_MARKER {MAP}:11")),
+        "{}",
+        lines.join("\n")
+    );
+    assert_eq!(
+        *cloud.lifecycle.lock().unwrap(),
+        ["move room", "move room", "move room"]
     );
 }
 

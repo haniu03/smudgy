@@ -1,13 +1,13 @@
 {
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "An auto-mapper for ArcticMUD",
   "entry": "index.ts",
   "min_smudgy_version": "0.5.8",
   "dependencies": [
-    "smudgy://kapusniak/map-layout@^0.2.4"
+    "smudgy:@map-layout@^0.2.9"
   ],
   "requires": [
-    "smudgy://kapusniak/arctic-prompt"
+    "smudgy:@arctic-prompt"
   ],
   "hosts": [
     "mud.arctic.org"
@@ -34,6 +34,22 @@
           "label": "Off"
         }
       ]
+    },
+    {
+      "key": "noteLinkHotkeys",
+      "label": "Enable room note link hotkeys",
+      "secret": false,
+      "required": false,
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "noteLinkPromptHint",
+      "label": "Show first room note link in the prompt",
+      "secret": false,
+      "required": false,
+      "type": "bool",
+      "default": true
     },
     {
       "key": "textSize",
@@ -105,10 +121,15 @@
       "session": [
         "send",
         "send-direct",
-        "echo"
+        "echo",
+        "reach-others"
       ],
       "mapper": [
         "write"
+      ],
+      "secrets": [
+        "write",
+        "manage"
       ],
       "display": [
         "change"

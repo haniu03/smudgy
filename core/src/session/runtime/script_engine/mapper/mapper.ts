@@ -105,6 +105,7 @@ const {
     op_smudgy_mapper_resolve_place,
     op_smudgy_mapper_list_area_places,
     op_smudgy_mapper_check_place,
+    op_smudgy_mapper_place_area,
     op_smudgy_mapper_room_place_data,
     op_smudgy_mapper_room_place_tags,
     op_smudgy_mapper_room_place_has_tag,
@@ -119,6 +120,9 @@ const {
     op_smudgy_mapper_create_secret,
     op_smudgy_mapper_update_secret,
     op_smudgy_mapper_delete_secret,
+    op_smudgy_mapper_prepare_room_move,
+    op_smudgy_mapper_room_move_details,
+    op_smudgy_mapper_commit_room_move,
     // (untyped: Deno.core is deno's private bootstrap namespace, no type decls)
 } = (globalThis as any).Deno.core.ops;
 
@@ -807,6 +811,11 @@ class AreaView {
 
     get place(): MapPlace {
         return placeOf(this.#key);
+    }
+
+    /** The area's own rooms in this place, including Private additions. */
+    get area(): Area {
+        return new Area(op_smudgy_mapper_place_area(this.#area.id, this.#key));
     }
 
     data(key: string): string | undefined {
@@ -2189,6 +2198,20 @@ class Room {
      * their own rooms. */
     get place(): MapPlace {
         return placeOf(op_smudgy_mapper_room_place(this.#obj));
+    }
+
+    /** Prepare a move to another place of the same cloud map, without changing it. */
+    async prepareMoveTo(place: MapPlaceLike): Promise<RoomMove> {
+        const prepared = await op_smudgy_mapper_prepare_room_move(this.areaId, this.roomNumber, placeKey(place));
+        const details = op_smudgy_mapper_room_move_details(prepared);
+        return Object.freeze({
+            requiresConfirmation: details.requiresConfirmation,
+            messages: Object.freeze(details.messages as string[]),
+            async commit(options?: { confirm?: boolean }): Promise<Room> {
+                const [areaId, number] = await op_smudgy_mapper_commit_room_move(prepared, options?.confirm === true);
+                return mapper.getAreaById(areaId).room(number)!;
+            },
+        });
     }
 
     /** One place's data on this room. */

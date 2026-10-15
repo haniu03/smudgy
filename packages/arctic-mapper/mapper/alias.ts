@@ -1,13 +1,26 @@
-import { createAlias, createHotkey, createTrigger, Matches, echo, send, sendRaw, capture, buffer, line, mapper} from "smudgy:core";
+import { createAlias, createHotkey, createTrigger, type Matches, echo, send, sendRaw, capture, buffer, line, mapper, getSessions, session } from "smudgy:core";
 import { extractMarkdownLinks } from "smudgy:widgets";
 import {
     planAreaChange,
+    loadLayoutModel,
+    planLayoutModel,
+    layoutSnapshotKey,
+    chooseProjectedConstraint,
+    inferElevationPreference,
+    materializePlannedLayoutModels,
+    measureIntegralLayoutQuality,
+    compareLayoutQuality,
+    DIRECTIONAL_VIOLATION_WEIGHT,
+    LEVEL_VIOLATION_WEIGHT,
     type AreaChangePlan,
     type ElevationPreference,
     type LayoutDirection,
-} from "smudgy://kapusniak/map-layout";
+    type LayoutModel,
+    type LayoutQuality,
+    type LayoutPatch,
+} from "smudgy:@map-layout";
 import { debugLog, distanceBetweenRooms, findRoomsAt, idsMatch, linkRooms, options, parseRoomExits, parseRoomExitsDetailed, RoomFlags, roomsImpactedByPush, speedwalk, State, state, ZMode } from "./mapper.ts";
-import { mapEvent, RoomEvent } from "./events.ts";
+import { mapEvent, type RoomEvent } from "./events.ts";
 import { requestExistingRoomConnection } from "./widget.tsx";
 
 import promptEvent from 'smudgy:events/kapusniak/arctic-prompt/prompt';
@@ -18,7 +31,13 @@ import {
     MoveCommands,
     OppositeDirection,
 } from "./mapper.ts";
-import { describeDoor, doorUpdate, nextDoorState, openCommandFor } from "./doors.ts";
+import { defaultOpenCommand, describeDoor, doorUpdate, nextDoorState, openCommandFor } from "./doors.ts";
+import { notesLinks } from "./places.ts";
+import { extendExit, linkCandidate, linkNeedsOtherPlace } from "./links.ts";
+import { recordObservedDoors } from "./recording.ts";
+import { findAreaByName, findNearestRoomWithTagsInArea, roomRouteCost } from "./tag-search.ts";
+import { targets } from "./targets.ts";
+import { extendRecordedExit } from "./recording-place.ts";
 
 createAlias(/^map\b(\s+(?<args>.*))?$/, mapperCommand, { name: "mapper" });
 
@@ -31,18 +50,20 @@ function links(text: string): { text: string; url: string }[] {
     return extractMarkdownLinks(text).map(({ label, url }) => ({ text: label, url }));
 }
 
-function firstLink(text: string): { text: string; url: string } | null {
-    return links(text)[0] ?? null;
-}
-
 // Run the destination of the `index`th (1-based) link in the current room's notes. Echoes when
 // the room has no notes, its notes contain no link, or it has fewer links than asked for.
-function sendRoomNotesLink(index = 1) {
-    const found = links(state.room?.data("notes") ?? "");
+function sendRoomNotesLink(index = 1, audience: "self" | "all" | "others" = "self") {
+    state.refreshRoomAndArea();
+    const found = notesLinks(state.room, links);
     const link = found[index - 1];
 
     if (link) {
-        send(link.url);
+        if (audience === "self") send(link.url);
+        else {
+            for (const target of getSessions()) {
+                if (audience === "all" || target.id !== session.id) target.send(link.url);
+            }
+        }
     } else if (found.length > 0) {
         echo(`This room's notes have only ${found.length} link${found.length === 1 ? "" : "s"}.`);
     } else {
@@ -50,17 +71,23 @@ function sendRoomNotesLink(index = 1) {
     }
 }
 
-// CTRL+ENTER: run the first link in the current room's notes.
-createHotkey({ key: "Enter", modifiers: ["CTRL"] }, () => {
-    sendRoomNotesLink();
-}, { name: "room_notes_link" });
+// Leave these keys available to other bindings when the package option is off.
+if (options.noteLinkHotkeys) {
+    createHotkey({ key: "Enter", modifiers: ["ctrl"] }, () => sendRoomNotesLink(),
+        { name: "room_notes_link" });
+    createHotkey({ key: "Enter", modifiers: ["ctrl", "alt"] }, () => sendRoomNotesLink(1, "all"),
+        { name: "room_notes_link_alt" });
+    createHotkey({ key: "Enter", modifiers: ["ctrl", "shift"] }, () => sendRoomNotesLink(1, "others"),
+        { name: "room_notes_link_shift" });
+}
 
 // When we enter a room whose notes carry a link, hint it inline in the game's prompt (the
 // same link CTRL+ENTER follows), borrowing the older command-hint module's approach. Runs in
 // the map update queue after the room event's handler, so state.room is the room just
 // entered.
 function hintShortcut(room: RoomEvent) {
-    const link = firstLink(state.room?.data("notes") ?? "");
+    if (!options.noteLinkPromptHint) return;
+    const link = notesLinks(state.room, links)[0];
     if (!link) {
         return;
     }
@@ -99,16 +126,23 @@ function promptLine(number: number, prefix: string) {
 // Speedwalk to the nearest room matching a dot-separated tag filter. Each token
 // is a required tag, or an excluded tag when prefixed with `!`. Tags are set with
 // `map room flag set <TAG>` (or the mapper UI). Examples:
-//   \inn              nearest INN
-//   \inn.peace        nearest room with BOTH INN and PEACE
-//   \!peace.guild     nearest GUILD room that is NOT PEACE
-createAlias(/^>(?<spec>[!\w.]+)$/, ({ spec }: Matches) => {
+//   >inn              nearest INN
+//   >inn.peace        nearest room with BOTH INN and PEACE
+//   >!peace.guild     nearest GUILD room that is NOT PEACE
+//   >inn@sol          nearest INN in the area named by "sol"
+createAlias(/^>(?<spec>[!\w.]+)(?:@(?<prefix>.+?))?(?:[ \t]+(?<alone>a|al|alo|alon|alone))?[ \t]*$/, ({ spec, prefix, alone }: Matches) => {
     if (!spec) {
         return;
     }
     const here = state.room;
     if (!here) {
         echo("The mapper doesn't know your current room yet.");
+        return;
+    }
+
+    const area = prefix === undefined ? undefined : findAreaByName(mapper.areas, prefix);
+    if (prefix !== undefined && !area) {
+        echo(`No area name starts with "${prefix.trim()}".`);
         return;
     }
 
@@ -131,22 +165,22 @@ createAlias(/^>(?<spec>[!\w.]+)$/, ({ spec }: Matches) => {
         return;
     }
 
-    const dest = mapper.findNearestRoomWithTags(here, { all, none });
+    const dest = area ? findNearestRoomWithTagsInArea(mapper, here, area, all, none)
+        : mapper.findNearestRoomWithTags(here, { all, none });
     if (dest) {
-        speedwalk(dest, here);
+        speedwalk(dest, here, !!alone);
         return;
     }
 
-    // No exact match: treat each required tag as a prefix of a real tag in the current
-    // area (e.g. ">dr" -> DRUID_GUILD) and walk to the nearest reachable expansion.
-    const resolved = resolveTagPrefixes(here, all, none);
+    // Expand tags in the named area, or the current area when no scope was given.
+    const resolved = resolveTagPrefixes(here, all, none, area);
     if (resolved) {
         echo(`Matched ${resolved.combo.join(".")}.`);
-        speedwalk(resolved.room, here);
+        speedwalk(resolved.room, here, !!alone);
         return;
     }
 
-    echo(`No room matching >${spec.toUpperCase()} is reachable from here.`);
+    echo(`No room matching >${spec.toUpperCase()}${area ? `@${area.name}` : ""} is reachable from here.`);
 }, { name: "speedwalk_tag" });
 
 // Speedwalk to an area named by prefix: `>@sol` walks to the closest reachable
@@ -154,7 +188,7 @@ createAlias(/^>(?<spec>[!\w.]+)$/, ({ spec }: Matches) => {
 // exact name wins over a longer prefix match, so `>@mud` reaches "Mud" even
 // when "Mudhole" exists). The destination is the area itself, so there is no
 // tag filter -- `>@sol.!peace` is just a (failing) prefix.
-createAlias(/^>@(?<prefix>.+)$/, ({ prefix }: Matches) => {
+createAlias(/^>@(?<prefix>.+?)(?:[ \t]+(?<alone>a|al|alo|alon|alone))?[ \t]*$/, ({ prefix, alone }: Matches) => {
     const wanted = (prefix ?? "").trim().toLowerCase();
     if (!wanted) {
         return;
@@ -165,9 +199,7 @@ createAlias(/^>@(?<prefix>.+)$/, ({ prefix }: Matches) => {
         return;
     }
 
-    const areas = mapper.areas;
-    const area = areas.find((a) => a.name.toLowerCase() === wanted)
-        ?? areas.find((a) => a.name.toLowerCase().startsWith(wanted));
+    const area = findAreaByName(mapper.areas, prefix);
     if (!area) {
         echo(`No area name starts with "${prefix.trim()}".`);
         return;
@@ -178,15 +210,39 @@ createAlias(/^>@(?<prefix>.+)$/, ({ prefix }: Matches) => {
         echo(`No room of ${area.name} is reachable from here.`);
         return;
     }
-    if (speedwalk(dest, here) === 0) {
+    if (speedwalk(dest, here, !!alone) === 0) {
         echo(`You're already in ${area.name}.`);
     }
 }, { name: "speedwalk_area" });
 
+// Named destinations supplied by procedures or another session's live location.
+createAlias(/^>\$(?<prefix>.+?)(?:[ \t]+(?<alone>a|al|alo|alon|alone))?[ \t]*$/, ({ prefix, alone }: Matches) => {
+    const here = state.room;
+    if (!here) {
+        echo("The mapper doesn't know your current room yet.");
+        return;
+    }
+    try {
+        const target = targets.find(prefix);
+        let room: Room | undefined;
+        try { room = mapper.getAreaById(target.location.areaId)?.room(target.location.roomNumber); }
+        catch { /* A target may refer to a map/place unavailable in this session. */ }
+        if (!room) {
+            echo(`Target "${target.name}" refers to a room unavailable in this session.`);
+        } else if (room.areaId === here.areaId && room.roomNumber === here.roomNumber) {
+            echo(`You're already at ${target.name}.`);
+        } else if (speedwalk(room, here, !!alone) === 0) {
+            echo(`Target "${target.name}" is not reachable from here.`);
+        }
+    } catch (error) {
+        echo(error instanceof Error ? error.message : String(error));
+    }
+}, { name: "speedwalk_target" });
+
 // The distinct tags present on rooms in an area (already stored UPPERCASE).
 function areaTags(area: Area): string[] {
     const tags = new Set<string>();
-    for (const roomNumber of area.room_numbers) {
+    for (const roomNumber of area.roomNumbers) {
         const room = area.room(roomNumber);
         for (const tag of room?.tags ?? []) {
             tags.add(tag);
@@ -204,11 +260,11 @@ function cartesian(lists: string[][]): string[][] {
 }
 
 // Fallback for ">tag" when no room matches the tags exactly: read each required token
-// as a prefix of a real tag in the current area and return the nearest reachable room
+// as a prefix of a real tag in the named or current area and return the nearest reachable room
 // (with the expansion used). A token that already names a real tag resolves to itself;
 // excluded (none) tags are left exact. Null if nothing expands to a reachable room.
-function resolveTagPrefixes(here: Room, all: string[], none: string[]): { room: Room; combo: string[] } | null {
-    const area = state.area;
+function resolveTagPrefixes(here: Room, all: string[], none: string[], scope?: Area): { room: Room; combo: string[] } | null {
+    const area = scope ?? state.area;
     if (!area || all.length === 0) {
         return null;
     }
@@ -223,10 +279,15 @@ function resolveTagPrefixes(here: Room, all: string[], none: string[]): { room: 
     }
 
     let best: { room: Room; combo: string[] } | null = null;
+    let bestDistance = Infinity;
     for (const combo of cartesian(candidatesPerToken)) {
-        const room = mapper.findNearestRoomWithTags(here, { all: combo, none });
-        if (room && (!best || distanceBetweenRooms(here, room) < distanceBetweenRooms(here, best.room))) {
+        const room = scope ? findNearestRoomWithTagsInArea(mapper, here, scope, combo, none)
+            : mapper.findNearestRoomWithTags(here, { all: combo, none });
+        if (!room) continue;
+        const distance = scope ? roomRouteCost(mapper, here, room) : distanceBetweenRooms(here, room);
+        if (distance < bestDistance) {
             best = { room, combo };
+            bestDistance = distance;
         }
     }
     return best;
@@ -294,11 +355,11 @@ function moveSelected(direction: string) {
         return;
     }
 
-    const exit = state.room.exits.find((e) => e.from_direction === intent && !!e.to_room_number);
+    const exit = state.room.exits.find((e) => e.fromDirection === intent && !!e.toRoomNumber);
 
     if (exit) {
-        const areaId = exit.to_area_id;
-        const roomId = exit.to_room_number;
+        const areaId = exit.toAreaId;
+        const roomId = exit.toRoomNumber;
 
         if (!areaId || !roomId) {
             echo(`Exit ${direction} from ${state.room.title} is not linked to a room`);
@@ -320,7 +381,7 @@ function moveSelected(direction: string) {
         state.area = area;
         state.room = room;
 
-        mapper.setCurrentLocation(state.area.id, state.room.room_number);
+        mapper.setCurrentLocation(state.area.id, state.room.roomNumber);
         echo(`Moved to room ${state.room.title}`);
     } else {
         echo(`No exit found in direction ${direction}`);
@@ -345,7 +406,7 @@ async function areaCommand([subcommand, ...args]: string[]) {
             echo("\nAreas:");
             for (const area of mapper.areas) {
                 echo(
-                    `  ${area.name} (${area.room_numbers.length} rooms) [${area.id}]`,
+                    `  ${area.name} (${area.roomNumbers.length} rooms) [${area.id}]`,
                 );
             }
             break;
@@ -370,9 +431,9 @@ async function roomCommand([subcommand, ...args]: string[]) {
                 echo("No room selected");
                 return;
             }
-            await mapper.setRoomColor(state.area.id, state.room.room_number, color);
+            await mapper.setRoomColor(state.area.id, state.room.roomNumber, color);
             state.refreshRoomAndArea();
-            mapper.setCurrentLocation(state.area.id, state.room.room_number);
+            mapper.setCurrentLocation(state.area.id, state.room.roomNumber);
             break;
         }
         case 'link': {
@@ -409,7 +470,7 @@ async function roomCommand([subcommand, ...args]: string[]) {
             await linkRooms(state.room, targetRoom, intent, !options.has('oneway'));
 
             state.refreshRoomAndArea();
-            mapper.setCurrentLocation(state.area.id, state.room.room_number);
+            mapper.setCurrentLocation(state.area.id, state.room.roomNumber);
             echo(`Linked room ${state.room.title} to ${targetRoom.title} in direction ${direction}`);
 
             break;
@@ -447,14 +508,14 @@ async function roomCommand([subcommand, ...args]: string[]) {
 
             const [direction] = args;
             const intent = MoveCommands[direction as keyof typeof MoveCommands];
-            const exits = state.room.exits.filter((e) => e.from_direction === intent);
+            const exits = state.room.exits.filter((e) => e.fromDirection === intent);
 
             for (const exit of exits) {
-                await mapper.deleteRoomExit(state.area.id, state.room.room_number, exit.id);
-                echo(`Deleted exit ${exit.from_direction} from ${state.room.title}`);
+                await mapper.deleteRoomExit(state.area.id, state.room.roomNumber, exit.id);
+                echo(`Deleted exit ${exit.fromDirection} from ${state.room.title}`);
             }
             state.refreshRoomAndArea();
-            mapper.setCurrentLocation(state.area.id, state.room.room_number);
+            mapper.setCurrentLocation(state.area.id, state.room.roomNumber);
 
             break;
         }
@@ -463,9 +524,9 @@ async function roomCommand([subcommand, ...args]: string[]) {
                 echo("No room selected");
                 return;
             }
-            const { area_id, room_number, title } = state.room;
-            await mapper.deleteRoom(area_id, room_number);
-            state.area = mapper.getAreaById(area_id);
+            const { areaId, roomNumber, title } = state.room;
+            await mapper.deleteRoom(areaId, roomNumber);
+            state.area = mapper.getAreaById(areaId);
             state.room = null;
             mapper.setCurrentLocation(state.area.id, null);
             echo(`Deleted room ${title}`);
@@ -483,11 +544,11 @@ async function roomCommand([subcommand, ...args]: string[]) {
             echo(`Exits: ${state.room.exits.map(e => {
                 const markers = [
                     e.door && `door ${describeDoor(e.door)}`,
-                    e.is_hidden && "hidden",
+                    e.isHidden && "hidden",
                     e.command && `cmd: ${e.command}`,
                     e.door?.opensWith && `open: ${e.door.opensWith}`,
                 ].filter(Boolean);
-                return `${e.from_direction} -> ${e.to_room_number ?? "?"}${markers.length ? ` [${markers.join(", ")}]` : ""}`;
+                return `${e.fromDirection} -> ${e.toRoomNumber ?? "?"}${markers.length ? ` [${markers.join(", ")}]` : ""}`;
             }).join(", ")}`);
             break;
         }
@@ -524,9 +585,9 @@ async function roomCommand([subcommand, ...args]: string[]) {
                     echo(`Known flags: ${Object.keys(RoomFlags).join(", ")}`);
                     return;
                 }
-                await mapper.addRoomTag(state.area.id, state.room.room_number, tag);
+                await mapper.addRoomTag(state.area.id, state.room.roomNumber, tag);
             } else if (action === "clear") {
-                await mapper.removeRoomTag(state.area.id, state.room.room_number, tag);
+                await mapper.removeRoomTag(state.area.id, state.room.roomNumber, tag);
             } else {
                 echo("Invalid action");
                 return;
@@ -544,8 +605,8 @@ async function roomCommand([subcommand, ...args]: string[]) {
 
             // find the nearest room with a matching title and description
             const nearestRoom = rooms.filter(r =>
-                idsMatch(r.area_id, state.area.id)
-                && r.room_number !== state.room.room_number
+                idsMatch(r.areaId, state.area.id)
+                && r.roomNumber !== state.room.roomNumber
             ).sort((a, b) => {
                 const aDistance = Math.abs(a.x - state.room.x) + Math.abs(a.y - state.room.y) + Math.abs(a.level - state.room.level);
                 const bDistance = Math.abs(b.x - state.room.x) + Math.abs(b.y - state.room.y) + Math.abs(b.level - state.room.level);
@@ -562,11 +623,11 @@ async function roomCommand([subcommand, ...args]: string[]) {
             try {
                 await mapper.mergeRooms(
                     state.area.id,
-                    state.room.room_number,
-                    mergeWith.room_number,
+                    state.room.roomNumber,
+                    mergeWith.roomNumber,
                 );
                 state.refreshRoomAndArea();
-                mapper.setCurrentLocation(state.area.id, state.room.room_number);
+                mapper.setCurrentLocation(state.area.id, state.room.roomNumber);
             } catch (error) {
                 echo(`Could not merge rooms: ${error}`);
             }
@@ -582,8 +643,9 @@ async function exitCommand([dirArg, action, ...rest]: string[]) {
         echo("Actions:");
         echo("  (none)                  - Show the exit's door, commands and flags");
         echo("  open <cmd>              - Command that opens the door (e.g. `unlock n;open n`, `part brush`)");
+        echo("  name <name>             - Door name used by the default open command");
         echo("  command <cmd>           - Command sent instead of the direction (e.g. `enter hole`)");
-        echo("  clear open|command|door - Remove the open command, the movement command, or the door");
+        echo("  clear open|command|door|name - Remove the open command, movement command, door, or door name");
         echo("  closed|locked [true|false] - Set the door's state");
         echo("  hidden [true|false]     - Set the hidden flag");
     };
@@ -600,14 +662,14 @@ async function exitCommand([dirArg, action, ...rest]: string[]) {
     }
     const direction = intent;
 
-    const exit = state.room.exits.find((e) => e.from_direction === direction);
+    const exit = state.room.exits.find((e) => e.fromDirection === direction);
     if (!exit) {
         echo(`No exit ${direction} from ${state.room.title}`);
         return;
     }
     const door = exit.door ?? null;
     const setDoor = async (next: DoorArgs | null) => {
-        await mapper.setRoomExit(state.area.id, state.room.room_number, exit.id, { door: next });
+        await mapper.setRoomExit(state.area.id, state.room.roomNumber, exit.id, { door: next });
         state.refreshRoomAndArea();
     };
 
@@ -615,10 +677,10 @@ async function exitCommand([dirArg, action, ...rest]: string[]) {
         case undefined:
         case 'show': {
             echo(`Exit ${direction} from ${state.room.title}:`);
-            echo(`  to: ${exit.to_room_number ?? "(unlinked)"}${exit.to_direction ? ` (arrives from ${exit.to_direction})` : ""}`);
+            echo(`  to: ${exit.toRoomNumber ?? "(unlinked)"}${exit.toDirection ? ` (arrives from ${exit.toDirection})` : ""}`);
             echo(`  door: ${door ? describeDoor(door) : "(none)"}`);
-            echo(`  flags: ${exit.is_hidden ? "hidden" : "(none)"}`);
-            echo(`  open command: ${openCommandFor(exit, `open door ${DirectionLetter[direction]} (default)`) ?? "(none)"}`);
+            echo(`  flags: ${exit.isHidden ? "hidden" : "(none)"}`);
+            echo(`  open command: ${openCommandFor(exit, `${defaultOpenCommand(exit, DirectionLetter[direction])} (default)`) ?? "(none)"}`);
             echo(`  movement command: ${exit.command || "(none)"}`);
             break;
         }
@@ -632,13 +694,20 @@ async function exitCommand([dirArg, action, ...rest]: string[]) {
             echo(`Exit ${direction}: open command set to \`${cmd}\``);
             break;
         }
+        case 'name': {
+            const name = rest.join(" ").trim();
+            if (!name) { usage(); return; }
+            await setDoor(doorUpdate(door, { name }));
+            echo(`Exit ${direction}: door name set to \`${name}\``);
+            break;
+        }
         case 'command': {
             const cmd = rest.join(" ").trim();
             if (!cmd) {
                 usage();
                 return;
             }
-            await mapper.setRoomExit(state.area.id, state.room.room_number, exit.id, { command: cmd });
+            await mapper.setRoomExit(state.area.id, state.room.roomNumber, exit.id, { command: cmd });
             state.refreshRoomAndArea();
             echo(`Exit ${direction}: movement command set to \`${cmd}\` (sent instead of ${DirectionLetter[direction]})`);
             break;
@@ -653,9 +722,12 @@ async function exitCommand([dirArg, action, ...rest]: string[]) {
                 await setDoor(doorUpdate(door, { opensWith: null }));
                 echo(`Exit ${direction}: open command cleared`);
             } else if (what === 'command') {
-                await mapper.setRoomExit(state.area.id, state.room.room_number, exit.id, { command: "" });
+                await mapper.setRoomExit(state.area.id, state.room.roomNumber, exit.id, { command: "" });
                 state.refreshRoomAndArea();
                 echo(`Exit ${direction}: movement command cleared`);
+            } else if (what === 'name') {
+                if (door) await setDoor(doorUpdate(door, { name: null }));
+                echo(`Exit ${direction}: door name cleared`);
             } else if (what === 'door') {
                 if (!door) {
                     echo(`Exit ${direction} has no door`);
@@ -686,7 +758,7 @@ async function exitCommand([dirArg, action, ...rest]: string[]) {
         }
         case 'hidden': {
             const value = (rest[0] ?? "true").toLowerCase() !== "false";
-            await mapper.setRoomExit(state.area.id, state.room.room_number, exit.id, { isHidden: value });
+            await mapper.setRoomExit(state.area.id, state.room.roomNumber, exit.id, { isHidden: value });
             state.refreshRoomAndArea();
             echo(`Exit ${direction}: hidden = ${value}`);
             break;
@@ -717,11 +789,13 @@ const commands = {
         echo("  reflow - Thoroughly search and reflow the complete current area");
         echo("  z [auto|levels|projected] - Show or set new U/D room placement style");
         echo("  refresh - Refresh the current room (will send a `look` command)");
-        echo("  send_link [n] - Run the nth link in the current room's notes (default 1; same as CTRL+ENTER)");
+        echo("  send_link [n] - Run the nth link in the current room's notes (default 1)");
         echo("  room move|color|link|shift|unlink|delete|show|flag|automerge - Edit the selected room");
-        echo("  exit <direction> [open|command|clear|closed|hidden|locked] - Show or edit an exit");
+        echo("  exit <direction> [open|name|command|clear|closed|hidden|locked] - Show or edit an exit");
         echo("  debug [on|off] - Toggle diagnostic logging");
         echo("  debug raw - Toggle raw line dump (escape codes shown as \\e)");
+        echo("Speedwalk: >tags, >tags@area, >@area, or >$target (optional: a|al|alo|alon|alone)");
+        echo("  Targets include other sessions' profile names; use an exact name or unique prefix.");
     },
     area: (...args: string[]) => areaCommand(args),
     room: (...args: string[]) => {
@@ -734,9 +808,9 @@ const commands = {
         }
 
         echo("\nRooms:");
-        for (const room_number of state.area.room_numbers) {
-            const room = state.area.room(room_number);
-            echo(`  ${room.title} (${room.room_number})`);
+        for (const roomNumber of state.area.roomNumbers) {
+            const room = state.area.room(roomNumber);
+            echo(`  ${room.title} (${room.roomNumber})`);
         }
     },
     path: (from: string, to: string) => {
@@ -746,7 +820,7 @@ const commands = {
             echo("Room not found (use a room number or <area>#<number>)");
             return;
         }
-        const path = mapper.getPathBetweenRooms(fromRoom.area_id, fromRoom.room_number, toRoom.area_id, toRoom.room_number);
+        const path = mapper.getPathBetweenRooms(fromRoom.areaId, fromRoom.roomNumber, toRoom.areaId, toRoom.roomNumber);
         for (const room of path) {
             const areaId = room[0];
             const roomNumber = room[1];
@@ -798,7 +872,7 @@ const commands = {
         echo("Searching violation-prioritized anchors for a better layout…");
         const result = await planAreaChange(state.area.id, {
             type: "reflow",
-            anchor: state.room?.room_number,
+            anchor: state.room?.roomNumber,
         }, {
             effort: "thorough",
         });
@@ -931,9 +1005,11 @@ const commands = {
             return;
         }
 
-        const areaId = state.area.id;
-        let roomNumber = state.room?.room_number;
+        const areaId = !state.room && state.state === State.Mapping
+            ? state.recordingDestination().area.id : state.area.id;
+        let roomNumber = state.room?.roomNumber;
         state.refreshRoomAndArea();
+        const selectedRoom = state.room;
 
         echo("Refreshing the current room");
 
@@ -947,11 +1023,11 @@ const commands = {
                 echo(`Exits: ${room.exits}`);
 
                 const currentExits = new Set([
-                    ...(state.room?.exits ?? []).map((e) => e.from_direction),
+                    ...(selectedRoom?.exits ?? []).map((e) => e.fromDirection),
                 ]);
                 const createdExits: [Direction, ExitId][] = [];
                 await mapper.mutateArea(areaId, async (mutation) => {
-                    if (!state.room) {
+                    if (!selectedRoom) {
                         roomNumber = await mutation.createRoom({
                             title: room.title,
                             description: room.description.join("\n"),
@@ -966,7 +1042,7 @@ const commands = {
                     for (const exit of parseRoomExitsDetailed(room.exits)) {
                         if (!currentExits.has(exit.direction) && roomNumber !== undefined) {
                             const id = await mutation.createRoomExit(roomNumber, {
-                                from_direction: exit.direction,
+                                fromDirection: exit.direction,
                                 door: exit.closed ? { state: "closed" } : null,
                             });
                             createdExits.push([exit.direction, id]);
@@ -978,6 +1054,11 @@ const commands = {
                 }
                 state.area = mapper.getAreaById(areaId);
                 state.room = state.area.room(roomNumber);
+                if (state.room) {
+                    await recordObservedDoors(mapper, state.room, parseRoomExitsDetailed(room.exits));
+                    state.refreshRoomAndArea();
+                    mapper.setCurrentLocation(state.room.areaId, state.room.roomNumber);
+                }
                 for (const [direction, id] of createdExits) {
                     echo(`Created exit ${direction} (${id})`);
                 }
@@ -1039,11 +1120,11 @@ function advanceInDark(visibleExits: string | undefined) {
     const targets: Room[] = [];
     for (const p of sources) {
         for (const e of p.exits) {
-            if ((p.hasTag("SPIN") || e.from_direction === direction) && e.to_room_number && e.to_area_id) {
-                if (targets.some((t) => t.room_number === e.to_room_number && idsMatch(t.area_id, e.to_area_id))) {
+            if ((p.hasTag("SPIN") || e.fromDirection === direction) && e.toRoomNumber && e.toAreaId) {
+                if (targets.some((t) => t.roomNumber === e.toRoomNumber && idsMatch(t.areaId, e.toAreaId))) {
                     continue;
                 }
-                const room = mapper.getAreaById(e.to_area_id)?.room(e.to_room_number);
+                const room = mapper.getAreaById(e.toAreaId)?.room(e.toRoomNumber);
                 if (room) {
                     targets.push(room);
                 }
@@ -1056,7 +1137,7 @@ function advanceInDark(visibleExits: string | undefined) {
     // the prompt shows.
     const visibleDirections = parseRoomExits(visibleExits);
     const matchingExits = targets.filter((r) =>
-        visibleDirections.every((d) => r.exits.some((e) => e.from_direction === d)));
+        visibleDirections.every((d) => r.exits.some((e) => e.fromDirection === d)));
     const candidates = matchingExits.length > 0 ? matchingExits : targets;
 
     if (candidates.length === 0) {
@@ -1071,7 +1152,7 @@ function advanceInDark(visibleExits: string | undefined) {
     candidates.sort((a, b) => distanceBetweenRooms(a, state.room) - distanceBetweenRooms(b, state.room));
     state.possibleRooms = candidates;
     state.setCurrentRoom(candidates[0]);
-    debugLog(`now at "${candidates[0].title}" (#${candidates[0].room_number}) via dark-room exit; ${candidates.length} possible`);
+    debugLog(`now at "${candidates[0].title}" (#${candidates[0].roomNumber}) via dark-room exit; ${candidates.length} possible`);
 }
 
 /**
@@ -1081,12 +1162,12 @@ function advanceInDark(visibleExits: string | undefined) {
  * parenthesized), then sends the exit's movement command if it has one.
  * Returns true when the movement command was sent in place of the direction.
  */
-function activeMove(direction: Direction): boolean {
+function activeMove(direction: Direction, alone = false): boolean {
     if (!state.room) {
         return false;
     }
 
-    const exit = state.room.exits.find((e) => e.from_direction === direction);
+    const exit = state.room.exits.find((e) => e.fromDirection === direction);
     if (!exit) {
         return false;
     }
@@ -1095,7 +1176,7 @@ function activeMove(direction: Direction): boolean {
     // undefined = unknown (no prompt data, or a hidden exit).
     const liveClosed = state.seenExits?.get(direction);
 
-    const openCommand = openCommandFor(exit, `open door ${DirectionLetter[direction]}`, liveClosed === true);
+    const openCommand = openCommandFor(exit, defaultOpenCommand(exit, DirectionLetter[direction]), liveClosed === true);
 
     // Skip opening only when the prompt affirmatively shows the exit open.
     if (openCommand && liveClosed !== false) {
@@ -1103,7 +1184,9 @@ function activeMove(direction: Direction): boolean {
         sendCommands(openCommand);
     }
 
-    if (exit.command) {
+    // Explicit solo movement keeps the typed direction and modifier. A custom
+    // exit command may have different arguments and cannot stand in for it.
+    if (exit.command && !alone) {
         debugLog(`sending exit command for ${direction} instead of moving: ${exit.command}`);
         sendCommands(exit.command);
         return true;
@@ -1112,15 +1195,17 @@ function activeMove(direction: Direction): boolean {
     return false;
 }
 
+const directionCommands = Object.keys(MoveCommands).filter(command => MoveCommands[command] !== "look");
+const lookCommands = Object.keys(MoveCommands).filter(command => MoveCommands[command] === "look");
 createAlias(
-    `^(${Object.keys(MoveCommands).join("|")})$`,
-    ({ 0: $0 }: Matches) => {
-        const intent = MoveCommands[$0 as keyof typeof MoveCommands];
+    `^(?:(?<direction>${directionCommands.join("|")})(?:[ \\t]+(?<alone>a|al|alo|alon|alone))?|(?<look>${lookCommands.join("|")}))[ \\t]*$`,
+    ({ direction, look, alone }: Matches) => {
+        const intent = MoveCommands[direction ?? look];
 
         state.captureMoveCommand(intent);
         debugLog(`move captured: ${intent} (queue ${state.moveQueue.length})`);
 
-        if (state.state === State.Active && intent !== "look" && activeMove(intent)) {
+        if (state.state === State.Active && intent !== "look" && activeMove(intent, !!alone)) {
             // the exit's command went out instead — swallow the typed direction
             return;
         }
@@ -1162,7 +1247,7 @@ function elevationPreference(): ElevationPreference {
 
 async function applyLayoutMoves(
     areaId: AreaId,
-    result: AreaChangePlan,
+    result: Pick<AreaChangePlan, "patch">,
     mutation?: AreaMutator,
 ): Promise<void> {
     const updates: [RoomNumber, UpdateRoomParams][] = result.patch.moves.map((move) => {
@@ -1186,65 +1271,162 @@ function matchingRoomsWithReciprocalStub(
     title: string,
     description: string,
     direction: Direction,
+    areaId: AreaId = source.areaId,
 ): Room[] {
     const reciprocalDirection = OppositeDirection[direction];
     return mapper.listRoomsByTitleAndDescription(title, description)
         .filter((room): room is Room => !!room)
-        .filter((room) => room.area_id === source.area_id &&
-            room.room_number !== source.room_number)
+        .filter((room) => room.areaId === areaId &&
+            (room.areaId !== source.areaId || room.roomNumber !== source.roomNumber))
         .filter((room) => room.exits.some((exit) =>
-            exit.from_direction === reciprocalDirection && exit.to_room_number === null
+            exit.fromDirection === reciprocalDirection && exit.toRoomNumber === null
         ))
-        .sort((a, b) => a.room_number - b.room_number);
+        .sort((a, b) => a.roomNumber - b.roomNumber);
 }
 
 async function reflowAndConnectExistingRoom(
     source: Room,
     destinationRoomNumber: RoomNumber,
     direction: Direction,
+    destination: ReturnType<typeof state.recordingDestination>,
 ): Promise<void> {
-    const result = await planAreaChange(source.area_id, {
+    if (source.areaId !== destination.area.id) {
+        const target = destination.area.room(destinationRoomNumber);
+        if (!target) throw new Error("The room to connect is no longer available.");
+        await linkRecordingRooms(source, target, direction, destination.place);
+        state.setCurrentRoom(target);
+        return;
+    }
+    const result = await planAreaChange(source.areaId, {
         type: "connect-rooms",
-        from: source.room_number,
+        from: source.roomNumber,
         to: destinationRoomNumber,
         direction: direction as LayoutDirection,
         elevation: elevationPreference(),
     });
-    await applyLayoutMoves(source.area_id, result);
+    await applyLayoutMoves(source.areaId, result);
 
-    const reflowedArea = mapper.getAreaById(source.area_id);
-    const reflowedSource = reflowedArea.room(source.room_number);
+    const reflowedArea = mapper.getAreaById(source.areaId);
+    const reflowedSource = reflowedArea.room(source.roomNumber);
     const reflowedDestination = reflowedArea.room(destinationRoomNumber);
     if (!reflowedSource || !reflowedDestination) {
         throw new Error("a room disappeared while reflowing an existing connection");
     }
 
-    await linkRooms(reflowedSource, reflowedDestination, direction);
+    await linkRecordingRooms(reflowedSource, reflowedDestination, direction, destination.place);
     state.setCurrentRoom(reflowedDestination);
-    echo(`Reflowed and connected ${direction} to ${reflowedDestination.title} (#${reflowedDestination.room_number}).`);
+    echo(`Reflowed and connected ${direction} to ${reflowedDestination.title} (#${reflowedDestination.roomNumber}).`);
 }
 
-async function createNewRoomInDirection(roomEvent: RoomEvent, direction: Direction): Promise<ExitId[]> {
+async function linkRecordingRooms(from: Room, to: Room, direction: Direction, place: MapPlace) {
+    const reverse = OppositeDirection[direction];
+    await extendRecordedExit(mapper, from, place, {
+        fromDirection: direction, toDirection: reverse, toAreaId: to.areaId, toRoomNumber: to.roomNumber,
+    });
+    await extendRecordedExit(mapper, to, place, {
+        fromDirection: reverse, toDirection: direction, toAreaId: from.areaId, toRoomNumber: from.roomNumber,
+    });
+}
+
+function measureRecordingLayout(model: LayoutModel): LayoutQuality {
+    return measureIntegralLayoutQuality(new Map(model.rooms.map(room => [room.id, room.position])), model.edges);
+}
+
+/** Compare defects only: adding a clean room naturally increases footprint and link length. */
+function recordingLayoutScore(quality: LayoutQuality): number {
+    const levels = quality.levelViolations ?? 0;
+    return DIRECTIONAL_VIOLATION_WEIGHT * (quality.cardinalRayViolations - levels)
+        + LEVEL_VIOLATION_WEIGHT * levels + quality.routingViolations + quality.linkCrossings;
+}
+
+/** Place along the intended ray without moving residents or invoking the planner. */
+function unadjustedRoomPatch(model: LayoutModel, from: string, direction: Direction): LayoutPatch {
+    const source = model.rooms.find(room => room.id === from);
+    if (!source) throw new Error("The room we left is no longer available for recording.");
+    const [x, y, level] = options.moveCoordinates[direction];
+    let step = { x, y, level };
+    if (direction === Direction.Up || direction === Direction.Down) {
+        const preference = elevationPreference();
+        const style = preference === "auto" ? inferElevationPreference(model, from) : preference;
+        step = style === "projected" ? chooseProjectedConstraint(model, from, direction)
+            : { x: 0, y: 0, level: direction === Direction.Up ? 1 : -1 };
+    }
+    const occupied = new Set(model.rooms.map(room => `${room.position.x},${room.position.y},${room.position.level}`));
+    let position = { ...source.position };
+    do {
+        position = { x: position.x + step.x, y: position.y + step.y, level: position.level + step.level };
+    } while (occupied.has(`${position.x},${position.y},${position.level}`));
+    return { moves: [], placements: [{ id: PROPOSED_ROOM_ID, position }] };
+}
+
+async function createNewRoomInDirection(
+    roomEvent: RoomEvent,
+    direction: Direction,
+    destination: ReturnType<typeof state.recordingDestination>,
+): Promise<ExitId[]> {
     const prevRoom = state.room;
-    let areaId = prevRoom?.area_id;
+    const areaId = destination.area.id;
 
     if (!prevRoom || !areaId) {
         echo("No current room, cannot create new room");
         return [];
     }
 
-    const layout = await planAreaChange(areaId, {
+    // Refuse an ambiguous entrance before committing a room in another place.
+    // The allocator still chooses the actual room number inside the mutation.
+    linkCandidate(prevRoom, {
+        fromDirection: direction, toAreaId: areaId,
+        toRoomNumber: destination.area.nextRoomNumber,
+    });
+
+    // Across places, include only a fixed reference to the source. It is never
+    // persisted, and the planner must not move the destination's existing rooms.
+    const crossingPlaces = prevRoom.areaId !== areaId;
+    const entryId = "$arctic:entry";
+    const snapshot = loadLayoutModel(areaId);
+    const model: LayoutModel = crossingPlaces ? {
+        ...snapshot,
+        rooms: [...snapshot.rooms, { id: entryId, movable: false,
+            position: { x: prevRoom.x, y: prevRoom.y, level: prevRoom.level } }],
+    } : snapshot;
+    const change = {
         type: "add-room",
-        from: prevRoom.room_number,
+        from: crossingPlaces ? entryId : String(prevRoom.roomNumber),
         direction: direction as LayoutDirection,
         temporaryId: PROPOSED_ROOM_ID,
         elevation: elevationPreference(),
-    });
+    } as const;
+    let layout: Pick<AreaChangePlan, "patch"> = { patch: unadjustedRoomPatch(model, change.from, direction) };
+    if (options.autoAdjustMapLayout) {
+        const after = materializePlannedLayoutModels(model, change, {}, layout.patch).after;
+        const quality = measureRecordingLayout(after);
+        const beforeScore = recordingLayoutScore(measureRecordingLayout(model));
+        const afterScore = recordingLayoutScore(quality);
+        if (afterScore > beforeScore) {
+            debugLog(`new room worsens layout defect score ${beforeScore} -> ${afterScore}; planning adjustment`);
+            const adjusted: AreaChangePlan = crossingPlaces ? planLayoutModel(model, change, { allowExistingMoves: false })
+                : await planAreaChange(areaId, change, { includeSnapshotKeys: true });
+            // The Worker can yield to a checkbox change or an edit in another
+            // session. Rebuild the simple fallback from live coordinates, and
+            // apply the adjustment only to the snapshot it was planned against.
+            const currentModel = crossingPlaces ? model : loadLayoutModel(areaId);
+            layout = { patch: unadjustedRoomPatch(currentModel, change.from, direction) };
+            const currentQuality = crossingPlaces ? quality : measureRecordingLayout(
+                materializePlannedLayoutModels(currentModel, change, {}, layout.patch).after);
+            const currentScore = crossingPlaces ? beforeScore : recordingLayoutScore(measureRecordingLayout(currentModel));
+            const snapshotMatches = crossingPlaces || adjusted.sourceSnapshotKey === layoutSnapshotKey(currentModel);
+            // Both candidates contain the new room, so the full quality ordering
+            // is meaningful here. Keep the simple placement unless planning improves it.
+            if (options.autoAdjustMapLayout && snapshotMatches && recordingLayoutScore(currentQuality) > currentScore
+                && compareLayoutQuality(adjusted.quality, currentQuality) > 0) layout = adjusted;
+        }
+    }
     const placement = layout.patch.placements.find((value) => value.id === PROPOSED_ROOM_ID);
     if (!placement) throw new Error("layout did not place the new Arctic room");
     // Definitely assigned inside the mutateArea callback before any later use.
     let newRoomNumber!: RoomNumber;
     const exitIds: ExitId[] = [];
+    let deferredLink: ExitArgs & { toAreaId: AreaId; toRoomNumber: RoomNumber } | undefined;
     await mapper.mutateArea(areaId, async (mutation) => {
         await applyLayoutMoves(areaId, layout, mutation);
         newRoomNumber = await mutation.createRoom({
@@ -1253,33 +1435,36 @@ async function createNewRoomInDirection(roomEvent: RoomEvent, direction: Directi
             description: roomEvent.description.join("\n"),
         });
 
-        for (const exit of prevRoom.exits.filter((candidate) =>
-            candidate.from_direction === direction && candidate.to_room_number !== newRoomNumber
-        )) {
-            await mutation.deleteRoomExit(prevRoom.room_number, exit.id);
-        }
-        exitIds.push(await mutation.createRoomExit(prevRoom.room_number, {
-            from_direction: direction,
-            to_direction: OppositeDirection[direction],
-            to_area_id: areaId,
-            to_room_number: newRoomNumber,
-        }));
+        const forward = {
+            fromDirection: direction,
+            toDirection: OppositeDirection[direction],
+            toAreaId: areaId,
+            toRoomNumber: newRoomNumber,
+        };
+        if (prevRoom.areaId !== areaId || linkNeedsOtherPlace(prevRoom, forward)) deferredLink = forward;
+        else exitIds.push(await extendExit(mutation, prevRoom, forward));
         exitIds.push(await mutation.createRoomExit(newRoomNumber, {
-            from_direction: OppositeDirection[direction],
-            to_direction: direction,
-            to_area_id: areaId,
-            to_room_number: prevRoom.room_number,
+            fromDirection: OppositeDirection[direction],
+            toDirection: direction,
+            toAreaId: prevRoom.areaId,
+            toRoomNumber: prevRoom.roomNumber,
+            door: parseRoomExitsDetailed(roomEvent.exits).find(exit => exit.direction === OppositeDirection[direction])?.closed
+                ? { state: "closed" } : null,
         }));
         for (const exit of parseRoomExitsDetailed(roomEvent.exits)) {
             if (exit.direction !== OppositeDirection[direction]) {
                 exitIds.push(await mutation.createRoomExit(newRoomNumber, {
-                    from_direction: exit.direction,
+                    fromDirection: exit.direction,
                     door: exit.closed ? { state: "closed" } : null,
                 }));
             }
         }
     }, { description: "Map Arctic room and exits" });
-
+    if (deferredLink) {
+        // The new room must exist before another place's attachment can name it.
+        // Updating the existing exit routes to that place without copying its door.
+        exitIds.push(await extendRecordedExit(mapper, prevRoom, destination.place, deferredLink));
+    }
 
     state.area = mapper.getAreaById(areaId);
     state.room = state.area.room(newRoomNumber)!;
@@ -1306,16 +1491,16 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
 
         // first, let's see if the map already links to a room in the direction we just moved
 
-        const existingLink = state.room.exits.find((e) => e.from_direction === direction && !!e.to_room_number);
+        const existingLink = state.room.exits.find((e) => e.fromDirection === direction && !!e.toRoomNumber);
         if (existingLink) {
-            const linkedRoomArea = mapper.getAreaById(existingLink.to_area_id);
-            const linkedRoom = linkedRoomArea.room(existingLink.to_room_number);
+            const linkedRoomArea = mapper.getAreaById(existingLink.toAreaId);
+            const linkedRoom = linkedRoomArea.room(existingLink.toRoomNumber);
 
             if (linkedRoom?.title === roomEvent.title && linkedRoom?.description === eventRoomDescription) {
                 state.area = linkedRoomArea;
                 state.room = linkedRoom;
-                mapper.setCurrentLocation(existingLink.to_area_id, existingLink.to_room_number);
-                debugLog(`followed existing link ${direction} to "${linkedRoom.title}" (#${linkedRoom.room_number})`);
+                mapper.setCurrentLocation(existingLink.toAreaId, existingLink.toRoomNumber);
+                debugLog(`followed existing link ${direction} to "${linkedRoom.title}" (#${linkedRoom.roomNumber})`);
                 return;
             } else {
                 echo(`Room ${roomEvent.title} already exists in the map, but with different description, or title, doing nothing.`);
@@ -1327,8 +1512,9 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
         // if so, let's see if it's a match
 
         const movedToCoordinates = offsetDirection(state.room, direction);
+        const destination = state.recordingDestination();
 
-        const roomsAtTarget = findRoomsAt(movedToCoordinates.x, movedToCoordinates.y, movedToCoordinates.level);
+        const roomsAtTarget = findRoomsAt(movedToCoordinates.x, movedToCoordinates.y, movedToCoordinates.level, destination.area);
 
         const matchingRoom = roomsAtTarget.find((room) =>
             room.title === roomEvent.title && room.description === eventRoomDescription
@@ -1336,16 +1522,14 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
 
         if (matchingRoom) {
             echo(`Found not-yet-linked room ${matchingRoom.title} at ${movedToCoordinates.x}, ${movedToCoordinates.y}, ${movedToCoordinates.level}, linking...`);
-            await linkRooms(state.room, matchingRoom, direction);
-            state.room = matchingRoom;
-            state.refreshRoomAndArea();
-            mapper.setCurrentLocation(matchingRoom.area_id, matchingRoom.room_number);
+            await linkRecordingRooms(state.room, matchingRoom, direction, destination.place);
+            state.setCurrentRoom(matchingRoom);
             return;
         }
 
         if (roomsAtTarget.length > 0) {
             const occupants = roomsAtTarget.map((room) => room.title).join(", ");
-            echo(`Target cell ${movedToCoordinates.x}, ${movedToCoordinates.y}, ${movedToCoordinates.level} is occupied by ${occupants}; layout reflow will be required.`);
+            echo(`Target cell ${movedToCoordinates.x}, ${movedToCoordinates.y}, ${movedToCoordinates.level} is occupied by ${occupants}; finding a free position for the new room.`);
         }
 
         const sourceRoom = state.room;
@@ -1354,29 +1538,31 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
             roomEvent.title,
             eventRoomDescription,
             direction,
+            destination.area.id,
         );
         if (existingCandidates.length > 0) {
             const decision = await requestExistingRoomConnection(
                 roomEvent.title,
                 existingCandidates.map((room) => ({
-                    roomNumber: room.room_number,
+                    roomNumber: room.roomNumber,
                     x: room.x,
                     y: room.y,
                     level: room.level,
                 })),
+                sourceRoom.areaId === destination.area.id,
             );
             if (decision.type === "connect") {
-                await reflowAndConnectExistingRoom(sourceRoom, decision.roomNumber, direction);
+                await reflowAndConnectExistingRoom(sourceRoom, decision.roomNumber, direction, destination);
                 return;
             }
         }
 
         echo(`Creating new room in direction ${direction}`);
 
-        await createNewRoomInDirection(roomEvent, direction);
+        await createNewRoomInDirection(roomEvent, direction, destination);
 
         state.refreshRoomAndArea();
-        mapper.setCurrentLocation(state.area.id, state.room.room_number);
+        mapper.setCurrentLocation(state.area.id, state.room.roomNumber);
     } else if (state.state === State.Following || state.state === State.Active) {
         const incomingExits = parseRoomExits(roomEvent.exits);
 
@@ -1394,8 +1580,8 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
         // SPIN room, any of its exits, since those scramble the direction you leave by.
         const reachedByMove = (p: Room, r: Room): boolean =>
             p.exits.some((e) =>
-                (p.hasTag("SPIN") || e.from_direction === direction) &&
-                e.to_room_number == r.room_number && idsMatch(e.to_area_id, r.area_id));
+                (p.hasTag("SPIN") || e.fromDirection === direction) &&
+                e.toRoomNumber == r.roomNumber && idsMatch(e.toAreaId, r.areaId));
 
         // Rooms reachable from any source by the move we just made. Without a
         // directional move (look, or an unexpected room), we haven't gone
@@ -1403,7 +1589,7 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
         const reachableFromPossible = (rooms: Room[]) => {
             if (!direction || direction === "look") {
                 return rooms.filter(r => sources.some(p =>
-                    p.room_number === r.room_number && idsMatch(p.area_id, r.area_id)));
+                    p.roomNumber === r.roomNumber && idsMatch(p.areaId, r.areaId)));
             }
             return rooms.filter(r => sources.some(p => reachedByMove(p, r)));
         };
@@ -1417,11 +1603,11 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
         // moved (a self-loop, where staying put is the correct outcome).
         const here = (direction && direction !== "look") ? state.room : null;
         const selfLoops = here !== null && here.exits.some((e) =>
-            (here.hasTag("SPIN") || e.from_direction === direction) &&
-            e.to_room_number === here.room_number && idsMatch(e.to_area_id, here.area_id));
+            (here.hasTag("SPIN") || e.fromDirection === direction) &&
+            e.toRoomNumber === here.roomNumber && idsMatch(e.toAreaId, here.areaId));
         const justLeft = selfLoops ? null : here;
         const stillEligible = (r: Room) => !justLeft
-            || !(r && r.room_number === justLeft.room_number && idsMatch(r.area_id, justLeft.area_id));
+            || !(r && r.roomNumber === justLeft.roomNumber && idsMatch(r.areaId, justLeft.areaId));
 
         // Adopt the nearest candidate as the current room; the full set stays in
         // possibleRooms until a later move disambiguates.
@@ -1433,7 +1619,7 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
             pool.sort((a, b) => distanceBetweenRooms(a, state.room) - distanceBetweenRooms(b, state.room));
             state.possibleRooms = pool;
             state.setCurrentRoom(pool[0]);
-            debugLog(`now at "${pool[0].title}" (#${pool[0].room_number}) via ${stage}; ${pool.length} possible`);
+            debugLog(`now at "${pool[0].title}" (#${pool[0].roomNumber}) via ${stage}; ${pool.length} possible`);
             return true;
         };
 
@@ -1476,6 +1662,14 @@ let mapUpdateQueue = Promise.resolve();
 mapEvent.on("room", (roomEvent: RoomEvent) => {
     mapUpdateQueue = mapUpdateQueue
         .then(() => handleRoomEvent(roomEvent))
+        .then(async () => {
+            const room = state.room;
+            if (state.state === State.Mapping && room?.title === roomEvent.title
+                && room.description === roomEvent.description.join("\n")) {
+                await recordObservedDoors(mapper, room, parseRoomExitsDetailed(roomEvent.exits));
+                state.refreshRoomAndArea();
+            }
+        })
         .then(() => hintShortcut(roomEvent))
         .catch((error) => {
             echo(`Automatic map update failed: ${error instanceof Error ? error.message : String(error)}`);

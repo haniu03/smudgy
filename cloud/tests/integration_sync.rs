@@ -203,6 +203,97 @@ async fn acknowledged_cloud_edits_wake_only_sessions_for_the_same_viewer() {
     assert_eq!(stranger_mapper.sync_status().last_sync, stranger_sync);
 }
 
+/// A full load beside a local tier, as a session's mapper runs: the cloud
+/// map's Private resolves before its first write, and that write creates it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_load_beside_local_maps_resolves_an_empty_private() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("full-load-private@example.com", "full-load-private", true);
+    let map = server.create_area(&owner, "Ridge");
+    server.add_room(map, 1, "Lookout");
+    let cache = TempCacheDir::new("full-load-private");
+    let local = Arc::new(smudgy_cloud::LocalBackend::new(cache.path().join("local")));
+    let local_map = local
+        .create_area(smudgy_cloud::CreateAreaRequest {
+            name: "Local only".into(),
+            atlas_id: None,
+            clan_id: None,
+            ownership: None,
+            ephemeral: false,
+            properties: BTreeMap::new(),
+        })
+        .await
+        .unwrap()
+        .id;
+    let cloud = Arc::new(CachedCloudMapper::new(
+        CloudMapper::new(server.base_url.clone(), owner.api_key.clone()),
+        cache.path().join("cloud"),
+    ));
+    let mapper = Mapper::new(
+        Arc::new(smudgy_cloud::CompositeBackend::new(local, cloud)),
+        cache.path().join("mapper"),
+    );
+    wait_until(|| {
+        let atlas = mapper.get_current_atlas();
+        atlas.get_area(&map).is_some() && atlas.get_area(&local_map).is_some()
+    })
+    .await;
+    mapper.load_all_areas().await.expect("a full load");
+    assert_eq!(mapper.area_storage(&map), smudgy_cloud::MapStorage::Cloud);
+    assert_eq!(
+        mapper.area_storage(&local_map),
+        smudgy_cloud::MapStorage::Local
+    );
+
+    let atlas = mapper.get_current_atlas();
+    let ridge = atlas.get_area(&map).expect("the cloud map");
+    assert!(
+        ridge.source_layers().is_empty(),
+        "nothing served for Private"
+    );
+    let private = ridge.private_area_id().expect("a map's Private");
+    let empty = atlas
+        .get_area(&private)
+        .expect("Private resolves before its first write");
+    assert_eq!(empty.room_count(), 0);
+    assert_eq!(
+        atlas.source_of(&private),
+        Some((map, smudgy_cloud::SourceId::Private))
+    );
+
+    let written = mapper
+        .mutate_batches(vec![
+            smudgy_cloud::mapper::AreaMutationBatch::strict(
+                map,
+                vec![AreaMutation::UpsertAreaProperty {
+                    name: "notes".into(),
+                    value: "Mine".into(),
+                }],
+                "Private notes",
+            )
+            .in_source(smudgy_cloud::SourceId::Private),
+        ])
+        .expect("queued")
+        .pop()
+        .expect("one submission")
+        .operation_id()
+        .expect("a cloud write");
+    mapper.wait_for_mutation(written).await.expect("written");
+    let atlas = mapper.get_current_atlas();
+    let layer = atlas.get_area(&private).expect("Private");
+    assert_eq!(layer.get_property("notes"), Some("Mine"));
+    assert_eq!(atlas.get_area(&map).unwrap().source_layers().len(), 1);
+    tick(&mapper).await;
+    let atlas = mapper.get_current_atlas();
+    let confirmed = atlas.get_area(&private).expect("Private");
+    assert_eq!(
+        confirmed.get_rev(),
+        1,
+        "the server created Private with the write"
+    );
+    assert_eq!(confirmed.get_property("notes"), Some("Mine"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_generation_adoption_does_not_request_cloud_sync() {
     let server = MockServer::spawn().await;

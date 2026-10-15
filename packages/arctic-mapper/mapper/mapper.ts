@@ -1,7 +1,10 @@
 import { mapper, sendRaw, echo } from 'smudgy:core';
 import { get } from 'smudgy:params';
 import { idsMatch } from './ids.ts';
-import { openCommandFor } from './doors.ts';
+import { defaultOpenCommand, openCommandFor } from './doors.ts';
+import { extendExit, linkNeedsOtherPlace } from './links.ts';
+import { room as locationChanged } from 'smudgy:events/map';
+import { RecordingPlaces, recordingArea } from "./recording-place.ts";
 
 export { idsMatch } from './ids.ts';
 
@@ -228,21 +231,23 @@ export const DirectionLetter: Record<Direction, string> = {
  * Speedwalk from `from` (default: the mapper's current room) to `to` along the
  * mapped shortest path, one hop at a time. ArcticMUD movement lives here rather
  * than in the host so each MUD owns its own conventions: per hop we first send
- * the exit's open command (its door's `opensWith`, or `open <d>` when the door
+ * the exit's open command (its door's `opensWith`, or `open <name-or-door> <d>` when the door
  * is mapped closed), then the exit's `command` if set, else the direction
  * letter. Commands go out with `sendRaw` so the emitted directions do NOT
- * re-fire the movement-capture alias. Returns the number of hops walked.
+ * re-fire the movement-capture alias. With `alone`, directional movement commands
+ * gain the `alone` argument; door and other custom commands keep their arguments.
+ * Returns the number of hops walked.
  */
-export function speedwalk(to: Room, from: Room | null = state.room): number {
+export function speedwalk(to: Room, from: Room | null = state.room, alone = false): number {
     if (!from) {
         return 0;
     }
 
     const path = mapper.getPathBetweenRooms(
-        from.area_id,
-        from.room_number,
-        to.area_id,
-        to.room_number,
+        from.areaId,
+        from.roomNumber,
+        to.areaId,
+        to.roomNumber,
     );
     if (path.length < 2) {
         return 0;
@@ -250,11 +255,13 @@ export function speedwalk(to: Room, from: Room | null = state.room): number {
 
     // Split on ";" and raw-send each command (an open command may be compound,
     // e.g. "unlock n;open n").
-    const sendCommands = (raw: string) => {
+    const sendCommands = (raw: string, moveAlone = false) => {
         for (const part of raw.split(";")) {
             const command = part.trim();
             if (command) {
-                sendRaw(command + "\n");
+                const intent = MoveCommands[command.toLowerCase()];
+                const modifier = moveAlone && intent && intent !== "look" ? " alone" : "";
+                sendRaw(command + modifier + "\n");
             }
         }
     };
@@ -268,24 +275,24 @@ export function speedwalk(to: Room, from: Room | null = state.room): number {
             continue;
         }
         const exit = room.exits.find((e) =>
-            e.to_room_number === nextRoomNumber &&
-            !!e.to_area_id && idsMatch(e.to_area_id, nextAreaId)
+            e.toRoomNumber === nextRoomNumber &&
+            !!e.toAreaId && idsMatch(e.toAreaId, nextAreaId)
         );
         if (!exit) {
             continue;
         }
 
-        const direction = exit.from_direction as Direction;
-        const letter = DirectionLetter[direction] ?? exit.from_direction.toLowerCase();
+        const direction = exit.fromDirection as Direction;
+        const letter = DirectionLetter[direction] ?? exit.fromDirection.toLowerCase();
 
         // Open the exit's door before stepping through it.
-        const openCommand = openCommandFor(exit, `open ${letter}`);
+        const openCommand = openCommandFor(exit, defaultOpenCommand(exit, letter));
         if (openCommand) {
             sendCommands(openCommand);
         }
 
         // Move: an explicit exit command (e.g. "enter hole"), else the direction.
-        sendCommands(exit.command && exit.command !== "" ? exit.command : letter);
+        sendCommands(exit.command && exit.command !== "" ? exit.command : letter, alone);
         steps++;
     }
 
@@ -314,23 +321,62 @@ export function onRoomChanged(listener: RoomChangedListener) {
     roomChangedListeners.push(listener);
 }
 
+const modeChangedListeners: ((mode: State) => void)[] = [];
+export function onModeChanged(listener: (mode: State) => void) {
+    modeChangedListeners.push(listener);
+}
+
+const infoChangedListeners: (() => void)[] = [];
+export function onInfoChanged(listener: () => void) {
+    infoChangedListeners.push(listener);
+}
+function infoChanged() {
+    for (const listener of infoChangedListeners) listener();
+}
+
 export class MapState {
+    readonly recordingPlaces = new RecordingPlaces();
+
+    recordingDestination(): { map: Area; place: MapPlace; area: Area } {
+        if (!this.area) throw new Error("Select a map before choosing a recording place.");
+        const map = mapper.getAreaById(this.area.mapId ?? this.area.id);
+        const place = this.recordingPlaces.place(map, this.area.place);
+        return { map, place, area: recordingArea(map, place) };
+    }
+
+    selectRecordingPlace(map: Area, place: MapPlace): void {
+        this.recordingPlaces.select(map, place);
+        infoChanged();
+    }
     #area: Area | null = null;
     #room: Room | null = null;
     possibleRooms: Room[] = [];
-    state: State = configuredMode();
+    #state: State = configuredMode();
     moveQueue: MoveCommand[] = [];
     lastMoveCommand = new Date();
     /** Exits from the most recent prompt; value is true when shown closed (parenthesized). Null when unknown. */
     seenExits: Map<Direction, boolean> | null = null;
+
+    get state(): State { return this.#state; }
+    set state(value: State) {
+        if (this.#state === value) return;
+        if (value === State.Mapping && this.area) {
+            const map = mapper.getAreaById(this.area.mapId ?? this.area.id);
+            this.recordingPlaces.place(map, this.area.place);
+        }
+        this.#state = value;
+        for (const listener of modeChangedListeners) listener(value);
+        infoChanged();
+    }
 
     get area(): Area | null {
         return this.#area;
     }
 
     set area(value: Area | null) {
-        const changed = value?.name !== this.#area?.name;
+        const changed = !idsMatch(value?.id, this.#area?.id) || value?.name !== this.#area?.name;
         this.#area = value;
+        infoChanged();
         if (changed) {
             for (const listener of areaChangedListeners) {
                 listener(value);
@@ -343,11 +389,10 @@ export class MapState {
     }
 
     set room(value: Room | null) {
-        // Fire only when we land in a *different* room (by area + number), not when
-        // refreshRoomAndArea swaps in a fresh snapshot of the same room.
-        const changed = value?.room_number !== this.#room?.room_number
-            || !idsMatch(value?.area_id, this.#room?.area_id);
+        const changed = value?.roomNumber !== this.#room?.roomNumber
+            || !idsMatch(value?.areaId, this.#room?.areaId);
         this.#room = value;
+        infoChanged();
         if (changed) {
             for (const listener of roomChangedListeners) {
                 listener(value);
@@ -356,9 +401,9 @@ export class MapState {
     }
 
     setCurrentRoom(room: Room) {
-        this.area = mapper.getAreaById(room.area_id);
-        this.room = this.area.room(room.room_number);
-        mapper.setCurrentLocation(room.area_id, room.room_number);
+        this.area = mapper.getAreaById(room.areaId);
+        this.room = this.area.room(room.roomNumber);
+        mapper.setCurrentLocation(room.areaId, room.roomNumber);
     }
 
     setCurrentPossibleRooms(rooms: Room[]) {
@@ -391,7 +436,7 @@ export class MapState {
             this.area = mapper.getAreaById(this.area.id);
 
             if (this.room) {
-                this.room = this.area.room(this.room.room_number);
+                this.room = this.area.room(this.room.roomNumber);
             }
         }
     }
@@ -415,22 +460,38 @@ export class MapState {
 export class MapOptions {
     debug: boolean = false;
     debugRaw: boolean = false;
+    /** Session-only opt-in to repair layout defects introduced by new rooms. */
+    autoAdjustMapLayout: boolean = false;
     /** Creation preference for new U/D links; Auto infers the nearby section. */
     zMode: ZMode = configuredZMode();
     /** Base text size (px) for the map panel's text/button/markdown widgets (the `textSize` param). */
     textSize: number = configuredTextSize();
     /** Side length (px) of the square map widget (the `widgetSize` param). */
     widgetSize: number = configuredWidgetSize();
+    /** First note link: Ctrl+Enter locally, +Alt in all sessions, +Shift in other sessions. */
+    noteLinkHotkeys: boolean = get("noteLinkHotkeys") !== false;
+    /** Insert the first room note link's label into the game's prompt. */
+    noteLinkPromptHint: boolean = get("noteLinkPromptHint") !== false;
 
     get moveCoordinates() {
         // Coordinate-only legacy operations have no topology to infer from.
-        // Auto therefore uses levels; room creation goes through map-layout.
+        // Auto therefore uses levels; room creation infers the nearby section.
         return this.zMode === ZMode.Isometric ? IsometricZMoveCoordinates : MoveCoordinates;
     }
 }
 
 export const state = new MapState();
 export const options = new MapOptions();
+
+// Editor moves between Map, Private and Secrets can renumber a room. The host's
+// location event already carries its new address; don't keep a stale Room handle.
+function adoptLocation(areaId: AreaId, roomNumber: RoomNumber | null) {
+    state.area = mapper.getAreaById(areaId);
+    state.room = roomNumber === null ? null : state.area.room(roomNumber) ?? null;
+}
+locationChanged.on(({ areaId, roomNumber }) => adoptLocation(areaId, roomNumber));
+const initialLocation = mapper.getCurrentLocation();
+if (initialLocation) adoptLocation(initialLocation.area, initialLocation.room ?? null);
 
 /** Echo a diagnostic line when `map debug` is on. */
 export function debugLog(message: string) {
@@ -478,100 +539,47 @@ export function parseRoomExits(exits: string | undefined): Direction[] {
 }
 
 export async function linkRooms(from: Room, to: Room, direction: Direction, createReturnExit: boolean = true): Promise<ExitId[]> {
-    const oppositeDirection = OppositeDirection[direction];
-
-    const toRemoveFrom = from.exits.filter((e) =>
-        e.from_direction === direction && e.to_room_number !== to.room_number
-    );
-    const toRemoveTo = to.exits.filter((e) =>
-        e.from_direction === oppositeDirection &&
-        e.to_room_number !== from.room_number
-    );
-
-    const fromExit = from.exits.find((e) =>
-        e.from_direction === direction &&
-        e.to_room_number === to.room_number
-    );
-
-    if (idsMatch(from.area_id, to.area_id)) {
+    const opposite = OppositeDirection[direction];
+    const destination = (target: Room, leaving: Direction, arriving: Direction): ExitArgs & { toAreaId: AreaId; toRoomNumber: RoomNumber } => ({
+        fromDirection: leaving, toDirection: arriving,
+        toAreaId: target.areaId, toRoomNumber: target.roomNumber,
+    });
+    const forward = destination(to, direction, opposite);
+    const reverse = destination(from, opposite, direction);
+    const foreignForward = linkNeedsOtherPlace(from, forward);
+    const foreignReverse = createReturnExit && linkNeedsOtherPlace(to, reverse);
+    if (idsMatch(from.areaId, to.areaId) && !foreignForward && !foreignReverse) {
         const ids: ExitId[] = [];
-        await mapper.mutateArea(from.area_id, async (mutation) => {
-            for (const exit of toRemoveFrom) {
-                await mutation.deleteRoomExit(from.room_number, exit.id);
-            }
-            for (const exit of toRemoveTo) {
-                await mutation.deleteRoomExit(to.room_number, exit.id);
-            }
-            ids.push(fromExit?.id ?? await mutation.createRoomExit(from.room_number, {
-                from_direction: direction,
-                to_direction: oppositeDirection,
-                to_area_id: to.area_id,
-                to_room_number: to.room_number,
-            }));
-            if (createReturnExit) {
-                const toExit = to.exits.find((e) =>
-                    e.from_direction === oppositeDirection &&
-                    e.to_room_number === from.room_number
-                );
-                ids.push(toExit?.id ?? await mutation.createRoomExit(to.room_number, {
-                    from_direction: oppositeDirection,
-                    to_direction: direction,
-                    to_area_id: from.area_id,
-                    to_room_number: from.room_number,
-                }));
-            }
+        await mapper.mutateArea(from.areaId, async mutation => {
+            ids.push(await extendExit(mutation, from, forward));
+            if (createReturnExit) ids.push(await extendExit(mutation, to, reverse));
         }, { description: "Link Arctic rooms" });
         return ids;
     }
-
-    for (const exit of toRemoveFrom) {
-        await mapper.deleteRoomExit(from.area_id, from.room_number, exit.id);
-    }
-    for (const exit of toRemoveTo) {
-        await mapper.deleteRoomExit(to.area_id, to.room_number, exit.id);
-    }
-
-    const fromExitPromise = fromExit ? Promise.resolve(fromExit.id) :
-        mapper.createRoomExit(from.area_id, from.room_number, {
-            from_direction: direction,
-            to_direction: oppositeDirection,
-            to_area_id: to.area_id,
-            to_room_number: to.room_number,
-        });
-
-    if (!createReturnExit) {
-        return [await fromExitPromise];
-    }
-
-    {
-        const toExit = to.exits.find((e) =>
-            e.from_direction === oppositeDirection &&
-            e.to_room_number === from.room_number
-        );
-
-        const toExitPromise = toExit ? Promise.resolve(toExit.id) :
-            mapper.createRoomExit(to.area_id, to.room_number, {
-                from_direction: oppositeDirection,
-                to_direction: direction,
-                to_area_id: from.area_id,
-                to_room_number: from.room_number,
-            });
-
-        return Promise.all([fromExitPromise, toExitPromise]);
-    }
+    const writer = (area: AreaId) => ({
+        createRoomExit: (room: Room | RoomNumber, exit: ExitArgs) => mapper.createRoomExit(area, room, exit),
+        setRoomExit: async (room: Room | RoomNumber, id: ExitIdLike, exit: ExitUpdates) => {
+            await mapper.setRoomExit(area, room, id, exit);
+        },
+    });
+    // Individual exit updates route by exit identity to its own place, including
+    // Secret/Private doors attached to map rooms.
+    const ids = [await extendExit(writer(from.areaId), from, forward)];
+    if (createReturnExit) ids.push(await extendExit(writer(to.areaId), to, reverse));
+    return ids;
 }
 
-export function findRoomsAt(x: number, y: number, level: number): Room[] {
+export function findRoomsAt(x: number, y: number, level: number, area: Area | null = state.area): Room[] {
     const radius = 0.25;
 
     const rooms: Room[] = [];
 
-    if (!state.area) {
+    if (!area) {
         return rooms;
     }
 
-    for (const roomNumber of state.area.room_numbers) {
-        const room = state.area.room(roomNumber);
+    for (const roomNumber of area.roomNumbers) {
+        const room = area.room(roomNumber);
         const roomX = room.x;
         const roomY = room.y;
         const roomLevel = room.level;
@@ -596,7 +604,7 @@ export function findRoomsInRect(x1: number, y1: number, x2: number, y2: number, 
     const minY = Math.min(y1, y2);
     const maxY = Math.max(y1, y2);
 
-    for (const roomNumber of state.area.room_numbers) {
+    for (const roomNumber of state.area.roomNumbers) {
         const room = state.area.room(roomNumber);
         if (room.level === level && room.x >= minX && room.x <= maxX && room.y >= minY && room.y <= maxY) {
             rooms.push(room);
@@ -632,15 +640,15 @@ export function findRoomsWithExitsThrough(x1: number, y1: number, x2: number, y2
         return result;
     }
 
-    for (const roomNumber of state.area.room_numbers) {
+    for (const roomNumber of state.area.roomNumbers) {
         const room = state.area.room(roomNumber);
         if (room.level !== level) {
             continue;
         }
 
         for (const exit of room.exits) {
-            if (typeof exit.to_room_number === "number" && exit.to_area_id && idsMatch(exit.to_area_id, exit.from_area_id)) {
-                const to_room = state.area.room(exit.to_room_number);
+            if (typeof exit.toRoomNumber === "number" && exit.toAreaId && idsMatch(exit.toAreaId, exit.fromAreaId)) {
+                const to_room = state.area.room(exit.toRoomNumber);
                 if (to_room.level !== level) {
                     continue;
                 }
@@ -651,13 +659,13 @@ export function findRoomsWithExitsThrough(x1: number, y1: number, x2: number, y2
                 const to_y = to_room.y;
 
                 if (linesIntersect(x1, y1, x2, y2, from_x, from_y, to_x, to_y)) {
-                    if (!seenRoomNumbers.has(room.room_number)) {
+                    if (!seenRoomNumbers.has(room.roomNumber)) {
                         result.push(room);
-                        seenRoomNumbers.add(room.room_number);
+                        seenRoomNumbers.add(room.roomNumber);
                     }
-                    if (!seenRoomNumbers.has(to_room.room_number)) {
+                    if (!seenRoomNumbers.has(to_room.roomNumber)) {
                         result.push(to_room);
-                        seenRoomNumbers.add(to_room.room_number);
+                        seenRoomNumbers.add(to_room.roomNumber);
                     }
                 }
             }
@@ -671,7 +679,7 @@ export function findRoomsWithExitsThrough(x1: number, y1: number, x2: number, y2
 export function roomsImpactedByPush(room: Room, direction: Direction, found: Set<RoomNumber> = new Set()): RoomNumber[] {
     const recurseTo = [];
 
-    found.add(room.room_number);
+    found.add(room.roomNumber);
 
     // rooms impacted by the push are the rooms that are near where we are pushing to, and any rooms connected perpendicular to
     // the room itself or to any affected rooms
@@ -686,18 +694,18 @@ export function roomsImpactedByPush(room: Room, direction: Direction, found: Set
 
 
     for (const exit of room.exits) {
-        if (typeof exit.to_room_number === "number" && exitsToFollow.includes(exit.from_direction as Direction) && exit.to_area_id && idsMatch(exit.from_area_id, exit.to_area_id)) {
-            if (!found.has(exit.to_room_number)) {
-                const toRoom = state.area.room(exit.to_room_number);
+        if (typeof exit.toRoomNumber === "number" && exitsToFollow.includes(exit.fromDirection as Direction) && exit.toAreaId && idsMatch(exit.fromAreaId, exit.toAreaId)) {
+            if (!found.has(exit.toRoomNumber)) {
+                const toRoom = state.area.room(exit.toRoomNumber);
 
                 if (toRoom && toRoom.level === room.level) {
-                    recurseTo.push(exit.to_room_number);
+                    recurseTo.push(exit.toRoomNumber);
 
                     // if the exit will move across any rooms during the push, push those rooms too
                     const roomsToAdd = findRoomsInRect(room.x, room.y, toRoom.x + offset[0] * 1.5, toRoom.y + offset[1] * 1.5, room.level);
                     for (const room of roomsToAdd) {
-                        if (!found.has(room.room_number)) {
-                            recurseTo.push(room.room_number);
+                        if (!found.has(room.roomNumber)) {
+                            recurseTo.push(room.roomNumber);
                         }
                     }
                 }
@@ -708,8 +716,8 @@ export function roomsImpactedByPush(room: Room, direction: Direction, found: Set
     const willCollideWith = findRoomsAt(room.x + offset[0], room.y + offset[1], room.level + offset[2]);
 
     for (const room of willCollideWith) {
-        if (!found.has(room.room_number)) {
-            recurseTo.push(room.room_number);
+        if (!found.has(room.roomNumber)) {
+            recurseTo.push(room.roomNumber);
         }
     }
 
@@ -718,8 +726,8 @@ export function roomsImpactedByPush(room: Room, direction: Direction, found: Set
     const willIntersectWith = findRoomsWithExitsThrough(room.x, room.y, intersectX, intersectY, room.level);
 
     for (const room of willIntersectWith) {
-        if (!found.has(room.room_number)) {
-            recurseTo.push(room.room_number);
+        if (!found.has(room.roomNumber)) {
+            recurseTo.push(room.roomNumber);
         }
     }
 

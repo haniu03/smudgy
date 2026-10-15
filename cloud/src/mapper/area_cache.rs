@@ -224,6 +224,9 @@ pub struct AreaCache {
     /// For a Secret's or Private additions' own area, the map it belongs
     /// to and the source it reads; `None` for a map.
     map: Option<(AreaId, SourceId)>,
+    /// Whose reading this is: the viewer whose Private additions it shows,
+    /// and would show before their first write.
+    viewer: Option<Uuid>,
 }
 
 /// The empty result an unmatched lookup borrows, so a miss allocates nothing
@@ -475,6 +478,7 @@ impl AreaCache {
             map: None,
             references: BTreeMap::new(),
             document_source: source,
+            viewer,
         }
     }
 
@@ -722,6 +726,55 @@ impl AreaCache {
     #[must_use]
     pub fn place(&self) -> SourceId {
         self.map.map_or(SourceId::Map, |(_, source)| source)
+    }
+
+    /// The area id `place`'s own content on this map reads under: the map's
+    /// own id for the map, a Secret's id for the Secret, and for Private the
+    /// id derived for this map's viewer, whether or not Private holds
+    /// anything yet. `None` for a Secret's or Private additions' own area.
+    #[must_use]
+    pub fn place_area_id(&self, place: SourceId) -> Option<AreaId> {
+        if self.map.is_some() {
+            return None;
+        }
+        Some(source_area_id(self.id, place, self.viewer).unwrap_or(self.id))
+    }
+
+    /// [`Self::place_area_id`] for Private.
+    #[must_use]
+    pub fn private_area_id(&self) -> Option<AreaId> {
+        self.place_area_id(SourceId::Private)
+    }
+
+    /// This map's Private additions as an area of their own before their
+    /// first write: no rooms or data, revision 0, under
+    /// [`Self::private_area_id`]. `None` once the map serves a Private
+    /// layer, and for a Secret's or Private additions' own area. The map
+    /// and its sources are untouched; the first write into Private creates
+    /// its source.
+    pub(super) fn empty_private_area(&self) -> Option<Self> {
+        let area_id = self.private_area_id()?;
+        if self
+            .layers
+            .iter()
+            .any(|layer| layer.source == SourceId::Private)
+        {
+            return None;
+        }
+        let header = AreaWithDetails {
+            room_data: Vec::new(),
+            sources: Vec::new(),
+            area: self.area_header(),
+            format_version: AREA_FORMAT_VERSION,
+            properties: Vec::new(),
+            rooms: Vec::new(),
+            labels: Vec::new(),
+            shapes: Vec::new(),
+            connections: Vec::new(),
+            linked_areas: Vec::new(),
+        };
+        let bundle = crate::backends::source_document::empty_bundle(SourceId::Private);
+        Some(Self::source_area(&header, &bundle, area_id, self.viewer).0)
     }
 
     /// This map's layer for `bundle`, when `details` changes nothing it was
@@ -1669,6 +1722,30 @@ impl AreaCache {
             .find(|connection| connection.id == id)
     }
 
+    /// The area's own row, as [`Self::to_details`] serializes it.
+    fn area_header(&self) -> Area {
+        Area {
+            projection_token: self.meta.projection_token.clone(),
+            id: self.id,
+            user_id: self.meta.owner_id,
+            atlas_id: self.meta.atlas_id,
+            atlas_name: self.meta.atlas_name.clone(),
+            name: self.name.clone(),
+            created_at: Utc::now(),
+            rev: self.rev,
+            access: self.meta.access,
+            owner_nickname: self.meta.owner_nickname.clone(),
+            copied_from_area_id: self.meta.copied_from_area_id,
+            copied_from_rev: self.meta.copied_from_rev,
+            copied_at: self.meta.copied_at,
+            family_token: None,
+            clan_id: self.meta.clan_id,
+            clan_name: None,
+            actions: self.meta.actions.clone(),
+            clan_ownership: self.meta.clan_ownership,
+        }
+    }
+
     /// Rebuilds the full editable document used by the shared mutation
     /// applier. Cache-only metadata that the editor never mutates is retained;
     /// list-only family tokens and linked-area presentation rows are omitted.
@@ -1686,26 +1763,7 @@ impl AreaCache {
         AreaWithDetails {
             room_data: self.meta.room_data.to_vec(),
             sources: self.meta.sources.to_vec(),
-            area: Area {
-                projection_token: self.meta.projection_token.clone(),
-                id: self.id,
-                user_id: self.meta.owner_id,
-                atlas_id: self.meta.atlas_id,
-                atlas_name: self.meta.atlas_name.clone(),
-                name: self.name.clone(),
-                created_at: Utc::now(),
-                rev: self.rev,
-                access: self.meta.access,
-                owner_nickname: self.meta.owner_nickname.clone(),
-                copied_from_area_id: self.meta.copied_from_area_id,
-                copied_from_rev: self.meta.copied_from_rev,
-                copied_at: self.meta.copied_at,
-                family_token: None,
-                clan_id: self.meta.clan_id,
-                clan_name: None,
-                actions: self.meta.actions.clone(),
-                clan_ownership: self.meta.clan_ownership,
-            },
+            area: self.area_header(),
             format_version: AREA_FORMAT_VERSION,
             properties,
             rooms: self.rooms.iter().map(|room| room.to_details()).collect(),

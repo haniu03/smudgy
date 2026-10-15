@@ -16,7 +16,7 @@ let roomNameLineNumber = 0;
 
 import { mapEvent } from "./events.ts";
 import { debugLog, options } from "./mapper.ts";
-import { createTriggers, echo, line, Matches } from "smudgy:core";
+import { createTriggers, echo, line, type Matches } from "smudgy:core";
 
 import promptEvent from 'smudgy:events/kapusniak/arctic-prompt/prompt';
 
@@ -25,7 +25,25 @@ const snip = (s: string) => s.length > 60 ? `${s.slice(0, 60)}…` : s;
 const ESC = String.fromCharCode(27);
 const visualizeEscapes = (s: string) => s.split(ESC).join("\\e");
 
-const triggers = createTriggers({
+// A prompt fragment can be delivered again as the prefix of the next complete
+// line. Match its HP anchor and terminator while allowing any optional fields
+// and color runs between them, just as arctic-prompt does for displayed text.
+const PROMPT_PREFIX = /^(?:�|\x1b\[[0-9;]*m)*-?\d+H\b[^>\r\n]*>[ \t]*/;
+const SGR = /\x1b\[[0-9;]*m/g;
+const TITLE_PATTERNS = [
+  // A preceding color run may leave a reset, or a GA may leave replacement
+  // characters, before the cyan, purple, or bright-green room title.
+  /^(?:�)*(?:\x1b\[0;37m)?\x1b\[36m(?<roomName>.*)\x1b\[0;37m$/,
+  /^(?:�)*(?:\x1b\[0;37m)?\x1b\[35m(?<roomName>[^\x1b]*)\x1b\[0;37m$/,
+  /^(?:�)*(?:\x1b\[0;37m)?\x1b\[32m\x1b\[1m(?<roomName>[^\x1b]*)\x1b\[0;37m$/,
+];
+const BODY_PATTERNS = [
+  /^(?<roomDescLine>[^\x1b]+)$/,
+  /^(\x1b\[33m\x1b\[1m)?\x1b\[0;37m\x1b\[31m\x1b\[1m(?<mobLine>.*)$/,
+  /^\x1b\[33m\x1b\[1m(?<objectLine>.*)$/,
+];
+
+createTriggers({
   // `map debug raw` dump: every line with its escape sequences made visible.
   rawDebug: {
     rawPatterns: [/^(?<raw>.*)$/],
@@ -37,39 +55,14 @@ const triggers = createTriggers({
       echo(`[raw] ${visualizeEscapes(raw)}`);
     },
   },
-  roomTitle: {
-    rawPatterns: [
-        // Room titles arrive as dark cyan, dark purple, or bright green. A
-        // preceding color run (e.g. a tell) closes at the START of the next
-        // line, leaving its reset on the front of the title - so allow an
-        // optional leading reset.
-        //
-        // With `prompt ga` and `prompt newline` both on, the prompt's trailing
-        // IAC GA is flushed onto the FRONT of the following line - the title -
-        // arriving as one or more U+FFFD replacement chars, so also allow an
-        // optional leading run of those.
-        /^(?:�)*(?:\u001b\[0;37m)?\u001b\[36m(?<roomName>.*)\u001b\[0;37m$/,
-        /^(?:�)*(?:\u001b\[0;37m)?\u001b\[35m(?<roomName>[^\u001b]*)\u001b\[0;37m$/,
-        /^(?:�)*(?:\u001b\[0;37m)?\u001b\[32m\u001b\[1m(?<roomName>[^\u001b]*)\u001b\[0;37m$/
-    ],
-    antiPatterns: [
-      /^-*$/,
-      /^Mortals$/,
-      /shouts '.*'$/,
-      /tells your group '.*'$/,
-      /tells your clan '.*'$/,
-    ],
-    script: onRoomTitle,
+  roomPrompt: {
+    rawPatterns: [PROMPT_PREFIX],
+    prompt: true,
+    script: ({ 0: raw }) => { consumePrompt(raw); },
   },
-  roomDesc: {
-    rawPatterns: [
-      /^(?<roomDescLine>[^\u001b]+)$/,
-      /^(\x1b\[33m\x1b\[1m)?\x1b\[0;37m\x1b\[31m\x1b\[1m(?<mobLine>.*)$/,
-      /^\x1b\[33m\x1b\[1m(?<objectLine>.*)$/,
-      /^(?<notARoomDescLine>.*)$/,
-    ],
-    enabled: false,
-    script: onRoomDesc,
+  roomLine: {
+    rawPatterns: [/^(?<raw>.*)$/],
+    script: ({ raw }) => onRoomLine(raw),
   },
   visionFailed: {
     patterns: [
@@ -96,15 +89,16 @@ const triggers = createTriggers({
   }
 });
 
-// A prompt terminates a room block: snapshot what we captured and emit it.
-promptEvent.on(({lineNumber, raw, exits}) => {
-  bodyStarted = false;
+// Use the provider as well, including prompts recognized by future versions.
+// Its event may arrive after the raw line (or after a newer room has begun).
+promptEvent.on(finishRoom);
 
-  if (!sawRoom) {
+function finishRoom({ lineNumber, raw, exits }: { lineNumber: number; raw: string; exits?: string }) {
+  if (!sawRoom || lineNumber <= roomNameLineNumber) {
     return;
   }
   sawRoom = false;
-  triggers.roomDesc.enabled = false;
+  bodyStarted = false;
 
   const room = {
     title: roomTitle,
@@ -122,7 +116,40 @@ promptEvent.on(({lineNumber, raw, exits}) => {
   // Defer so every prompt listener observes pre-move state before the map
   // updates the current room.
   queueMicrotask(() => mapEvent.emit("room", room));
-});
+}
+
+function consumePrompt(raw: string): string {
+  const prefix = PROMPT_PREFIX.exec(raw)?.[0];
+  if (prefix) {
+    const prompt = prefix.replace(SGR, "").replace(/^�+/, "");
+    const exits = /\bExits:([NESWUD()]*)>/.exec(prompt)?.[1];
+    finishRoom({ lineNumber: line.number, raw: prompt, exits });
+    return raw.slice(prefix.length);
+  }
+  return raw;
+}
+
+function onRoomLine(raw: string) {
+  // Only complete lines contribute title/body text. Idle fragments may be
+  // replayed with more text later; the prompt-only trigger handles those.
+  raw = consumePrompt(raw);
+
+  for (const pattern of TITLE_PATTERNS) {
+    const match = pattern.exec(raw);
+    if (match?.groups) {
+      onRoomTitle(match.groups.roomName);
+      return;
+    }
+  }
+  if (!sawRoom) return;
+  for (const pattern of BODY_PATTERNS) {
+    const match = pattern.exec(raw);
+    if (match?.groups) {
+      onRoomDesc(match.groups);
+      return;
+    }
+  }
+}
 
 // Comms (tells, shouts) are colored identically to room titles; a line with
 // a comm verb is never a title.
@@ -133,11 +160,8 @@ const COMM_OPENER = /^You (tell|shout)\b|tells you '|tells your group '|tells yo
 // line after the body began is mob chatter, not a new title.
 let bodyStarted = false;
 
-// deno-lint-ignore no-explicit-any
-function onRoomTitle(matches: any) {
-  const text: string = matches.roomName;
-
-  if (COMM_OPENER.test(text)) {
+function onRoomTitle(text: string) {
+  if (COMM_OPENER.test(text) || /^-*$/.test(text) || text === "Mortals") {
     debugLog(`ignored comm line: "${snip(text)}"`);
     return;
   }
@@ -160,13 +184,11 @@ function onRoomTitle(matches: any) {
   roomObjects = [];
   roomMobs = [];
   state = RoomState.DESCRIPTION;
-  triggers.roomDesc.enabled = true;
   sawRoom = true;
   bodyStarted = false;
   roomNameLineNumber = line.number;
 }
 
-// deno-lint-ignore no-explicit-any
 function onRoomDesc(matches: Matches) {
   const matched = new Set(Object.keys(matches));
   if (matched.has("roomDescLine")) {
@@ -186,7 +208,5 @@ function onRoomDesc(matches: Matches) {
     bodyStarted = true;
     roomMobs.push(matches.mobLine);
     state = RoomState.MOBS;
-  } else if (matched.has("notARoomDescLine")) {
-    return;
   }
 }
