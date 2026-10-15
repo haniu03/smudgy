@@ -495,6 +495,12 @@ fn an_object_row_keeps_its_paragraph_while_its_widget_keeps_its_size() {
     assert_eq!(views.get(), 2);
     assert_eq!(identity(&tree), first);
 
+    // Keep the first shaping alive: once dropped, the reshaped row can be
+    // allocated at the same addresses and compare equal by identity.
+    let _first_row = {
+        let row = &tree.state.downcast_ref::<Cache>().cache[0];
+        (row.paragraph.clone(), row.effects.clone())
+    };
     width.set(160.0);
     layout(&mut pane, &mut tree, &renderer, size);
     assert_ne!(identity(&tree), first);
