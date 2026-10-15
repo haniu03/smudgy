@@ -1003,6 +1003,62 @@ fn labels_in(mapper: &Mapper, area: AreaId, source: &SourceId) -> Vec<LabelId> {
         .unwrap_or_default()
 }
 
+/// Two sessions of one account draw into Private before it holds anything,
+/// each from a reading without it: the server creates Private with whichever
+/// write lands first, and the other's lands on top of it instead of failing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_sessions_race_the_first_private_write() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("first-private@example.com", "first-private", true);
+    let area = server.create_area(&owner, "Den");
+    server.add_room(area, 1, "Hearth");
+    let one_cache = TempCacheDir::new("private-race-one");
+    let two_cache = TempCacheDir::new("private-race-two");
+    let one = new_synced_mapper(&server.base_url, &owner.api_key, one_cache.path()).await;
+    let two = new_synced_mapper(&server.base_url, &owner.api_key, two_cache.path()).await;
+    let private = SourceId::Private;
+    assert!(bundle(&one, area, &private).is_none());
+    assert!(bundle(&two, area, &private).is_none());
+    let draw = |text: &str| {
+        let id = LabelId(Uuid::new_v4());
+        let operation = AreaMutation::CreateLabel {
+            body: LabelArgs {
+                id: Some(id),
+                text: text.to_string(),
+                width: 40.0,
+                height: 10.0,
+                color: "#ffffff".to_string(),
+                font_size: 12,
+                font_weight: 400,
+                ..LabelArgs::default()
+            },
+        };
+        (id, operation)
+    };
+    let (mine, drawn_here) = draw("Mine");
+    let (also_mine, drawn_there) = draw("Also mine");
+
+    let here = write_to(&one, area, private, drawn_here);
+    let there = write_to(&two, area, private, drawn_there);
+    let (here, there) = tokio::join!(one.wait_for_mutation(here), two.wait_for_mutation(there));
+    here.expect("the first session's write lands");
+    there.expect("the second session's write lands");
+    assert!(
+        server.requests_to("POST", &format!("/areas/{area}/mutations")) > 2,
+        "both were sent expecting no Private, so one was refused and resent"
+    );
+
+    tick(&one).await;
+    tick(&two).await;
+    let both = std::collections::HashSet::from([mine, also_mine]);
+    for mapper in [&one, &two] {
+        let drawn: std::collections::HashSet<_> =
+            labels_in(mapper, area, &private).into_iter().collect();
+        assert_eq!(drawn, both);
+        assert_eq!(bundle(mapper, area, &private).expect("Private").rev, 2);
+    }
+}
+
 /// A label moves between Secrets right after it was drawn or edited there,
 /// and back and forth: each move stands on the revisions the edits and the
 /// moves before it produced, not on the ones the map was last read at.

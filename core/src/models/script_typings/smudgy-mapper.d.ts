@@ -288,6 +288,13 @@ interface RoomView {
 /** One place's data on one map ({@link Area.in}), and the searches narrowed to it. */
 interface AreaView {
     readonly place: MapPlace;
+    /** This place's own area, for creating and editing its rooms. Unlike this
+     * view's data methods, it addresses the place's own rooms, not map rooms.
+     * Private on a cloud map is available even before its first room or note;
+     * reading this accessor does not create server content.
+     * Throws if the place's area is unavailable. Needs Secrets read for Private
+     * and Secrets; writes to the returned area also need Secrets write. */
+    readonly area: Area;
     /** This place's own property `key` on the map (keyed by no room), or `undefined`. */
     data(key: string): string | undefined;
     setData(key: string, value: string): Promise<OperationId | null>;
@@ -728,6 +735,22 @@ interface AreaMutator {
     setConnection(connectionId: ConnectionIdLike, updates: ConnectionUpdates): Promise<void>;
 }
 
+/** A server-reviewed move of one room between places of the same cloud map. */
+interface RoomMove {
+    readonly requiresConfirmation: boolean;
+    /** Human-readable access changes returned for this exact move. */
+    readonly messages: readonly string[];
+    /**
+     * Move the room, its own data and links using the reviewed request. If
+     * requiresConfirmation is true, show messages and pass confirm: true after
+     * acknowledgement. Room numbering may change; use the returned fresh Room.
+     * Other places retain their own data. Location markers follow the room.
+     * Can be submitted once. Stale reviews and permission changes reject;
+     * prepare again before retrying. Dropping this handle cancels without writes.
+     */
+    commit(options?: { confirm?: boolean }): Promise<Room>;
+}
+
 /** A room read from the map. Obtain one via `area.room(n)` or the `listRooms*` helpers. */
 interface Room {
     readonly roomNumber: RoomNumber;
@@ -751,6 +774,13 @@ interface Room {
     /** Where the room lives: `"map"` for a map's room, or the Secret (or
      *  `"private"`) whose own room it is. */
     readonly place: MapPlace;
+    /**
+     * Prepare a move to Map, Private or a Secret of this room's cloud map.
+     * Changes nothing until the returned move is committed. Requires mapper
+     * write and secrets write, plus permission to remove from the current place
+     * and add to the destination. A move within the same place is refused.
+     */
+    prepareMoveTo(place: MapPlaceLike): Promise<RoomMove>;
     /**
      * Read a custom property of the room's own place by key (or `undefined` if
      * unset). Other places' values never stand in: reach them with `in(place)` or

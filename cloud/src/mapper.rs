@@ -7704,11 +7704,18 @@ mod tests {
         let written = exit.to_exit();
         assert_eq!(written.to_area_id, Some(area_id));
         assert_eq!(written.to_source, Some(SourceId::Secret(first.0)));
-        // An unloaded Private source supplies no target; a Secret destination
+        // An empty Private source supplies no target room; a Secret destination
         // must identify a room.
         let private = crate::mapper::area_cache::source_area_id(area_id, SourceId::Private, None)
             .expect("a Private area");
-        assert!(mapper.get_current_atlas().get_area(&private).is_none());
+        assert_eq!(
+            mapper
+                .get_current_atlas()
+                .get_area(&private)
+                .unwrap()
+                .room_count(),
+            0
+        );
         let roomless = mapper
             .create_exit(
                 RoomKey::new(elsewhere, RoomNumber(1)),

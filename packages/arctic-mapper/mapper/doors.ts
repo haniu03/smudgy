@@ -13,6 +13,11 @@ export function openCommandFor(exit: Pick<Exit, "door">, fallback: string, close
     return exit.door?.opensWith || ((doorIsClosed(exit) || closedNow) ? fallback : null);
 }
 
+/** Arctic disambiguates a named door by the direction it guards. */
+export function defaultOpenCommand(exit: Pick<Exit, "door">, direction: string): string {
+    return `open ${exit.door?.name || "door"} ${direction}`;
+}
+
 /** A door as `map` output shows it: its state, then its name in quotes when it has one. */
 export function describeDoor(door: Pick<DoorArgs, "state" | "name">): string {
     return door.name ? `${door.state} "${door.name}"` : door.state;
@@ -29,6 +34,12 @@ export function doorUpdate(door: Door | null, changes: Partial<DoorArgs>): DoorA
         name: changes.name !== undefined ? changes.name : door?.name ?? null,
         opensWith: changes.opensWith !== undefined ? changes.opensWith : door?.opensWith ?? null,
     };
+}
+
+/** An open prompt exit doesn't prove a door exists. Closed doesn't prove unlocked. */
+export function observedDoor(door: Door | null, closed: boolean): DoorArgs | null {
+    if (!door && !closed) return null;
+    return doorUpdate(door, { state: closed ? (door?.state === "locked" ? "locked" : "closed") : "open" });
 }
 
 /**

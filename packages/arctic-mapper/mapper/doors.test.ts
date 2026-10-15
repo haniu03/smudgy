@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { describeDoor, doorIsClosed, doorUpdate, nextDoorState, openCommandFor } from "./doors.ts";
+import { defaultOpenCommand, describeDoor, doorIsClosed, doorUpdate, nextDoorState, openCommandFor } from "./doors.ts";
 
 const door = (state: DoorState, name: string | null = null, opensWith: string | null = null): Door =>
     ({ state, name, opensWith });
+
+test("default Arctic opening uses the door name and direction", () => {
+    assert.equal(defaultOpenCommand({ door: door("closed", "gate") }, "n"), "open gate n");
+    assert.equal(defaultOpenCommand({ door: null }, "e"), "open door e");
+});
 
 test("a closed or locked door is closed; an open door and no door are not", () => {
     assert.equal(doorIsClosed({ door: door("closed") }), true);

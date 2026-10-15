@@ -216,7 +216,9 @@ pub struct AtlasCache {
     /// Every map's Secrets and the caller's Private additions, each an area
     /// of its own, by area id. Each is placed as its map is (turned off,
     /// out of scope and owned with it) and is replaced and dropped with its
-    /// map. `areas` holds maps only.
+    /// map. Private is here before its first write too, as an empty area
+    /// the map serves no layer for, so its id resolves like any place's.
+    /// `areas` holds maps only.
     source_areas: HashMap<AreaId, SourceArea>,
     /// Every area that has been a map's Secret or Private additions in this
     /// atlas or any atlas it was derived from, with its map. It only grows:
@@ -292,6 +294,16 @@ impl AtlasCache {
                 cache
                     .source_areas
                     .insert(id, SourceArea::of(area_id, layer));
+            }
+            if let Some(private) = area.empty_private_area() {
+                let id = *private.get_id();
+                if placement.owned {
+                    cache.owned_areas.insert(id);
+                }
+                cache.places_ever.insert(id, area_id);
+                cache
+                    .source_areas
+                    .insert(id, SourceArea::empty_private(area_id, private));
             }
             cache.areas.insert(area_id, area);
         }
@@ -388,6 +400,14 @@ impl AtlasCache {
         if let Some(layer) = new_map.map_document_layer() {
             self.count_anchored_targets(layer.anchored_shared(), true);
         }
+        // An empty Private holds nothing to re-index: it is rebuilt with
+        // every snapshot of its map, and a Private layer replaces it.
+        if let (Some(old_map), Some(old_placement)) = (old_map, old_placement)
+            && let Some(id) = old_map.private_area_id()
+            && old_map.source_layer(&id).is_none()
+        {
+            self.remove_source_area(id, old_placement);
+        }
         if let (Some(old_map), Some(old_placement)) = (old_map, old_placement) {
             for layer in old_map.source_layers() {
                 let id = layer.area_id();
@@ -413,6 +433,14 @@ impl AtlasCache {
                 }
                 None => self.add_source_area(id, next, new_placement),
             }
+        }
+        if let Some(private) = new_map.empty_private_area() {
+            let id = *private.get_id();
+            self.add_source_area(
+                id,
+                SourceArea::empty_private(map_id, private),
+                new_placement,
+            );
         }
     }
 
@@ -895,6 +923,9 @@ impl AtlasCache {
             }
             for layer in area.source_layers() {
                 next.remove_source_area(layer.area_id(), placement);
+            }
+            if let Some(id) = area.private_area_id() {
+                next.remove_source_area(id, placement);
             }
             next.areas.remove(&area_id);
             next.remove_area_contribution(area_id, &area);
@@ -1630,6 +1661,17 @@ impl SourceArea {
             source: layer.source(),
             area: layer.area().clone(),
             anchored: layer.anchored_shared().clone(),
+        }
+    }
+
+    /// Map `map`'s Private additions before their first write
+    /// ([`AreaCache::empty_private_area`]).
+    fn empty_private(map: AreaId, area: AreaCache) -> Self {
+        Self {
+            map,
+            source: SourceId::Private,
+            area: Arc::new(area),
+            anchored: AnchoredExits::default(),
         }
     }
 }
@@ -3610,6 +3652,83 @@ mod tests {
                 Some(Uuid::from_u128(7))
             )
         );
+    }
+
+    #[test]
+    fn private_resolves_before_its_first_write_and_follows_its_map() {
+        let map_id = area_id(1);
+        let viewer = Some(Uuid::from_u128(7));
+        let private_of = |viewer| {
+            crate::mapper::area_cache::source_area_id(map_id, SourceId::Private, viewer).unwrap()
+        };
+        let plain = |viewer| {
+            Arc::new(AreaCache::for_viewer(
+                map_details(map_id, true, vec![room(1, "Hall", Vec::new())], Vec::new()),
+                viewer,
+                None,
+            ))
+        };
+        let atlas = self::atlas(HashMap::from([(map_id, plain(viewer))]));
+
+        // An empty place of the map, which serves no layer for it.
+        let id = private_of(viewer);
+        let empty = atlas.get_area(&id).expect("Private before its first write");
+        assert_eq!(empty.room_count(), 0);
+        assert_eq!(empty.get_rev(), 0);
+        assert_eq!(empty.place(), SourceId::Private);
+        assert_eq!(empty.map_id(), Some(map_id));
+        assert_eq!(atlas.source_of(&id), Some((map_id, SourceId::Private)));
+        assert_eq!(atlas.map_of(&id), Some(map_id));
+        assert_eq!(atlas.room_number_floor(&id), Some(1));
+        assert!(atlas.get_area(&map_id).unwrap().source_layers().is_empty());
+        assert_eq!(atlas.areas().len(), 1, "places are not maps");
+        assert!(atlas.sees(Sources::Shown, &id));
+        assert!(!atlas.sees(Sources::Hidden, &id), "hidden with every place");
+        assert!(atlas.is_area_owned(&id), "owned with its map");
+        assert!(!atlas.is_area_owned(&private_of(Some(Uuid::from_u128(8)))));
+
+        // Each viewer reads its own.
+        let theirs = atlas.insert_area(map_id, plain(Some(Uuid::from_u128(8))));
+        assert!(theirs.get_area(&id).is_none());
+        assert!(
+            theirs
+                .get_area(&private_of(Some(Uuid::from_u128(8))))
+                .is_some()
+        );
+
+        // The first write's layer takes the same id.
+        let private = crate::SourceBundle {
+            source: SourceId::Private,
+            name: None,
+            ..secret_bundle(map_id, Uuid::nil(), vec![room(1, "Nook", Vec::new())])
+        };
+        let written_map = Arc::new(AreaCache::for_viewer(
+            map_details(
+                map_id,
+                true,
+                vec![room(1, "Hall", Vec::new())],
+                vec![private],
+            ),
+            viewer,
+            None,
+        ));
+        let written = atlas.insert_area(map_id, written_map.clone());
+        assert_eq!(written.get_area(&id).unwrap().room_count(), 1);
+        assert_eq!(titled(&written, "Nook"), [(id, 1)]);
+        let rebuilt = self::atlas(HashMap::from([(map_id, written_map)]));
+        assert_eq!(titled(&rebuilt, "Nook"), [(id, 1)]);
+        assert_eq!(rebuilt.source_of(&id), written.source_of(&id));
+        // Losing the layer leaves Private empty again.
+        let emptied = written.insert_area(map_id, plain(viewer));
+        assert!(titled(&emptied, "Nook").is_empty());
+        assert_eq!(emptied.get_area(&id).unwrap().room_count(), 0);
+
+        // It goes with its map, and still reads as a place.
+        let gone = atlas.delete_area(map_id);
+        assert!(gone.get_area(&id).is_none());
+        assert_eq!(gone.source_of(&id), None);
+        assert_eq!(gone.place_map(&id), Some(map_id));
+        assert!(!gone.is_area_owned(&id));
     }
 
     #[test]
