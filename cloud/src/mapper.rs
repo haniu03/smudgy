@@ -1067,6 +1067,26 @@ fn compile_source_mutations(
             {
                 Vec::new()
             }
+            // Deleting a property that is not there changes nothing, so it is
+            // not sent either. A missing room still fails below.
+            AreaMutation::DeleteRoomProperty {
+                room_number,
+                room_source,
+                ref name,
+            } if crate::backends::source_document::room_keeps_property(
+                details,
+                context,
+                crate::RoomAddress::from_wire(room_source, room_number),
+                name,
+            ) == Some(false) =>
+            {
+                Vec::new()
+            }
+            AreaMutation::DeleteAreaProperty { ref name }
+                if !details.properties.iter().any(|kept| kept.name == *name) =>
+            {
+                Vec::new()
+            }
             other => vec![other],
         };
 
@@ -8886,6 +8906,59 @@ mod tests {
             [["SNACK"]],
             "room data left with nothing goes"
         );
+    }
+
+    #[test]
+    fn deleting_a_property_that_is_not_there_compiles_to_nothing() {
+        let mut details = sample_area(AreaId(Uuid::new_v4()), "Hall");
+        details.rooms[0].properties.push(crate::Property {
+            name: "notes".to_string(),
+            value: "n".to_string(),
+        });
+        details.properties.push(crate::Property {
+            name: "zone".to_string(),
+            value: "z".to_string(),
+        });
+        let delete_room = |room: i32, name: &str| AreaMutation::DeleteRoomProperty {
+            room_number: RoomNumber(room),
+            room_source: None,
+            name: name.to_string(),
+        };
+        let delete_area = |name: &str| AreaMutation::DeleteAreaProperty {
+            name: name.to_string(),
+        };
+        let compile =
+            |ops| compile_area_mutations(&mut details.clone(), ops, PairedExitPolicy::Reject);
+
+        assert!(
+            compile(vec![delete_room(1, "kws"), delete_area("summary")])
+                .unwrap()
+                .is_empty(),
+            "nothing to delete sends nothing"
+        );
+        assert_eq!(
+            compile(vec![delete_room(1, "notes"), delete_area("zone")])
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            compile(vec![delete_room(1, "notes"), delete_room(1, "notes")])
+                .unwrap()
+                .len(),
+            1,
+            "a second delete in the batch finds it gone"
+        );
+        assert!(matches!(
+            compile(vec![delete_room(9, "notes")]),
+            Err(CloudError::RoomNotFound(_))
+        ));
+
+        // A replay over a map that already lost the property changes nothing.
+        let mut replayed = details.clone();
+        replayed.rooms[0].properties.clear();
+        area_edits::apply_mutation(&mut replayed, &delete_room(1, "notes"))
+            .expect("an absent property's deletion changes nothing");
     }
 
     #[test]

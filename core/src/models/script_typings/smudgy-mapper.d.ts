@@ -274,6 +274,7 @@ interface RoomView {
     /** The exits this place keeps on the room. */
     readonly exits: Exit[];
     setData(key: string, value: string): Promise<OperationId | null>;
+    /** Delete this place's value for `key`; deleting one it does not keep resolves to `null`. */
     deleteData(key: string): Promise<OperationId | null>;
     /** Add a tag (normalized to UPPERCASE); adding one the place already keeps is a
      *  no-op that resolves to `null`. Rejects a tag that is empty or only whitespace,
@@ -300,6 +301,8 @@ interface AreaView {
     /** This place's own property `key` on the map (keyed by no room), or `undefined`. */
     data(key: string): string | undefined;
     setData(key: string, value: string): Promise<OperationId | null>;
+    /** Delete this place's own property `key`; deleting one it does not keep resolves to
+     *  `null`. */
     deleteData(key: string): Promise<OperationId | null>;
     findRoomsByProperty(name: string, value: string): Room[];
     findRoomsWithProperty(name: string): Room[];
@@ -1133,9 +1136,11 @@ interface Mapper {
     /** Set a custom area property (string key/value) in the area's own place; the write
      *  counterpart of `area.data(key)`. Pass an empty value to clear it. */
     setAreaProperty(area: Area | AreaIdLike, name: string, value: string): Promise<OperationId | null>;
-    /** Delete a property from the room's own place; no other place's value changes. */
+    /** Delete a property from the room's own place; no other place's value changes. Deleting
+     *  one the place does not keep resolves to `null`. */
     deleteRoomProperty(area: Area | AreaIdLike, room: Room | RoomNumber, name: string): Promise<OperationId | null>;
-    /** Delete a property from the area's own place. */
+    /** Delete a property from the area's own place; deleting one it does not keep resolves
+     *  to `null`. */
     deleteAreaProperty(area: Area | AreaIdLike, name: string): Promise<OperationId | null>;
     /** Add a case-insensitive tag to the room's own place (normalized to UPPERCASE;
      *  re-adding is a no-op): on a map room, the map's tags, which everyone who reads

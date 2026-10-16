@@ -95,6 +95,36 @@ pub(crate) fn room_sites(details: &AreaWithDetails) -> HashMap<RoomAddress, Room
         .collect()
 }
 
+/// Tags of an anchor a source keeps nothing on yet.
+static NO_TAGS: BTreeSet<String> = BTreeSet::new();
+
+/// The writing source's properties and tags for the room at `address`, read
+/// only; an anchor it keeps nothing on yet reads as empty. `None` when there
+/// is no such room for it to write, so the write itself reports why.
+fn writer_room_content<'a>(
+    document: &'a AreaWithDetails,
+    context: &EditContext,
+    address: RoomAddress,
+) -> Option<(&'a [Property], &'a BTreeSet<String>)> {
+    if address.source == context.source {
+        return document
+            .rooms
+            .iter()
+            .find(|room| room.room_number == address.number)
+            .map(|room| (room.properties.as_slice(), &room.tags));
+    }
+    context.require_anchor(address).ok()?;
+    Some(
+        document
+            .room_data
+            .iter()
+            .find(|data| room_data_address(data) == address)
+            .map_or((&[][..], &NO_TAGS), |data| {
+                (data.properties.as_slice(), &data.tags)
+            }),
+    )
+}
+
 /// Whether the writing source's content for the room at `address` carries
 /// `tag`, normalized, in any stored case. `None` when there is no such room
 /// for it to write, so the write itself reports why.
@@ -104,25 +134,22 @@ pub(crate) fn room_carries_tag(
     address: RoomAddress,
     tag: &str,
 ) -> Option<bool> {
-    let carries = |tags: &BTreeSet<String>| {
+    writer_room_content(document, context, address).map(|(_, tags)| {
         tags.iter()
             .any(|kept| crate::mapper::normalize_tag(kept) == tag)
-    };
-    if address.source == context.source {
-        return document
-            .rooms
-            .iter()
-            .find(|room| room.room_number == address.number)
-            .map(|room| carries(&room.tags));
-    }
-    context.require_anchor(address).ok()?;
-    Some(
-        document
-            .room_data
-            .iter()
-            .find(|data| room_data_address(data) == address)
-            .is_some_and(|data| carries(&data.tags)),
-    )
+    })
+}
+
+/// Whether the writing source's content for the room at `address` keeps a
+/// property named `name`. `None` as for [`room_carries_tag`].
+pub(crate) fn room_keeps_property(
+    document: &AreaWithDetails,
+    context: &EditContext,
+    address: RoomAddress,
+    name: &str,
+) -> Option<bool> {
+    writer_room_content(document, context, address)
+        .map(|(properties, _)| properties.iter().any(|kept| kept.name == name))
 }
 
 /// Mutable content belongs to the writing source even when its anchor does not.

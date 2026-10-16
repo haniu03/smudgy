@@ -1110,16 +1110,9 @@ pub(crate) fn apply_mutation_in(
                 context,
                 RoomAddress::from_wire(*room_source, *room_number),
             )?;
-            let idx = room
-                .properties
-                .iter()
-                .position(|p| p.name == *name)
-                .ok_or_else(|| CloudError::PropertyNotFound {
-                    entity_type: "room".to_string(),
-                    entity_id: format!("{area_id}:{room_number}"),
-                    property_name: name.clone(),
-                })?;
-            room.properties.remove(idx);
+            // Deleting an absent property changes nothing, here as on the
+            // server; compilation drops it, so nothing is sent for it.
+            room.properties.retain(|p| p.name != *name);
             Ok(OpResult::RoomPropertyDeleted {
                 room_number: *room_number,
                 name: name.clone(),
@@ -1168,16 +1161,8 @@ pub(crate) fn apply_mutation_in(
             Ok(OpResult::AreaProperty { name: name.clone() })
         }
         AreaMutation::DeleteAreaProperty { name } => {
-            let idx = details
-                .properties
-                .iter()
-                .position(|p| p.name == *name)
-                .ok_or_else(|| CloudError::PropertyNotFound {
-                    entity_type: "area".to_string(),
-                    entity_id: area_id.to_string(),
-                    property_name: name.clone(),
-                })?;
-            details.properties.remove(idx);
+            // As for a room's property above.
+            details.properties.retain(|p| p.name != *name);
             Ok(OpResult::AreaPropertyDeleted { name: name.clone() })
         }
         AreaMutation::CreateExit {

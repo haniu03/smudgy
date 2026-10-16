@@ -429,6 +429,63 @@ async fn a_removal_resent_after_a_conflict_finds_the_tag_gone() {
     assert!(room.has_tag("shop"));
 }
 
+/// Deleting a property that is not there sends nothing. When two sessions
+/// delete the same property, the second, resent after a revision conflict,
+/// finds it gone: that succeeds and changes nothing, so the queue keeps moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_property_deleted_twice_keeps_the_queue_moving() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("prop-race@example.com", "prop-race", true);
+    let area = server.create_area(&owner, "Harbor");
+    server.add_room(area, 1, "Pier");
+    server.set_room_property(area, 1, "notes", "Mind the gap");
+    let one_cache = TempCacheDir::new("prop-race-one");
+    let two_cache = TempCacheDir::new("prop-race-two");
+    let one = new_synced_mapper(&server.base_url, &owner.api_key, one_cache.path()).await;
+    let two = new_synced_mapper(&server.base_url, &owner.api_key, two_cache.path()).await;
+    let pier = RoomKey::new(area, RoomNumber(1));
+    let posts = || server.requests_to("POST", &format!("/areas/{area}/mutations"));
+    let sent = posts();
+
+    for absent in [
+        one.delete_room_property(pier.clone(), "kws".into()),
+        one.delete_area_property(area, "summary".into()),
+    ] {
+        assert!(matches!(
+            absent.expect("nothing to refuse"),
+            smudgy_cloud::mapper::MutationSubmission::NoChange
+        ));
+    }
+    assert_eq!(posts(), sent, "nothing to delete sends nothing");
+
+    let first = one
+        .delete_room_property(pier.clone(), "notes".into())
+        .expect("queued")
+        .operation_id()
+        .expect("a cloud write");
+    one.wait_for_mutation(first).await.expect("deleted");
+    let second = two
+        .delete_room_property(pier.clone(), "notes".into())
+        .expect("queued")
+        .operation_id()
+        .expect("a cloud write");
+    two.wait_for_mutation(second)
+        .await
+        .expect("the resent delete succeeds");
+
+    let later = two
+        .set_room_property(pier.clone(), "kws".into(), "rope".into())
+        .expect("queued")
+        .operation_id()
+        .expect("a cloud write");
+    two.wait_for_mutation(later)
+        .await
+        .expect("the queue keeps moving");
+    let room = two.get_current_atlas().get_room(&pier).expect("the pier");
+    assert_eq!(room.get_property("notes"), None);
+    assert_eq!(room.get_property("kws"), Some("rope"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_generation_adoption_does_not_request_cloud_sync() {
     let server = MockServer::spawn().await;
