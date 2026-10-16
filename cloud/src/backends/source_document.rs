@@ -95,6 +95,36 @@ pub(crate) fn room_sites(details: &AreaWithDetails) -> HashMap<RoomAddress, Room
         .collect()
 }
 
+/// Whether the writing source's content for the room at `address` carries
+/// `tag`, normalized, in any stored case. `None` when there is no such room
+/// for it to write, so the write itself reports why.
+pub(crate) fn room_carries_tag(
+    document: &AreaWithDetails,
+    context: &EditContext,
+    address: RoomAddress,
+    tag: &str,
+) -> Option<bool> {
+    let carries = |tags: &BTreeSet<String>| {
+        tags.iter()
+            .any(|kept| crate::mapper::normalize_tag(kept) == tag)
+    };
+    if address.source == context.source {
+        return document
+            .rooms
+            .iter()
+            .find(|room| room.room_number == address.number)
+            .map(|room| carries(&room.tags));
+    }
+    context.require_anchor(address).ok()?;
+    Some(
+        document
+            .room_data
+            .iter()
+            .find(|data| room_data_address(data) == address)
+            .is_some_and(|data| carries(&data.tags)),
+    )
+}
+
 /// Mutable content belongs to the writing source even when its anchor does not.
 pub(crate) struct RoomContentMut<'a> {
     pub properties: &'a mut Vec<Property>,
@@ -936,6 +966,61 @@ mod regression_tests {
         )
         .expect("the map room deletes");
         assert_eq!(serde_json::to_value(bundle(&details)).unwrap(), before);
+    }
+
+    /// A place's tag on a map room is kept as the server keeps it, whatever
+    /// case it was written in, so lookups find it before the next read.
+    #[test]
+    fn a_places_tag_on_a_map_room_is_kept_uppercase() {
+        let tag = |source: Option<SourceId>, tag: &str| AreaMutation::AddRoomTag {
+            room_number: RoomNumber(1),
+            room_source: source,
+            tag: tag.to_string(),
+        };
+        let untag = |tag: &str| AreaMutation::RemoveRoomTag {
+            room_number: RoomNumber(1),
+            room_source: None,
+            tag: tag.to_string(),
+        };
+        let tags = |details: &AreaWithDetails, source: SourceId| -> Vec<String> {
+            let bundle = details
+                .sources
+                .iter()
+                .find(|bundle| bundle.source == source)
+                .expect("the place");
+            bundle
+                .room_data
+                .iter()
+                .flat_map(|data| data.tags.iter().cloned())
+                .collect()
+        };
+        let mut details = document(empty_secret());
+        apply_source_ops(&mut details, secret(), &[tag(None, " quest ")]).expect("tags");
+        assert_eq!(tags(&details, secret()), ["QUEST"]);
+        apply_source_ops(&mut details, SourceId::Private, &[tag(None, "snack")]).expect("tags");
+        assert_eq!(tags(&details, SourceId::Private), ["SNACK"]);
+
+        apply_source_ops(&mut details, secret(), &[untag("Quest")]).expect("untags");
+        assert!(tags(&details, secret()).is_empty());
+        let legacy = details
+            .sources
+            .iter_mut()
+            .find(|bundle| bundle.source == SourceId::Private)
+            .expect("Private");
+        legacy.room_data[0].tags.insert("snack".to_string());
+        apply_source_ops(&mut details, SourceId::Private, &[untag("SNACK")]).expect("untags");
+        assert!(
+            tags(&details, SourceId::Private).is_empty(),
+            "both spellings go"
+        );
+
+        for refused in [tag(None, "  "), untag("")] {
+            let result = apply_source_ops(&mut details, secret(), &[refused]);
+            assert!(
+                matches!(&result, Err(CloudError::InvalidInput(message)) if message == "tag must not be empty"),
+                "{result:?}"
+            );
+        }
     }
 
     /// A pending write to a Secret the projection no longer carries never

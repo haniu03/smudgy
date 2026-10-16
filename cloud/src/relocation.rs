@@ -435,6 +435,7 @@ impl Mapper {
         for snapshot in &mut snapshots {
             let cloud = self.area_storage(&snapshot.area.id) == MapStorage::Cloud;
             keep_what_a_copy_carries(snapshot, cloud);
+            crate::mapper::keep_valid_tags(snapshot);
             validate_import_document(snapshot)?;
         }
         // Session storage keeps no places, so a move there would delete the
@@ -964,11 +965,16 @@ impl Mapper {
                                 value: property.value.clone(),
                             }
                         });
-                        let tags = room.tags.iter().map(|tag| AreaMutation::AddRoomTag {
-                            room_source: None,
-                            room_number: room.room_number,
-                            tag: tag.clone(),
-                        });
+                        // A tag no room may keep (an old local write) is not copied.
+                        let tags = room
+                            .tags
+                            .iter()
+                            .filter(|tag| crate::mapper::checked_tag(tag).is_ok())
+                            .map(|tag| AreaMutation::AddRoomTag {
+                                room_source: None,
+                                room_number: room.room_number,
+                                tag: tag.clone(),
+                            });
                         properties.chain(tags)
                     });
                     chunk_ops(
@@ -1413,11 +1419,15 @@ fn place_batches(
                             name: property.name.clone(),
                             value: property.value.clone(),
                         })
-                        .chain(tags.iter().map(move |tag| AreaMutation::AddRoomTag {
-                            room_source,
-                            room_number,
-                            tag: tag.clone(),
-                        }))
+                        .chain(
+                            tags.iter()
+                                .filter(|tag| crate::mapper::checked_tag(tag).is_ok())
+                                .map(move |tag| AreaMutation::AddRoomTag {
+                                    room_source,
+                                    room_number,
+                                    tag: tag.clone(),
+                                }),
+                        )
                 },
             );
             in_source(chunk_ops(

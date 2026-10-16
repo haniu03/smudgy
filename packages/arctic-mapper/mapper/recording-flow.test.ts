@@ -11,6 +11,7 @@ import { RecordingPlaces } from "./recording-place.ts";
 
 const areas = new Map<string, any>();
 const writes: { area: string; kind: string; place?: MapPlace }[] = [];
+const tagCalls: [string, string, number, string][] = [];
 const messages: string[] = [];
 const aliases = new Map<string, Function>();
 const layoutCalls: { area: string; change: any; options: any }[] = [];
@@ -52,6 +53,11 @@ const mapper = {
     getCurrentLocation: () => undefined,
     getAreaById: (id: string) => { const area = areas.get(id); if (!area) throw new Error("Area not found"); return area; },
     setCurrentLocation: (area: string, room: number) => { location = [area, room]; },
+    addRoomTag: async (area: string, room: number, tag: string) => { tagCalls.push(["add", area, room, tag]); },
+    removeRoomTag: async (area: string, room: number, tag: string) => {
+        tagCalls.push(["remove", area, room, tag]);
+        return areas.get(area).room(room).tags.includes(tag.toUpperCase()) ? "operation" : null;
+    },
     updateRooms: async (id: string, updates: [number, any][]) => {
         for (const [number, fields] of updates) Object.assign(areas.get(id).room(number), fields);
         writes.push({ area: id, kind: "layout" });
@@ -140,7 +146,7 @@ const { state, State, Direction, options, ZMode } = await import("./mapper.ts");
 await import("./alias.ts");
 
 beforeEach(() => {
-    areas.clear(); writes.length = 0; messages.length = 0;
+    areas.clear(); writes.length = 0; messages.length = 0; tagCalls.length = 0;
     layoutCalls.length = 0; qualityMeasurements = 0;
     afterPlanning = undefined;
     options.autoAdjustMapLayout = false; options.zMode = ZMode.Auto;
@@ -222,6 +228,29 @@ test("a link out of a Private room into a new Secret room belongs to Private", a
     const forward = mine.exits.find(exit => exit.fromDirection === "North" && exit.toRoomNumber !== null)!;
     assert.equal(forward.place, "private");
     assert.equal(forward.toAreaId, secret.id);
+});
+
+test("room flags take any name, with no list of known flags and no ! override", async () => {
+    const flag = async (args: string) => {
+        aliases.get("mapper")!({ args: `room flag ${args}` });
+        await new Promise<void>(resolve => setImmediate(resolve));
+    };
+    await flag("set tollhouse");
+    await flag("set peace!");
+    await flag("clear inn");
+    start.hasTag = (tag: string) => tag.toUpperCase() === "SNACK";
+    await flag("clear snack");
+    assert.deepEqual(tagCalls, [
+        ["add", map.id, start.roomNumber, "tollhouse"],
+        ["add", map.id, start.roomNumber, "peace!"],
+        ["remove", map.id, start.roomNumber, "inn"],
+        ["remove", map.id, start.roomNumber, "snack"],
+    ]);
+    assert.deepEqual(messages.filter(message => /known flag|Append !/.test(message)), []);
+    assert.deepEqual(messages.slice(-2), [
+        "This room has no INN flag.",
+        "SNACK comes from Private or a Secret, not this room's own flags.",
+    ]);
 });
 
 test("switching the dropdown redirects later rooms without moving existing rooms", async () => {

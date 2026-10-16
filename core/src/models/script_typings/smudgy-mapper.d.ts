@@ -276,9 +276,11 @@ interface RoomView {
     setData(key: string, value: string): Promise<OperationId | null>;
     deleteData(key: string): Promise<OperationId | null>;
     /** Add a tag (normalized to UPPERCASE); adding one the place already keeps is a
-     *  no-op that resolves to `null`. */
+     *  no-op that resolves to `null`. Rejects a tag that is empty or only whitespace,
+     *  or longer than 64 characters. */
     addTag(tag: string): Promise<OperationId | null>;
-    /** Remove a tag; removing one the place does not keep resolves to `null`. */
+    /** Remove a tag; removing one the place does not keep resolves to `null`. Rejects
+     *  a tag that is empty or only whitespace. */
     removeTag(tag: string): Promise<OperationId | null>;
     /** Create an exit owned by this place on the readable room. Reading the
      *  destination is required; writing to its source is not. */
@@ -724,8 +726,11 @@ interface AreaMutator {
     setAreaProperty(name: string, value: string): Promise<void>;
     deleteRoomProperty(room: Room | RoomNumber, name: string): Promise<void>;
     deleteAreaProperty(name: string): Promise<void>;
-    /** Add a tag to the room's own place, as {@link Mapper.addRoomTag} does. */
+    /** Add a tag to the room's own place, as {@link Mapper.addRoomTag} does: an empty,
+     *  whitespace-only or overlong tag fails the whole batch. */
     addRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
+    /** Remove a tag from the room's own place, as {@link Mapper.removeRoomTag} does;
+     *  removing one the room does not carry adds nothing to the batch. */
     removeRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
     createRoomExit(room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId>;
     setRoomExit(room: Room | RoomNumber, exitId: ExitIdLike, exit: ExitUpdates): Promise<void>;
@@ -1135,9 +1140,12 @@ interface Mapper {
     /** Add a case-insensitive tag to the room's own place (normalized to UPPERCASE;
      *  re-adding is a no-op): on a map room, the map's tags, which everyone who reads
      *  the map sees. To tag it in a Secret or your Private additions, use
-     *  `room.in(place).addTag(tag)`. */
+     *  `room.in(place).addTag(tag)`. Rejects a tag that is empty or only whitespace,
+     *  or longer than 64 characters. */
     addRoomTag(area: Area | AreaIdLike, room: Room | RoomNumber, tag: string): Promise<OperationId | null>;
-    /** Remove a tag from the room's own place (case-insensitive). */
+    /** Remove a tag from the room's own place (case-insensitive). Removing one the room's
+     *  own place does not keep resolves to `null`, even when another place tags the room.
+     *  Rejects a tag that is empty or only whitespace. */
     removeRoomTag(area: Area | AreaIdLike, room: Room | RoomNumber, tag: string): Promise<OperationId | null>;
     /**
      * The nearest reachable room carrying `tag` (case-insensitive) in any place you

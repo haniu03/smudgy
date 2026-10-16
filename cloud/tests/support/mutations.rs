@@ -1983,14 +1983,15 @@ fn apply_room_tag(
             secret_bumps: Vec::new(),
         })
     } else {
-        // The deployed server 404s an absent tag and rolls the envelope
-        // back (`delete_room_tag_in_tx` checks `rows_affected`).
-        if !room.tags.remove(&normalized) {
-            return Err(err(404, "Not found"));
-        }
-        Ok(OpOutcome::scoped(
-            json!({"entity": "room_tag_removed", "room_number": room_number, "tag": normalized}),
-        ))
+        // Removing a tag the room does not have changes nothing, as
+        // re-adding one does (smudgy-cloudflare `removeRoomTag`).
+        let removed = room.tags.remove(&normalized);
+        Ok(OpOutcome {
+            result: json!({"entity": "room_tag_removed", "room_number": room_number, "tag": normalized}),
+            changed: removed,
+            foreign_bumps: Vec::new(),
+            secret_bumps: Vec::new(),
+        })
     }
 }
 

@@ -1130,6 +1130,7 @@ pub(crate) fn apply_mutation_in(
             room_source,
             tag,
         } => {
+            let tag = stored_tag(tag)?;
             let room = room_content_mut(
                 details,
                 context,
@@ -1138,7 +1139,7 @@ pub(crate) fn apply_mutation_in(
             room.tags.insert(tag.clone());
             Ok(OpResult::RoomTag {
                 room_number: *room_number,
-                tag: tag.clone(),
+                tag,
             })
         }
         AreaMutation::RemoveRoomTag {
@@ -1146,16 +1147,20 @@ pub(crate) fn apply_mutation_in(
             room_source,
             tag,
         } => {
-            // Removing an absent tag succeeds, like the server's DELETE.
+            // Removing an absent tag changes nothing, here as on the server;
+            // compilation drops it, so nothing is sent for it.
+            let tag = crate::mapper::removable_tag(tag)?;
             let room = room_content_mut(
                 details,
                 context,
                 RoomAddress::from_wire(*room_source, *room_number),
             )?;
-            room.tags.remove(tag);
+            // A copy kept in another case (written raw to a local map) goes too.
+            room.tags
+                .retain(|kept| crate::mapper::normalize_tag(kept) != tag);
             Ok(OpResult::RoomTagRemoved {
                 room_number: *room_number,
-                tag: tag.clone(),
+                tag,
             })
         }
         AreaMutation::UpsertAreaProperty { name, value } => {
@@ -1703,6 +1708,13 @@ pub(crate) fn apply_local_envelope(
         ],
         data,
     })
+}
+
+/// `tag` as rooms keep it and lookups compare it, refused as the server
+/// refuses it ([`crate::mapper::checked_tag`]). Removals use
+/// [`crate::mapper::removable_tag`].
+fn stored_tag(tag: &str) -> CloudResult<String> {
+    crate::mapper::checked_tag(tag)
 }
 
 pub(crate) fn apply_mutation(

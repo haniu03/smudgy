@@ -294,6 +294,141 @@ async fn a_full_load_beside_local_maps_resolves_an_empty_private() {
     assert_eq!(confirmed.get_property("notes"), Some("Mine"));
 }
 
+/// Removing a tag a room lacks changes nothing, so it sends nothing. A tag no
+/// room may keep is refused before anything is queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_an_absent_tag_sends_nothing() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("absent-tag@example.com", "absent-tag", true);
+    let area = server.create_area(&owner, "Square");
+    server.add_room(area, 1, "Fountain");
+    let cache = TempCacheDir::new("absent-tag");
+    let mapper = new_synced_mapper(&server.base_url, &owner.api_key, cache.path()).await;
+    let fountain = RoomKey::new(area, RoomNumber(1));
+    let posts = || server.requests_to("POST", &format!("/areas/{area}/mutations"));
+    let sent = posts();
+
+    let unchanged = |submission: smudgy_cloud::mapper::MutationSubmission| {
+        matches!(
+            submission,
+            smudgy_cloud::mapper::MutationSubmission::NoChange
+        )
+    };
+    assert!(unchanged(
+        mapper
+            .remove_room_tag(fountain.clone(), "peace".into())
+            .expect("nothing to refuse")
+    ));
+    let in_private = mapper
+        .mutate_batches(vec![
+            smudgy_cloud::mapper::AreaMutationBatch::strict(
+                area,
+                vec![AreaMutation::RemoveRoomTag {
+                    room_number: RoomNumber(1),
+                    room_source: None,
+                    tag: "quest".into(),
+                }],
+                "Untag",
+            )
+            .in_source(smudgy_cloud::SourceId::Private),
+        ])
+        .expect("nothing to refuse")
+        .pop()
+        .expect("one submission");
+    assert!(unchanged(in_private));
+    for refused in ["", "  "] {
+        assert!(
+            matches!(
+                mapper.add_room_tag(fountain.clone(), refused.into()),
+                Err(CloudError::InvalidInput(_))
+            ),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            mapper.remove_room_tag(fountain.clone(), refused.into()),
+            Err(CloudError::InvalidInput(_))
+        ));
+    }
+
+    // A tag the room carries still round trips, and the queue keeps moving.
+    let added = mapper
+        .add_room_tag(fountain.clone(), "inn".into())
+        .expect("queued")
+        .operation_id()
+        .expect("a cloud write");
+    mapper.wait_for_mutation(added).await.expect("added");
+    let removed = mapper
+        .remove_room_tag(fountain.clone(), "Inn".into())
+        .expect("queued")
+        .operation_id()
+        .expect("a cloud write");
+    mapper.wait_for_mutation(removed).await.expect("removed");
+    assert_eq!(posts(), sent + 2, "only the real add and removal were sent");
+    assert!(
+        !mapper
+            .get_current_atlas()
+            .get_room(&fountain)
+            .expect("the fountain")
+            .has_tag("inn")
+    );
+}
+
+/// Two sessions remove the same tag. The second, sent from a reading that
+/// still had it, meets a revision conflict, replays over the fresh map and is
+/// sent again as a removal of a tag the room no longer has: that succeeds and
+/// changes nothing, so the map's queue keeps moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_resent_after_a_conflict_finds_the_tag_gone() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("tag-race@example.com", "tag-race", true);
+    let area = server.create_area(&owner, "Market");
+    server.add_room(area, 1, "Stall");
+    let one_cache = TempCacheDir::new("tag-race-one");
+    let two_cache = TempCacheDir::new("tag-race-two");
+    let one = new_synced_mapper(&server.base_url, &owner.api_key, one_cache.path()).await;
+    let stall = RoomKey::new(area, RoomNumber(1));
+    let tagged = one
+        .add_room_tag(stall.clone(), "inn".into())
+        .expect("queued")
+        .operation_id()
+        .expect("a cloud write");
+    one.wait_for_mutation(tagged).await.expect("tagged");
+    let two = new_synced_mapper(&server.base_url, &owner.api_key, two_cache.path()).await;
+    assert!(
+        two.get_current_atlas()
+            .get_room(&stall)
+            .expect("the stall")
+            .has_tag("inn")
+    );
+
+    let first = one
+        .remove_room_tag(stall.clone(), "inn".into())
+        .expect("queued")
+        .operation_id()
+        .expect("a cloud write");
+    one.wait_for_mutation(first).await.expect("removed");
+    let second = two
+        .remove_room_tag(stall.clone(), "inn".into())
+        .expect("queued")
+        .operation_id()
+        .expect("a cloud write");
+    two.wait_for_mutation(second)
+        .await
+        .expect("the resent removal succeeds");
+
+    let later = two
+        .add_room_tag(stall.clone(), "shop".into())
+        .expect("queued")
+        .operation_id()
+        .expect("a cloud write");
+    two.wait_for_mutation(later)
+        .await
+        .expect("the queue keeps moving");
+    let room = two.get_current_atlas().get_room(&stall).expect("the stall");
+    assert!(!room.has_tag("inn"));
+    assert!(room.has_tag("shop"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_generation_adoption_does_not_request_cloud_sync() {
     let server = MockServer::spawn().await;

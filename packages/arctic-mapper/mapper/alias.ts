@@ -19,7 +19,7 @@ import {
     type LayoutQuality,
     type LayoutPatch,
 } from "smudgy:@map-layout";
-import { debugLog, distanceBetweenRooms, findRoomsAt, idsMatch, linkRooms, options, parseRoomExits, parseRoomExitsDetailed, RoomFlags, roomsImpactedByPush, speedwalk, State, state, ZMode } from "./mapper.ts";
+import { debugLog, distanceBetweenRooms, findRoomsAt, idsMatch, linkRooms, options, parseRoomExits, parseRoomExitsDetailed, roomsImpactedByPush, speedwalk, State, state, ZMode } from "./mapper.ts";
 import { mapEvent, type RoomEvent } from "./events.ts";
 import { requestExistingRoomConnection } from "./widget.tsx";
 
@@ -140,9 +140,11 @@ createAlias(/^>(?<spec>[!\w.]+)(?:@(?<prefix>.+?))?(?:[ \t]+(?<alone>a|al|alo|al
         return;
     }
 
-    const area = prefix === undefined ? undefined : findAreaByName(mapper.areas, prefix);
-    if (prefix !== undefined && !area) {
-        echo(`No area name starts with "${prefix.trim()}".`);
+    // An absent optional group reads "", so only a named area scopes the search.
+    const scope = prefix?.trim() || undefined;
+    const area = scope === undefined ? undefined : findAreaByName(mapper.areas, scope);
+    if (scope !== undefined && !area) {
+        echo(`No area name starts with "${scope}".`);
         return;
     }
 
@@ -563,16 +565,12 @@ async function roomCommand([subcommand, ...args]: string[]) {
             if (!action || !flag) {
                 echo("Usage: map room flag <action> <flag>");
                 echo("Actions: set, clear");
-                echo("Append ! to set a flag that isn't in the known list (e.g. tollhouse!).");
                 echo(`Current flags: ${state.room.tags.join(", ") || "(none)"}`);
                 return;
             }
 
-            // Flags are first-class room tags (case-insensitive, stored UPPERCASE).
-            // RoomFlags is the suggested set; a trailing "!" forces an arbitrary flag
-            // that isn't in that set (e.g. "tollhouse!" -> the TOLLHOUSE flag).
-            const force = flag.endsWith("!");
-            const tag = (force ? flag.slice(0, -1) : flag).toUpperCase();
+            // Flags are room tags: any name, case-insensitive, stored UPPERCASE.
+            const tag = flag.trim();
 
             if (!tag) {
                 echo("No flag given");
@@ -580,14 +578,14 @@ async function roomCommand([subcommand, ...args]: string[]) {
             }
 
             if (action === "set") {
-                if (!(tag in RoomFlags) && !force) {
-                    echo(`${tag} is not a known flag. Append ! to set it anyway (e.g. ${flag}!).`);
-                    echo(`Known flags: ${Object.keys(RoomFlags).join(", ")}`);
-                    return;
-                }
                 await mapper.addRoomTag(state.area.id, state.room.roomNumber, tag);
             } else if (action === "clear") {
-                await mapper.removeRoomTag(state.area.id, state.room.roomNumber, tag);
+                const flagged = state.room.hasTag(tag);
+                if (await mapper.removeRoomTag(state.area.id, state.room.roomNumber, tag) === null) {
+                    echo(flagged
+                        ? `${tag.toUpperCase()} comes from Private or a Secret, not this room's own flags.`
+                        : `This room has no ${tag.toUpperCase()} flag.`);
+                }
             } else {
                 echo("Invalid action");
                 return;
@@ -1200,7 +1198,7 @@ const lookCommands = Object.keys(MoveCommands).filter(command => MoveCommands[co
 createAlias(
     `^(?:(?<direction>${directionCommands.join("|")})(?:[ \\t]+(?<alone>a|al|alo|alon|alone))?|(?<look>${lookCommands.join("|")}))[ \\t]*$`,
     ({ direction, look, alone }: Matches) => {
-        const intent = MoveCommands[direction ?? look];
+        const intent = MoveCommands[direction || look];
 
         state.captureMoveCommand(intent);
         debugLog(`move captured: ${intent} (queue ${state.moveQueue.length})`);
