@@ -1055,8 +1055,14 @@ async fn two_sessions_race_the_first_private_write() {
         let drawn: std::collections::HashSet<_> =
             labels_in(mapper, area, &private).into_iter().collect();
         assert_eq!(drawn, both);
-        assert_eq!(bundle(mapper, area, &private).expect("Private").rev, 2);
     }
+    // A session's cached Private revision can trail its own acknowledged
+    // write, since later writes name the acknowledged revision; the server's
+    // is the one that counts.
+    assert_eq!(
+        server.state.lock().areas[&area.0].private_sources[&owner.id].rev,
+        2
+    );
 }
 
 /// A label moves between Secrets right after it was drawn or edited there,
