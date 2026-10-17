@@ -30,6 +30,7 @@ use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::update::Update;
 
+use super::area_list::name_order;
 use super::folder_picker::{self, FolderPicker, NewFolderForm, NewFolderMessage, PickerMessage};
 use super::{Event, FolderKey, MapEditorWindow, Message, ScopeTarget, modals};
 
@@ -1366,7 +1367,7 @@ impl MapEditorWindow {
                     })
                     .map(|area| (*area.get_id(), area.get_name().to_string()))
                     .collect();
-                maps.sort_by_cached_key(|(_, name)| name.to_lowercase());
+                maps.sort_by(|(a_id, a), (b_id, b)| name_order(a, a_id.0, b, b_id.0));
                 Some(Holding {
                     atlas_id,
                     name: facts.name.clone(),

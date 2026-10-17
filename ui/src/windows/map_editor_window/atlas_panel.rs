@@ -17,6 +17,7 @@ use smudgy_cloud::{AreaId, AtlasId, AtlasListItem};
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 
+use super::area_list::name_order;
 use super::clan_maps::{self, ClanMessage};
 use super::default_atlases;
 use super::panels::{self, PanelMessage, Section, muted};
@@ -45,12 +46,7 @@ pub fn atlas_maps(
         .into_iter()
         .filter(|map| map.atlas_id == Some(atlas_id) || put_in(map.id))
         .collect();
-    maps.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    maps.sort_by(|a, b| name_order(&a.name, a.id.0, &b.name, b.id.0));
     maps
 }
 

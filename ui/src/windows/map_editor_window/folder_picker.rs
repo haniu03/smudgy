@@ -11,6 +11,7 @@ use crate::components::cloud_errors::display_error;
 use crate::theme::Element as ThemedElement;
 use crate::update::Update;
 
+use super::area_list::name_order;
 use super::modals::{Modal, section_label};
 use super::multi_select::{MoveDialog, MultiDialog, MultiMessage};
 use super::{Event, FolderKey, MapEditorWindow, Message};
@@ -58,12 +59,7 @@ pub fn own_folders(
 }
 
 fn sort_folders(folders: &mut [OwnFolder]) {
-    folders.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    folders.sort_by(|a, b| name_order(&a.name, a.id.0, &b.name, b.id.0));
 }
 
 /// Which storages the picker offers.

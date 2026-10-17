@@ -26,7 +26,7 @@ use crate::theme::builtins;
 use crate::update::Update;
 use crate::widgets::dropdown::Dropdown;
 
-use super::area_list::{AreaSummary, Folder};
+use super::area_list::{AreaSummary, Folder, name_order, sort_by_name, sort_folders};
 use super::{FolderKey, MapEditorWindow, Message, ScopeTarget, modals};
 
 /// What the map editor knows about the viewer's clans.
@@ -106,12 +106,7 @@ fn folder_choices(window: &MapEditorWindow, clan_id: Uuid, clan_action: &str) ->
             name: atlas.name.clone(),
         })
         .collect();
-    folders.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    folders.sort_by(|a, b| name_order(&a.name, a.id.0, &b.name, b.id.0));
     folders
 }
 
@@ -837,15 +832,6 @@ pub struct ClanGroup {
     pub unfiled: Vec<AreaSummary>,
 }
 
-fn sort_folders(folders: &mut [Folder]) {
-    folders.sort_by(|a, b| {
-        a.label
-            .to_lowercase()
-            .cmp(&b.label.to_lowercase())
-            .then_with(|| a.label.cmp(&b.label))
-    });
-}
-
 /// One map as the clan grouping reads it.
 #[derive(Debug, Clone)]
 pub struct ListedMap {
@@ -963,12 +949,7 @@ pub fn group_clans(
             let mut folders: Vec<Folder> = folders
                 .into_iter()
                 .map(|(atlas_id, (label, mut areas))| {
-                    areas.sort_by(|a, b| {
-                        a.name
-                            .to_lowercase()
-                            .cmp(&b.name.to_lowercase())
-                            .then_with(|| a.name.cmp(&b.name))
-                    });
+                    sort_by_name(&mut areas);
                     Folder {
                         key: FolderKey::Atlas(atlas_id),
                         label,
@@ -979,12 +960,7 @@ pub fn group_clans(
                 .collect();
             sort_folders(&mut folders);
             let mut loose = unfiled.remove(&clan_id).unwrap_or_default();
-            loose.sort_by(|a, b| {
-                a.name
-                    .to_lowercase()
-                    .cmp(&b.name.to_lowercase())
-                    .then_with(|| a.name.cmp(&b.name))
-            });
+            sort_by_name(&mut loose);
             ClanGroup {
                 clan_id,
                 label: state
@@ -1002,13 +978,7 @@ pub fn group_clans(
             }
         })
         .collect();
-    groups.sort_by(|a, b| {
-        a.label
-            .to_lowercase()
-            .cmp(&b.label.to_lowercase())
-            .then_with(|| a.label.cmp(&b.label))
-            .then_with(|| a.clan_id.cmp(&b.clan_id))
-    });
+    groups.sort_by(|a, b| name_order(&a.label, a.clan_id, &b.label, b.clan_id));
     groups
 }
 
@@ -1175,7 +1145,7 @@ pub fn refile_targets(
         })
         .map(|atlas| (atlas.id, atlas.name.clone()))
         .collect();
-    targets.sort_by_key(|(_, name)| name.to_lowercase());
+    targets.sort_by(|(a_id, a), (b_id, b)| name_order(a, a_id.0, b, b_id.0));
     targets
 }
 
@@ -1629,6 +1599,54 @@ mod tests {
                 .flat_map(|folder| &folder.areas)
                 .all(|area| area.name != "My own")
         );
+    }
+
+    #[test]
+    fn clan_folders_and_maps_that_share_a_name_list_by_id_whatever_order_they_arrive_in() {
+        let mut state = ClanState::default();
+        state
+            .names
+            .insert(Uuid::from_u128(1), "Lantern Company".into());
+        let atlases = [folder(10, 1, "Roads"), folder(11, 1, "Roads")];
+        let maps = [
+            map(100, "Haven", Some(1), Some(10)),
+            map(101, "Haven", Some(1), Some(10)),
+            map(102, "Hollow", Some(1), None),
+            map(103, "Hollow", Some(1), None),
+        ];
+        let listed = |atlases: &[AtlasListItem], maps: &[ListedMap]| {
+            let group = group_clans(&state, atlases, maps).remove(0);
+            let folders: Vec<(FolderKey, Vec<AreaId>)> = group
+                .folders
+                .iter()
+                .map(|folder| {
+                    (
+                        folder.key,
+                        folder.areas.iter().map(|area| area.id).collect(),
+                    )
+                })
+                .collect();
+            let unfiled: Vec<AreaId> = group.unfiled.iter().map(|area| area.id).collect();
+            (folders, unfiled)
+        };
+        let in_order = listed(&atlases, &maps);
+        assert_eq!(
+            in_order,
+            (
+                vec![
+                    (
+                        FolderKey::Atlas(AtlasId(Uuid::from_u128(10))),
+                        vec![AreaId(Uuid::from_u128(100)), AreaId(Uuid::from_u128(101))]
+                    ),
+                    (FolderKey::Atlas(AtlasId(Uuid::from_u128(11))), vec![]),
+                ],
+                vec![AreaId(Uuid::from_u128(102)), AreaId(Uuid::from_u128(103))]
+            )
+        );
+        let (mut atlases, mut maps) = (atlases, maps);
+        atlases.reverse();
+        maps.reverse();
+        assert_eq!(listed(&atlases, &maps), in_order);
     }
 
     #[test]

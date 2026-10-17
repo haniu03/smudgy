@@ -14,6 +14,7 @@
 //! display fallback. A re-shared map (sharer differs from owner) gets a
 //! subtle "owned by …" badge.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use iced::widget::{
@@ -213,13 +214,18 @@ pub struct AreaSummary {
     pub in_family: bool,
 }
 
-fn sort_by_name(areas: &mut [AreaSummary]) {
-    areas.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.name.cmp(&b.name))
-    });
+/// The order named rows list in: by name ignoring case, then exactly, then
+/// by `key`. The cache hands rows back in no fixed order, so the key keeps
+/// rows that share a name in place from one refresh to the next.
+pub(super) fn name_order<K: Ord>(a: &str, a_key: K, b: &str, b_key: K) -> Ordering {
+    a.to_lowercase()
+        .cmp(&b.to_lowercase())
+        .then_with(|| a.cmp(b))
+        .then_with(|| a_key.cmp(&b_key))
+}
+
+pub(super) fn sort_by_name(areas: &mut [AreaSummary]) {
+    areas.sort_by(|a, b| name_order(&a.name, a.id.0, &b.name, b.id.0));
 }
 
 /// One folder in the tree: a named atlas, or the "Not in a folder" bucket
@@ -235,6 +241,15 @@ pub struct Folder {
     pub areas: Vec<AreaSummary>,
     /// The viewer owns this folder (drives owner-only header affordances).
     pub owned: bool,
+}
+
+/// Sorts folders by name, then by atlas.
+pub(super) fn sort_folders(folders: &mut [Folder]) {
+    let atlas = |folder: &Folder| match folder.key {
+        FolderKey::Atlas(atlas_id) => Some(atlas_id.0),
+        FolderKey::Unfiled(_) | FolderKey::Unassigned => None,
+    };
+    folders.sort_by(|a, b| name_order(&a.label, atlas(a), &b.label, atlas(b)));
 }
 
 /// The shared maps handed to the viewer by one sharer: the owner's named atlas
@@ -285,15 +300,15 @@ pub fn first_area_id(
         if ephemeral.contains(area.get_id()) {
             continue;
         }
-        let entry = (area.get_name().to_lowercase(), *area.get_id());
+        let entry = (area.get_name().to_string(), *area.get_id());
         if is_own_map(&area) {
             owned.push(entry);
         } else {
             shared.push(entry);
         }
     }
-    owned.sort_by(|a, b| a.0.cmp(&b.0));
-    shared.sort_by(|a, b| a.0.cmp(&b.0));
+    owned.sort_by(|a, b| name_order(&a.0, a.1.0, &b.0, b.1.0));
+    shared.sort_by(|a, b| name_order(&a.0, a.1.0, &b.0, b.1.0));
     owned.into_iter().chain(shared).map(|(_, id)| id).next()
 }
 
@@ -404,12 +419,7 @@ pub fn group_owned(
         }
     }
 
-    folders.sort_by(|(a_id, a, _), (b_id, b, _)| {
-        a.to_lowercase()
-            .cmp(&b.to_lowercase())
-            .then_with(|| a.cmp(b))
-            .then_with(|| a_id.0.cmp(&b_id.0))
-    });
+    folders.sort_by(|(a_id, a, _), (b_id, b, _)| name_order(a, a_id.0, b, b_id.0));
 
     let mut groups = OwnedGroups::default();
     for (id, label, local) in folders {
@@ -574,9 +584,11 @@ pub fn shared_groups(
         }
     }
 
-    let mut groups: Vec<SharedGroup> = shared
-        .into_values()
-        .map(|accum| {
+    // Each group keeps its sharer's id, which orders sharers who show the
+    // same label (two handle-less friends both read "a friend").
+    let mut groups: Vec<(Uuid, SharedGroup)> = shared
+        .into_iter()
+        .map(|(sharer, accum)| {
             let mut folders: Vec<Folder> = accum
                 .by_atlas
                 .into_iter()
@@ -590,28 +602,19 @@ pub fn shared_groups(
                     }
                 })
                 .collect();
-            folders.sort_by(|a, b| {
-                a.label
-                    .to_lowercase()
-                    .cmp(&b.label.to_lowercase())
-                    .then_with(|| a.label.cmp(&b.label))
-            });
+            sort_folders(&mut folders);
             let mut loose = accum.loose;
             sort_by_name(&mut loose);
-            SharedGroup {
+            let group = SharedGroup {
                 label: crate::i18n::t!("area-list-shared-by", "person" => accum.label),
                 folders,
                 loose,
-            }
+            };
+            (sharer, group)
         })
         .collect();
-    groups.sort_by(|a, b| {
-        a.label
-            .to_lowercase()
-            .cmp(&b.label.to_lowercase())
-            .then_with(|| a.label.cmp(&b.label))
-    });
-    groups
+    groups.sort_by(|(a_id, a), (b_id, b)| name_order(&a.label, a_id, &b.label, b_id));
+    groups.into_iter().map(|(_, group)| group).collect()
 }
 
 /// A subtle, dimmed badge text used for inline row annotations.
@@ -1798,6 +1801,46 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn rows_that_share_a_name_list_by_id_whatever_order_they_arrive_in() {
+        let atlases = [
+            folder_item(1, "Arctic", None),
+            folder_item(2, "Arctic", None),
+        ];
+        let maps = || {
+            vec![
+                owned_map(10, "Midgaard", Some(1), false),
+                owned_map(11, "Midgaard", Some(1), false),
+                owned_map(12, "Midgaard", Some(2), false),
+            ]
+        };
+        let listed = |atlases: &[AtlasListItem], maps: Vec<OwnedMap>| {
+            group_owned(maps, atlases, &HashSet::new())
+                .shared
+                .iter()
+                .map(|folder| {
+                    let ids: Vec<AreaId> = folder.areas.iter().map(|area| area.id).collect();
+                    (folder.key, ids)
+                })
+                .collect::<Vec<_>>()
+        };
+        let in_order = listed(&atlases, maps());
+        assert_eq!(
+            in_order,
+            [
+                (
+                    FolderKey::Atlas(AtlasId(uuid(1))),
+                    vec![AreaId(uuid(10)), AreaId(uuid(11))]
+                ),
+                (FolderKey::Atlas(AtlasId(uuid(2))), vec![AreaId(uuid(12))]),
+            ]
+        );
+        let mut atlases = atlases;
+        atlases.reverse();
+        let reversed = listed(&atlases, maps().into_iter().rev().collect());
+        assert_eq!(reversed, in_order);
     }
 
     #[test]
