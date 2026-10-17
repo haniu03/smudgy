@@ -3717,11 +3717,22 @@ impl MapEditorWindow {
                     dialog.busy = false;
                     match result {
                         Ok(report) => {
-                            dialog.atlas_report = Some(crate::i18n::t!(
-                                "mapper-copy-report",
-                                "copied" => report.copied.len(),
-                                "skipped" => report.skipped.len()
-                            ));
+                            // The server copies the maps one at a time: those
+                            // still on their way arrive with a later sync.
+                            dialog.atlas_report = Some(if report.pending.is_empty() {
+                                crate::i18n::t!(
+                                    "mapper-copy-report",
+                                    "copied" => report.copied.len(),
+                                    "skipped" => report.skipped.len()
+                                )
+                            } else {
+                                crate::i18n::t!(
+                                    "mapper-copy-report-pending",
+                                    "copied" => report.copied.len(),
+                                    "pending" => report.pending.len(),
+                                    "skipped" => report.skipped.len()
+                                )
+                            });
                             // Select the first clone when sync lands it.
                             self.pending_copied_area = report.copied.first().copied();
                             self.mapper.sync_now();

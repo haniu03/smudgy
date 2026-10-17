@@ -1362,6 +1362,7 @@ mapper-shared-by-person = 由 { $person } 分享
 mapper-window-title = Smudgy 地圖編輯器
 mapper-window-area-title = Smudgy 地圖編輯器 — { $area }
 mapper-copy-report = 已複製 { $copied } 張地圖；略過 { $skipped } 張無法複製的地圖。
+mapper-copy-report-pending = 已複製 { $copied } 張地圖；另外 { $pending } 張正在複製，稍後會出現在資料夾中。略過 { $skipped } 張無法複製的地圖。
 mapper-copy-rooms-denied = 此地圖的擁有者不允許複製房間。
 mapper-create-first-room = 建立第一個房間
 mapper-create-first-room-help = 接著在格線上選擇它的位置。

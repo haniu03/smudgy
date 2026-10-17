@@ -557,6 +557,12 @@ pub struct MockState {
     /// and before its flip, as a request racing it would; `true` stops the
     /// acceptance there, as a failure would.
     pub interrupt_acceptance: Option<fn(&mut MockState, &PendingTransferRecord) -> bool>,
+    /// Test hook: atlas copies answer 202 with every member but the first
+    /// still pending, as the server's copy job does once a request's budget
+    /// runs out; `MockServer::finish_atlas_copies` lands the rest.
+    pub defer_atlas_copies: bool,
+    /// Copies a deferred atlas copy made that have not landed yet.
+    pub deferred_copies: Vec<AreaRecord>,
     /// Test hook: fail the next N area reads (`GET /areas/{id}`) with a 500 —
     /// an outage between a sync row and the refetch it calls for.
     pub fail_area_reads: u32,

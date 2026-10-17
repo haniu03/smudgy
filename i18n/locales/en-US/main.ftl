@@ -1438,6 +1438,7 @@ mapper-shared-by-person = Shared by { $person }
 mapper-window-title = Smudgy map editor
 mapper-window-area-title = Smudgy map editor — { $area }
 mapper-copy-report = Copied { $copied } maps; skipped { $skipped } (not copyable).
+mapper-copy-report-pending = Copied { $copied } maps so far; { $pending } more are on their way and will appear in the folder shortly. Skipped { $skipped } (not copyable).
 mapper-copy-rooms-denied = This map's owner hasn't allowed copying rooms.
 mapper-create-first-room = Create first room
 mapper-create-first-room-help = Then choose its position on the grid.

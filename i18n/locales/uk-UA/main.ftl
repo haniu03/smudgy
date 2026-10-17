@@ -1529,6 +1529,7 @@ mapper-shared-by-person = Надано користувачем { $person }
 mapper-window-title = Smudgy — редактор мап
 mapper-window-area-title = Smudgy — редактор мап — { $area }
 mapper-copy-report = Скопійовано мапи: { $copied }; пропущено: { $skipped } (не можна скопіювати).
+mapper-copy-report-pending = Наразі скопійовано мапи: { $copied }; ще { $pending } в дорозі й незабаром з'являться в теці. Пропущено: { $skipped } (не можна скопіювати).
 mapper-copy-rooms-denied = Власник цієї мапи не дозволив копіювати кімнати.
 mapper-create-first-room = Створити першу кімнату
 mapper-create-first-room-help = Потім виберіть її розташування на сітці.

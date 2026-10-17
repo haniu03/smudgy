@@ -827,6 +827,21 @@ impl MockHandle {
         self.state.lock().refuse_mutations = n;
     }
 
+    /// Atlas copies from now on answer 202 with every member but the first
+    /// still pending, as the server's copy job does past a request's budget.
+    pub fn defer_atlas_copies(&self) {
+        self.state.lock().defer_atlas_copies = true;
+    }
+
+    /// Lands the copies deferred atlas copies left pending, as the server's
+    /// copy job finishes them.
+    pub fn finish_atlas_copies(&self) {
+        let mut st = self.state.lock();
+        for record in std::mem::take(&mut st.deferred_copies) {
+            st.areas.insert(record.id, record);
+        }
+    }
+
     /// Runs `during` inside the next transfer acceptance, between its claim
     /// and its flip; `during` returning `true` stops the acceptance there.
     pub fn interrupt_next_acceptance(
