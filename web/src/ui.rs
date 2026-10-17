@@ -23,6 +23,9 @@ use smudgy_session_model::{DEFAULT_SCROLLBACK_LINES, InputOp, SessionId};
 use smudgy_theme::{Theme, builtins};
 
 use crate::{connect_manager, wire::SessionUpdate};
+use smudgy_ui_shared::hide_flight;
+use smudgy_ui_shared::layout_menu;
+use smudgy_ui_shared::pane_provenance::{self, PaneCreator};
 use smudgy_ui_shared::{
     assets::GEIST,
     bounds_probe::BoundsProbe,
@@ -98,6 +101,8 @@ struct SessionUiState {
     has_live_row: bool,
     server_echo: bool,
     script_panes: Vec<ScriptPaneUiState>,
+    /// The user hid the session's main pane into the Layout menu.
+    main_hidden: bool,
 }
 
 struct ScriptPaneUiState {
@@ -138,6 +143,7 @@ impl SessionUiState {
             has_live_row: false,
             server_echo: false,
             script_panes: Vec::new(),
+            main_hidden: false,
         }
     }
 
@@ -184,6 +190,12 @@ pub struct ClientUiState {
     pane_grid: Option<pane_grid::State<pane_groups::GroupId>>,
     split_targets: BTreeMap<pane_grid::Split, EdgeTarget>,
     grid_bounds: Cell<Rectangle>,
+    /// Ghosts of panes the user hid or showed, and the draw-time mirrors of
+    /// where they fly: the Layout button, and the hamburger while the
+    /// toolbar is collapsed.
+    flights: hide_flight::Flights,
+    layout_button_bounds: Cell<Rectangle>,
+    menu_button_bounds: Cell<Rectangle>,
     strip_bands: RefCell<HashMap<pane_groups::GroupId, Rectangle>>,
     tab_spans: RefCell<HashMap<TabId, Rectangle>>,
     strip_scroll: RefCell<HashMap<pane_groups::GroupId, f32>>,
@@ -218,6 +230,9 @@ impl ClientUiState {
             pane_grid: None,
             split_targets: BTreeMap::new(),
             grid_bounds: Cell::new(Rectangle::new(Point::ORIGIN, Size::ZERO)),
+            flights: hide_flight::Flights::default(),
+            layout_button_bounds: Cell::new(Rectangle::default()),
+            menu_button_bounds: Cell::new(Rectangle::default()),
             strip_bands: RefCell::new(HashMap::new()),
             tab_spans: RefCell::new(HashMap::new()),
             strip_scroll: RefCell::new(HashMap::new()),
@@ -348,10 +363,13 @@ impl ClientUiState {
 
     #[must_use]
     pub fn tab_session(&self, tab: TabId) -> Option<SessionId> {
-        self.pane_layout
-            .tab(tab)
-            .and_then(Tab::binding)
-            .map(|pane| pane.session_id)
+        self.tab_pane(tab).map(|pane| pane.session_id)
+    }
+
+    /// The pane bound to a strip tab.
+    #[must_use]
+    pub fn tab_pane(&self, tab: TabId) -> Option<PaneRef> {
+        self.pane_layout.tab(tab).and_then(Tab::binding).copied()
     }
 
     #[must_use]
@@ -421,7 +439,7 @@ impl ClientUiState {
             tab_strip::Event::Connect(_)
             | tab_strip::Event::Disconnect(_)
             | tab_strip::Event::CloseSession(_)
-            | tab_strip::Event::ToggleVisibility(_) => false,
+            | tab_strip::Event::Hide(_) => false,
         }
     }
 
@@ -566,14 +584,23 @@ impl ClientUiState {
                 self.connect_panel = false;
                 self.settings_panel = false;
             }
-            Message::AnimationFrame(now) if self.sessions.is_empty() => self.cat_clock.tick(*now),
+            Message::AnimationFrame(now) if self.needs_animation_frames() => {
+                self.cat_clock.tick(*now);
+            }
             _ => {}
         }
     }
 
     #[must_use]
     pub fn needs_animation_frames(&self) -> bool {
-        self.sessions.is_empty()
+        // The cat animates in both empty states: no sessions, or every pane
+        // hidden (no grid while sessions run).
+        self.sessions.is_empty() || self.pane_grid.is_none()
+    }
+
+    /// Expand the toolbar (a no-op when it already is).
+    pub fn expand_toolbar(&mut self) {
+        self.toolbar_expanded = true;
     }
 
     #[must_use]
@@ -710,7 +737,7 @@ impl ClientUiState {
             Some(PaneRecord {
                 slot: slot_of(pane.session_id)?,
                 identity: dto::PaneIdentity::Main,
-                hidden: false,
+                hidden: self.pane_hidden(pane),
             })
         })
     }
@@ -769,19 +796,198 @@ impl ClientUiState {
         }
     }
 
-    fn pane_hidden(&self, pane: PaneRef) -> bool {
-        if pane.key == MAIN_PANE_KEY {
+    /// The bound panes hidden in this window, in layout order.
+    #[must_use]
+    pub fn hidden_panes(&self) -> Vec<PaneRef> {
+        self.pane_layout
+            .panes()
+            .into_iter()
+            .filter_map(|tab| tab.binding().copied())
+            .filter(|pane| self.pane_hidden(*pane))
+            .collect()
+    }
+
+    /// How many panes wait hidden in the Layout menu.
+    #[must_use]
+    pub fn hidden_pane_count(&self) -> usize {
+        self.hidden_panes().len()
+    }
+
+    /// Mirror the Layout button's bounds (the host builds the button).
+    pub fn record_layout_button(&self, bounds: Rectangle) {
+        self.layout_button_bounds.set(bounds);
+    }
+
+    /// The user hid or showed a pane: [`Self::set_pane_hidden`], with its
+    /// ghost flying between where the pane shows and the Layout menu. A
+    /// single shown pane comes to the front of its group.
+    pub fn set_pane_hidden_by_user(&mut self, pane: PaneRef, hidden: bool, front: bool) -> bool {
+        let label = self.pane_title(pane);
+        let target = self.menu_target();
+        if hidden {
+            let from = self.pane_rect(pane);
+            if !self.set_pane_hidden(pane, true) {
+                return false;
+            }
+            if let (Some(from), Some(label)) = (from, label) {
+                self.flights.launch(from, target, label);
+            }
+            return true;
+        }
+        if !self.set_pane_hidden(pane, false) {
             return false;
         }
-        self.sessions
+        if front && let Some(tab) = self.tab_of(pane) {
+            self.select_tab(tab);
+        }
+        if let (Some(to), Some(label)) = (self.pane_rect(pane), label) {
+            self.flights.launch(target, to, label);
+        }
+        true
+    }
+
+    /// A pane's strip title: the session's for main, the pane name else.
+    fn pane_title(&self, pane: PaneRef) -> Option<String> {
+        let session = self
+            .sessions
             .iter()
+            .find(|session| session.id == pane.session_id)?;
+        if pane.key == MAIN_PANE_KEY {
+            return Some(session.title.clone());
+        }
+        session
+            .script_panes
+            .iter()
+            .find(|script| script.key == pane.key)
+            .map(|script| script.name.clone())
+    }
+
+    fn tab_of(&self, pane: PaneRef) -> Option<TabId> {
+        self.pane_layout
+            .panes()
+            .into_iter()
+            .find(|tab| tab.binding() == Some(&pane))
+            .map(Tab::id)
+    }
+
+    /// Where `pane` shows right now (window-local): its group's grid region
+    /// when it is the group's rendered pane, else its tab in the strip.
+    fn pane_rect(&self, pane: PaneRef) -> Option<Rectangle> {
+        let tab = self.tab_of(pane)?;
+        let group = self.pane_layout.group_of(tab)?;
+        let grid = self.pane_grid.as_ref()?;
+        let rendered = self.pane_layout.effective_selected(group, |tab| {
+            tab.binding().is_some_and(|pane| !self.pane_hidden(*pane))
+        });
+        if rendered == Some(tab) {
+            let bounds = self.grid_bounds.get();
+            let regions = grid.layout().pane_regions(4.0, 80.0, bounds.size());
+            let (id, _) = grid.panes.iter().find(|(_, payload)| **payload == group)?;
+            let region = regions.get(id)?;
+            return Some(Rectangle {
+                x: region.x + bounds.x,
+                y: region.y + bounds.y,
+                ..*region
+            });
+        }
+        let span = *self.tab_spans.borrow().get(&tab)?;
+        let offset = self
+            .strip_scroll
+            .borrow()
+            .get(&group)
+            .copied()
+            .unwrap_or(0.0);
+        Some(Rectangle {
+            x: span.x - offset,
+            ..span
+        })
+    }
+
+    /// Where a hidden pane goes: the Layout button, or the hamburger while
+    /// the toolbar (and so the button) is collapsed away.
+    fn menu_target(&self) -> Rectangle {
+        if self.toolbar_expanded && self.active_session.is_some() {
+            self.layout_button_bounds.get()
+        } else {
+            self.menu_button_bounds.get()
+        }
+    }
+
+    /// The user hid or showed a pane: flip it here at once (the session
+    /// worker echoes the definition back, which then agrees). Returns
+    /// whether anything changed.
+    pub fn set_pane_hidden(&mut self, pane: PaneRef, hidden: bool) -> bool {
+        let Some(session) = self
+            .sessions
+            .iter_mut()
             .find(|session| session.id == pane.session_id)
-            .and_then(|session| {
-                session
+        else {
+            return false;
+        };
+        let state = if pane.key == MAIN_PANE_KEY {
+            &mut session.main_hidden
+        } else {
+            match session
+                .script_panes
+                .iter_mut()
+                .find(|script| script.key == pane.key)
+            {
+                Some(script) => &mut script.hidden,
+                None => return false,
+            }
+        };
+        if *state == hidden {
+            return false;
+        }
+        *state = hidden;
+        self.rebuild_grid();
+        true
+    }
+
+    /// The Layout menu's hidden-pane rows, under their sessions. Browser
+    /// scripts all run in the user namespace.
+    #[must_use]
+    pub fn hidden_menu_rows(&self) -> Vec<layout_menu::HiddenSession> {
+        layout_menu::group_by_session(self.hidden_panes().into_iter().filter_map(|pane| {
+            let session = self
+                .sessions
+                .iter()
+                .find(|session| session.id == pane.session_id)?;
+            let (name, creator) = if pane.key == MAIN_PANE_KEY {
+                (session.title.clone(), PaneCreator::Session)
+            } else {
+                let script = session
                     .script_panes
                     .iter()
-                    .find(|script| script.key == pane.key)
-            })
+                    .find(|script| script.key == pane.key)?;
+                (script.name.clone(), PaneCreator::UserScripts)
+            };
+            Some((
+                session.title.clone(),
+                layout_menu::HiddenPane {
+                    pane,
+                    name,
+                    creator,
+                },
+            ))
+        }))
+    }
+
+    fn pane_hidden(&self, pane: PaneRef) -> bool {
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == pane.session_id)
+        else {
+            return pane.key != MAIN_PANE_KEY;
+        };
+        if pane.key == MAIN_PANE_KEY {
+            return session.main_hidden;
+        }
+        session
+            .script_panes
+            .iter()
+            .find(|script| script.key == pane.key)
             .is_none_or(|pane| pane.hidden)
     }
 
@@ -901,17 +1107,15 @@ impl ClientUiState {
                 self.rebuild_grid();
             }
             BrowserPaneEvent::Updated { key, hidden } => {
-                if let Some(pane) = self
-                    .sessions
-                    .iter_mut()
-                    .find(|session| session.id == id)
-                    .and_then(|session| {
-                        session.script_panes.iter_mut().find(|pane| pane.key == key)
-                    })
-                {
-                    pane.hidden = hidden;
-                    self.rebuild_grid();
-                }
+                // Idempotent for the page's own hide or show, which already
+                // flipped the state before the worker echoed it.
+                self.set_pane_hidden(
+                    PaneRef {
+                        session_id: id,
+                        key,
+                    },
+                    hidden,
+                );
             }
             BrowserPaneEvent::Echo { key, text } => {
                 let target = self.sessions.iter_mut().find(|session| session.id == id);
@@ -1044,10 +1248,8 @@ pub fn blueprint_from_dto(
                 .tabs
                 .iter()
                 .map(|pane| {
-                    if pane.id != dto::PaneIdentity::Main || pane.hidden {
-                        return Err(
-                            "This browser build cannot yet display script or hidden panes".into(),
-                        );
+                    if pane.id != dto::PaneIdentity::Main {
+                        return Err("This browser build cannot yet display script panes".into());
                     }
                     let session = session_of(pane.slot).ok_or_else(|| {
                         format!("Layout session slot {} is unavailable", pane.slot)
@@ -1075,6 +1277,28 @@ pub fn blueprint_from_dto(
             a: Box::new(blueprint_from_dto(&split.a, session_of)?),
             b: Box::new(blueprint_from_dto(&split.b, session_of)?),
         }),
+    }
+}
+
+/// The main panes a stored layout node names, each with its stored hidden
+/// state (what an install applies after the arrangement lands). Slots that
+/// resolve to no session are skipped.
+pub fn main_visibility(
+    node: &dto::Node,
+    session_of: &impl Fn(u64) -> Option<SessionId>,
+) -> Vec<(PaneRef, bool)> {
+    match node {
+        dto::Node::Group(group) => group
+            .tabs
+            .iter()
+            .filter(|pane| pane.id == dto::PaneIdentity::Main)
+            .filter_map(|pane| Some((PaneRef::main(session_of(pane.slot)?), pane.hidden)))
+            .collect(),
+        dto::Node::Split(split) => {
+            let mut panes = main_visibility(&split.a, session_of);
+            panes.extend(main_visibility(&split.b, session_of));
+            panes
+        }
     }
 }
 
@@ -1119,9 +1343,12 @@ pub fn pane_drag_event(
 /// remain owned by the platform host's per-session workers.
 #[must_use]
 #[allow(clippy::too_many_lines)]
+/// `layout_menu` is the toolbar's Layout button and menu, which the host
+/// builds (it owns the saved-layout store the menu lists).
 pub fn view<'a>(
     ui: &'a ClientUiState,
     label: &impl Fn(&'static str) -> String,
+    layout_menu: Element<'a, main_toolbar::Message, Theme>,
 ) -> Element<'a, Message, Theme> {
     let main_content: Element<'_, Message, Theme> = if let Some(grid) = &ui.pane_grid {
         // Native reveals otherwise-hidden headers while its toolbar is expanded.
@@ -1230,7 +1457,16 @@ pub fn view<'a>(
                     main: pane.key == MAIN_PANE_KEY,
                     selected: durable_selected == Some(*tab),
                     rendered: selected == Some(*tab),
-                    hidden: false,
+                    // Browser scripts all run in the user namespace.
+                    tooltip: if pane.key == MAIN_PANE_KEY {
+                        None
+                    } else {
+                        pane_provenance::tooltip_text(
+                            &member.title,
+                            &PaneCreator::UserScripts,
+                            label,
+                        )
+                    },
                     active_session: ui.active_session == Some(pane.session_id),
                     connected: member.connection == ConnectionState::Connected,
                     ever_connected: member.connection != ConnectionState::Connecting,
@@ -1243,7 +1479,7 @@ pub fn view<'a>(
                 tab_strip::StripContext {
                     drag_live: ui.tab_drag.is_some(),
                     modifiers: keyboard::Modifiers::default(),
-                    visibility_eyes: false,
+                    hide_controls: ui.toolbar_expanded,
                     labels: tab_strip::StripLabels::default(),
                     on_strip_bounds: Box::new(move |bounds| {
                         ui.strip_bands.borrow_mut().insert(*group, bounds);
@@ -1280,23 +1516,39 @@ pub fn view<'a>(
             }
         }
         stack![panes, drag_overlay::TargetOverlay::new(rects)].into()
+    } else if !ui.sessions.is_empty() {
+        // Sessions run but every pane is hidden.
+        layout_menu::everything_hidden(crt_cat::view(ui.cat_clock.seconds()), label)
+            .map(|action| Message::Toolbar(main_toolbar::Message::LayoutMenu(action)))
     } else {
         empty_state(ui.cat_clock.seconds())
     };
 
     let body: Element<'_, Message, Theme> = column![
-        main_toolbar::view(ui.toolbar_expanded, ui.active_session.is_some()).map(Message::Toolbar),
+        main_toolbar::view(
+            ui.toolbar_expanded,
+            ui.active_session.is_some(),
+            label,
+            layout_menu,
+            |bounds| ui.menu_button_bounds.set(bounds)
+        )
+        .map(Message::Toolbar),
         main_content
     ]
     .width(Fill)
     .height(Fill)
     .into();
 
-    let main: Element<'_, Message, Theme> = container(body)
-        .width(Fill)
-        .height(Fill)
-        .style(builtins::container::opaque)
-        .into();
+    // Ghosts of hidden and shown panes fly on an inert layer above the
+    // toolbar and grid, always mounted so nothing beneath loses its state.
+    let main: Element<'_, Message, Theme> = stack![
+        container(body)
+            .width(Fill)
+            .height(Fill)
+            .style(builtins::container::opaque),
+        ui.flights.layer(),
+    ]
+    .into();
     if ui.connect_panel {
         let modal = connect_modal::frame(
             "Connect",
@@ -1683,6 +1935,42 @@ mod tests {
             selected: 0,
         });
         assert!(blueprint_from_dto(&node, &|_| Some(SessionId::from(1))).is_err());
+    }
+
+    #[test]
+    fn a_hidden_main_leaves_the_grid_and_round_trips_through_the_snapshot() {
+        let mut ui = ClientUiState::new();
+        let first = ui.open_session("wss://first.example/ws");
+        let main = PaneRef::main(first);
+        assert!(ui.set_pane_hidden(main, true));
+        assert!(!ui.set_pane_hidden(main, true), "already hidden");
+        assert!(ui.pane_grid.is_none(), "every pane hidden: no grid");
+        assert!(
+            ui.needs_animation_frames(),
+            "the everything-hidden view animates its cat"
+        );
+        assert_eq!(ui.hidden_panes(), vec![main]);
+        assert_eq!(ui.hidden_menu_rows()[0].panes[0].pane, main);
+
+        let clusters = ui.snapshot_clusters(|_| Some(1));
+        assert_eq!(
+            main_visibility(&clusters[0].root, &|_| Some(first)),
+            vec![(main, true)]
+        );
+        assert!(blueprint_from_dto(&clusters[0].root, &|_| Some(first)).is_ok());
+
+        // The worker's echo of the page's own hide changes nothing.
+        ui.apply_browser_pane_event(
+            first,
+            BrowserPaneEvent::Updated {
+                key: MAIN_PANE_KEY,
+                hidden: true,
+            },
+        );
+        assert!(ui.pane_grid.is_none());
+        assert!(ui.set_pane_hidden(main, false));
+        assert!(ui.pane_grid.is_some());
+        assert_eq!(ui.hidden_pane_count(), 0);
     }
 
     #[test]

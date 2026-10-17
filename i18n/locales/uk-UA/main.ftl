@@ -293,7 +293,7 @@ session-action-disconnect = Від'єднатися
 # Pane tab strip controls
 pane-tab-close = Закрити сесію
 pane-tab-hide = Приховати панель
-pane-tab-show = Показати панель
+pane-creator-user-scripts = Ваші скрипти
 
 # Server and profile connection manager
 servers-title = Сервери
@@ -429,10 +429,24 @@ window-automations = Smudgy — Автоматизації — { $server }
 toolbar-connect = Підключитися
 toolbar-automations = Автоматизації
 toolbar-map-editor = Редактор мап
-toolbar-layouts = Розкладки
+toolbar-layout = Розкладка
 toolbar-settings = Налаштування
 
 # Named layouts menu
+layouts-manage-title = Збережені розкладки
+layout-menu-hidden = Приховані
+layout-menu-show-all = Показати всі
+layout-menu-saved = Збережені розкладки для { $server }
+layout-menu-loading = Завантаження…
+layout-menu-saved-empty = Ще немає збережених розкладок.
+layout-menu-save-as = Зберегти розкладку як…
+layout-menu-manage = Керувати збереженими розкладками…
+layout-menu-reset = Скинути розкладку панелей…
+layout-menu-main = Головна
+layout-hidden-heading = Усе приховано
+layout-hidden-subtext = Ваші сесії й далі працюють.
+layout-hidden-show-all = Показати всі панелі
+layout-hidden-choose = Вибрати в меню «Розкладка»
 layouts-apply-hint = Натисніть на розкладку, щоб застосувати її.
 layouts-empty = Немає збережених розкладок для { $server }.
 layouts-overwrite = Перезаписати

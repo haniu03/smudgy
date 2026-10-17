@@ -455,8 +455,8 @@ pub struct ClassifiedTarget {
 /// One tab's horizontal span within its group's header band, grid-local,
 /// strip order. Feeds insertion-slot classification. `slot` is the tab's
 /// index in the group's full member vec: bands cover only the tabs the
-/// strip lists, so consecutive bands may skip invisible members (tabs
-/// eyeball-hidden under a collapsed toolbar, vacancy bookkeeping), and
+/// strip lists, so consecutive bands may skip invisible members (hidden
+/// panes, vacancy bookkeeping), and
 /// the drop slot must be counted in member space — [`merge_tab`]'s
 /// contract — never band space.
 ///
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn gapped_bands_classify_drops_in_member_space() {
         // A five-member strip listing only members 1 and 3 (the rest
-        // invisible — eyeball-hidden under a collapsed toolbar): drops
+        // invisible — hidden panes): drops
         // land at member-vec slots, never band indices.
         let bands = [
             TabBand {

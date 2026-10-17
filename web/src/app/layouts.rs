@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use smudgy_ui_shared::layout_menu::{Message as MenuMessage, SavedLayouts};
+
 use super::{
     Completion, CredentialRequest, Effect, Labels, LayoutEvent, Message, SaveOutcome,
     SessionDefinition, SessionId, SmudgyWeb, StartupSend, Task, TemplateSource, UiMessage, dto,
@@ -45,6 +47,14 @@ fn chosen_omitted(
             .filter(|id| keep.contains(id) && !close.contains(id))
             .collect(),
     ))
+}
+
+/// The toolbar's Layout menu while it is open.
+pub(super) struct LayoutMenu {
+    /// The active session's server when the menu opened: the store its
+    /// saved layouts are listed from and applied against.
+    pub(super) server: String,
+    pub(super) saved: SavedLayouts,
 }
 
 pub(super) struct WebLabels(pub(super) smudgy_i18n::Translator);
@@ -108,11 +118,22 @@ impl SmudgyWeb {
                 let transition = state.record_save_outcome(outcome);
                 self.drive_layouts(transition)
             }
-            Message::LayoutToApply(nonce, name, result) => {
+            Message::LayoutToApply(nonce, server, name, result) => {
                 if nonce != self.layout_nonce {
                     return Task::none();
                 }
-                self.apply_loaded_layout(name, result)
+                self.apply_loaded_layout(&server, name, result)
+            }
+            Message::LayoutMenuListed(nonce, result) => {
+                if nonce == self.layout_menu_nonce
+                    && let Some(menu) = self.layout_menu.as_mut()
+                {
+                    menu.saved = match result {
+                        Ok(names) => SavedLayouts::Listed(names),
+                        Err(error) => SavedLayouts::Failed(error),
+                    };
+                }
+                Task::none()
             }
             Message::CloseLayouts => {
                 self.layout_nonce = self.layout_nonce.wrapping_add(1);
@@ -122,6 +143,111 @@ impl SmudgyWeb {
             }
             _ => Task::none(),
         }
+    }
+
+    pub(super) fn close_layout_menu(&mut self) {
+        self.layout_menu = None;
+        self.layout_menu_nonce = self.layout_menu_nonce.wrapping_add(1);
+    }
+
+    /// Handle a Layout menu action. Every item closes the menu; the button
+    /// opens it, scoped to the active session's server (none, no menu), and
+    /// lists that server's saved layouts from browser storage.
+    pub(super) fn layout_menu_action(&mut self, action: MenuMessage) -> Task<Message> {
+        let menu = self.layout_menu.take();
+        self.layout_menu_nonce = self.layout_menu_nonce.wrapping_add(1);
+        match action {
+            MenuMessage::Toggle => {
+                if menu.is_some() {
+                    return Task::none();
+                }
+                let Some(server) = self.active_server() else {
+                    return Task::none();
+                };
+                self.layout_menu = Some(LayoutMenu {
+                    server: server.clone(),
+                    saved: SavedLayouts::Loading,
+                });
+                let nonce = self.layout_menu_nonce;
+                Task::perform(
+                    async move { crate::storage::list_layouts(&server).await },
+                    move |result| Message::LayoutMenuListed(nonce, result),
+                )
+            }
+            MenuMessage::Open => {
+                // The everything-hidden view's way in: the Layout button
+                // lives on the expanded toolbar.
+                self.ui.expand_toolbar();
+                self.layout_menu_action(MenuMessage::Toggle)
+            }
+            MenuMessage::Dismiss => Task::none(),
+            MenuMessage::Show(pane) => {
+                self.set_panes_hidden(vec![pane], false);
+                Task::none()
+            }
+            MenuMessage::ShowAll => {
+                let hidden = self.ui.hidden_panes();
+                self.set_panes_hidden(hidden, false);
+                Task::none()
+            }
+            MenuMessage::Apply(name) => match menu {
+                Some(menu) => self.load_layout_to_apply(menu.server, name),
+                None => Task::none(),
+            },
+            MenuMessage::SaveAs => {
+                self.open_layouts_at(menu, layouts_modal::Message::SaveAsPressed)
+            }
+            MenuMessage::Manage => self.open_layouts(),
+            MenuMessage::Reset => self.open_layouts_at(menu, layouts_modal::Message::ResetPressed),
+        }
+    }
+
+    fn active_server(&self) -> Option<String> {
+        self.ui
+            .active_session()
+            .and_then(|id| self.session_definitions.get(&id))
+            .map(|definition| definition.server.clone())
+    }
+
+    /// Open the named-layout dialog straight at the stage `entry` leads to,
+    /// seeded with the menu's listing: backing out closes it.
+    fn open_layouts_at(
+        &mut self,
+        menu: Option<LayoutMenu>,
+        entry: layouts_modal::Message,
+    ) -> Task<Message> {
+        let Some(menu) = menu else {
+            return Task::none();
+        };
+        self.ui.handle_chrome(&UiMessage::ClosePanel);
+        self.layout_nonce = self.layout_nonce.wrapping_add(1);
+        self.pending_layout = None;
+        let names = match menu.saved {
+            SavedLayouts::Listed(names) => names,
+            SavedLayouts::Loading | SavedLayouts::Failed(_) => Vec::new(),
+        };
+        let mut state = layouts_modal::State::new(menu.server, names);
+        let transition = state.enter_directly(entry);
+        self.layouts = Some(state);
+        self.drive_layouts(transition)
+    }
+
+    /// The dialog that reports an apply's errors and questions: the open
+    /// one, or a fresh one for `server` when the apply came from the menu.
+    fn layouts_dialog(&mut self, server: &str) -> &mut layouts_modal::State {
+        self.layouts
+            .get_or_insert_with(|| layouts_modal::State::new(server.to_owned(), Vec::new()))
+    }
+
+    fn load_layout_to_apply(&mut self, server: String, name: String) -> Task<Message> {
+        let nonce = self.layout_nonce;
+        Task::perform(
+            async move {
+                let result = crate::storage::load_layout(&server, &name).await;
+                (server, name, result)
+            },
+            move |(server, name, result)| Message::LayoutToApply(nonce, server, name, result),
+        )
     }
 
     pub(super) fn open_layouts(&mut self) -> Task<Message> {
@@ -233,14 +359,7 @@ impl SmudgyWeb {
                     return Task::none();
                 };
                 let server = state.server.clone();
-                let nonce = self.layout_nonce;
-                Task::perform(
-                    async move {
-                        let result = crate::storage::load_layout(&server, &name).await;
-                        (name, result)
-                    },
-                    move |(name, result)| Message::LayoutToApply(nonce, name, result),
-                )
+                self.load_layout_to_apply(server, name)
             }
             LayoutEvent::ApplyWithAnswers {
                 source,
@@ -261,6 +380,7 @@ impl SmudgyWeb {
                 self.layouts = None;
                 Task::none()
             }
+            LayoutEvent::Close => self.handle_layout_message(Message::CloseLayouts),
         }
     }
 
@@ -309,9 +429,13 @@ impl SmudgyWeb {
 
     pub(super) fn apply_loaded_layout(
         &mut self,
+        server: &str,
         name: String,
         result: Result<Option<dto::Workspace>, String>,
     ) -> Task<Message> {
+        // An apply from the Layout menu has no dialog yet; its errors and
+        // keep-or-close questions open one.
+        self.layouts_dialog(server);
         let workspace = match result {
             Ok(Some(workspace)) => workspace,
             Ok(None) => {
@@ -462,7 +586,19 @@ impl SmudgyWeb {
             .active_slot
             .and_then(|slot| slot_to_session.get(&slot).copied())
             .or_else(|| self.ui.active_session());
+        // The layout's hidden states apply to the panes it names (a visible
+        // one shows even if it was hidden); kept sessions keep theirs.
+        let visibility: Vec<_> = window
+            .clusters
+            .iter()
+            .flat_map(|cluster| {
+                super::ui::main_visibility(&cluster.root, &|slot| {
+                    slot_to_session.get(&slot).copied()
+                })
+            })
+            .collect();
         self.ui.install_blueprint(blueprints, active);
+        self.apply_pane_visibility(visibility);
         self.save_window();
 
         let mut tasks = Vec::new();

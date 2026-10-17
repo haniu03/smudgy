@@ -231,7 +231,7 @@ session-action-disconnect = 中斷連線
 # Pane tab strip controls
 pane-tab-close = 關閉連線
 pane-tab-hide = 隱藏面板
-pane-tab-show = 顯示面板
+pane-creator-user-scripts = 你的腳本
 
 # 伺服器與設定檔管理
 servers-title = 伺服器
@@ -360,10 +360,24 @@ window-automations = Smudgy automations — { $server }
 toolbar-connect = 連線
 toolbar-automations = 自動化
 toolbar-map-editor = 地圖編輯器
-toolbar-layouts = 版面配置
+toolbar-layout = 版面配置
 toolbar-settings = 設定
 
 # Named layouts menu
+layouts-manage-title = 已儲存的版面配置
+layout-menu-hidden = 已隱藏
+layout-menu-show-all = 全部顯示
+layout-menu-saved = { $server } 的已儲存版面配置
+layout-menu-loading = 載入中…
+layout-menu-saved-empty = 尚無已儲存的版面配置。
+layout-menu-save-as = 將版面配置另存為…
+layout-menu-manage = 管理已儲存的版面配置…
+layout-menu-reset = 重設窗格版面…
+layout-menu-main = 主要
+layout-hidden-heading = 所有窗格都已隱藏
+layout-hidden-subtext = 你的連線仍在運作。
+layout-hidden-show-all = 顯示所有窗格
+layout-hidden-choose = 從「版面配置」選單中選擇
 layouts-apply-hint = 點選版面配置即可套用。
 layouts-empty = { $server } 尚未有已儲存的版面配置。
 layouts-overwrite = 覆寫

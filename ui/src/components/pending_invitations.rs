@@ -5,14 +5,12 @@
 //! an hour, and when Settings or the map editor opens. A Settings tab that
 //! has loaded its own lists counts those instead.
 
-use iced::widget::{container, text};
 use smudgy_cloud::Uuid;
 use smudgy_cloud::clan_secrets::OwnershipOffer;
 use smudgy_cloud::cloud_api::{CloudApiClient, FriendRequestView, TransferView};
 
 use crate::cloud_account::AccountSnapshot;
 use crate::components::clan_map_offers::MapOffers;
-use crate::theme::Element as ThemedElement;
 
 /// How often the counts are read again while nothing else asks.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -137,19 +135,6 @@ pub async fn fetch(client: CloudApiClient) -> Pending {
             Pending::default()
         }
     }
-}
-
-/// The accent pill counting what waits beside a nav or toolbar item.
-pub fn count_pill<'a, Message: 'a>(count: usize) -> ThemedElement<'a, Message> {
-    container(text(count.to_string()).size(11))
-        .padding([0, 6])
-        .style(|theme: &crate::Theme| container::Style {
-            background: Some(theme.styles.general.accent.into()),
-            text_color: Some(iced::Color::WHITE),
-            border: iced::border::rounded(8.0),
-            ..Default::default()
-        })
-        .into()
 }
 
 #[cfg(test)]

@@ -28,7 +28,7 @@ use crate::cloud_account::{CloudHandles, DeletionKey};
 use crate::components::clan_panel::{self, ClanPanel};
 use crate::components::cloud_errors::display_error;
 use crate::components::color_picker::{self, ColorPicker};
-use crate::components::pending_invitations::{self, Pending};
+use crate::components::pending_invitations::Pending;
 use crate::components::social_panel::{self, SocialPanel};
 use crate::i18n::{self, LocaleChoice, t, ts};
 use crate::prefs;
@@ -2220,23 +2220,17 @@ fn nav_button_with_count(
     if count == 0 {
         return nav_button(label, selected, tab);
     }
-    button(
-        row![
-            text(label).size(14),
-            space::horizontal(),
-            pending_invitations::count_pill(count)
-        ]
-        .align_y(iced::Alignment::Center),
-    )
-    .style(if selected {
-        theme::builtins::button::list_item_selected
-    } else {
-        theme::builtins::button::list_item
-    })
-    .width(Length::Fill)
-    .padding([6, 10])
-    .on_press(Message::TabSelected(tab))
-    .into()
+    let pill = smudgy_ui_shared::badge::count(count, smudgy_ui_shared::badge::BadgeTone::Accent);
+    button(row![text(label).size(14), space::horizontal(), pill].align_y(iced::Alignment::Center))
+        .style(if selected {
+            theme::builtins::button::list_item_selected
+        } else {
+            theme::builtins::button::list_item
+        })
+        .width(Length::Fill)
+        .padding([6, 10])
+        .on_press(Message::TabSelected(tab))
+        .into()
 }
 
 fn nav_button(label: String, selected: bool, tab: Tab) -> ThemedElement<'static, Message> {

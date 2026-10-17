@@ -6,18 +6,17 @@ use smudgy_theme::builtins;
 use iced::window;
 
 use crate::assets;
-use crate::components::pending_invitations;
 use crate::theme::Element;
 #[cfg(not(target_os = "windows"))]
 use crate::widgets::titlebar_press::TitlebarPress;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     ConnectPressed,
     SettingsPressed,
     AutomationsPressed,
     MapEditorPressed,
-    LayoutsPressed,
+    LayoutMenu(smudgy_ui_shared::layout_menu::Message),
     ToggleExpand,
     // Window controls: the toolbar doubles as the titlebar of the borderless
     // main window. On Windows moves go through the `WM_NCHITTEST` chrome
@@ -125,7 +124,7 @@ fn settings_button(pending: usize) -> Element<'static, Message> {
     button(
         row![
             text(label).size(14),
-            pending_invitations::count_pill(pending)
+            smudgy_ui_shared::badge::count(pending, smudgy_ui_shared::badge::BadgeTone::Accent)
         ]
         .spacing(6)
         .align_y(Vertical::Center),
@@ -180,14 +179,21 @@ fn traffic_light_inset() -> Element<'static, Message> {
         .into()
 }
 
-pub fn view(
+/// `layout_menu` is the Layout button and its menu, built by the window
+/// (which owns the menu's rows); shown beside the session items.
+/// `on_menu_bounds` mirrors the hamburger's bounds — where hidden panes fly
+/// while the toolbar is collapsed.
+pub fn view<'a>(
     window: window::Id,
     expanded: bool,
     maximized: bool,
     fullscreen: bool,
     session_context: &SessionContext,
     pending_invitations: usize,
-) -> Element<'static, Message> {
+    layout_menu: Element<'a, Message>,
+    on_menu_bounds: impl Fn(iced::Rectangle) + 'a,
+) -> Element<'a, Message> {
+    let menu_button = crate::widgets::bounds_probe::BoundsProbe::new(menu_button(), on_menu_bounds);
     // The maximize state only styles the custom window controls, which macOS
     // doesn't render; the fullscreen state only drops the traffic-light
     // inset, which exists nowhere else.
@@ -204,7 +210,7 @@ pub fn view(
         if !fullscreen {
             buttons.push(traffic_light_inset());
         }
-        buttons.push(menu_button());
+        buttons.push(menu_button.into());
         buttons.push(toolbar_button(
             crate::i18n::t!("toolbar-connect"),
             Message::ConnectPressed,
@@ -220,10 +226,7 @@ pub fn view(
                 crate::i18n::t!("toolbar-map-editor"),
                 Message::MapEditorPressed,
             ));
-            buttons.push(toolbar_button(
-                crate::i18n::t!("toolbar-layouts"),
-                Message::LayoutsPressed,
-            ));
+            buttons.push(layout_menu);
         }
 
         buttons.push(settings_button(pending_invitations));
@@ -245,14 +248,14 @@ pub fn view(
         // title bar, so it mirrors the OS title (incl. the dev-build marker).
         let title = text(crate::main_window_title()).size(14).color(TITLE_COLOR);
 
-        let mut items: Vec<Element<'static, Message>> = Vec::new();
+        let mut items: Vec<Element<'a, Message>> = Vec::new();
         // Native fullscreen auto-hides the traffic lights, so their reserved
         // corner goes too.
         #[cfg(target_os = "macos")]
         if !fullscreen {
             items.push(traffic_light_inset());
         }
-        items.push(menu_button());
+        items.push(menu_button.into());
         items.push(title.into());
         items.push(drag_area(window));
         #[cfg(not(target_os = "macos"))]

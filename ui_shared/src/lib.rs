@@ -3,18 +3,22 @@
 #![allow(clippy::pedantic)]
 
 pub mod assets;
+pub mod badge;
 pub mod bounds_probe;
 pub mod connect_modal;
 pub mod connect_model;
 pub mod controls;
 pub mod crt_cat;
 pub mod drag_overlay;
+pub mod dropdown;
+pub mod hide_flight;
 pub mod hotkey_matching_input;
 pub mod i18n;
 pub mod inline_effects;
 pub mod inline_fonts;
 pub mod inline_object;
 pub mod keymap;
+pub mod layout_menu;
 pub mod layouts_modal;
 pub mod layouts_view;
 pub mod main_toolbar;
@@ -22,6 +26,7 @@ pub mod modal_layer;
 pub mod palettes;
 pub mod pane_drag;
 pub mod pane_groups;
+pub mod pane_provenance;
 pub mod pane_workspace;
 pub mod prefs;
 pub mod session_input;

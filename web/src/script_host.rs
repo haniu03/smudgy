@@ -13,8 +13,8 @@ use smudgy_engine::{
 };
 use smudgy_session_model::automation::AutomationPlan;
 use smudgy_session_model::pane::{
-    DefStateSpec, PaneError, PaneKind, PaneNamespace, PanePlacement, PaneRegistry, SplitDirection,
-    TabPosition,
+    DefStateSpec, PaneError, PaneKey, PaneKind, PaneNamespace, PanePlacement, PaneRegistry,
+    SplitDirection, TabPosition,
 };
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 
@@ -32,6 +32,9 @@ struct Script {
     active: Rc<Cell<bool>>,
     pane_active: Rc<Cell<bool>>,
     startup_effects: Vec<AutomationEffect>,
+    /// The script's pane definitions, shared with the pane API closures; the
+    /// user's hide and show reach it here.
+    pane_registry: Registry,
     _send: Closure<dyn FnMut(JsValue)>,
     _print: Closure<dyn FnMut(JsValue)>,
     _pane_split: Closure<dyn FnMut(JsValue, JsValue, JsValue) -> JsValue>,
@@ -102,6 +105,21 @@ impl AutomationHost for WorkerAutomation {
         outcome
     }
 
+    fn on_pane_user_hidden(&mut self, key: PaneKey, hidden: bool) -> Vec<AutomationEffect> {
+        // Without a script there are no script panes, and the main pane's
+        // state lives with the page.
+        self.script
+            .as_ref()
+            .and_then(|script| {
+                script
+                    .pane_registry
+                    .borrow_mut()
+                    .set_hidden_by_key(key, hidden)
+            })
+            .map(|def| vec![AutomationEffect::Pane(PaneEffect::Updated(def))])
+            .unwrap_or_default()
+    }
+
     fn on_output_line(&mut self, line: &str) -> Vec<AutomationEffect> {
         let mut effects = self.shared.on_output_line(line);
         if let Some(profile) = &mut self.profile {
@@ -170,8 +188,11 @@ impl Script {
             Rc::clone(&pane_active),
         );
         let pane_hidden = pane_hidden_closure(Rc::clone(&pane_registry));
-        let pane_set_hidden =
-            pane_set_hidden_closure(pane_registry, Rc::clone(&effects), Rc::clone(&pane_active));
+        let pane_set_hidden = pane_set_hidden_closure(
+            Rc::clone(&pane_registry),
+            Rc::clone(&effects),
+            Rc::clone(&pane_active),
+        );
         for (name, function) in [
             ("__paneSplit", pane_split.as_ref()),
             ("__paneAddTab", pane_add_tab.as_ref()),
@@ -200,6 +221,7 @@ impl Script {
             active,
             pane_active,
             startup_effects,
+            pane_registry,
             _send: send,
             _print: print,
             _pane_split: pane_split,

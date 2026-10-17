@@ -237,7 +237,7 @@ session-action-disconnect = Rozłącz
 # Pane tab strip controls
 pane-tab-close = Zamknij sesję
 pane-tab-hide = Ukryj panel
-pane-tab-show = Pokaż panel
+pane-creator-user-scripts = Twoje skrypty
 
 # Server and profile connection manager
 servers-title = Serwery
@@ -372,10 +372,24 @@ window-automations = automatyzacje Smudgy — { $server }
 toolbar-connect = Połącz
 toolbar-automations = Automatyzacje
 toolbar-map-editor = Edytor map
-toolbar-layouts = Układy
+toolbar-layout = Układ
 toolbar-settings = Ustawienia
 
 # Named layouts menu
+layouts-manage-title = Zapisane układy
+layout-menu-hidden = Ukryte
+layout-menu-show-all = Pokaż wszystkie
+layout-menu-saved = Zapisane układy dla { $server }
+layout-menu-loading = Wczytywanie…
+layout-menu-saved-empty = Brak zapisanych układów.
+layout-menu-save-as = Zapisz układ jako…
+layout-menu-manage = Zarządzaj zapisanymi układami…
+layout-menu-reset = Resetuj układ paneli…
+layout-menu-main = Główny
+layout-hidden-heading = Wszystko jest ukryte
+layout-hidden-subtext = Twoje sesje nadal działają.
+layout-hidden-show-all = Pokaż wszystkie panele
+layout-hidden-choose = Wybierz z menu Układ
 layouts-apply-hint = Kliknij układ, aby go zastosować.
 layouts-empty = Brak zapisanych układów dla { $server }.
 layouts-overwrite = Nadpisz

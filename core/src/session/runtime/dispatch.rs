@@ -2325,12 +2325,13 @@ impl Inner<'_> {
                 Ok(ActionResult::None)
             }
             RuntimeAction::PaneUserHidden { key, hidden } => {
-                // The UI's report of a user eyeball click. The toggling window
-                // already flipped optimistically; writing the def and echoing
-                // `PaneUpdated` makes every consumer converge on it (idempotent
-                // for the reporter). No main guard — the user may hide any
-                // pane, including main (the all-hidden fallback keeps a window
-                // usable). A retired key or an already-matching state drops
+                // The UI's report of a user hide or show (a tab's hide
+                // control, or the Layout menu). The window already flipped
+                // optimistically; writing the def and echoing `PaneUpdated`
+                // makes every consumer converge on it (idempotent for the
+                // reporter). No main guard — the user may hide any pane,
+                // including main (a window with every pane hidden offers the
+                // way back). A retired key or an already-matching state drops
                 // the report whole, like a stale `InputStateChanged`.
                 let updated = self
                     .pane_registry

@@ -235,7 +235,7 @@ session-action-disconnect = Disconnect
 # Pane tab strip controls
 pane-tab-close = Close session
 pane-tab-hide = Hide pane
-pane-tab-show = Show pane
+pane-creator-user-scripts = Your scripts
 
 # Server and profile connection manager
 servers-title = Servers
@@ -367,10 +367,24 @@ window-automations = Smudgy automations — { $server }
 toolbar-connect = Connect
 toolbar-automations = Automations
 toolbar-map-editor = Map Editor
-toolbar-layouts = Layouts
+toolbar-layout = Layout
 toolbar-settings = Settings
 
 # Named layouts menu
+layouts-manage-title = Saved layouts
+layout-menu-hidden = Hidden
+layout-menu-show-all = Show all
+layout-menu-saved = Saved layouts for { $server }
+layout-menu-loading = Loading…
+layout-menu-saved-empty = No saved layouts yet.
+layout-menu-save-as = Save layout as…
+layout-menu-manage = Manage saved layouts…
+layout-menu-reset = Reset pane layout…
+layout-menu-main = Main
+layout-hidden-heading = Everything's hidden
+layout-hidden-subtext = Your sessions are still running.
+layout-hidden-show-all = Show all panes
+layout-hidden-choose = Choose from the Layout menu
 layouts-apply-hint = Click a layout to apply it.
 layouts-empty = No saved layouts for { $server } yet.
 layouts-overwrite = Overwrite

@@ -178,17 +178,6 @@ pub fn pane_title_bar_active(theme: &Theme) -> container::Style {
     }
 }
 
-/// Veil over a pane the user toggled hidden while it still renders (the
-/// toolbar is expanded, so the grid shows every pane): a translucent wash of
-/// the window background that mutes the pane without erasing what it is.
-#[must_use]
-pub fn pane_hidden_overlay(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(theme.styles.general.background.scale_alpha(0.75).into()),
-        ..Default::default()
-    }
-}
-
 /// Muted circular chip that sits behind a single glyph in empty-state headers
 /// (e.g. the connect/lightning glyph on the empty session view). A translucent
 /// white fill with a large radius; pair it with a fixed square size to render a
@@ -199,6 +188,37 @@ pub fn icon_chip(_theme: &Theme) -> container::Style {
         background: Some(Color::from_rgba8(255, 255, 255, 0.06).into()),
         border: Border {
             radius: Radius::from(100.0),
+            ..Border::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// A small count pill beside a label, for things waiting on the user (the
+/// settings nav's pending clan offers): the accent fill under white text.
+#[must_use]
+pub fn count_badge(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(theme.styles.general.accent.into()),
+        text_color: Some(Color::WHITE),
+        border: Border {
+            radius: Radius::from(8.0),
+            ..Border::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// [`count_badge`] in grey, for a count that only informs (the panes
+/// waiting in the Layout menu). Tinted from the text color so it follows
+/// palette remaps.
+#[must_use]
+pub fn count_badge_neutral(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(theme.styles.text.normal.scale_alpha(0.22).into()),
+        text_color: Some(theme.styles.text.normal),
+        border: Border {
+            radius: Radius::from(8.0),
             ..Border::default()
         },
         ..Default::default()
