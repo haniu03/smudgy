@@ -21,7 +21,8 @@ pub use smudgy_ui_shared::layouts_modal::{Event, Message, OmittedRow, SaveOutcom
 use smudgy_ui_shared::layouts_modal::{OverwriteAction, Stage};
 use smudgy_ui_shared::layouts_view::Labels;
 
-struct NativeLabels;
+/// The native catalog behind the shared layout views.
+pub struct NativeLabels;
 
 impl Labels for NativeLabels {
     fn text(&self, id: &'static str) -> String {
@@ -170,6 +171,20 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
         transition,
     )
 }
+/// Open straight at the stage `message` leads to (the Layout menu's save
+/// and reset items): backing out closes the dialog.
+pub fn enter(state: &mut State, message: Message) -> Task<Message> {
+    let transition = state.model.enter_directly(message);
+    drive(
+        &mut state.model,
+        NativeStore {
+            dir: state.dir.as_deref(),
+        },
+        transition,
+    )
+    .0
+}
+
 pub fn view(state: &State) -> Element<'_, Message> {
     smudgy_ui_shared::layouts_view::view(&state.model, &NativeLabels)
 }

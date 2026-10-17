@@ -4193,12 +4193,14 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         None => task,
                     }
                 }
-                Some(SmudgyWindowEvent::PaneVisibilityToggled { slot, hidden }) => {
+                Some(SmudgyWindowEvent::PaneVisibilityChanged { slots, hidden }) => {
                     // The window flipped optimistically; the def lives on the
                     // pane's session runtime, which echoes `PaneUpdated` to
                     // converge every consumer (and fires `pane:visibility`).
-                    if let Some(session) = smudgy.sessions.get(slot.session_id) {
-                        session.report_user_hidden(slot.key, hidden);
+                    for slot in slots {
+                        if let Some(session) = smudgy.sessions.get(slot.session_id) {
+                            session.report_user_hidden(slot.key, hidden);
+                        }
                     }
                     task
                 }

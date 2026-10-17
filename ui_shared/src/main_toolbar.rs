@@ -6,15 +6,16 @@ use iced::{Color, Length};
 use smudgy_theme::{Element, Theme, builtins};
 
 use crate::assets::{BARS_3_BYTES, GEIST};
+use crate::layout_menu;
 
 const TITLE_COLOR: Color = Color::from_rgb8(92, 92, 92);
 const TOOLBAR_HEIGHT: f32 = 42.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     ToggleExpand,
     Connect,
-    Layouts,
+    LayoutMenu(layout_menu::Message),
     Settings,
 }
 
@@ -37,7 +38,7 @@ fn menu_button() -> Element<'static, Message> {
     .into()
 }
 
-fn toolbar_button(label: &'static str, message: Message) -> Element<'static, Message> {
+fn toolbar_button(label: String, message: Message) -> Element<'static, Message> {
     button(text(label).font(GEIST).size(14))
         .style(builtins::button::toolbar)
         .padding([4, 10])
@@ -45,15 +46,26 @@ fn toolbar_button(label: &'static str, message: Message) -> Element<'static, Mes
         .into()
 }
 
+/// `label` resolves the host's localized text for a catalog id;
+/// `layout_menu` is the Layout button and its menu, shown beside the
+/// session items; `on_menu_bounds` mirrors the hamburger's bounds (where
+/// hidden panes fly while the toolbar is collapsed).
 #[must_use]
-pub fn view(expanded: bool, has_session: bool) -> Element<'static, Message> {
-    let mut items = vec![menu_button()];
+pub fn view<'a>(
+    expanded: bool,
+    has_session: bool,
+    label: &impl Fn(&'static str) -> String,
+    layout_menu: Element<'a, Message>,
+    on_menu_bounds: impl Fn(iced::Rectangle) + 'a,
+) -> Element<'a, Message> {
+    let mut items: Vec<Element<'a, Message>> =
+        vec![crate::bounds_probe::BoundsProbe::new(menu_button(), on_menu_bounds).into()];
     if expanded {
-        items.push(toolbar_button("Connect", Message::Connect));
+        items.push(toolbar_button(label("toolbar-connect"), Message::Connect));
         if has_session {
-            items.push(toolbar_button("Layouts", Message::Layouts));
+            items.push(layout_menu);
         }
-        items.push(toolbar_button("Settings", Message::Settings));
+        items.push(toolbar_button(label("toolbar-settings"), Message::Settings));
     } else {
         items.push(
             text("Smudgy")

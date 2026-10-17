@@ -96,6 +96,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Hidden panes wait in the new Layout menu.** The toolbar's Layouts button is
+  now **Layout**, and it opens a menu instead of a dialog. A pane you hide with
+  its tab's hide control, or that a script hides or creates hidden, leaves the
+  window and is listed in the menu under its session, with the package
+  (`@name`) or "Your scripts" that created it; a grey count on the button says
+  how many are waiting. Pick one to show it again, or show them all. Your own
+  hides and shows animate between the pane and the menu; a script's do not.
+  The menu also lists the server's saved layouts, applied with one click, and
+  opens the saved-layout dialog to save, manage, or reset. Hidden panes no
+  longer show dimmed and crossed out while the toolbar is expanded, and a
+  window whose every pane is hidden says so and offers to bring them back.
+  Hovering a pane's tab shows its session and the code that created it. The
+  browser client gets the same menu and can hide main panes too.
 - Published packages resolve by their globally unique name regardless of legacy
   owner spelling. Local packages with that name retain priority. This also fixes
   false owner-conflict errors when installing a package required by a local package.

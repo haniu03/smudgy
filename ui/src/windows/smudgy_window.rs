@@ -6,7 +6,7 @@ use iced::{
     keyboard,
     widget::{
         PaneGrid, center, column, container, mouse_area, opaque, operation, pane_grid, row, stack,
-        svg, text,
+        text,
     },
     window,
 };
@@ -20,6 +20,7 @@ use smudgy_core::session::runtime::pane::{
 pub use smudgy_session_model::pane::PaneRef;
 
 use rustc_hash::FxHashMap;
+use smudgy_ui_shared::{hide_flight, layout_menu, pane_provenance::PaneCreator};
 
 use crate::{
     assets,
@@ -103,10 +104,10 @@ pub enum Message {
     /// pane's session.
     PaneClicked(pane_grid::Pane),
     PaneResized(pane_grid::ResizeEvent),
-    /// The title-bar eye toggle: flip a pane between visible and hidden.
-    /// Hidden is a soft display state — the pane's session keeps running;
-    /// the slot just leaves the derived grid while the toolbar is collapsed.
-    TogglePaneVisibility(PaneRef),
+    /// A tab's hide control: hide the pane into the Layout menu. Hidden is
+    /// a soft display state — the pane's session keeps running; the slot
+    /// just leaves the derived grid until it is shown again.
+    HidePane(PaneRef),
     /// A user action on a group's tab strip (select, drag transitions,
     /// connection toggle, close, visibility, scroll mirror).
     TabStrip(GroupId, tab_strip::Event),
@@ -182,12 +183,13 @@ pub enum Event {
     /// Settings window's Audio pane).
     #[cfg(feature = "web-audio-cpal")]
     OpenAudioPanel,
-    /// The user clicked a pane's title-bar eyeball. The window already
-    /// flipped its local state optimistically; the daemon reports the toggle
-    /// to the pane's session runtime (`PaneUserHidden`), which owns the def —
-    /// the echoed `PaneUpdated` then converges every consumer.
-    PaneVisibilityToggled {
-        slot: PaneRef,
+    /// The user hid or showed panes — a tab's hide control, or the Layout
+    /// menu's show items. The window already flipped its local state
+    /// optimistically; the daemon reports each change to the pane's session
+    /// runtime (`PaneUserHidden`), which owns the def — the echoed
+    /// `PaneUpdated` then converges every consumer.
+    PaneVisibilityChanged {
+        slots: Vec<PaneRef>,
         hidden: bool,
     },
     /// A tab's press surface was pressed (true press point, window-local
@@ -316,7 +318,7 @@ fn displaced_input_for_selection(
 
 /// One group's rendered pane before and after a pane payload exchange —
 /// `None` on either side when the group rendered nothing (every member tab
-/// hidden under a collapsed toolbar, or unbound).
+/// hidden, or unbound).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RenderedSlotChange {
     before: Option<PaneRef>,
@@ -403,12 +405,12 @@ pub struct DragViewContext<'a> {
 }
 
 /// The strip-facing identity of an unbound tab: the label its durable
-/// record supplies and the stored eyeball preference it will apply when its
-/// pane arrives. Placeholders carry no session, so the connection facts a
-/// bound descriptor derives all render as absent.
+/// record supplies. Placeholders carry no session, so the connection facts
+/// a bound descriptor derives all render as absent. (A pre-hidden
+/// placeholder never reaches the strip: it is listed nowhere until its pane
+/// arrives and waits in the Layout menu.)
 struct PlaceholderDescriptor {
     label: String,
-    hidden: bool,
 }
 
 /// The pane name a durable descriptor stands for, namespace-independent —
@@ -426,6 +428,29 @@ struct PendingLayoutPrompt {
     rows: Vec<modal::layouts::OmittedRow>,
 }
 
+/// Where a script pane comes from, as its tab's tooltip says: the session,
+/// then the code that created it (the Layout menu's rows say the same).
+/// `None` for a main pane, whose tab label already names its session, and
+/// for a stale key mid-teardown.
+fn pane_tooltip(session: &session_store::ManagedSession, key: PaneKey) -> Option<String> {
+    if key == MAIN_PANE_KEY {
+        return None;
+    }
+    smudgy_ui_shared::pane_provenance::tooltip_text(
+        &session.pane_label(MAIN_PANE_KEY),
+        &PaneCreator::of(session.pane_def(key)?),
+        crate::i18n::translate,
+    )
+}
+
+/// The toolbar's Layout menu while it is open.
+struct LayoutMenu {
+    /// The active session's server when the menu opened: the store its
+    /// saved layouts are listed from and applied against.
+    server: String,
+    saved: layout_menu::SavedLayouts,
+}
+
 pub struct SmudgyWindow {
     window_id: window::Id,
     cloud: CloudHandles,
@@ -437,6 +462,19 @@ pub struct SmudgyWindow {
     /// the self-drawn frame the same way maximized does.
     fullscreen: bool,
     modal: Option<modal::Modal>,
+    /// The toolbar's Layout menu, while open.
+    layout_menu: Option<LayoutMenu>,
+    /// Ghosts of panes the user hid or showed, flying between the grid and
+    /// the Layout menu (or the hamburger, while the toolbar is collapsed).
+    flights: hide_flight::Flights,
+    /// Shows whose ghost lands once the grid rebuild places the pane: the
+    /// pane, where its ghost leaves from, and its label.
+    pending_show_flights: Vec<(PaneRef, iced::Rectangle, String)>,
+    /// Draw-time mirrors of where ghosts fly: the grid's window-local
+    /// origin, the Layout button, and the hamburger.
+    grid_origin: std::cell::Cell<Point>,
+    layout_button_bounds: std::cell::Cell<iced::Rectangle>,
+    menu_button_bounds: std::cell::Cell<iced::Rectangle>,
     /// Bottom-anchored package-update toasts: one visible slot plus a FIFO
     /// queue. Non-modal — no backdrop, the window stays interactive behind the
     /// pill. Fed by the daemon's background update checker via
@@ -498,10 +536,10 @@ pub struct SmudgyWindow {
     /// this map is re-derived after every structural mutation so no stale
     /// target can be applied.
     split_targets: std::collections::BTreeMap<pane_grid::Split, pane_groups::EdgeTarget>,
-    /// Slots the user toggled hidden (the title-bar eye). Hidden panes drop
-    /// out of the derived grid while the toolbar is collapsed; with the
-    /// toolbar expanded every pane renders (hidden ones under a veil) so the
-    /// toggle stays reachable. Pruned when a slot leaves this window.
+    /// Slots whose pane is hidden (by the user or a script; the pane def is
+    /// the source of truth). Hidden panes drop out of the derived grid and
+    /// their strips, and wait in the Layout menu until shown again. Pruned
+    /// when a slot leaves this window.
     hidden_panes: std::collections::HashSet<PaneRef>,
     /// The group keyboard tab-cycling operates on: the group of the last
     /// clicked pane or selected tab. Falls back to the active session's main
@@ -711,6 +749,12 @@ impl SmudgyWindow {
             maximized: false,
             fullscreen: false,
             modal: None,
+            layout_menu: None,
+            flights: hide_flight::Flights::default(),
+            pending_show_flights: Vec::new(),
+            grid_origin: std::cell::Cell::new(Point::ORIGIN),
+            layout_button_bounds: std::cell::Cell::new(iced::Rectangle::default()),
+            menu_button_bounds: std::cell::Cell::new(iced::Rectangle::default()),
             toasts: toast::Toasts::default(),
             pending_layout_prompt: None,
             grid_area: std::cell::Cell::new(Size::ZERO),
@@ -743,37 +787,31 @@ impl SmudgyWindow {
         self.toasts.push(toast);
     }
 
-    /// Whether every group renders regardless of the hidden set. Toolbar
-    /// expanded is rearrange mode: hidden panes stay in the build (marked by
-    /// their veil) so they can be re-shown and rearranged. Collapsed, hidden
-    /// panes drop out — unless every pane is hidden, in which case the hidden
-    /// state is ignored (an all-hidden window would otherwise render the
-    /// empty connect state over live sessions).
-    fn show_all(&self) -> bool {
-        self.toolbar_expanded
-            || self
-                .bindings
-                .keys()
-                .all(|slot| self.hidden_panes.contains(slot))
+    /// Whether pending placeholders render. Rearrange mode (toolbar
+    /// expanded) shows them holding their persisted geometry; collapsed,
+    /// only bound panes render — unless the window has no bound pane at
+    /// all, when its placeholders are all there is to show. Hidden panes
+    /// never render in any mode: they wait in the Layout menu.
+    fn admits_placeholders(&self) -> bool {
+        self.toolbar_expanded || self.bindings.is_empty()
     }
 
-    /// The pane a group currently renders: its effective selection under the
-    /// window's visibility mode. `None` for an unknown group, a fully hidden
-    /// group, or a selection resolving to an unbound placeholder tab.
-    fn rendered_slot_with(&self, group: GroupId, show_all: bool) -> Option<PaneRef> {
-        let tab = self.layout.effective_selected(group, |tab| {
-            tab.binding()
-                .is_some_and(|slot| show_all || !self.hidden_panes.contains(slot))
-        })?;
-        self.layout.tab(tab)?.binding().copied()
+    /// Whether `slot` is bound here and not hidden.
+    fn renders(&self, slot: &PaneRef) -> bool {
+        !self.hidden_panes.contains(slot)
     }
 
-    /// [`Self::rendered_slot_with`] under the current visibility mode.
+    /// The pane a group currently renders: its effective selection among its
+    /// visible panes. `None` for an unknown group, a group whose every pane
+    /// is hidden, or a selection resolving to an unbound placeholder tab.
     /// Public because it answers the drop question for a body-center swap:
     /// what the user sees in a group is what swaps (rendered, not
     /// durably-selected).
     pub fn rendered_slot(&self, group: GroupId) -> Option<PaneRef> {
-        self.rendered_slot_with(group, self.show_all())
+        let tab = self.layout.effective_selected(group, |tab| {
+            tab.binding().is_some_and(|slot| self.renders(slot))
+        })?;
+        self.layout.tab(tab)?.binding().copied()
     }
 
     /// The layout model, read-only — what the workspace snapshot walks
@@ -882,28 +920,23 @@ impl SmudgyWindow {
     /// user-visible in any mode, so the strip omits it exactly as snapshots
     /// do.
     fn placeholder_descriptor(&self, tab: TabId) -> Option<PlaceholderDescriptor> {
-        let (_, key, hidden) = self.pending_pane_for_tab(tab)?;
+        let (_, key, _) = self.pending_pane_for_tab(tab)?;
         Some(PlaceholderDescriptor {
             label: descriptor_pane_name(key).to_string(),
-            hidden,
         })
     }
 
-    /// Whether `tab` is listed in its group's strip under the given
-    /// visibility mode ([`Self::show_all`]). Rearrange mode lists every
-    /// content tab — a bound pane, or a pending placeholder a live
-    /// session still owes — with hidden ones dimmed behind their eyes for
-    /// recovery. Otherwise the strip mirrors the grid: eyeball-hidden
-    /// entries (bound panes and pre-hidden placeholders alike) drop out,
-    /// so a collapsed toolbar never advertises a tab whose pane is not
-    /// rendering. Vacancy tabs and recordless strays are invisible
-    /// bookkeeping in every mode.
-    fn tab_in_strip(&self, tab: &Tab<PaneRef>, show_all: bool) -> bool {
+    /// Whether `tab` is listed in its group's strip: a visible bound pane,
+    /// or a pending placeholder a live session still owes. Hidden entries
+    /// (bound panes and pre-hidden placeholders alike) are never listed —
+    /// hidden panes wait in the Layout menu — and vacancy tabs and
+    /// recordless strays are invisible bookkeeping.
+    fn tab_in_strip(&self, tab: &Tab<PaneRef>) -> bool {
         match tab.binding() {
-            Some(slot) => show_all || !self.hidden_panes.contains(slot),
+            Some(slot) => self.renders(slot),
             None => self
                 .pending_pane_for_tab(tab.id())
-                .is_some_and(|(_, _, hidden)| show_all || !hidden),
+                .is_some_and(|(_, _, hidden)| !hidden),
         }
     }
 
@@ -911,8 +944,8 @@ impl SmudgyWindow {
     /// many tabs its strip lists ([`Self::tab_in_strip`]). A strip
     /// listing more than one tab always shows — tab selection must not
     /// depend on header preferences — and the count is of listed tabs,
-    /// not members, so a group whose other members are all eyeball-hidden
-    /// under a collapsed toolbar renders exactly like a true singleton
+    /// not members, so a group whose other members are all hidden renders
+    /// exactly like a true singleton
     /// under the §2.11 header-visibility rule: body-only when the global
     /// hide setting is on, the toolbar is collapsed, and the rendered
     /// pane's policy does not pin its bar. Two overrides remain: a live
@@ -1372,26 +1405,29 @@ impl SmudgyWindow {
         // ever admits an unbound tab without a pending record, so a group
         // (or window) of nothing but vacancies drops out of the grid — an
         // all-vacancy window therefore has no grid and renders the
-        // no-active-sessions view. Pending placeholders are visible content
-        // and render whenever the mode admits unbound tabs at all.
+        // no-active-sessions view. Hidden panes drop out too, so a window
+        // whose every pane is hidden has no grid either and renders the
+        // everything-hidden view. Pending placeholders render whenever the
+        // mode admits them ([`Self::admits_placeholders`]).
         let hidden = &self.hidden_panes;
         let pending = &self.pending_panes;
-        let is_content = |tab: &Tab<PaneRef>| {
-            tab.binding().is_some() || pending.values().any(|record| record.tab == tab.id())
-        };
-        let built = if self.show_all() {
-            self.layout.build_filtered(
-                self.grid_area.get(),
-                GRID_SPACING,
-                GRID_MIN_SIZE,
-                is_content,
-            )
-        } else {
+        let placeholders = self.admits_placeholders();
+        let built =
             self.layout
-                .build_filtered(self.grid_area.get(), GRID_SPACING, GRID_MIN_SIZE, |tab| {
-                    tab.binding().is_some_and(|slot| !hidden.contains(slot))
-                })
-        };
+                .build_filtered(
+                    self.grid_area.get(),
+                    GRID_SPACING,
+                    GRID_MIN_SIZE,
+                    |tab| match tab.binding() {
+                        Some(slot) => !hidden.contains(slot),
+                        None => {
+                            placeholders
+                                && pending
+                                    .values()
+                                    .any(|record| record.tab == tab.id() && !record.hidden)
+                        }
+                    },
+                );
         match built {
             Some((config, mirror)) => {
                 let state = pane_grid::State::with_configuration(config);
@@ -1401,6 +1437,12 @@ impl SmudgyWindow {
             None => {
                 self.grid = None;
                 self.split_targets.clear();
+            }
+        }
+        // Shown panes are placed now: their ghosts fly out to land there.
+        for (slot, from, label) in std::mem::take(&mut self.pending_show_flights) {
+            if let Some(to) = self.pane_rect(slot) {
+                self.flights.launch(from, to, label);
             }
         }
         // Diagnostic: a rebuild re-mints pane ids, so pane_grid re-pairs
@@ -1601,11 +1643,10 @@ impl SmudgyWindow {
     /// (deterministic where the grid's map order is not). The whole
     /// candidate set prefers a session whose main pane is a rendered tab:
     /// activation should land where the user can see it, not on a main
-    /// input buried behind another tab or hidden under a collapsed toolbar.
-    /// A window whose every candidate is obscured still repairs to the
-    /// first candidate — hosting alone suffices when nothing renders a
-    /// main pane. (In an all-hidden window the hidden filter is inert, so
-    /// every main renders and the preference changes nothing.)
+    /// input buried behind another tab or hidden. A window whose every
+    /// candidate is obscured — an all-hidden window included — still
+    /// repairs to the first candidate: hosting alone suffices when nothing
+    /// renders a main pane.
     fn repair_fallback(&self) -> Option<SessionId> {
         let previous = self
             .previous_active_session_id
@@ -1755,23 +1796,220 @@ impl SmudgyWindow {
         Subscription::batch(subscriptions)
     }
 
-    /// Flip the toolbar between expanded and collapsed. The hidden-pane
-    /// filter reads this state, so the grid is re-derived whenever hidden
-    /// panes exist and the state actually changes.
+    /// Flip the toolbar between expanded and collapsed. Placeholders render
+    /// only in rearrange mode ([`Self::admits_placeholders`]), so the grid is
+    /// re-derived when visible ones are waiting and the state actually
+    /// changes.
     fn set_toolbar_expanded(&mut self, expanded: bool) {
         if self.toolbar_expanded == expanded {
             return;
         }
         self.toolbar_expanded = expanded;
-        if !self.hidden_panes.is_empty() {
+        if self.pending_panes.values().any(|pending| !pending.hidden) {
             self.mark_grid_dirty();
         }
+    }
+
+    /// Where `slot` shows in the window right now (window-local logical): its
+    /// group's grid region when it is the group's rendered pane, else its
+    /// tab in the strip. `None` when it shows nowhere (hidden, a group out
+    /// of the grid) or before the first layout pass measured anything.
+    fn pane_rect(&self, slot: PaneRef) -> Option<iced::Rectangle> {
+        let group = self.group_of_slot(slot)?;
+        let grid = self.grid.as_ref()?;
+        let origin = self.grid_origin.get();
+        if self.rendered_slot(group) == Some(slot) {
+            let regions =
+                grid.layout()
+                    .pane_regions(GRID_SPACING, GRID_MIN_SIZE, self.grid_area.get());
+            let (pane, _) = grid.panes.iter().find(|(_, payload)| **payload == group)?;
+            let region = regions.get(pane)?;
+            return Some(iced::Rectangle {
+                x: region.x + origin.x,
+                y: region.y + origin.y,
+                ..*region
+            });
+        }
+        // A listed, unrendered tab: its span is strip content space,
+        // scrolled horizontally by the strip's offset.
+        let span = *self.tab_spans.borrow().get(&self.tab_of(slot)?)?;
+        Some(iced::Rectangle {
+            x: span.x - self.strip_scroll_offset(group),
+            ..span
+        })
+    }
+
+    /// Where a hidden pane goes: the Layout button, or the hamburger while
+    /// the toolbar (and so the button) is collapsed away.
+    fn menu_target(&self, sessions: &SessionStore) -> iced::Rectangle {
+        if self.toolbar_expanded && self.create_session_context(sessions).has_active_session {
+            self.layout_button_bounds.get()
+        } else {
+            self.menu_button_bounds.get()
+        }
+    }
+
+    /// The bound panes this window hosts hidden, in layout order (the order
+    /// the Layout menu lists them).
+    fn hidden_bound_panes(&self) -> Vec<PaneRef> {
+        self.layout
+            .panes()
+            .into_iter()
+            .filter_map(|tab| tab.binding().copied())
+            .filter(|slot| self.hidden_panes.contains(slot))
+            .collect()
+    }
+
+    /// The Layout menu's hidden-pane rows, under their sessions.
+    fn layout_menu_hidden(&self, sessions: &SessionStore) -> Vec<layout_menu::HiddenSession> {
+        layout_menu::group_by_session(self.hidden_bound_panes().into_iter().filter_map(|slot| {
+            let session = sessions.get(slot.session_id)?;
+            let creator = if slot.key == MAIN_PANE_KEY {
+                PaneCreator::Session
+            } else {
+                PaneCreator::of(session.pane_def(slot.key)?)
+            };
+            Some((
+                session.pane_label(MAIN_PANE_KEY),
+                layout_menu::HiddenPane {
+                    pane: slot,
+                    name: session.pane_label(slot.key),
+                    creator,
+                },
+            ))
+        }))
+    }
+
+    /// Handle a Layout menu action. Every item closes the menu; the button
+    /// opens it, scoped to the active session's server (none, no menu).
+    fn layout_menu_action(
+        &mut self,
+        message: layout_menu::Message,
+        sessions: &SessionStore,
+    ) -> Update<Message, Event> {
+        use layout_menu::Message as M;
+        let menu = self.layout_menu.take();
+        match message {
+            M::Toggle => {
+                if menu.is_none() {
+                    self.layout_menu = self.opened_layout_menu(sessions);
+                }
+                Update::none()
+            }
+            M::Open => {
+                // The everything-hidden view's way in: the Layout button
+                // needs the expanded toolbar and an active session (a
+                // window that never had one adopts its first pane's).
+                self.set_toolbar_expanded(true);
+                if self.active_session_id.is_none()
+                    && let Some(slot) = self.hidden_bound_panes().first()
+                {
+                    self.remember_active_session(slot.session_id);
+                }
+                self.layout_menu = self.opened_layout_menu(sessions);
+                Update::none()
+            }
+            M::Dismiss => Update::none(),
+            M::Show(slot) => self.show_panes(vec![slot], sessions),
+            M::ShowAll => {
+                let hidden = self.hidden_bound_panes();
+                self.show_panes(hidden, sessions)
+            }
+            M::Apply(name) => match menu {
+                Some(menu) => Update::with_event(Event::ApplyLayout {
+                    server: menu.server,
+                    name,
+                }),
+                None => Update::none(),
+            },
+            M::SaveAs => {
+                self.open_layouts_dialog(menu, Some(modal::layouts::Message::SaveAsPressed))
+            }
+            M::Manage => self.open_layouts_dialog(menu, None),
+            M::Reset => self.open_layouts_dialog(menu, Some(modal::layouts::Message::ResetPressed)),
+        }
+    }
+
+    /// The Layout menu as it opens: scoped to the active session's server,
+    /// listing that server's saved layouts. `None` without an active session.
+    fn opened_layout_menu(&self, sessions: &SessionStore) -> Option<LayoutMenu> {
+        let session = sessions.get(self.active_session_id?)?;
+        let server = session.server_name.clone();
+        let saved = crate::workspace::layouts::layouts_dir(&server)
+            .as_deref()
+            .map(crate::workspace::layouts::list_in)
+            .unwrap_or_default();
+        Some(LayoutMenu {
+            server,
+            saved: layout_menu::SavedLayouts::Listed(saved),
+        })
+    }
+
+    /// Open the named-layout dialog for the menu's server: at the browse
+    /// list, or straight at the stage `entry` leads to.
+    fn open_layouts_dialog(
+        &mut self,
+        menu: Option<LayoutMenu>,
+        entry: Option<modal::layouts::Message>,
+    ) -> Update<Message, Event> {
+        let Some(menu) = menu else {
+            return Update::none();
+        };
+        let mut state = modal::layouts::State::opening(menu.server);
+        let task = match entry {
+            Some(entry) => modal::layouts::enter(&mut state, entry),
+            None => Task::none(),
+        };
+        self.modal = Some(modal::Modal::Layouts(state));
+        // A parked keep-or-close prompt outranks a fresh browse list (a
+        // directly opened stage keeps it parked until the dialog closes).
+        self.deliver_pending_layout_prompt();
+        Update::with_task(task.map(modal::Message::Layouts).map(Message::ModalMessage))
+    }
+
+    /// Show hidden panes (the Layout menu's show items): the reverse of a
+    /// tab's hide control, reported to each pane's session runtime. Each
+    /// pane's ghost flies out of the menu once the rebuild places it.
+    fn show_panes(
+        &mut self,
+        slots: Vec<PaneRef>,
+        sessions: &SessionStore,
+    ) -> Update<Message, Event> {
+        let slots: Vec<PaneRef> = slots
+            .into_iter()
+            .filter(|slot| self.hidden_panes.remove(slot))
+            .collect();
+        if slots.is_empty() {
+            return Update::none();
+        }
+        // Showing one pane brings it to the front of its group: the user
+        // asked to see it. (Showing every pane leaves selections alone.)
+        if let [slot] = slots.as_slice()
+            && let Some(tab) = self.tab_of(*slot)
+        {
+            self.layout.select(tab);
+        }
+        let from = self.menu_target(sessions);
+        for slot in &slots {
+            if let Some(session) = sessions.get(slot.session_id) {
+                self.pending_show_flights
+                    .push((*slot, from, session.pane_label(slot.key)));
+            }
+        }
+        self.mark_workspace_dirty();
+        self.mark_grid_dirty();
+        Update::with_event(Event::PaneVisibilityChanged {
+            slots,
+            hidden: false,
+        })
     }
 
     /// Set the active session, deactivating all others
     fn remember_active_session(&mut self, session_id: SessionId) {
         if self.active_session_id != Some(session_id) {
             self.previous_active_session_id = self.active_session_id;
+            // The open Layout menu lists the previous session's server.
+            self.layout_menu = None;
             // The active session is persisted per window.
             self.mark_workspace_dirty();
         }
@@ -2162,11 +2400,9 @@ impl SmudgyWindow {
             self.hidden_panes.remove(&slot)
         };
         if changed {
-            // The user-set eyeball state persists whatever the toolbar
-            // mode; only the grid rebuild is gated on the collapsed filter.
+            // The hidden state persists, and the pane leaves or rejoins the
+            // grid.
             self.mark_workspace_dirty();
-        }
-        if changed && !self.toolbar_expanded {
             self.mark_grid_dirty();
         }
     }
@@ -2236,12 +2472,13 @@ impl SmudgyWindow {
         // Classification precedes every mutation in its cycle, so the grid
         // is never mid-cycle stale here.
         debug_assert!(!self.grid_dirty, "drag classification read a stale grid");
-        if self.is_visually_empty() {
-            // A window with no visible content (empty, or holding only
-            // invisible vacancy tabs) renders the connect view and is one
-            // whole drop surface: adopt as a fresh cluster. The highlight
-            // covers the window's content region (the overlay clips
-            // nothing; overdraw past the bottom is harmless).
+        if self.is_visually_empty() || self.grid.is_none() {
+            // A window with no visible content (empty, holding only
+            // invisible vacancy tabs, or with every pane hidden) renders an
+            // empty-state view and is one whole drop surface: adopt as a
+            // fresh cluster (beside any hidden ones). The highlight covers
+            // the window's content region (the overlay clips nothing;
+            // overdraw past the bottom is harmless).
             return Some(ClassifiedTarget {
                 action: pane_drag::DragAction::Vacant,
                 highlight: iced::Rectangle::with_size(window_size),
@@ -2262,7 +2499,6 @@ impl SmudgyWindow {
         let bands = self.strip_bands.borrow();
         let spans = self.tab_spans.borrow();
         let scroll = self.strip_scroll.borrow();
-        let show_all = self.show_all();
         let mut geoms: Vec<pane_drag::PaneTargetGeom> = Vec::with_capacity(regions.len());
         for (pane, group) in grid.panes.iter() {
             let Some(region) = regions.get(pane) else {
@@ -2276,8 +2512,8 @@ impl SmudgyWindow {
             let offset = scroll.get(group).copied().unwrap_or(0.0);
             // Only listed tabs contribute bands ([`Self::tab_in_strip`], the
             // strip's own filter): spans persist stale-until-rendered, so a
-            // tab the strip is not showing — eyeball-hidden under a
-            // collapsed toolbar — still has a span on file, and counting it
+            // tab the strip is not showing — a hidden pane — still has a
+            // span on file, and counting it
             // would aim carets and insertion slots at strip positions that
             // do not exist. Each band carries its member-vec index so the
             // drop slot stays in `merge_tab`'s member-counted space even
@@ -2288,7 +2524,7 @@ impl SmudgyWindow {
                 .into_iter()
                 .flatten()
                 .enumerate()
-                .filter(|(_, tab)| self.tab_in_strip(tab, show_all))
+                .filter(|(_, tab)| self.tab_in_strip(tab))
                 .filter_map(|(slot, tab)| {
                     spans.get(&tab.id()).map(|span| pane_drag::TabBand {
                         start: span.x - offset,
@@ -2540,8 +2776,8 @@ impl SmudgyWindow {
 
     /// The measured sizes of every rendered pane in this window's grid, for
     /// the pane-size mirror feed. Empty before the first layout pass. A pane
-    /// not currently rendered — hidden and dropped from the
-    /// collapsed-toolbar grid, or an unselected tab — simply doesn't appear;
+    /// not currently rendered — hidden and dropped from the grid, or an
+    /// unselected tab — simply doesn't appear;
     /// its mirror keeps the last laid-out size.
     pub fn pane_sizes(&self) -> Vec<(PaneRef, Size)> {
         // The measurement feed must never publish a grid the model has
@@ -2554,7 +2790,6 @@ impl SmudgyWindow {
         if area.width <= 0.0 || area.height <= 0.0 {
             return Vec::new();
         }
-        let show_all = self.show_all();
         let regions = grid
             .layout()
             .pane_regions(GRID_SPACING, GRID_MIN_SIZE, area);
@@ -2566,7 +2801,7 @@ impl SmudgyWindow {
                 // Every measured group refreshes its last-rendered size,
                 // whether or not it currently resolves to a reportable pane.
                 group_sizes.insert(*group, region.size());
-                let slot = self.rendered_slot_with(*group, show_all)?;
+                let slot = self.rendered_slot(*group)?;
                 Some((slot, region.size()))
             })
             .collect()
@@ -2587,7 +2822,7 @@ impl SmudgyWindow {
 
     /// The on-screen size (logical) of the grid slot hosting `slot`'s group,
     /// for sizing a torn-out window after it. A group absent from the
-    /// current grid (hidden under a collapsed toolbar) reports its last
+    /// current grid (every member hidden) reports its last
     /// measured size — a pane's size is stale until it renders again, never
     /// absent. `None` only for a group never measured (a window that has
     /// not completed a layout pass since the group arrived). Grid-derived:
@@ -2829,6 +3064,8 @@ impl SmudgyWindow {
         match message {
             Message::ToolbarAction(action) => match action {
                 toolbar::Message::ToggleExpand => {
+                    // The Layout button leaves with the expanded toolbar.
+                    self.layout_menu = None;
                     self.set_toolbar_expanded(!self.toolbar_expanded);
                     Update::none()
                 }
@@ -2842,25 +3079,7 @@ impl SmudgyWindow {
                     self.modal = Some(new_modal);
                     Update::with_task(modal_init_task.map(Message::ModalMessage))
                 }
-                toolbar::Message::LayoutsPressed => {
-                    // Scoped to the acting session's server: the menu lists
-                    // that store and nothing else.
-                    if let Some(server) = self
-                        .active_session_id
-                        .and_then(|active| sessions.get(active))
-                        .map(|session| session.server_name.clone())
-                    {
-                        self.modal = Some(modal::Modal::Layouts(modal::layouts::State::opening(
-                            server,
-                        )));
-                        // A parked keep-or-close prompt outranks the fresh
-                        // browse stage.
-                        self.deliver_pending_layout_prompt();
-                    } else {
-                        log::info!("LayoutsPressed ignored - no active session");
-                    }
-                    Update::none()
-                }
+                toolbar::Message::LayoutMenu(message) => self.layout_menu_action(message, sessions),
                 toolbar::Message::SettingsPressed => Update::with_event(Event::OpenSettingsWindow),
                 toolbar::Message::DragWindow => Update::with_task(window::drag(self.window_id)),
                 toolbar::Message::MinimizePressed => {
@@ -2999,6 +3218,11 @@ impl SmudgyWindow {
                                 }
                                 None => Update::none(),
                             }
+                        }
+                        modal::layouts::Event::Close => {
+                            self.modal = None;
+                            self.deliver_pending_layout_prompt();
+                            Update::none()
                         }
                     }
                 }
@@ -3226,26 +3450,30 @@ impl SmudgyWindow {
                 }
                 Update::none()
             }
-            Message::TogglePaneVisibility(slot) => {
-                let hidden = if self.hidden_panes.remove(&slot) {
-                    false
-                } else {
-                    self.hidden_panes.insert(slot);
-                    true
-                };
-                // The eyeball state persists (replayed at restore through
-                // this same user-toggle path).
-                self.mark_workspace_dirty();
-                // With the toolbar expanded the toggle only changes the veil
-                // (the grid renders everything); collapsed — reachable when
-                // the pane's header is pinned or the global hide setting is
-                // off — the pane leaves or rejoins the grid immediately.
-                if !self.toolbar_expanded {
-                    self.mark_grid_dirty();
+            Message::HidePane(slot) => {
+                if !self.bindings.contains_key(&slot) || self.hidden_panes.contains(&slot) {
+                    return Update::none();
                 }
+                // The ghost leaves from where the pane shows now, before the
+                // rebuild drops it.
+                if let (Some(from), Some(session)) =
+                    (self.pane_rect(slot), sessions.get(slot.session_id))
+                {
+                    let to = self.menu_target(sessions);
+                    self.flights.launch(from, to, session.pane_label(slot.key));
+                }
+                self.hidden_panes.insert(slot);
+                // The hidden state persists (replayed at restore through
+                // this same user path), and the pane leaves the grid for the
+                // Layout menu.
+                self.mark_workspace_dirty();
+                self.mark_grid_dirty();
                 // The flip above is optimistic display state; the def lives
                 // on the pane's session runtime, so the daemon reports it.
-                Update::with_event(Event::PaneVisibilityToggled { slot, hidden })
+                Update::with_event(Event::PaneVisibilityChanged {
+                    slots: vec![slot],
+                    hidden: true,
+                })
             }
             Message::TabStrip(group, event) => match event {
                 tab_strip::Event::Select(tab) => {
@@ -3343,9 +3571,9 @@ impl SmudgyWindow {
                         None => Update::none(),
                     }
                 }
-                tab_strip::Event::ToggleVisibility(tab) => {
+                tab_strip::Event::Hide(tab) => {
                     match self.layout.tab(tab).and_then(|t| t.binding().copied()) {
-                        Some(slot) => self.update(Message::TogglePaneVisibility(slot), sessions),
+                        Some(slot) => self.update(Message::HidePane(slot), sessions),
                         None => Update::none(),
                     }
                 }
@@ -3373,16 +3601,12 @@ impl SmudgyWindow {
                     .and_then(|selected| tabs.iter().position(|t| t.id() == selected))
                     .unwrap_or(0);
                 // Keyboard cycling reaches only tabs that would render:
-                // hidden panes dropped under a collapsed toolbar and unbound
-                // placeholders are skipped (a hidden tab stays reachable by
-                // clicking its dimmed strip entry — an explicit act). Walking
-                // at most one full wrap keeps the direction's order; no
-                // renderable destination means no-op.
-                let show_all = self.show_all();
-                let renderable = |tab: &Tab<PaneRef>| {
-                    tab.binding()
-                        .is_some_and(|slot| show_all || !self.hidden_panes.contains(slot))
-                };
+                // hidden panes and unbound placeholders are skipped (a hidden
+                // pane comes back through the Layout menu — an explicit act).
+                // Walking at most one full wrap keeps the direction's order;
+                // no renderable destination means no-op.
+                let renderable =
+                    |tab: &Tab<PaneRef>| tab.binding().is_some_and(|slot| self.renders(slot));
                 let mut index = current;
                 let mut target = None;
                 for _ in 1..tabs.len() {
@@ -3513,6 +3737,30 @@ impl SmudgyWindow {
         pending_invitations: usize,
     ) -> ThemedElement<'a, Message> {
         let session_context = self.create_session_context(sessions);
+        let hidden_count = self
+            .hidden_panes
+            .iter()
+            .filter(|slot| self.bindings.contains_key(slot))
+            .count();
+        let hidden_rows = self
+            .layout_menu
+            .as_ref()
+            .map(|_| self.layout_menu_hidden(sessions))
+            .unwrap_or_default();
+        let layout_menu = layout_menu::view(
+            hidden_count,
+            self.layout_menu.as_ref().map(|menu| layout_menu::Contents {
+                hidden: &hidden_rows,
+                server: &menu.server,
+                saved: &menu.saved,
+            }),
+            &modal::layouts::NativeLabels,
+        )
+        .map(toolbar::Message::LayoutMenu);
+        let layout_menu = widgets::bounds_probe::BoundsProbe::new(layout_menu, |bounds| {
+            self.layout_button_bounds.set(bounds);
+        })
+        .into();
         let toolbar_element = toolbar::view(
             self.window_id,
             self.toolbar_expanded,
@@ -3520,6 +3768,8 @@ impl SmudgyWindow {
             self.fullscreen,
             &session_context,
             pending_invitations,
+            layout_menu,
+            |bounds| self.menu_button_bounds.set(bounds),
         );
 
         // Header-visibility rule (§2.11): a pane's title bar is attached only
@@ -3533,13 +3783,12 @@ impl SmudgyWindow {
             // The responsive wrapper records the grid's on-screen size each
             // layout pass; the layout model's px->ratio math and transplant
             // hit-testing measure against it.
-            iced::widget::responsive(move |size| {
+            let grid = iced::widget::responsive(move |size| {
                 self.grid_area.set(size);
                 let grid = self
                     .grid
                     .as_ref()
                     .expect("the grid presence was checked before building the view");
-                let show_all = self.show_all();
                 let panes = PaneGrid::new(grid, |_pane, group, _is_maximized| {
                     let group = *group;
                     // The payload is the stable group id; the strip renders
@@ -3551,8 +3800,7 @@ impl SmudgyWindow {
                     };
                     let selected_tab = self.layout.selected(group);
                     let rendered_tab = self.layout.effective_selected(group, |tab| {
-                        tab.binding()
-                            .is_some_and(|slot| show_all || !self.hidden_panes.contains(slot))
+                        tab.binding().is_some_and(|slot| self.renders(slot))
                     });
                     // A group whose every member is a pending placeholder —
                     // a restored or layout-applied window whose pane
@@ -3582,8 +3830,6 @@ impl SmudgyWindow {
                     let rendered = rendered_slot.zip(rendered_session);
                     let is_active = rendered
                         .is_some_and(|(slot, _)| self.active_session_id == Some(slot.session_id));
-                    let is_hidden =
-                        rendered.is_some_and(|(slot, _)| self.hidden_panes.contains(&slot));
 
                     // Every member subtree stays mounted, keyed by stable tab
                     // id; only the rendered one is laid out fresh, drawn, and
@@ -3621,51 +3867,17 @@ impl SmudgyWindow {
                     let body: ThemedElement<'_, Message> =
                         widgets::tab_host::TabHost::new(keys, children, rendered_index).into();
 
-                    // A hidden pane that still renders (toolbar expanded, or
-                    // every pane hidden) is marked, not removed: a veil of
-                    // the window background with a red ✕, showing what
-                    // collapsing the toolbar will drop. The stack is emitted
-                    // in BOTH states, the veil layer an inert placeholder
-                    // while the pane is visible: chrome around a stateful
-                    // subtree must keep one element shape (the rule the
-                    // grid-level drag overlay follows) — swapping the bare
-                    // body for a stack across the toggle would change the
-                    // subtree's element type, making iced rebuild it and
-                    // erase every mounted tab's widget state on each
-                    // hide/unhide. The veil layer itself is stateless, so
-                    // its own container↔placeholder swap rebuilds nothing
-                    // that matters.
-                    let veil: ThemedElement<'_, Message> = if is_hidden {
-                        container(
-                            svg(assets::hero_icons::X_MARK.clone())
-                                .width(24)
-                                .height(24)
-                                .style(|theme: &crate::Theme, _| svg::Style {
-                                    color: Some(theme.styles.text.error),
-                                }),
-                        )
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .align_x(Horizontal::Center)
-                        .align_y(Vertical::Center)
-                        .style(theme::builtins::container::pane_hidden_overlay)
-                        .into()
-                    } else {
-                        iced::widget::Space::new().into()
-                    };
-                    let body: ThemedElement<'_, Message> = stack(vec![body, veil]).into();
                     let content = pane_grid::Content::new(body);
 
                     // Strip emission ([`Self::strip_emitted`]): the count is
                     // of listed tabs, not members, so a group whose other
-                    // members are all eyeball-hidden under a collapsed
-                    // toolbar renders as a plain pane, indistinguishable
-                    // from a true singleton. (Invisible vacancy tabs never
+                    // members are all hidden renders as a plain pane,
+                    // indistinguishable from a true singleton. (Invisible vacancy tabs never
                     // list: a bound singleton sharing its group with vacancy
                     // bookkeeping is still a singleton to the user.)
                     let listed_tabs = tabs
                         .iter()
-                        .filter(|tab| self.tab_in_strip(tab, show_all))
+                        .filter(|tab| self.tab_in_strip(tab))
                         .count();
                     let show_header = Self::strip_emitted(
                         listed_tabs,
@@ -3693,7 +3905,7 @@ impl SmudgyWindow {
                     // close, and visibility handler requires a binding.
                     let descriptors: smallvec::SmallVec<[components::tab_strip::TabDescriptor; 8]> =
                         tabs.iter()
-                            .filter(|tab| self.tab_in_strip(tab, show_all))
+                            .filter(|tab| self.tab_in_strip(tab))
                             .filter_map(|tab| match tab.binding() {
                                 Some(slot) => {
                                     let session = sessions.get(slot.session_id)?;
@@ -3703,7 +3915,7 @@ impl SmudgyWindow {
                                         main: slot.key == MAIN_PANE_KEY,
                                         selected: selected_tab == Some(tab.id()),
                                         rendered: rendered_tab == Some(tab.id()),
-                                        hidden: self.hidden_panes.contains(slot),
+                                        tooltip: pane_tooltip(session, slot.key),
                                         active_session: self.active_session_id
                                             == Some(slot.session_id),
                                         connected: session.is_connected(),
@@ -3721,7 +3933,7 @@ impl SmudgyWindow {
                                         main: false,
                                         selected: selected_tab == Some(tab.id()),
                                         rendered: false,
-                                        hidden: placeholder.hidden,
+                                        tooltip: None,
                                         active_session: false,
                                         connected: false,
                                         ever_connected: false,
@@ -3736,14 +3948,13 @@ impl SmudgyWindow {
                         components::tab_strip::StripContext {
                             drag_live: drag.live,
                             modifiers: drag.modifiers,
-                            visibility_eyes: show_all,
+                            hide_controls: self.toolbar_expanded,
                             labels: components::tab_strip::StripLabels {
                                 connect: crate::i18n::ts!("session-action-connect"),
                                 reconnect: crate::i18n::ts!("session-action-reconnect"),
                                 disconnect: crate::i18n::ts!("session-action-disconnect"),
                                 close: crate::i18n::ts!("pane-tab-close"),
                                 hide: crate::i18n::ts!("pane-tab-hide"),
-                                show: crate::i18n::ts!("pane-tab-show"),
                             },
                             on_strip_bounds: Box::new(move |bounds| {
                                 self.strip_bands.borrow_mut().insert(group, bounds);
@@ -3828,7 +4039,25 @@ impl SmudgyWindow {
                     drag_overlay::TargetOverlay::new(target_overlay_rects(drag.target)).into(),
                 ])
                 .into()
+            });
+            // The grid's window-local origin, for placing ghosts over it.
+            widgets::bounds_probe::BoundsProbe::new(grid, |bounds| {
+                self.grid_origin.set(bounds.position());
             })
+            .into()
+        } else if !self.bindings.is_empty() {
+            // Every pane here is hidden (the grid drops hidden panes): the
+            // sessions still run, so this is not the no-sessions view but
+            // its sibling — the same cat, and the ways back to the panes.
+            let cat = widgets::crt_cat::view(self.cat_clock.seconds());
+            let hidden = layout_menu::everything_hidden(cat, crate::i18n::translate)
+                .map(|action| Message::ToolbarAction(toolbar::Message::LayoutMenu(action)));
+            // A whole-window drop surface like the empty state, with its
+            // overlay mounted for the same shape-stability reason.
+            stack(vec![
+                hidden,
+                drag_overlay::TargetOverlay::new(target_overlay_rects(drag.target)).into(),
+            ])
             .into()
         } else {
             // Empty session: an actionable empty state — animated CRT cat,
@@ -3924,11 +4153,18 @@ impl SmudgyWindow {
         if let Some(upgrade_banner) = upgrade_banner {
             layout = layout.push(upgrade_banner);
         }
-        let main_layout: ThemedElement<_> = layout
-            .push(main_content_area)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+        // Ghosts of hidden and shown panes fly on an inert layer above the
+        // toolbar and grid. Always mounted: the stack's shape never changes,
+        // so nothing beneath loses its state when a flight starts.
+        let main_layout: ThemedElement<_> = stack(vec![
+            layout
+                .push(main_content_area)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            self.flights.layer(),
+        ])
+        .into();
 
         // Package-update toasts: a non-modal bottom pill layer — no backdrop,
         // the window stays fully interactive behind it. Stacked under any modal,
@@ -4823,7 +5059,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_in_an_all_hidden_window_behaves_as_if_visible() {
+    fn repair_in_an_all_hidden_window_falls_back_to_candidate_order() {
         let mut window = test_window();
         let (main10, main20) = (main_pane(10), main_pane(20));
         host_cluster(&mut window, main10);
@@ -4831,8 +5067,8 @@ mod tests {
         window.set_toolbar_expanded(false);
         window.set_pane_hidden(main10, true);
         window.set_pane_hidden(main20, true);
-        // Every pane hidden: the hidden filter is inert, so both mains
-        // render and the preference changes nothing.
+        // Every pane hidden: no main renders, so none is preferred and the
+        // candidate order decides.
         window.active_session_id = None;
         window.previous_active_session_id = None;
         window.repair_active_session_without_focus();
@@ -4875,7 +5111,7 @@ mod tests {
     }
 
     /// A window hosting one two-tab group (main + one script pane merged
-    /// beside it), the script pane eyeball-hidden.
+    /// beside it), the script pane hidden.
     fn window_with_hidden_second_tab() -> (SmudgyWindow, PaneRef, PaneRef) {
         let mut window = test_window();
         let main = main_pane(1);
@@ -4888,36 +5124,133 @@ mod tests {
         (window, main, script)
     }
 
-    /// Which of `group`'s member tabs the strip lists under the window's
-    /// current visibility mode, in strip order.
+    /// Which of `group`'s member tabs the strip lists, in strip order.
     fn strip_listing(window: &SmudgyWindow, group: GroupId) -> Vec<bool> {
-        let show_all = window.show_all();
         window
             .layout
             .tabs(group)
             .expect("group exists")
             .iter()
-            .map(|tab| window.tab_in_strip(tab, show_all))
+            .map(|tab| window.tab_in_strip(tab))
             .collect()
     }
 
     #[test]
-    fn strip_lists_hidden_tabs_only_in_rearrange_mode() {
+    fn strip_never_lists_hidden_tabs() {
         let (mut window, main, _) = window_with_hidden_second_tab();
         let group = window.group_of_slot(main).expect("main hosted");
 
-        // Expanded (rearrange mode): the hidden tab stays listed, dimmed
-        // behind its eye.
-        assert_eq!(strip_listing(&window, group), vec![true, true]);
-        // Collapsed: the hidden tab drops out of the strip with its pane.
+        // Hidden panes wait in the Layout menu in every toolbar mode.
+        assert_eq!(strip_listing(&window, group), vec![true, false]);
         window.set_toolbar_expanded(false);
         window.flush_grid_rebuild();
         assert_eq!(strip_listing(&window, group), vec![true, false]);
-        // All panes hidden: the inert-filter exception lists everything
-        // again (the panes render, so their tabs must too).
+        // All panes hidden: nothing lists, and nothing renders.
         window.set_pane_hidden(main, true);
         window.flush_grid_rebuild();
-        assert_eq!(strip_listing(&window, group), vec![true, true]);
+        assert_eq!(strip_listing(&window, group), vec![false, false]);
+        assert!(window.grid.is_none());
+    }
+
+    #[test]
+    fn an_all_hidden_window_is_a_whole_window_drop_surface_but_not_empty() {
+        let (mut window, main, script) = window_with_hidden_second_tab();
+        window.set_pane_hidden(main, true);
+        window.flush_grid_rebuild();
+        assert!(window.grid.is_none(), "every pane hidden: no grid");
+        assert!(
+            !window.is_visually_empty(),
+            "hidden panes are content: the emptied-window rule must not close it"
+        );
+        let drag = TabDrag {
+            source_window: window::Id::unique(),
+            tab: window.tab_of(script).expect("script hosted"),
+            slot: script,
+            source_group: window.group_of_slot(script).expect("script hosted"),
+            press: Point::ORIGIN,
+            hover: None,
+        };
+        let target = window
+            .classify_drag_target(Point::new(10.0, 10.0), Size::new(800.0, 600.0), &drag)
+            .expect("the whole window takes the drop");
+        assert_eq!(target.action, pane_drag::DragAction::Vacant);
+    }
+
+    #[test]
+    fn hiding_from_a_tab_and_showing_from_the_menu_report_to_the_runtime() {
+        let (mut window, main, script) = window_with_hidden_second_tab();
+        let mut sessions = SessionStore::new(crate::cloud_account::test_handles());
+        let update = window.update(Message::HidePane(main), &mut sessions);
+        assert!(matches!(
+            update.event,
+            Some(Event::PaneVisibilityChanged { slots, hidden: true }) if slots == vec![main]
+        ));
+        assert!(window.pane_hidden(main));
+        // Hiding twice reports nothing new.
+        assert!(
+            window
+                .update(Message::HidePane(main), &mut sessions)
+                .event
+                .is_none()
+        );
+
+        let update = window.layout_menu_action(layout_menu::Message::ShowAll, &sessions);
+        assert!(matches!(
+            update.event,
+            Some(Event::PaneVisibilityChanged { slots, hidden: false }) if slots == vec![main, script]
+        ));
+        window.flush_grid_rebuild();
+        assert!(!window.pane_hidden(main) && !window.pane_hidden(script));
+    }
+
+    #[test]
+    fn ghosts_fly_from_where_panes_show_and_land_where_shown_panes_go() {
+        let (mut window, main, script) = window_with_hidden_second_tab();
+        window.grid_area.set(Size::new(800.0, 600.0));
+        window.grid_origin.set(Point::new(0.0, 42.0));
+        window.mark_grid_dirty();
+        window.flush_grid_rebuild();
+
+        // The rendered main shows as its group's whole region, placed at
+        // the grid's window-local origin; the hidden script shows nowhere.
+        let rect = window.pane_rect(main).expect("main renders in the grid");
+        assert_eq!(rect.y, 42.0);
+        assert_eq!(rect.size(), Size::new(800.0, 600.0));
+        assert!(window.pane_rect(script).is_none());
+
+        // A script showing its pane changes the grid with no ghost.
+        window.set_pane_hidden(script, false);
+        window.flush_grid_rebuild();
+        assert!(window.flights.is_empty());
+
+        // A user show queued for the rebuild lands where the pane is placed.
+        window.set_pane_hidden(script, true);
+        window.flush_grid_rebuild();
+        window.hidden_panes.remove(&script);
+        window.pending_show_flights.push((
+            script,
+            iced::Rectangle::new(Point::new(5.0, 5.0), Size::new(32.0, 32.0)),
+            "chat".into(),
+        ));
+        window.mark_grid_dirty();
+        window.flush_grid_rebuild();
+        assert!(window.pending_show_flights.is_empty());
+        assert_eq!(
+            window.flights.len(),
+            0,
+            "a listed but unrendered tab has no span on file yet"
+        );
+        // Selected, the shown pane renders as the group's body: it flies.
+        let tab = window.tab_of(script).expect("hosted");
+        assert!(window.layout.select(tab));
+        window.pending_show_flights.push((
+            script,
+            iced::Rectangle::new(Point::new(5.0, 5.0), Size::new(32.0, 32.0)),
+            "chat".into(),
+        ));
+        window.mark_grid_dirty();
+        window.flush_grid_rebuild();
+        assert_eq!(window.flights.len(), 1);
     }
 
     #[test]
@@ -4955,11 +5288,11 @@ mod tests {
             true,
             true
         ));
-        // Expanded, the group is multi-tab again and the strip returns
-        // regardless of the other clauses.
+        // Expanded, the hidden tab stays out of the strip, but rearrange
+        // mode shows the header regardless of the other clauses.
         window.set_toolbar_expanded(true);
         window.flush_grid_rebuild();
-        assert_eq!(listed(&window), 2);
+        assert_eq!(listed(&window), 1);
         assert!(SmudgyWindow::strip_emitted(
             listed(&window),
             true,
@@ -5085,10 +5418,9 @@ mod tests {
     }
 
     #[test]
-    fn strip_lists_pre_hidden_placeholders_only_in_rearrange_mode() {
+    fn strip_never_lists_pre_hidden_placeholders() {
         let (mut window, notes0, notes1) = restored_window();
         let in_strip = |window: &SmudgyWindow, tab: TabId| {
-            let show_all = window.show_all();
             let group = window.layout.group_of(tab).expect("tab hosted");
             window
                 .layout
@@ -5096,19 +5428,17 @@ mod tests {
                 .expect("group exists")
                 .iter()
                 .find(|member| member.id() == tab)
-                .map(|member| window.tab_in_strip(member, show_all))
+                .map(|member| window.tab_in_strip(member))
                 .expect("tab is a member")
         };
-        // Collapsed (restored_window's mode): the visible placeholder
-        // holds its strip position; the pre-hidden one is absent exactly
-        // like the hidden pane it will bind into.
+        // The visible placeholder holds its strip position; the pre-hidden
+        // one is absent exactly like the hidden pane it will bind into, in
+        // either toolbar mode.
         assert!(in_strip(&window, notes0));
         assert!(!in_strip(&window, notes1));
-        // Expanded, both list — the pre-hidden placeholder dims exactly
-        // as the pane carrying its stored eyeball state will.
         window.set_toolbar_expanded(true);
         assert!(in_strip(&window, notes0));
-        assert!(in_strip(&window, notes1));
+        assert!(!in_strip(&window, notes1));
     }
 
     #[test]
@@ -5691,8 +6021,9 @@ mod tests {
     /// A restored window holding ONLY another window's session's script
     /// pane (a torn-out pane window persisted while its session's main
     /// lived elsewhere — legal per the schema): every tab installs as an
-    /// unbound placeholder, `show_all` is vacuously true with zero
-    /// bindings, so the grid admits the group and its render resolution
+    /// unbound placeholder, a window with zero bindings admits its
+    /// placeholders in either mode, so the grid admits the group and its
+    /// render resolution
     /// finds no bound pane. The view must produce placeholder bodies and
     /// strip descriptors.
     #[test]

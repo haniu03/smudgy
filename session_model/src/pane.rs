@@ -207,12 +207,13 @@ pub struct PaneDef {
     /// existing pane (when given explicitly) — which is also the only way to
     /// set it on the main pane, whose def otherwise exists from construction.
     pub title_bar: TitleBarPolicy,
-    /// The title-bar eyeball's toggle state — a soft display state (the pane
-    /// keeps running; a hidden pane drops from the collapsed-toolbar grid).
-    /// This is the source of truth the UI's `hidden_panes` derives from; user
-    /// eyeball clicks report back here through `RuntimeAction::PaneUserHidden`.
-    /// Always `false` for main via scripts (hiding main throws); the user's
-    /// eyeball may still set it.
+    /// Whether the pane is hidden — a soft display state (the pane keeps
+    /// running; a hidden pane leaves the grid and waits in the Layout menu).
+    /// This is the source of truth the UI's `hidden_panes` derives from; the
+    /// user's hide and show report back here through
+    /// `RuntimeAction::PaneUserHidden`.
+    /// Always `false` for main via scripts (hiding main throws); the user
+    /// may still hide it.
     pub hidden: bool,
     /// Per-pane font size override in px (validated to the same
     /// 8–40 range as the global setting); `None` follows the global setting.

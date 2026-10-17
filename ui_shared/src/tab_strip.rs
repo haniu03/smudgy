@@ -7,8 +7,8 @@
 //! is a discrete element beside the tab's label surface, never layered over
 //! it: the label surface is the tab's drag region (a [`TabPress`] owning the
 //! click-vs-drag deadband), and the embedded controls (connect/disconnect,
-//! close, visibility) are sibling elements a press can only ever operate —
-//! never drag.
+//! close, hide) are sibling elements a press can only ever operate — never
+//! drag.
 //!
 //! The strip also mirrors its geometry for drag hit-testing: the hosting
 //! window hands in draw-time callbacks recording the strip band and each
@@ -51,8 +51,8 @@ pub enum Event {
     Disconnect(TabId),
     /// The main tab's close control: close the whole session.
     CloseSession(TabId),
-    /// The tab's visibility eye.
-    ToggleVisibility(TabId),
+    /// The tab's hide control: hide the pane into the Layout menu.
+    Hide(TabId),
 }
 
 /// Window-supplied context for one strip: drag-view state handed down from
@@ -66,12 +66,10 @@ pub struct StripContext<'a> {
     /// Window-level keyboard modifier state, passed at view time — the
     /// press surface keeps no shadow copy.
     pub modifiers: keyboard::Modifiers,
-    /// Whether tabs carry their visibility eye. Rearrange mode only: a
-    /// collapsed-toolbar strip lists exactly the tabs whose panes render,
-    /// and a hide there would vanish the tab with no in-strip way back —
-    /// the eye retreats to the expanded toolbar's strip, where hidden
-    /// tabs stay listed (dimmed) beside it.
-    pub visibility_eyes: bool,
+    /// Whether tabs carry their hide control: rearrange mode only (the
+    /// toolbar expanded), where the Layout menu that brings a hidden pane
+    /// back sits one click away. Strips list only visible panes.
+    pub hide_controls: bool,
     /// Host-localized labels for controls and tooltips.
     pub labels: StripLabels,
     /// Records the strip's on-screen band (window-local).
@@ -90,7 +88,6 @@ pub struct StripLabels {
     pub disconnect: &'static str,
     pub close: &'static str,
     pub hide: &'static str,
-    pub show: &'static str,
 }
 
 impl Default for StripLabels {
@@ -101,7 +98,6 @@ impl Default for StripLabels {
             disconnect: "Disconnect",
             close: "Close session",
             hide: "Hide pane",
-            show: "Show pane",
         }
     }
 }
@@ -120,8 +116,9 @@ pub struct TabDescriptor {
     /// The tab the group's body currently renders (the effective selection —
     /// differs from `selected` when the selected tab is hidden).
     pub rendered: bool,
-    /// User-hidden (the eye): dimmed in the strip, body suppressed.
-    pub hidden: bool,
+    /// Shown on hovering the label: where the pane comes from (its session,
+    /// and the code that created it). `None` shows nothing.
+    pub tooltip: Option<String>,
     /// The tab's session is the window's active session.
     pub active_session: bool,
     /// The tab's session is connected.
@@ -133,6 +130,10 @@ pub struct TabDescriptor {
 
 /// Keep-visible margin inside the strip viewport when revealing a tab.
 const REVEAL_PADDING: f32 = 12.0;
+
+/// How long the cursor rests on a tab's label before its tooltip shows, so
+/// sweeping across the strip never flashes one.
+const TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// Grounds a point published from inside the strip's scrollable into window
 /// space. The scrollable hands its children a scroll-translated cursor, so a
@@ -161,7 +162,7 @@ pub fn view<'a, M: Clone + 'static>(
     let StripContext {
         drag_live,
         modifiers,
-        visibility_eyes,
+        hide_controls,
         labels,
         on_strip_bounds,
         on_tab_bounds,
@@ -169,7 +170,7 @@ pub fn view<'a, M: Clone + 'static>(
     let tab_context = TabElementContext {
         drag_live,
         modifiers,
-        visibility_eyes,
+        hide_controls,
         labels,
         on_tab_bounds,
     };
@@ -205,7 +206,7 @@ pub fn view<'a, M: Clone + 'static>(
 struct TabElementContext<'a> {
     drag_live: bool,
     modifiers: keyboard::Modifiers,
-    visibility_eyes: bool,
+    hide_controls: bool,
     labels: StripLabels,
     on_tab_bounds: std::rc::Rc<dyn Fn(TabId, Rectangle) + 'a>,
 }
@@ -221,7 +222,7 @@ fn tab_element<'a, M: Clone + 'static>(
     let TabElementContext {
         drag_live,
         modifiers,
-        visibility_eyes,
+        hide_controls,
         labels,
         on_tab_bounds,
     } = context;
@@ -231,25 +232,21 @@ fn tab_element<'a, M: Clone + 'static>(
         main,
         selected,
         rendered,
-        hidden,
+        tooltip: tip,
         active_session,
         connected,
         ever_connected,
     } = descriptor;
 
     // Text emphasis mirrors the pre-group session tab: full strength on the
-    // active session's rendered tab, dimmer otherwise; hidden tabs dim
-    // further and a disconnected session shades toward the muted end. The
-    // ladder scales the theme's base label color, so every theme keeps the
-    // same state contrast.
+    // active session's rendered tab, dimmer otherwise; a disconnected
+    // session shades toward the muted end. The ladder scales the theme's
+    // base label color, so every theme keeps the same state contrast.
     let mut alpha: f32 = match (rendered, active_session) {
         (true, true) => 1.0,
         (true, false) => 0.75,
         (false, _) => 0.5,
     };
-    if hidden {
-        alpha *= 0.5;
-    }
     if !connected {
         alpha *= 0.85;
     }
@@ -287,6 +284,22 @@ fn tab_element<'a, M: Clone + 'static>(
     )
     .into();
 
+    // The press surface always sits inside the tooltip, whether or not a
+    // tooltip shows: wrapping it only sometimes would change its element
+    // shape mid-gesture and wipe the press state a drag depends on. While a
+    // drag is live (and for tabs without one) the tooltip is empty.
+    let tip: ThemedElement<'a, M> = match tip.filter(|_| !drag_live) {
+        Some(tip) => container(text(tip).size(11))
+            .padding([2, 6])
+            .style(builtins::container::tooltip)
+            .into(),
+        None => iced::widget::Space::new().into(),
+    };
+    let label_surface: ThemedElement<'a, M> =
+        tooltip(label_surface, tip, tooltip::Position::Bottom)
+            .delay(TOOLTIP_DELAY)
+            .into();
+
     let mut items = row![label_surface].spacing(2).align_y(Alignment::Center);
 
     if main {
@@ -312,22 +325,15 @@ fn tab_element<'a, M: Clone + 'static>(
         ));
     }
 
-    // The visibility eye rides rearrange mode: there the strip lists
-    // hidden tabs dimmed beside their visible peers, and the eye at each
-    // tab's trailing edge is the recovery path. A collapsed-toolbar strip
-    // lists only rendering tabs and carries no eyes at all — a hide there
-    // would vanish the tab with no in-strip way back.
-    if visibility_eyes {
+    // In rearrange mode, the hide control sends the pane to the Layout
+    // menu, where it waits (and from where it is shown again).
+    if hide_controls {
         items = items.push(labeled(
             title_bar_icon_button(
-                if hidden {
-                    assets::hero_icons::EYE_SLASH.clone()
-                } else {
-                    assets::hero_icons::EYE.clone()
-                },
-                on_event(Event::ToggleVisibility(id)),
+                assets::hero_icons::EYE_SLASH.clone(),
+                on_event(Event::Hide(id)),
             ),
-            if hidden { labels.show } else { labels.hide },
+            labels.hide,
         ));
     }
 

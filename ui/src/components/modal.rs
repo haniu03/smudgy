@@ -75,7 +75,7 @@ impl Modal {
                 connect::view(state).map(Message::Connect),
             ),
             Modal::Layouts(state) => (
-                crate::i18n::t!("toolbar-layouts"),
+                crate::i18n::t!("layouts-manage-title"),
                 560.0,
                 480.0,
                 layouts::view(state).map(Message::Layouts),

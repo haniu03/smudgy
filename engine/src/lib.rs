@@ -56,6 +56,11 @@ pub enum ClientEvent {
         columns: u16,
         rows: u16,
     },
+    /// The user hid or showed a pane from the UI.
+    PaneUserHidden {
+        key: smudgy_session_model::pane::PaneKey,
+        hidden: bool,
+    },
 }
 
 /// Side effects requested by the portable engine and performed by a shell.
@@ -206,6 +211,10 @@ impl<A: AutomationHost> ClientEngine<A> {
                     .map(ClientEffect::SendNetwork)
                     .into_iter()
                     .collect()
+            }
+            ClientEvent::PaneUserHidden { key, hidden } => {
+                let automation = self.automation.on_pane_user_hidden(key, hidden);
+                self.apply_automation(automation)
             }
         }
     }
@@ -409,6 +418,39 @@ mod tests {
     use smudgy_protocol::telnet::option;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn a_user_hide_reaches_the_host_and_its_echo_reaches_the_shell() {
+        use smudgy_session_model::pane::PaneKey;
+
+        #[derive(Default)]
+        struct Panes(Option<(PaneKey, bool)>);
+        impl AutomationHost for Panes {
+            fn on_user_input(&mut self, _input: &str) -> InputOutcome {
+                InputOutcome::default()
+            }
+            fn on_output_line(&mut self, _line: &str) -> Vec<AutomationEffect> {
+                Vec::new()
+            }
+            fn on_pane_user_hidden(&mut self, key: PaneKey, hidden: bool) -> Vec<AutomationEffect> {
+                self.0 = Some((key, hidden));
+                vec![AutomationEffect::Pane(PaneEffect::Clear(key))]
+            }
+        }
+
+        let key = PaneKey::from_u32(3);
+        let mut engine = ClientEngine::new(Panes::default(), 80, 24);
+        let effects = engine.handle(ClientEvent::PaneUserHidden { key, hidden: true });
+        assert_eq!(effects, vec![ClientEffect::Pane(PaneEffect::Clear(key))]);
+        assert_eq!(engine.automation.0, Some((key, true)));
+        // A host without panes has nothing to do.
+        let mut plain = ClientEngine::new(NoAutomation, 80, 24);
+        assert!(
+            plain
+                .handle(ClientEvent::PaneUserHidden { key, hidden: true })
+                .is_empty()
+        );
+    }
 
     fn sent(line: &str) -> ClientEffect {
         ClientEffect::SendCommand {

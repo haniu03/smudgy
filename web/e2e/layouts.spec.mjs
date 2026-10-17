@@ -1,5 +1,7 @@
 import { test, expect } from '@playwright/test';
-import { lastWindow, profile, resetFixture, seedCatalog, server, waitForOpen, waitForPurple } from './support.mjs';
+import {
+  lastWindow, profile, resetFixture, seedCatalog, server, waitForHighlight, waitForOpen, waitForPurple,
+} from './support.mjs';
 
 test.beforeEach(async ({ request }) => resetFixture(request));
 
@@ -21,6 +23,14 @@ async function savedLayouts(page, serverName) {
       db.close();
     }
   }, serverName);
+}
+
+// Apply the only saved layout from the Layout menu: open the menu, wait for
+// its listing to arrive, and click the row.
+async function applyFromMenu(page) {
+  await page.mouse.click(130, 20);
+  await waitForHighlight(page, 380, 81);
+  await page.mouse.click(380, 81);
 }
 
 async function seedLayout(page, serverName, name, workspace) {
@@ -46,7 +56,7 @@ async function seedLayout(page, serverName, name, workspace) {
   }, { serverName, name, workspace });
 }
 
-test('shared Layouts dialog saves the active browser window as a versioned workspace', async ({ page, request }) => {
+test('Layout menu saves the active browser window as a versioned workspace', async ({ page, request }) => {
   await seedCatalog(page, [server('layouts', [profile('main')])]);
   await page.goto('/');
   await expect(page.locator('canvas')).toHaveCount(1);
@@ -55,9 +65,10 @@ test('shared Layouts dialog saves the active browser window as a versioned works
   await waitForPurple(page, 500, 165);
   await page.mouse.click(875, 411);
   await waitForOpen(request, 'layouts');
-  await page.mouse.click(130, 20);
+  await page.mouse.click(130, 20); // Open the Layout menu.
+  await waitForHighlight(page, 380, 118);
+  await page.mouse.click(380, 118); // Save layout as… opens the dialog at its name form.
   await waitForPurple(page, 500, 217);
-  await page.mouse.click(300, 670);
   await page.keyboard.type('combat');
   await page.mouse.click(270, 343);
   await expect.poll(async () => (await savedLayouts(page, 'layouts')).map(({ name }) => name))
@@ -113,9 +124,7 @@ test('one-window split layout applies and survives explicit restore', async ({ p
       } }],
     }],
   });
-  await page.mouse.click(130, 20);
-  await waitForPurple(page, 500, 217);
-  await page.mouse.click(290, 288);
+  await applyFromMenu(page);
   await expect.poll(async () => (await lastWindow(page))?.sessions.length ?? 0).toBe(2);
   expect(page.workers()).toHaveLength(1);
   const before = await lastWindow(page);
@@ -163,9 +172,7 @@ test('one-window tab group restores its selection and switches main-session bodi
       } } }],
     }],
   });
-  await page.mouse.click(130, 20);
-  await waitForPurple(page, 500, 217);
-  await page.mouse.click(290, 288);
+  await applyFromMenu(page);
   await expect.poll(async () => (await lastWindow(page))?.windows[0].clusters[0].root.group.selected)
     .toBe(1);
   expect(page.workers()).toHaveLength(1);
@@ -212,9 +219,7 @@ test('shared tab drag moves a browser tab to a whole-grid edge and persists the 
       } } }],
     }],
   });
-  await page.mouse.click(130, 20);
-  await waitForPurple(page, 500, 217);
-  await page.mouse.click(290, 288);
+  await applyFromMenu(page);
   await expect.poll(async () => (await lastWindow(page))?.windows[0].clusters[0].root.group.tabs.length)
     .toBe(2);
 
@@ -258,9 +263,7 @@ test('applying a layout asks before closing an omitted live session', async ({ p
       clusters: [{ weight: 1, root: { group: { tabs: [{ slot: 1, id: 'main' }], selected: 0 } } }],
     }],
   });
-  await page.mouse.click(130, 20);
-  await waitForPurple(page, 500, 217);
-  await page.mouse.click(290, 288);
+  await applyFromMenu(page);
   await waitForPurple(page, 250, 670); // Keep-or-close prompt is ready.
   expect(page.workers()).toHaveLength(2); // Nothing closes without an explicit answer.
   await page.mouse.click(832, 289); // Explicit Close for the omitted session.

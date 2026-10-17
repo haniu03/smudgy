@@ -65,6 +65,13 @@ pub trait AutomationHost {
     fn on_user_input(&mut self, input: &str) -> InputOutcome;
 
     fn on_output_line(&mut self, line: &str) -> Vec<AutomationEffect>;
+
+    /// The user hid or showed a pane (a tab's hide control, or the Layout
+    /// menu). A host that keeps pane definitions records the state and
+    /// echoes the updated definition; one without panes has nothing to do.
+    fn on_pane_user_hidden(&mut self, _key: PaneKey, _hidden: bool) -> Vec<AutomationEffect> {
+        Vec::new()
+    }
 }
 
 /// Compile-time-selected automation host that performs no automation.

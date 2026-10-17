@@ -387,6 +387,26 @@ pub fn worker_message(message: JsValue) {
             }
         }
         "disconnect" => dispatch_global(ClientEvent::DisconnectRequested),
+        "set-pane-hidden" => {
+            let key = Reflect::get(&message, &JsValue::from_str("key"))
+                .ok()
+                .and_then(|value| value.as_f64())
+                .filter(|value| {
+                    value.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(value)
+                });
+            let hidden = Reflect::get(&message, &JsValue::from_str("hidden"))
+                .ok()
+                .and_then(|value| value.as_bool());
+            match (key, hidden) {
+                (Some(key), Some(hidden)) => {
+                    // The range check above makes this an exact conversion.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let key = smudgy_session_model::pane::PaneKey::from_u32(key as u32);
+                    dispatch_global(ClientEvent::PaneUserHidden { key, hidden });
+                }
+                _ => publish_fatal("pane visibility update is missing its key or state"),
+            }
+        }
         "resize" => {
             let columns = get_u16(&message, "columns").unwrap_or(DEFAULT_COLUMNS);
             let rows = get_u16(&message, "rows").unwrap_or(DEFAULT_ROWS);

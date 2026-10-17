@@ -285,6 +285,14 @@ impl SessionWorker {
         self.post(&command)
     }
 
+    fn set_pane_hidden(&self, key: PaneKey, hidden: bool) -> Result<(), String> {
+        let command = Object::new();
+        set(&command, "kind", &JsValue::from_str("set-pane-hidden"))?;
+        set(&command, "key", &JsValue::from_f64(f64::from(key.as_u32())))?;
+        set(&command, "hidden", &JsValue::from_bool(hidden))?;
+        self.post(&command)
+    }
+
     fn disconnect(&self) -> Result<(), String> {
         let command = Object::new();
         set(&command, "kind", &JsValue::from_str("disconnect"))?;
@@ -344,8 +352,9 @@ enum Message {
     Layouts(layouts_modal::Message),
     LayoutEffectCompleted(u64, Completion),
     LayoutSaved(u64, String, Result<(), String>),
-    LayoutToApply(u64, String, Result<Option<dto::Workspace>, String>),
+    LayoutToApply(u64, String, String, Result<Option<dto::Workspace>, String>),
     CloseLayouts,
+    LayoutMenuListed(u64, Result<Vec<String>, String>),
     Worker(WorkerEvent),
     CatalogLoaded(Result<Catalog, String>),
     SettingsLoaded(u64, Result<BrowserSettings, String>),
@@ -374,6 +383,10 @@ struct SmudgyWeb {
     layouts: Option<layouts_modal::State>,
     layout_nonce: u64,
     pending_layout: Option<(String, dto::Workspace)>,
+    /// The toolbar's Layout menu, while open.
+    layout_menu: Option<layouts::LayoutMenu>,
+    /// Guards a listing that settles after its menu closed or reopened.
+    layout_menu_nonce: u64,
     settings_revision: u64,
 }
 
@@ -433,6 +446,8 @@ impl Default for SmudgyWeb {
             layouts: None,
             layout_nonce: 0,
             pending_layout: None,
+            layout_menu: None,
+            layout_menu_nonce: 0,
             settings_revision: 0,
         }
     }
@@ -571,7 +586,8 @@ impl SmudgyWeb {
             | Message::LayoutEffectCompleted(..)
             | Message::LayoutSaved(..)
             | Message::LayoutToApply(..)
-            | Message::CloseLayouts) => self.handle_layout_message(message),
+            | Message::CloseLayouts
+            | Message::LayoutMenuListed(..)) => self.handle_layout_message(message),
             Message::Worker(event) => self.handle_worker(event),
             Message::CatalogLoaded(result) => {
                 match result {
@@ -657,13 +673,63 @@ impl SmudgyWeb {
         }
     }
 
+    /// Hide or show panes for the user, each pane's ghost flying to or
+    /// from the Layout menu; a single shown pane comes to the front.
+    fn set_panes_hidden(&mut self, panes: Vec<smudgy_session_model::pane::PaneRef>, hidden: bool) {
+        let front = panes.len() == 1;
+        self.report_pane_visibility(
+            panes.into_iter().map(|pane| (pane, hidden)),
+            |ui, pane, hidden| ui.set_pane_hidden_by_user(pane, hidden, front),
+        );
+    }
+
+    /// Apply stored hidden states (a restored window or an applied layout):
+    /// no ghosts, the arrangement simply lands.
+    fn apply_pane_visibility(
+        &mut self,
+        states: impl IntoIterator<Item = (smudgy_session_model::pane::PaneRef, bool)>,
+    ) {
+        self.report_pane_visibility(states, ClientUiState::set_pane_hidden);
+    }
+
+    /// Flip hidden states on the page at once through `flip`, then report
+    /// each to its pane's session worker, which owns the definition (and
+    /// echoes it back, which then agrees).
+    fn report_pane_visibility(
+        &mut self,
+        states: impl IntoIterator<Item = (smudgy_session_model::pane::PaneRef, bool)>,
+        mut flip: impl FnMut(&mut ClientUiState, smudgy_session_model::pane::PaneRef, bool) -> bool,
+    ) {
+        let mut changed = false;
+        for (pane, hidden) in states {
+            if !flip(&mut self.ui, pane, hidden) {
+                continue;
+            }
+            changed = true;
+            if let Some(worker) = self.sessions.get(&pane.session_id)
+                && let Err(error) = worker.set_pane_hidden(pane.key, hidden)
+            {
+                log::warn!("[layout] pane visibility not reported: {error}");
+            }
+        }
+        if changed {
+            self.save_window();
+        }
+    }
+
     // This is the top-level exhaustive router for the shared UI protocol. Its
     // branches stay together so browser-only effects remain visible in one
     // place beside the shared reducer calls.
     #[allow(clippy::too_many_lines)]
     fn handle_ui(&mut self, message: UiMessage) -> Task<Message> {
-        if let UiMessage::Toolbar(smudgy_ui_shared::main_toolbar::Message::Layouts) = message {
-            return self.open_layouts();
+        if let UiMessage::Toolbar(smudgy_ui_shared::main_toolbar::Message::LayoutMenu(action)) =
+            message
+        {
+            return self.layout_menu_action(action);
+        }
+        if let UiMessage::Toolbar(smudgy_ui_shared::main_toolbar::Message::ToggleExpand) = message {
+            // The Layout button leaves with the expanded toolbar.
+            self.close_layout_menu();
         }
         if let UiMessage::PaneClicked(pane) = message {
             self.ui.activate_pane(pane);
@@ -695,7 +761,10 @@ impl SmudgyWeb {
                         .tab_session(tab)
                         .map_or_else(Task::none, |id| self.handle_ui(UiMessage::CloseSession(id)));
                 }
-                smudgy_ui_shared::tab_strip::Event::ToggleVisibility(_) => {
+                smudgy_ui_shared::tab_strip::Event::Hide(tab) => {
+                    if let Some(pane) = self.ui.tab_pane(tab) {
+                        self.set_panes_hidden(vec![pane], true);
+                    }
                     return Task::none();
                 }
                 event => {
@@ -984,7 +1053,15 @@ impl SmudgyWeb {
         let active = window
             .active_slot
             .and_then(|slot| slot_to_session.get(&slot).copied());
+        let visibility: Vec<_> = window
+            .clusters
+            .iter()
+            .flat_map(|cluster| {
+                ui::main_visibility(&cluster.root, &|slot| slot_to_session.get(&slot).copied())
+            })
+            .collect();
         self.ui.install_blueprint(clusters, active);
+        self.apply_pane_visibility(visibility);
         self.save_window();
         let mut tasks = Vec::new();
         for slot in &workspace.sessions {
@@ -1220,13 +1297,34 @@ impl SmudgyWeb {
 
     fn view(&self) -> Element<'_, Message, Theme> {
         let translator = smudgy_i18n::Translator::default();
-        let main = ui::view(&self.ui, &|id| translator.translate(id)).map(Message::Ui);
+        let labels = WebLabels(smudgy_i18n::Translator::default());
+        let hidden_rows = self
+            .layout_menu
+            .as_ref()
+            .map(|_| self.ui.hidden_menu_rows())
+            .unwrap_or_default();
+        let layout_menu = smudgy_ui_shared::layout_menu::view(
+            self.ui.hidden_pane_count(),
+            self.layout_menu
+                .as_ref()
+                .map(|menu| smudgy_ui_shared::layout_menu::Contents {
+                    hidden: &hidden_rows,
+                    server: &menu.server,
+                    saved: &menu.saved,
+                }),
+            &labels,
+        )
+        .map(smudgy_ui_shared::main_toolbar::Message::LayoutMenu);
+        let layout_menu = smudgy_ui_shared::bounds_probe::BoundsProbe::new(layout_menu, |bounds| {
+            self.ui.record_layout_button(bounds);
+        })
+        .into();
+        let main = ui::view(&self.ui, &|id| translator.translate(id), layout_menu).map(Message::Ui);
         let Some(state) = &self.layouts else {
             return main;
         };
-        let labels = WebLabels(smudgy_i18n::Translator::default());
         let modal = smudgy_ui_shared::connect_modal::frame_with_size(
-            labels.text("toolbar-layouts"),
+            labels.text("layouts-manage-title"),
             smudgy_ui_shared::layouts_view::view(state, &labels).map(Message::Layouts),
             640.0,
             500.0,

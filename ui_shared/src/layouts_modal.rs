@@ -58,6 +58,11 @@ pub struct State {
     pub stage: Stage,
     pub outcome: Option<SaveOutcome>,
     pub storage_error: Option<String>,
+    /// Opened straight at a stage (the Layout menu's save and reset items)
+    /// rather than at the browse list: backing out of that stage closes the
+    /// dialog instead of revealing a list the user never asked for. Cleared
+    /// once the dialog reaches the browse list.
+    direct: bool,
     next_request: u64,
     pending: Option<(u64, bool)>,
 }
@@ -96,6 +101,9 @@ pub enum Event {
         replace: bool,
     },
     Reset,
+    /// Backing out of a stage the dialog was opened at directly: the host
+    /// closes the dialog.
+    Close,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,9 +179,18 @@ impl State {
             stage: Stage::Browse,
             outcome: None,
             storage_error: None,
+            direct: false,
             next_request: 0,
             pending: None,
         }
+    }
+
+    /// Open straight at the stage `message` leads to (from the Layout menu),
+    /// so backing out closes the dialog rather than browsing.
+    pub fn enter_directly(&mut self, message: Message) -> Transition {
+        let transition = self.update(message);
+        self.direct = !self.is_browsing();
+        transition
     }
 
     #[must_use]
@@ -183,6 +200,7 @@ impl State {
 
     pub fn prompt_keep_or_close(&mut self, source: TemplateSource, rows: Vec<OmittedRow>) {
         self.pending = None;
+        self.direct = false;
         self.stage = Stage::KeepOrClose { source, rows };
     }
 
@@ -210,6 +228,14 @@ impl State {
     }
 
     pub fn update(&mut self, message: Message) -> Transition {
+        let transition = self.apply_message(message);
+        if self.is_browsing() {
+            self.direct = false;
+        }
+        transition
+    }
+
+    fn apply_message(&mut self, message: Message) -> Transition {
         // A submitted mutation or its subsequent listing refresh cannot be
         // cancelled. Keep its completion authoritative until it settles.
         if self.pending.is_some_and(|(_, mutating)| mutating) {
@@ -344,7 +370,11 @@ impl State {
             M::Back => {
                 self.clear_pending();
                 self.stage = Stage::Browse;
-                Transition::default()
+                if self.direct {
+                    Transition::event(Event::Close)
+                } else {
+                    Transition::default()
+                }
             }
             M::ToggleClose(session, close) => {
                 if let Stage::KeepOrClose { rows, .. } = &mut self.stage
@@ -387,6 +417,14 @@ impl State {
     }
 
     pub fn complete(&mut self, completion: Completion) -> Transition {
+        let transition = self.apply_completion(completion);
+        if self.is_browsing() {
+            self.direct = false;
+        }
+        transition
+    }
+
+    fn apply_completion(&mut self, completion: Completion) -> Transition {
         let id = match &completion {
             Completion::NameChecked { id, .. }
             | Completion::Renamed { id, .. }
@@ -483,6 +521,33 @@ mod tests {
             panic!("name check requested");
         };
         id
+    }
+
+    #[test]
+    fn backing_out_of_a_directly_opened_stage_closes_the_dialog() {
+        let mut state = State::new("Arctic".into(), vec!["combat".into()]);
+        assert!(state.enter_directly(Message::SaveAsPressed).focus_name);
+        assert_eq!(state.update(Message::Back).event, Some(Event::Close));
+
+        // A direct save that lands in the browse list stays browsing: the
+        // next back-out is an ordinary one.
+        let mut saved = State::new("Arctic".into(), Vec::new());
+        saved.enter_directly(Message::SaveAsPressed);
+        saved.update(Message::NameChanged("peace".into()));
+        let id = checked_id(saved.update(Message::SaveAsConfirmed));
+        saved.complete(Completion::NameChecked {
+            id,
+            result: Ok(false),
+        });
+        assert!(saved.is_browsing());
+        saved.update(Message::DeletePressed("peace".into()));
+        assert_eq!(saved.update(Message::Back).event, None);
+
+        // Opened at the browse list, backing out of a stage browses again.
+        let mut browsing = State::new("Arctic".into(), Vec::new());
+        browsing.update(Message::ResetPressed);
+        assert_eq!(browsing.update(Message::Back).event, None);
+        assert!(browsing.is_browsing());
     }
 
     #[test]

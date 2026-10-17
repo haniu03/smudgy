@@ -275,6 +275,18 @@ export async function waitForPurple(page, x, y) {
   }).toBeTruthy();
 }
 
+// A list row under the cursor shows its hover highlight once it renders:
+// the readiness signal for rows that arrive asynchronously, such as the
+// Layout menu's saved layouts. Point at an empty stretch of the row, so a
+// glyph never reads as the highlight.
+export async function waitForHighlight(page, x, y) {
+  await page.mouse.move(x, y);
+  await expect.poll(async () => {
+    const [red, green, blue] = await pixel(page, x, y);
+    return red > 20 && Math.abs(red - green) < 8 && Math.abs(red - blue) < 8;
+  }).toBeTruthy();
+}
+
 export async function catalog(page) {
   return page.evaluate(async () => {
     const db = await new Promise((resolve, reject) => {
