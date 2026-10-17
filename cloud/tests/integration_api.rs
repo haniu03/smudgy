@@ -582,6 +582,75 @@ async fn share_host_hints_roundtrip() {
 // 4. Clone flows: area copy with provenance, atlas copy with a copy split
 // ---------------------------------------------------------------------------
 
+/// An atlas copy the server answers before copying every member (202)
+/// reports the rest as pending; they arrive in the new atlas later, linked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn atlas_copy_reports_the_maps_still_on_their_way() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("owner@example.com", "owner", true);
+    let atlas = server.create_atlas(&owner, "World");
+    let first = server.create_area_in_atlas(&owner, "A", atlas);
+    let second = server.create_area_in_atlas(&owner, "B", atlas);
+    let third = server.create_area_in_atlas(&owner, "C", atlas);
+    server.add_room(first, 1, "Gate");
+    server.add_room(second, 1, "Road");
+    server.add_room(third, 1, "Inn");
+    server.add_exit(first, 1, "East", Some((second, 1)));
+
+    server.defer_atlas_copies();
+    let client = api_client(&server.base_url, &owner.api_key);
+    let report = client
+        .copy_atlas(AtlasId(atlas), None)
+        .await
+        .expect("a 202 is a report too");
+    assert_eq!(report.copied.len(), 1);
+    assert_eq!(report.pending, vec![second, third]);
+    assert!(report.skipped.is_empty());
+
+    let mapper = CloudMapper::new(server.base_url.clone(), owner.api_key.clone());
+    let in_copy = |areas: &[smudgy_cloud::Area]| {
+        let mut names: Vec<String> = areas
+            .iter()
+            .filter(|area| area.atlas_id == Some(report.atlas_id))
+            .map(|area| area.name.clone())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        in_copy(&mapper.list_areas().await.expect("list")),
+        vec!["A (copy)".to_string()]
+    );
+
+    server.finish_atlas_copies();
+    let listed = mapper.list_areas().await.expect("list after");
+    assert_eq!(
+        in_copy(&listed),
+        vec![
+            "A (copy)".to_string(),
+            "B (copy)".to_string(),
+            "C (copy)".to_string()
+        ]
+    );
+    let copy_of = |name: &str| {
+        listed
+            .iter()
+            .find(|area| area.atlas_id == Some(report.atlas_id) && area.name == name)
+            .expect("copy listed")
+            .id
+    };
+    let first_copy = mapper.get_area(&copy_of("A (copy)")).await.expect("A copy");
+    let exit = first_copy
+        .rooms
+        .iter()
+        .find(|room| room.room_number == RoomNumber(1))
+        .expect("room 1")
+        .exits
+        .first()
+        .expect("the exit");
+    assert_eq!(exit.to_area_id, Some(copy_of("B (copy)")));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clone_flow() {
     let server = MockServer::spawn().await;

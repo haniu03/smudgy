@@ -1521,6 +1521,7 @@ impl MapEditorWindow {
                 dialog.submitting = false;
                 dialog.results = results;
                 self.mapper.sync_now();
+                return Update::with_task(super::follow_up_syncs());
             }
             (MultiDialog::Servers(dialog), DialogMessage::ServerToggled(server, show)) => {
                 let deltas = server_deltas(&self.map_scopes, &dialog.targets, &server, show);

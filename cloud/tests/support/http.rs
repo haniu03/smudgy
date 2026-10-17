@@ -28,6 +28,11 @@ pub fn created(data: Value) -> Response {
     envelope(201, data)
 }
 
+/// A `202` whose data says what was done and what is still to come.
+pub fn accepted_with(data: Value) -> Response {
+    envelope(202, data)
+}
+
 /// The enumeration-flat `202 {status:"accepted"}` body.
 pub fn accepted() -> Response {
     envelope(202, json!({"status": "accepted"}))

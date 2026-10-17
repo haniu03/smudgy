@@ -2444,7 +2444,10 @@ pub(super) fn update_put_in_clan(
                         .unwrap_or_default();
                     dialog.done = Some(crate::i18n::t!("clan-share-put-done", "clan" => clan));
                     window.mapper.sync_now();
-                    return Update::with_task(super::clan_maps::fetch(window));
+                    return Update::with_task(Task::batch([
+                        super::clan_maps::fetch(window),
+                        super::follow_up_syncs(),
+                    ]));
                 }
                 Err(error) => {
                     dialog.error = Some(match error {

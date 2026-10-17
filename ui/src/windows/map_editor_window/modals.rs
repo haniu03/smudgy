@@ -825,10 +825,15 @@ pub(super) fn update_transfer(
             Ok(()) => {
                 dialog.sent = true;
                 window.mapper.sync_now();
-                Update::with_task(Task::perform(
-                    async { tokio::time::sleep(Duration::from_millis(1600)).await },
-                    |()| transfer(TransferMessage::CloseTick),
-                ))
+                // A transfer into a clan answers once ownership moves; its
+                // maps keep arriving for a while.
+                Update::with_task(Task::batch([
+                    Task::perform(
+                        async { tokio::time::sleep(Duration::from_millis(1600)).await },
+                        |()| transfer(TransferMessage::CloseTick),
+                    ),
+                    super::follow_up_syncs(),
+                ]))
             }
             Err(error) => {
                 dialog.submitting = false;

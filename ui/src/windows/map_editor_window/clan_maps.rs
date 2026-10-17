@@ -742,11 +742,12 @@ pub(super) fn update(
                     }
                 }
             }
-            // The badge follows at once; the refetch confirms it.
+            // The badge follows at once; the refetch confirms it, and the
+            // accepted maps keep arriving for a while.
             for offers in window.clans.transfers.values_mut() {
                 offers.retain(|known| known.id != offer);
             }
-            Update::with_task(refresh(window))
+            Update::with_task(Task::batch([refresh(window), super::follow_up_syncs()]))
         }
         ClanMessage::FolderPicked(offer, choice) => {
             if let Some(ClanModal::Incoming { rows, .. }) = modal_mut(window)

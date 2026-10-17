@@ -87,6 +87,24 @@ use smudgy_map_widget::map_editor::{
 /// [`Message::Tick`]).
 const NOTICE_TTL: Duration = Duration::from_secs(5);
 
+/// When the mapper syncs again after server work a request answered before
+/// finishing: the rest of an atlas copy, a transfer's activation.
+const FOLLOW_UP_SYNCS: [Duration; 4] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(45),
+    Duration::from_secs(120),
+];
+
+/// Syncs that pick up server work still landing after its request answered.
+pub(super) fn follow_up_syncs() -> Task<Message> {
+    Task::batch(FOLLOW_UP_SYNCS.map(|delay| {
+        Task::perform(async move { tokio::time::sleep(delay).await }, |()| {
+            Message::FollowUpSync
+        })
+    }))
+}
+
 /// The copy/paste clipboard, swappable so every editor window can be handed
 /// one shared instance.
 pub type SharedClipboard = Arc<ArcSwap<commands::EntityClipboard>>;
@@ -242,6 +260,8 @@ pub enum Message {
     /// "Copy whole atlas…" pressed inside the copy modal.
     CopyAtlasRequested,
     CopyAtlasCompleted(Result<AtlasCopyReport, CloudError>),
+    /// One of the syncs that follow server work still finishing.
+    FollowUpSync,
     /// The signed-out banner's CTA; bubbles up as [`Event::OpenSettings`].
     OpenSettingsRequested,
     /// The signed-out banner's close affordance; hides the banner and persists
@@ -3712,19 +3732,37 @@ impl MapEditorWindow {
                     Message::CopyAtlasCompleted,
                 ))
             }
+            Message::FollowUpSync => {
+                self.mapper.sync_now();
+                Update::none()
+            }
             Message::CopyAtlasCompleted(result) => {
                 if let Some(modals::Modal::CopyArea(dialog)) = &mut self.modal {
                     dialog.busy = false;
                     match result {
                         Ok(report) => {
-                            dialog.atlas_report = Some(crate::i18n::t!(
-                                "mapper-copy-report",
-                                "copied" => report.copied.len(),
-                                "skipped" => report.skipped.len()
-                            ));
+                            // The server copies the maps one at a time: those
+                            // still on their way arrive with a later sync.
+                            dialog.atlas_report = Some(if report.pending.is_empty() {
+                                crate::i18n::t!(
+                                    "mapper-copy-report",
+                                    "copied" => report.copied.len(),
+                                    "skipped" => report.skipped.len()
+                                )
+                            } else {
+                                crate::i18n::t!(
+                                    "mapper-copy-report-pending",
+                                    "copied" => report.copied.len(),
+                                    "pending" => report.pending.len(),
+                                    "skipped" => report.skipped.len()
+                                )
+                            });
                             // Select the first clone when sync lands it.
                             self.pending_copied_area = report.copied.first().copied();
                             self.mapper.sync_now();
+                            if !report.pending.is_empty() {
+                                return Update::with_task(follow_up_syncs());
+                            }
                         }
                         Err(error) => dialog.error = Some(copy_error_message(&error)),
                     }

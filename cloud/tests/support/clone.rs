@@ -475,7 +475,9 @@ struct CopyAtlasRequest {
 /// skipped (skipped = viewable-but-not-copyable; invisible members dropped
 /// silently); intra-atlas links remap pairwise. An atlas the caller reads
 /// no map of and does not administer, or a clan's atlas to a non-member,
-/// is the uniform 404 (the server's `exportAtlasCopy`).
+/// is the uniform 404 (the server's `planAtlasCopy`). With the
+/// `defer_atlas_copies` hook, every member but the first is still pending
+/// in a 202, as the server's copy job leaves them past a request's budget.
 pub async fn copy_atlas(
     State(state): State<Shared>,
     Path(raw_id): Path<String>,
@@ -590,11 +592,30 @@ pub async fn copy_atlas(
     if !area_map.is_empty() {
         materialize_clone(&mut st, viewer, &area_map);
     }
+    // A deferred copy lands its first member now and the rest later, as the
+    // server's job does past a request's budget: they are made, linked, and
+    // held back until the test lands them.
+    let mut pending: Vec<Uuid> = Vec::new();
+    if st.defer_atlas_copies {
+        for (src, new_area) in area_map.iter().skip(1) {
+            if let Some(record) = st.areas.remove(new_area) {
+                st.deferred_copies.push(record);
+                copied.retain(|id| id != new_area);
+                pending.push(*src);
+            }
+        }
+    }
 
-    created(json!({
+    let report = json!({
         "atlas_id": new_atlas_id,
         "name": new_name,
         "copied": copied,
         "skipped": skipped,
-    }))
+        "pending": pending,
+    });
+    if pending.is_empty() {
+        created(report)
+    } else {
+        super::http::accepted_with(report)
+    }
 }

@@ -1458,6 +1458,7 @@ mapper-shared-by-person = Udostępnione przez { $person }
 mapper-window-title = Smudgy edytor map
 mapper-window-area-title = Smudgy edytor map — { $area }
 mapper-copy-report = Skopiowano mapy: { $copied }; pominięto: { $skipped } (nie można skopiować).
+mapper-copy-report-pending = Skopiowano dotąd map: { $copied }; kolejne ({ $pending }) są w drodze i wkrótce pojawią się w folderze. Pominięto: { $skipped } (nie można skopiować).
 mapper-copy-rooms-denied = Właściciel tej mapy nie zezwolił na kopiowanie pokoi.
 mapper-create-first-room = Utwórz pierwszy pokój
 mapper-create-first-room-help = Następnie wybierz jego położenie na siatce.

@@ -580,13 +580,18 @@ pub struct AreaPref {
 }
 
 /// `POST /atlases/{id}/copy` response: the new atlas plus which source
-/// members were copied or skipped (viewable-but-not-copyable).
+/// members were copied or skipped (viewable-but-not-copyable). The server
+/// copies the members one at a time: a `202` lists under `pending` the
+/// source members still being copied, whose copies arrive in the new atlas
+/// as the server makes them; a `201` has none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AtlasCopyReport {
     pub atlas_id: AtlasId,
     pub name: String,
     pub copied: Vec<AreaId>,
     pub skipped: Vec<AreaId>,
+    #[serde(default)]
+    pub pending: Vec<AreaId>,
 }
 
 /// Which side of share grants to list (`GET /shares?direction=`).
@@ -1513,7 +1518,8 @@ impl CloudApiClient {
     }
 
     /// `POST /atlases/{id}/copy` — copies every member the caller can copy
-    /// into a new atlas, reporting copied and skipped members.
+    /// into a new atlas, reporting copied and skipped members, and those
+    /// still on their way when the server answered before copying them all.
     ///
     /// # Errors
     /// Non-2xx statuses via [`CloudError::from_status`]; transport failures as
