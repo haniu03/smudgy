@@ -38,6 +38,7 @@ pub mod http;
 pub mod identity;
 pub mod mock_server;
 pub mod mutations;
+pub mod pending;
 pub mod projection;
 pub mod reviewed_moves;
 pub mod secret_grants;

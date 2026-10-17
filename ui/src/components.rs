@@ -3,6 +3,7 @@ pub mod clan_panel;
 pub mod cloud_errors;
 pub mod color_picker;
 pub mod modal;
+pub mod pending_invitations;
 pub mod permissions;
 pub mod preset_picker;
 pub mod resize_grips;

@@ -23,6 +23,7 @@ use smudgy_cloud::{CloudError, Uuid};
 
 use crate::cloud_account::CloudHandles;
 use crate::components::cloud_errors::display_error;
+use crate::components::pending_invitations;
 use crate::theme::{self, Element as ThemedElement};
 
 #[derive(Debug, Clone)]
@@ -122,6 +123,19 @@ impl SocialPanel {
     /// refresh — the host should render its verify-email gate.
     pub fn needs_email_verification(&self) -> bool {
         self.email_unverified
+    }
+
+    /// What waits on the caller: incoming friend requests, and the transfer
+    /// offers made to them. `None` until either has loaded.
+    #[must_use]
+    pub fn pending(&self) -> Option<usize> {
+        if self.incoming.is_none() && self.incoming_transfers.is_none() {
+            return None;
+        }
+        Some(pending_invitations::friends_waiting(
+            self.incoming.as_deref().unwrap_or_default(),
+            self.incoming_transfers.as_deref().unwrap_or_default(),
+        ))
     }
 
     /// Reloads friends, requests (both directions), and blocks.

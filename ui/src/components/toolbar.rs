@@ -1,15 +1,12 @@
 use iced::alignment::Vertical;
-use iced::widget::{Row, button, svg, text};
-// The `row!` macro only builds the custom window controls, which macOS
-// (native traffic lights) never renders.
-#[cfg(not(target_os = "macos"))]
-use iced::widget::row;
+use iced::widget::{Row, button, row, svg, text};
 use iced::{Color, Length};
 use smudgy_theme::builtins;
 
 use iced::window;
 
 use crate::assets;
+use crate::components::pending_invitations;
 use crate::theme::Element;
 #[cfg(not(target_os = "windows"))]
 use crate::widgets::titlebar_press::TitlebarPress;
@@ -118,6 +115,27 @@ fn toolbar_button(label: String, message: Message) -> Element<'static, Message> 
         .into()
 }
 
+/// The Settings item, counting the invitations and offers waiting in
+/// Settings › Clans and Friends.
+fn settings_button(pending: usize) -> Element<'static, Message> {
+    let label = crate::i18n::t!("toolbar-settings");
+    if pending == 0 {
+        return toolbar_button(label, Message::SettingsPressed);
+    }
+    button(
+        row![
+            text(label).size(14),
+            pending_invitations::count_pill(pending)
+        ]
+        .spacing(6)
+        .align_y(Vertical::Center),
+    )
+    .style(builtins::button::toolbar)
+    .padding([4, 10])
+    .on_press(Message::SettingsPressed)
+    .into()
+}
+
 /// The hamburger toggle, identical in both toolbar states so it doesn't jump
 /// around when expanding/collapsing.
 fn menu_button() -> Element<'static, Message> {
@@ -168,6 +186,7 @@ pub fn view(
     maximized: bool,
     fullscreen: bool,
     session_context: &SessionContext,
+    pending_invitations: usize,
 ) -> Element<'static, Message> {
     // The maximize state only styles the custom window controls, which macOS
     // doesn't render; the fullscreen state only drops the traffic-light
@@ -207,10 +226,7 @@ pub fn view(
             ));
         }
 
-        buttons.push(toolbar_button(
-            crate::i18n::t!("toolbar-settings"),
-            Message::SettingsPressed,
-        ));
+        buttons.push(settings_button(pending_invitations));
 
         buttons.push(drag_area(window));
         #[cfg(not(target_os = "macos"))]
