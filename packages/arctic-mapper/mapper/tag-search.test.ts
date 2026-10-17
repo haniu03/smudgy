@@ -23,7 +23,12 @@ const mapper = {
     areas,
     getAreaById: (id: string) => areas.find(area => area.id === id)!,
     getPathBetweenRooms: (_from: string, _number: number, to: string, number: number) => routes.get(key(to, number)) ?? [],
-    findNearestRoomWithTags: () => { globalSearches++; return state.room; },
+    findNearestRoomWithTags: (_here: Room, { all = [], none = [] }: { all?: string[]; none?: string[] }) => {
+        globalSearches++;
+        const room = state.room;
+        const has = (tag: string) => !!room?.tags.includes(tag.toUpperCase());
+        return room && all.every(has) && !none.some(has) ? room : undefined;
+    },
     findNearestRoomInArea: (_here: Room, area: Area) => area.room(area.roomNumbers[0]),
 };
 
@@ -42,7 +47,7 @@ globalThis.__tagSearchTest = {
         distanceBetweenRooms: (a: Room, b: Room) => Math.abs(a.x - b.x),
         debugLog() {}, findRoomsAt() {}, idsMatch() {}, linkRooms() {},
         options: {}, parseRoomExits() {}, parseRoomExitsDetailed() {},
-        RoomFlags: {}, roomsImpactedByPush() {}, State: {}, ZMode: {},
+        roomsImpactedByPush() {}, State: {}, ZMode: {},
         Direction: {}, DirectionLetter: {}, MoveCommands: {}, OppositeDirection: {},
     },
     events: { RoomEvent: undefined, mapEvent: { on() {} } },
@@ -99,12 +104,20 @@ function makeRoom(area: Area, number: number, tags: string[], cost?: number) {
     }
     return room;
 }
+/** The matches the host hands an alias or trigger body: every numbered and named group, an
+ *  optional group that did not take part reading "". */
+function hostMatches(match: RegExpExecArray): Record<string, string> {
+    const values: Record<string, string> = {};
+    match.forEach((value, index) => { values[index] = value ?? ""; });
+    for (const [name, value] of Object.entries(match.groups ?? {})) values[name] = value ?? "";
+    return values;
+}
 function run(input: string) {
     const matched = ["speedwalk_tag", "speedwalk_area", "speedwalk_target"].map(name => aliases.get(name)!)
         .filter(alias => alias.pattern.test(input));
     assert.equal(matched.length, 1, `exactly one speedwalk alias handles ${input}`);
     const alias = matched[0];
-    alias.run(alias.pattern.exec(input)!.groups);
+    alias.run(hostMatches(alias.pattern.exec(input)!));
 }
 beforeEach(() => {
     rooms.clear(); areas.length = 0; routes.clear(); walks.length = 0; messages.length = 0; soloWalks.length = 0;
@@ -170,6 +183,16 @@ test("unreachable and missing scoped matches do not fall back to global tags", (
         "No room matching >FOO@Bar is reachable from here.",
         "No room matching >INN@Bar is reachable from here.",
         'No area name starts with "missing".',
+    ]);
+});
+
+test("an unscoped tag that matches nothing reports the tag, not a missing area", () => {
+    run(">nothing");
+    run(">nothing@ ");
+    assert.deepEqual(walks, []);
+    assert.deepEqual(messages, [
+        "No room matching >NOTHING is reachable from here.",
+        "No room matching >NOTHING is reachable from here.",
     ]);
 });
 

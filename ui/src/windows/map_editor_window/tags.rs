@@ -19,7 +19,7 @@ use smudgy_cloud::mapper::area_cache::AreaCache;
 use smudgy_cloud::{RoomNumber, SourceId};
 
 /// The server's limit on a tag, in characters, after normalization.
-pub const TAG_LIMIT: usize = 64;
+pub const TAG_LIMIT: usize = smudgy_cloud::mapper::MAX_TAG_CHARS;
 
 /// The most suggestions under the tag input.
 pub const SUGGESTION_LIMIT: usize = 8;

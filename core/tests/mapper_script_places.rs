@@ -182,6 +182,28 @@ check("map untouched", map.room(1).data("notes"), "Ordinary");
 check("existing tag", await room.in(bookcase).addTag("door"), null);
 await room.in(bookcase.id).addTag("quest");
 check("tag written", room.in(bookcase).tags.join(","), "DOOR,QUEST");
+check("written tag found", found(mapper.findRoomsWithTag("QUEST")), "map:1");
+check("written tag nearest", found([mapper.findNearestRoomWithTags(room, {{ all: ["Quest"] }})]), "map:1");
+check("written tag hasTag", room.hasTag("quest"), true);
+await room.in("private").addTag("snack");
+check("private tag found", found(mapper.findRoomsWithTag("snack")), "map:1");
+check("private tag nearest", found([mapper.findNearestRoomWithTag(room, "SNACK")]), "map:1");
+await room.in("private").removeTag("Snack");
+check("private tag removed", found(mapper.findRoomsWithTag("snack")), "");
+const refusesEmpty = async (label, run) =>
+    check(label, (await failure(run)).includes("tag must not be empty"), true);
+await refusesEmpty("empty map tag", () => mapper.addRoomTag(map, 1, ""));
+await refusesEmpty("blank map tag", () => mapper.addRoomTag(map, 1, "   "));
+await refusesEmpty("blank map untag", () => mapper.removeRoomTag(map, 1, " "));
+await refusesEmpty("blank place tag", () => room.in(bookcase).addTag("  "));
+await refusesEmpty("empty place untag", () => room.in("private").removeTag(""));
+await refusesEmpty("blank batch tag", () => mapper.mutateArea(map, (m) => m.addRoomTag(1, "\t")));
+check("absent map untag", await mapper.removeRoomTag(map, 1, "never"), null);
+check("absent map property", await mapper.deleteRoomProperty(map, 1, "never"), null);
+check("absent area property", await mapper.deleteAreaProperty(map, "never"), null);
+check("absent place data", await room.in(bookcase).deleteData("never"), null);
+check("absent place area data", await map.in(bookcase).deleteData("never"), null);
+check("absent place untag", await room.in(bookcase).removeTag("never"), null);
 await room.in("private").setData("notes", "Mine");
 check("private written", room.in("private").data("notes"), "Mine");
 await mapper.mutateArea(map, async (m) => {{
@@ -1679,6 +1701,14 @@ async fn scripts_reach_a_maps_places() {
             (
                 bookcase,
                 serde_json::json!([{ "op": "add_room_tag", "room_number": 1, "tag": "quest" }]),
+            ),
+            (
+                SourceId::Private,
+                serde_json::json!([{ "op": "add_room_tag", "room_number": 1, "tag": "snack" }]),
+            ),
+            (
+                SourceId::Private,
+                serde_json::json!([{ "op": "remove_room_tag", "room_number": 1, "tag": "Snack" }]),
             ),
             (
                 SourceId::Private,

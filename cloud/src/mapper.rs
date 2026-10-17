@@ -756,6 +756,87 @@ pub fn normalize_tag(tag: &str) -> String {
     tag.trim().to_uppercase()
 }
 
+/// The longest tag a room keeps, in characters once normalized, as the
+/// server bounds it.
+pub const MAX_TAG_CHARS: usize = 64;
+
+/// `tag` as rooms keep it ([`normalize_tag`]), or the server's refusal of a
+/// tag no room may keep: empty or whitespace-only, or longer than
+/// [`MAX_TAG_CHARS`] once normalized.
+///
+/// # Errors
+/// [`CloudError::InvalidInput`] for an empty, whitespace-only or overlong tag.
+pub fn checked_tag(tag: &str) -> CloudResult<String> {
+    let tag = normalize_tag(tag);
+    if tag.is_empty() {
+        return Err(CloudError::InvalidInput(
+            "tag must not be empty".to_string(),
+        ));
+    }
+    if tag.chars().count() > MAX_TAG_CHARS {
+        return Err(CloudError::InvalidInput(format!(
+            "A tag must be at most {MAX_TAG_CHARS} characters"
+        )));
+    }
+    Ok(tag)
+}
+
+/// `tag` as a removal names it: normalized, and refused only when empty or
+/// whitespace-only. A removal takes any length, so a tag stored before the
+/// [`MAX_TAG_CHARS`] bound can still be removed.
+///
+/// # Errors
+/// [`CloudError::InvalidInput`] for an empty or whitespace-only tag.
+pub fn removable_tag(tag: &str) -> CloudResult<String> {
+    let tag = normalize_tag(tag);
+    if tag.is_empty() {
+        return Err(CloudError::InvalidInput(
+            "tag must not be empty".to_string(),
+        ));
+    }
+    Ok(tag)
+}
+
+/// Every tag in `details` as rooms keep it: normalized, and gone when no
+/// room may keep it ([`checked_tag`]). Covers the map's rooms and room data
+/// and every source's; room data that cleaning leaves with nothing goes
+/// too. For documents arriving whole, such as imports.
+pub(crate) fn keep_valid_tags(details: &mut AreaWithDetails) {
+    /// Whether anything changed.
+    fn keep(tags: &mut std::collections::BTreeSet<String>) -> bool {
+        if tags
+            .iter()
+            .all(|tag| checked_tag(tag).is_ok_and(|kept| kept == *tag))
+        {
+            return false;
+        }
+        *tags = tags
+            .iter()
+            .filter_map(|tag| checked_tag(tag).ok())
+            .collect();
+        true
+    }
+    fn keep_data(room_data: &mut Vec<crate::RoomData>) {
+        room_data.retain_mut(|data| {
+            let emptied = keep(&mut data.tags)
+                && data.tags.is_empty()
+                && data.properties.is_empty()
+                && data.exits.is_empty();
+            !emptied
+        });
+    }
+    for room in &mut details.rooms {
+        keep(&mut room.tags);
+    }
+    keep_data(&mut details.room_data);
+    for source in &mut details.sources {
+        for room in &mut source.rooms {
+            keep(&mut room.tags);
+        }
+        keep_data(&mut source.room_data);
+    }
+}
+
 /// An allocated room number, or the refusal of an area whose room numbers
 /// are used up.
 fn room_number_within_range(number: i64) -> CloudResult<RoomNumber> {
@@ -967,6 +1048,44 @@ fn compile_source_mutations(
                         vec![AreaMutation::UpdateExit { exit_id, body }]
                     }
                 }
+            }
+            // Removing a tag the room does not carry changes nothing, so it
+            // is not sent. An invalid tag or a missing room still fails
+            // below.
+            AreaMutation::RemoveRoomTag {
+                room_number,
+                room_source,
+                ref tag,
+            } if removable_tag(tag).is_ok_and(|tag| {
+                crate::backends::source_document::room_carries_tag(
+                    details,
+                    context,
+                    crate::RoomAddress::from_wire(room_source, room_number),
+                    &tag,
+                ) == Some(false)
+            }) =>
+            {
+                Vec::new()
+            }
+            // Deleting a property that is not there changes nothing, so it is
+            // not sent either. A missing room still fails below.
+            AreaMutation::DeleteRoomProperty {
+                room_number,
+                room_source,
+                ref name,
+            } if crate::backends::source_document::room_keeps_property(
+                details,
+                context,
+                crate::RoomAddress::from_wire(room_source, room_number),
+                name,
+            ) == Some(false) =>
+            {
+                Vec::new()
+            }
+            AreaMutation::DeleteAreaProperty { ref name }
+                if !details.properties.iter().any(|kept| kept.name == *name) =>
+            {
+                Vec::new()
             }
             other => vec![other],
         };
@@ -3246,10 +3365,21 @@ impl Mapper {
         self.inner.delete_room_property(room_key, name)
     }
 
+    /// Tags the room in its own place, normalized ([`checked_tag`]).
+    ///
+    /// # Errors
+    /// An empty, whitespace-only or overlong tag is refused before anything
+    /// is queued; otherwise as [`Self::mutate_area`].
     pub fn add_room_tag(&self, room_key: RoomKey, tag: String) -> CloudResult<MutationSubmission> {
         self.inner.add_room_tag(room_key, tag)
     }
 
+    /// Removes a tag from the room's own place, in any case. Removing a tag
+    /// the room does not carry changes nothing and sends nothing.
+    ///
+    /// # Errors
+    /// An empty or whitespace-only tag is refused ([`removable_tag`]);
+    /// otherwise as [`Self::mutate_area`].
     pub fn remove_room_tag(
         &self,
         room_key: RoomKey,
@@ -4337,8 +4467,9 @@ impl Inner {
 
         // §8.4: the whole import is validated before any write — one invalid
         // document rejects the batch (a v1 document migrated on the way in
-        // passes by construction).
-        for details in &areas {
+        // passes by construction). Tags arrive as rooms keep them.
+        for details in &mut areas {
+            keep_valid_tags(details);
             validate_import_document(details)?;
         }
 
@@ -5005,10 +5136,7 @@ impl Inner {
             area_id,
             room_number,
         } = room_key;
-        let tag = normalize_tag(&tag);
-        if tag.is_empty() {
-            return Ok(MutationSubmission::NoChange);
-        }
+        let tag = checked_tag(&tag)?;
         let description = format!("Add tag {tag} to room {room_number}");
         self.mutate_area(
             area_id,
@@ -5032,10 +5160,7 @@ impl Inner {
             area_id,
             room_number,
         } = room_key;
-        let tag = normalize_tag(&tag);
-        if tag.is_empty() {
-            return Ok(MutationSubmission::NoChange);
-        }
+        let tag = removable_tag(&tag)?;
         let description = format!("Remove tag {tag} from room {room_number}");
         self.mutate_area(
             area_id,
@@ -8714,6 +8839,193 @@ mod tests {
         .expect("equal fields are not structural edits");
 
         assert!(compiled.is_empty(), "a no-op must not mint a mutation");
+    }
+
+    #[test]
+    fn tags_are_kept_and_refused_as_the_server_keeps_and_refuses_them() {
+        assert_eq!(checked_tag("  inn ").unwrap(), "INN");
+        let longest = "a".repeat(MAX_TAG_CHARS);
+        assert_eq!(checked_tag(&longest).unwrap(), longest.to_uppercase());
+        for empty in ["", "   ", "\t\n"] {
+            assert!(
+                matches!(checked_tag(empty), Err(CloudError::InvalidInput(m)) if m == "tag must not be empty"),
+                "{empty:?}"
+            );
+        }
+        // Counted once normalized, as the server counts: "ß" uppercases to "SS".
+        for long in [
+            "a".repeat(MAX_TAG_CHARS + 1),
+            "ß".repeat(MAX_TAG_CHARS / 2 + 1),
+        ] {
+            assert!(
+                matches!(checked_tag(&long), Err(CloudError::InvalidInput(m)) if m == "A tag must be at most 64 characters"),
+                "{long}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_whole_document_keeps_only_tags_a_room_may_keep() {
+        let mut details = sample_area(AreaId(Uuid::new_v4()), "Hall");
+        let tags = |list: &[&str]| list.iter().map(|tag| (*tag).to_string()).collect();
+        let overlong = "x".repeat(MAX_TAG_CHARS + 1);
+        details.rooms[0].tags = tags(&["inn", " ", "PEACE", &overlong]);
+        let data = |list: &[&str]| crate::RoomData {
+            room_number: RoomNumber(1),
+            room_source: None,
+            properties: Vec::new(),
+            tags: tags(list),
+            exits: Vec::new(),
+        };
+        details.room_data.push(data(&[" quest", ""]));
+        let mut private = crate::backends::source_document::empty_bundle(SourceId::Private);
+        private.room_data.push(data(&["snack", "\t"]));
+        private.room_data.push(crate::RoomData {
+            room_number: RoomNumber(2),
+            ..data(&["  "])
+        });
+        private.rooms.push(RoomWithDetails {
+            tags: tags(&["nook", ""]),
+            ..details.rooms[0].clone()
+        });
+        details.sources.push(private);
+
+        keep_valid_tags(&mut details);
+        let kept =
+            |set: &std::collections::BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(kept(&details.rooms[0].tags), ["INN", "PEACE"]);
+        assert_eq!(kept(&details.room_data[0].tags), ["QUEST"]);
+        let private = &details.sources[0];
+        assert_eq!(kept(&private.rooms[0].tags), ["NOOK"]);
+        assert_eq!(
+            private
+                .room_data
+                .iter()
+                .map(|data| kept(&data.tags))
+                .collect::<Vec<_>>(),
+            [["SNACK"]],
+            "room data left with nothing goes"
+        );
+    }
+
+    #[test]
+    fn deleting_a_property_that_is_not_there_compiles_to_nothing() {
+        let mut details = sample_area(AreaId(Uuid::new_v4()), "Hall");
+        details.rooms[0].properties.push(crate::Property {
+            name: "notes".to_string(),
+            value: "n".to_string(),
+        });
+        details.properties.push(crate::Property {
+            name: "zone".to_string(),
+            value: "z".to_string(),
+        });
+        let delete_room = |room: i32, name: &str| AreaMutation::DeleteRoomProperty {
+            room_number: RoomNumber(room),
+            room_source: None,
+            name: name.to_string(),
+        };
+        let delete_area = |name: &str| AreaMutation::DeleteAreaProperty {
+            name: name.to_string(),
+        };
+        let compile =
+            |ops| compile_area_mutations(&mut details.clone(), ops, PairedExitPolicy::Reject);
+
+        assert!(
+            compile(vec![delete_room(1, "kws"), delete_area("summary")])
+                .unwrap()
+                .is_empty(),
+            "nothing to delete sends nothing"
+        );
+        assert_eq!(
+            compile(vec![delete_room(1, "notes"), delete_area("zone")])
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            compile(vec![delete_room(1, "notes"), delete_room(1, "notes")])
+                .unwrap()
+                .len(),
+            1,
+            "a second delete in the batch finds it gone"
+        );
+        assert!(matches!(
+            compile(vec![delete_room(9, "notes")]),
+            Err(CloudError::RoomNotFound(_))
+        ));
+
+        // A replay over a map that already lost the property changes nothing.
+        let mut replayed = details.clone();
+        replayed.rooms[0].properties.clear();
+        area_edits::apply_mutation(&mut replayed, &delete_room(1, "notes"))
+            .expect("an absent property's deletion changes nothing");
+    }
+
+    #[test]
+    fn removing_a_tag_the_room_lacks_compiles_to_nothing() {
+        let mut details = sample_area(AreaId(Uuid::new_v4()), "Hall");
+        details.rooms[0].tags.insert("PEACE".to_string());
+        let remove = |room: i32, tag: &str| AreaMutation::RemoveRoomTag {
+            room_number: RoomNumber(room),
+            room_source: None,
+            tag: tag.to_string(),
+        };
+        let compile =
+            |ops| compile_area_mutations(&mut details.clone(), ops, PairedExitPolicy::Reject);
+
+        assert!(
+            compile(vec![remove(1, "inn")]).unwrap().is_empty(),
+            "the server refuses to remove a tag the room lacks"
+        );
+        assert_eq!(compile(vec![remove(1, "peace")]).unwrap().len(), 1);
+        let added_then_removed = compile(vec![
+            AreaMutation::AddRoomTag {
+                room_number: RoomNumber(1),
+                room_source: None,
+                tag: "inn".to_string(),
+            },
+            remove(1, "INN"),
+        ])
+        .unwrap();
+        assert_eq!(added_then_removed.len(), 2, "earlier operations count");
+        let mixed = compile(vec![
+            AreaMutation::AddRoomTag {
+                room_number: RoomNumber(1),
+                room_source: None,
+                tag: "inn".to_string(),
+            },
+            remove(1, "never"),
+        ])
+        .unwrap();
+        assert!(
+            matches!(mixed.as_slice(), [AreaMutation::AddRoomTag { .. }]),
+            "only the absent removal goes: {mixed:?}"
+        );
+
+        // A tag stored before the length bound can still be removed.
+        let overlong = "x".repeat(MAX_TAG_CHARS + 1);
+        let mut legacy = details.clone();
+        legacy.rooms[0].tags.insert(overlong.clone());
+        let removed = compile_area_mutations(
+            &mut legacy,
+            vec![remove(1, &overlong)],
+            PairedExitPolicy::Reject,
+        )
+        .unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(!legacy.rooms[0].tags.contains(&overlong.to_uppercase()));
+        assert!(
+            compile(vec![remove(1, &overlong)]).unwrap().is_empty(),
+            "an absent overlong tag sends nothing either"
+        );
+        assert!(matches!(
+            compile(vec![remove(9, "inn")]),
+            Err(CloudError::RoomNotFound(_))
+        ));
+        assert!(matches!(
+            compile(vec![remove(1, " ")]),
+            Err(CloudError::InvalidInput(m)) if m == "tag must not be empty"
+        ));
     }
 
     #[test]

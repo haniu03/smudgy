@@ -5,6 +5,15 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { mapEvent, type RoomEvent } from "./events.ts";
 
+/** The matches the host hands an alias or trigger body: every numbered and named group, an
+ *  optional group that did not take part reading "". */
+function hostMatches(match: RegExpExecArray): Record<string, string> {
+  const values: Record<string, string> = {};
+  match.forEach((value, index) => { values[index] = value ?? ""; });
+  for (const [name, value] of Object.entries(match.groups ?? {})) values[name] = value ?? "";
+  return values;
+}
+
 // Replay incoming lines through the registered trigger scripts, with only the
 // Smudgy host and cross-package prompt event replaced by test doubles.
 let fixtureId = 0;
@@ -66,7 +75,7 @@ async function capture() {
         if (trigger.antiPatterns?.some((pattern: RegExp) => pattern.test(line.text))) continue;
         for (const pattern of trigger.rawPatterns ?? trigger.patterns ?? []) {
           const match = pattern.exec(trigger.rawPatterns ? raw : line.text);
-          if (match) { trigger.script({ ...match, ...match.groups }); break; }
+          if (match) { trigger.script(hostMatches(match)); break; }
         }
       }
       await Promise.resolve();

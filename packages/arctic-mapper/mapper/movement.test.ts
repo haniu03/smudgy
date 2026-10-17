@@ -64,11 +64,19 @@ registerHooks({
 const { state, State, Direction, MoveCommands, speedwalk } = await import("./mapper.ts");
 await import("./alias.ts");
 
+/** The matches the host hands an alias or trigger body: every numbered and named group, an
+ *  optional group that did not take part reading "". */
+function hostMatches(match: RegExpExecArray): Record<string, string> {
+    const values: Record<string, string> = {};
+    match.forEach((value, index) => { values[index] = value ?? ""; });
+    for (const [name, value] of Object.entries(match.groups ?? {})) values[name] = value ?? "";
+    return values;
+}
 function move(input: string) {
     const alias = aliases.get("mapper_captureMovements")!;
     const match = alias.pattern.exec(input);
     if (!match) return false;
-    alias.run({ ...match, ...match.groups });
+    alias.run(hostMatches(match));
     return true;
 }
 const exit = (fromDirection: string, toRoomNumber: number, extra = {}) => ({

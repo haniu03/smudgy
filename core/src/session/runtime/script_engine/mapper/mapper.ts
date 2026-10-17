@@ -774,7 +774,9 @@ class RoomView {
     }
 
     async removeTag(tag: string): Promise<OperationId | null> {
-        if (!this.hasTag(tag)) return null;
+        // A blank tag goes on to the host, which refuses it. Blank means Unicode White_Space only,
+        // as the host trims.
+        if (!/^\p{White_Space}*$/u.test(String(tag)) && !this.hasTag(tag)) return null;
         const room = this.#room;
         if (this.#own) return mapper.removeRoomTag(room.areaId, room, tag);
         const { mapId, ...anchor } = this.#attachmentAddress();
@@ -1181,15 +1183,18 @@ const mapper = {
 
     /** Add a case-insensitive tag to a room, in the room's own place (on a map room, the map's
      * tags, which everyone who reads the map sees; `room.in(place).addTag` tags it in another
-     * place). The tag is normalized to UPPERCASE; re-adding an existing tag is a no-op. Requires
-     * the `mapper:write` capability. */
+     * place). The tag is normalized to UPPERCASE; re-adding an existing tag is a no-op. Rejects a
+     * tag that is empty or only whitespace, or longer than 64 characters. Requires the
+     * `mapper:write` capability. */
     addRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
         const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_add_room_tag(areaId, roomNumber, tag);
     },
 
-    /** Remove a tag from a room's own place (case-insensitive). Requires `mapper:write`. */
+    /** Remove a tag from a room's own place (case-insensitive). Removing one the room's own place
+     * does not keep resolves to `null`, even when another place tags the room. Rejects a tag that
+     * is empty or only whitespace. Requires `mapper:write`. */
     removeRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
         const roomNumber = roomNumberOf(room);

@@ -82,7 +82,7 @@ async function loadSession(name: string, room: TargetLocation | null) {
         mapper: {
             state, onRoomChanged: (callback: Function) => roomListeners.push(callback),
             onAreaChanged() {}, onModeChanged() {}, speedwalk() {}, options: {},
-            State: {}, Direction: {}, DirectionLetter: {}, MoveCommands: {}, RoomFlags: {},
+            State: {}, Direction: {}, DirectionLetter: {}, MoveCommands: {},
         },
         consumer: { sessionTarget: { from: (other: SessionHandle) => ({
             get value() { return snapshots.get(other.id); },

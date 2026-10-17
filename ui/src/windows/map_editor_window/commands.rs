@@ -1336,11 +1336,16 @@ fn delete_in(
                     value: value.to_string(),
                 }),
         );
-        step.extend(room.tags().map(|tag| AreaMutation::AddRoomTag {
-            room_number: number.number,
-            room_source: number.wire_source(),
-            tag: tag.to_string(),
-        }));
+        // A tag no room may keep (an old local write) is not restored.
+        step.extend(
+            room.tags()
+                .filter(|tag| smudgy_cloud::mapper::checked_tag(tag).is_ok())
+                .map(|tag| AreaMutation::AddRoomTag {
+                    room_number: number.number,
+                    room_source: number.wire_source(),
+                    tag: tag.to_string(),
+                }),
+        );
         // An exit whose link row is missing returns under its id and
         // finds its link again.
         step.extend(
@@ -3568,7 +3573,12 @@ pub fn paste_into_source(
                     value: value.clone(),
                 });
             }
-            for tag in &room.tags {
+            // A tag no room may keep (an old local write) is not pasted.
+            for tag in room
+                .tags
+                .iter()
+                .filter(|tag| smudgy_cloud::mapper::checked_tag(tag).is_ok())
+            {
                 compound.push(AreaMutation::AddRoomTag {
                     room_source,
                     room_number: number,

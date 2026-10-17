@@ -142,7 +142,7 @@ map room unlink <direction>      Delete exits in a direction
 map room shift <direction>       Move the selected room one step on the grid
 map room delete                  Delete the selected room
 map room show                    Print title/description/coords/exits
-map room flag set|clear <flag>   Set or clear a room flag (e.g. SPIN)
+map room flag set|clear <flag>   Set or clear a room flag; any name works (e.g. SPIN)
 map room automerge               Merge the nearest duplicate room into this one
 
 map exit <dir>                   Show the exit's door, commands and flags

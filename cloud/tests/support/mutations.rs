@@ -1951,12 +1951,15 @@ fn apply_delete_room_property(
     let Some(room) = area.rooms.get_mut(&room_number) else {
         return Err(err(404, "Room not found"));
     };
-    if room.properties.remove(&name).is_none() {
-        return Err(err(404, "Room property not found"));
-    }
-    Ok(OpOutcome::scoped(
-        json!({"entity": "room_property_deleted", "room_number": room_number, "name": name}),
-    ))
+    // Deleting a property the room does not have changes nothing
+    // (smudgy-cloudflare `deleteRoomProperty`).
+    let deleted = room.properties.remove(&name).is_some();
+    Ok(OpOutcome {
+        result: json!({"entity": "room_property_deleted", "room_number": room_number, "name": name}),
+        changed: deleted,
+        foreign_bumps: Vec::new(),
+        secret_bumps: Vec::new(),
+    })
 }
 
 /// Add or remove one room tag, normalized trim+UPPERCASE (`ops.rs`
@@ -1983,14 +1986,15 @@ fn apply_room_tag(
             secret_bumps: Vec::new(),
         })
     } else {
-        // The deployed server 404s an absent tag and rolls the envelope
-        // back (`delete_room_tag_in_tx` checks `rows_affected`).
-        if !room.tags.remove(&normalized) {
-            return Err(err(404, "Not found"));
-        }
-        Ok(OpOutcome::scoped(
-            json!({"entity": "room_tag_removed", "room_number": room_number, "tag": normalized}),
-        ))
+        // Removing a tag the room does not have changes nothing, as
+        // re-adding one does (smudgy-cloudflare `removeRoomTag`).
+        let removed = room.tags.remove(&normalized);
+        Ok(OpOutcome {
+            result: json!({"entity": "room_tag_removed", "room_number": room_number, "tag": normalized}),
+            changed: removed,
+            foreign_bumps: Vec::new(),
+            secret_bumps: Vec::new(),
+        })
     }
 }
 
@@ -2015,12 +2019,15 @@ fn apply_delete_area_property(
     ctx: &ApplyCtx,
     name: String,
 ) -> Result<OpOutcome, Response> {
-    if scope_area(working, ctx).properties.remove(&name).is_none() {
-        return Err(err(404, "Property not found"));
-    }
-    Ok(OpOutcome::scoped(
-        json!({"entity": "area_property_deleted", "name": name}),
-    ))
+    // Deleting a property the source does not have changes nothing
+    // (smudgy-cloudflare `deleteAreaProperty`).
+    let deleted = scope_area(working, ctx).properties.remove(&name).is_some();
+    Ok(OpOutcome {
+        result: json!({"entity": "area_property_deleted", "name": name}),
+        changed: deleted,
+        foreign_bumps: Vec::new(),
+        secret_bumps: Vec::new(),
+    })
 }
 
 fn apply_create_exit(
