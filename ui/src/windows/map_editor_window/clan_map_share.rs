@@ -40,6 +40,7 @@ use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::update::Update;
 
+use super::area_list::name_order;
 use super::{MapEditorWindow, Message, modals};
 
 fn muted(theme: &crate::Theme) -> iced::widget::text::Style {
@@ -884,7 +885,7 @@ pub(super) fn open(window: &mut MapEditorWindow, area_id: AreaId) -> Update<Mess
             name: folder.name.clone(),
         })
         .collect();
-    accept_folders.sort_by_key(|folder| folder.name.to_lowercase());
+    accept_folders.sort_by(|a, b| name_order(&a.name, a.id.0, &b.name, b.id.0));
     // A Secret is shared from the open map's dialog, so only the open map
     // lists its Secrets here.
     let open_map = window.editor.area_id() == Some(area_id);

@@ -16,6 +16,7 @@ use smudgy_cloud::{
 };
 use smudgy_map_widget::map_editor::PlacedRoom;
 
+use super::area_list::name_order;
 use super::document::Document;
 
 /// A room anywhere: its map, its place on that map, and its number there.
@@ -874,7 +875,7 @@ pub fn other_maps(
         .map(|area| (*area.get_id(), area.get_name().to_string()))
         .filter(|(_, name)| query.is_empty() || name.to_lowercase().contains(&query))
         .collect();
-    maps.sort_by_cached_key(|(_, name)| name.to_lowercase());
+    maps.sort_by(|(a_id, a), (b_id, b)| name_order(a, a_id.0, b, b_id.0));
     maps
 }
 
