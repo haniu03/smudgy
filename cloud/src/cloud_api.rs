@@ -156,6 +156,32 @@ pub struct FriendRequestView {
     pub created_at: DateTime<Utc>,
 }
 
+/// `GET /me/pending` response: how many answers wait on the caller, by kind.
+/// Each counts as its list does, except that the Secret and map ownership
+/// offers leave out those the caller has already accepted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCounts {
+    pub clan_invitations: usize,
+    pub secret_offers: usize,
+    pub map_offers: usize,
+    pub friend_requests: usize,
+    pub transfer_offers: usize,
+}
+
+impl PendingCounts {
+    /// Clan invitations and ownership offers.
+    #[must_use]
+    pub const fn clans(self) -> usize {
+        self.clan_invitations + self.secret_offers + self.map_offers
+    }
+
+    /// Incoming friend requests and transfer offers.
+    #[must_use]
+    pub const fn friends(self) -> usize {
+        self.friend_requests + self.transfer_offers
+    }
+}
+
 /// `GET /friends/requests` response: pending requests, both directions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FriendRequests {
@@ -1077,6 +1103,16 @@ impl CloudApiClient {
     /// [`CloudError::NetworkError`].
     pub async fn friend_requests(&self) -> CloudResult<FriendRequests> {
         self.get("/friends/requests").await
+    }
+
+    /// `GET /me/pending` — how many clan invitations, ownership offers,
+    /// friend requests and transfer offers wait on the caller, in one call.
+    ///
+    /// # Errors
+    /// Non-2xx statuses via [`CloudError::from_status`]; transport failures as
+    /// [`CloudError::NetworkError`].
+    pub async fn pending_counts(&self) -> CloudResult<PendingCounts> {
+        self.get("/me/pending").await
     }
 
     /// `POST /friends/requests` — `202` always. The server never

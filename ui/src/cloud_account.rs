@@ -515,6 +515,13 @@ impl CloudAccount {
         self.snapshot.load_full()
     }
 
+    /// The credential generation in use; it moves on every sign-in, sign-out
+    /// and credential swap.
+    #[must_use]
+    pub fn credential_generation(&self) -> u64 {
+        self.credentials.generation()
+    }
+
     /// Whether automatic update checks are enabled — the master switch for the
     /// launch-time and periodic checks and the soft upgrade prompt.
     #[must_use]

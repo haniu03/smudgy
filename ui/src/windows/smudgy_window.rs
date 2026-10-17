@@ -3510,6 +3510,7 @@ impl SmudgyWindow {
         &'a self,
         sessions: &'a SessionStore,
         drag: DragViewContext<'a>,
+        pending_invitations: usize,
     ) -> ThemedElement<'a, Message> {
         let session_context = self.create_session_context(sessions);
         let toolbar_element = toolbar::view(
@@ -3518,6 +3519,7 @@ impl SmudgyWindow {
             self.maximized,
             self.fullscreen,
             &session_context,
+            pending_invitations,
         );
 
         // Header-visibility rule (§2.11): a pane's title bar is attached only
@@ -5499,7 +5501,7 @@ mod tests {
         for tab in window.layout().panes() {
             assert!(window.placeholder_descriptor(tab.id()).is_none());
         }
-        let _ = window.view(&sessions, DragViewContext::default());
+        let _ = window.view(&sessions, DragViewContext::default(), 0);
     }
 
     #[test]
@@ -5742,7 +5744,7 @@ mod tests {
         );
         // Building the view drives the grid closure for every slot — an
         // unbound group must resolve to a placeholder body, never panic.
-        let _ = window.view(&sessions, DragViewContext::default());
+        let _ = window.view(&sessions, DragViewContext::default(), 0);
     }
 
     /// A user-initiated layout apply that spawned a missing session
@@ -5807,6 +5809,6 @@ mod tests {
                 .map(|descriptor| descriptor.label),
             Some("map".to_string())
         );
-        let _ = window.view(&sessions, DragViewContext::default());
+        let _ = window.view(&sessions, DragViewContext::default(), 0);
     }
 }

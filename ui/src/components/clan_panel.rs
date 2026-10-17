@@ -44,6 +44,7 @@ use smudgy_palette::{ColorSequence, Rgb};
 use crate::cloud_account::CloudHandles;
 use crate::components::clan_map_offers;
 use crate::components::cloud_errors::display_error;
+use crate::components::pending_invitations;
 use crate::presets::ScopeKind;
 
 pub use editor::{
@@ -583,14 +584,12 @@ impl ClanPanel {
     /// offers they have not accepted yet.
     #[must_use]
     pub fn pending(&self) -> usize {
-        let me = self.me();
-        self.invitations.len()
-            + self.map_offers.waiting(me)
-            + self
-                .offers
-                .iter()
-                .filter(|offer| !me.is_some_and(|me| offer.accepted_by(me)))
-                .count()
+        pending_invitations::clans_waiting(
+            self.invitations.len(),
+            &self.offers,
+            &self.map_offers,
+            self.me(),
+        )
     }
 
     /// Leaves the clan page and its dialogs. Late page replies are ignored

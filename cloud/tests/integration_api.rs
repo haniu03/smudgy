@@ -5,7 +5,9 @@
 
 mod support;
 
-use smudgy_cloud::cloud_api::{CopyAreaRequest, CreateShareRequest, ShareDirection, ShareScope};
+use smudgy_cloud::cloud_api::{
+    CopyAreaRequest, CreateShareRequest, PendingCounts, ShareDirection, ShareScope,
+};
 use smudgy_cloud::{
     AreaId, AtlasId, CloudApiClient, CloudError, CloudMapper, CreateAreaRequest, Credential,
     CredentialSource, MapperBackend, RoomNumber,
@@ -430,6 +432,44 @@ async fn friends_and_blocks_lifecycle() {
     assert!(
         requests.incoming.is_empty(),
         "the shadow-pending never reaches the blocking target"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_counts_what_waits_on_the_caller() {
+    let server = MockServer::spawn().await;
+    let alice = server.create_user("alice@example.com", "alice", true);
+    let bob = server.create_user("bob@example.com", "bob", true);
+    let carol = server.create_user("carol@example.com", "carol", true);
+    let client_a = api_client(&server.base_url, &alice.api_key);
+    let client_b = api_client(&server.base_url, &bob.api_key);
+    let client_c = api_client(&server.base_url, &carol.api_key);
+    assert_eq!(
+        client_b.pending_counts().await.expect("bob's counts"),
+        PendingCounts::default()
+    );
+
+    client_a
+        .send_friend_request(bob.id)
+        .await
+        .expect("send is a flat 202");
+    server.befriend(&alice, &carol);
+    let area = server.create_area(&alice, "Heirloom");
+    client_a
+        .offer_area_transfer(area, carol.id)
+        .await
+        .expect("alice offers her map");
+
+    let bob_waits = client_b.pending_counts().await.expect("bob's counts");
+    assert_eq!(bob_waits.friend_requests, 1);
+    assert_eq!((bob_waits.clans(), bob_waits.friends()), (0, 1));
+    let carol_waits = client_c.pending_counts().await.expect("carol's counts");
+    assert_eq!(carol_waits.transfer_offers, 1);
+    assert_eq!(carol_waits.friends(), 1);
+    // What Alice asked of others waits on them, not on her.
+    assert_eq!(
+        client_a.pending_counts().await.expect("alice's counts"),
+        PendingCounts::default()
     );
 }
 

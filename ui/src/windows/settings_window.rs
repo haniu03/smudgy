@@ -28,6 +28,7 @@ use crate::cloud_account::{CloudHandles, DeletionKey};
 use crate::components::clan_panel::{self, ClanPanel};
 use crate::components::cloud_errors::display_error;
 use crate::components::color_picker::{self, ColorPicker};
+use crate::components::pending_invitations::{self, Pending};
 use crate::components::social_panel::{self, SocialPanel};
 use crate::i18n::{self, LocaleChoice, t, ts};
 use crate::prefs;
@@ -408,14 +409,22 @@ impl SettingsWindow {
         input.chars().filter(char::is_ascii_digit).collect()
     }
 
-    /// What the window loads as it opens: the clans and what waits there,
-    /// so the Clans item can show its count before the tab is opened.
-    pub fn prefetch(&mut self) -> Task<Message> {
-        if self.cloud.snapshot.get().email_verified {
-            self.clans.refresh().map(Message::Clans)
-        } else {
-            Task::none()
+    /// What waits on the user's answer, per tab, as far as the panels know:
+    /// a tab counts once it has loaded its lists.
+    #[must_use]
+    pub fn pending(&self) -> Pending {
+        Pending {
+            clans: self.clans.is_loaded().then(|| self.clans.pending()),
+            friends: self.social.pending(),
         }
+    }
+
+    /// The counts the nav shows: what the daemon last read (`counted`),
+    /// except where a tab has loaded its own lists.
+    fn waiting(&self, counted: Pending) -> Pending {
+        let mut waiting = counted;
+        waiting.absorb(self.pending());
+        waiting
     }
 
     pub fn update(&mut self, message: Message) -> Update<Message, Event> {
@@ -1146,8 +1155,10 @@ impl SettingsWindow {
     }
 
     /// The left nav rail, shared by [`Self::view`] and the daemon's composed
-    /// Audio pane.
-    pub fn nav(&self) -> ThemedElement<'_, Message> {
+    /// Audio pane. `counted` is what the daemon last read waiting on the user;
+    /// a tab that has loaded its own lists counts those instead.
+    pub fn nav(&self, counted: Pending) -> ThemedElement<'_, Message> {
+        let waiting = self.waiting(counted);
         let mut nav = column![
             nav_button(t!("nav-account"), self.tab == Tab::Account, Tab::Account),
             nav_button(
@@ -1169,16 +1180,17 @@ impl SettingsWindow {
             self.tab == Tab::Security,
             Tab::Security,
         ));
-        nav = nav.push(nav_button(
+        nav = nav.push(nav_button_with_count(
             t!("nav-friends"),
             self.tab == Tab::Friends,
             Tab::Friends,
+            waiting.friends.unwrap_or(0),
         ));
         nav = nav.push(nav_button_with_count(
             t!("nav-clans"),
             self.tab == Tab::Clans,
             Tab::Clans,
-            self.clans.pending(),
+            waiting.clans.unwrap_or(0),
         ));
         nav = nav.push(nav_button(
             t!("nav-licenses"),
@@ -1188,7 +1200,7 @@ impl SettingsWindow {
         nav.spacing(4).width(140).into()
     }
 
-    pub fn view(&self) -> ThemedElement<'_, Message> {
+    pub fn view(&self, counted: Pending) -> ThemedElement<'_, Message> {
         let content: ThemedElement<'_, Message> = match self.tab {
             Tab::Account => self.account_view(),
             Tab::Preferences => self.preferences_view(),
@@ -1223,7 +1235,12 @@ impl SettingsWindow {
             .into(),
             None => page.into(),
         };
-        row![container(self.nav()).padding(12), rule::vertical(1), page].into()
+        row![
+            container(self.nav(counted)).padding(12),
+            rule::vertical(1),
+            page
+        ]
+        .into()
     }
 
     fn feedback(&self) -> ThemedElement<'_, Message> {
@@ -2203,24 +2220,23 @@ fn nav_button_with_count(
     if count == 0 {
         return nav_button(label, selected, tab);
     }
-    let pill = container(text(count.to_string()).size(11))
-        .padding([0, 6])
-        .style(|theme: &crate::Theme| container::Style {
-            background: Some(theme.styles.general.accent.into()),
-            text_color: Some(iced::Color::WHITE),
-            border: iced::border::rounded(8.0),
-            ..Default::default()
-        });
-    button(row![text(label).size(14), space::horizontal(), pill].align_y(iced::Alignment::Center))
-        .style(if selected {
-            theme::builtins::button::list_item_selected
-        } else {
-            theme::builtins::button::list_item
-        })
-        .width(Length::Fill)
-        .padding([6, 10])
-        .on_press(Message::TabSelected(tab))
-        .into()
+    button(
+        row![
+            text(label).size(14),
+            space::horizontal(),
+            pending_invitations::count_pill(count)
+        ]
+        .align_y(iced::Alignment::Center),
+    )
+    .style(if selected {
+        theme::builtins::button::list_item_selected
+    } else {
+        theme::builtins::button::list_item
+    })
+    .width(Length::Fill)
+    .padding([6, 10])
+    .on_press(Message::TabSelected(tab))
+    .into()
 }
 
 fn nav_button(label: String, selected: bool, tab: Tab) -> ThemedElement<'static, Message> {
@@ -2439,5 +2455,62 @@ mod tests {
         };
         assert!(unknown.applies(3, Some(mira)));
         assert!(!unknown.applies(4, Some(mira)));
+    }
+
+    #[test]
+    fn friends_counts_incoming_requests_and_transfer_offers() {
+        use smudgy_cloud::cloud_api::{FriendRequestView, FriendRequests, TransferView};
+
+        let mut window = SettingsWindow::new(crate::cloud_account::test_handles_signed_in("mira"));
+        assert_eq!(window.pending().friends, None, "nothing has loaded");
+
+        let created_at = "2026-01-01T00:00:00Z".parse().unwrap();
+        let request = |n| FriendRequestView {
+            user_id: Uuid::from_u128(n),
+            nickname: None,
+            created_at,
+        };
+        let _ = window.update(Message::Social(social_panel::Message::RequestsLoaded(Ok(
+            FriendRequests {
+                incoming: vec![request(1), request(2)],
+                // Requests the user sent wait on someone else.
+                outgoing: vec![request(3)],
+            },
+        ))));
+        assert_eq!(window.pending().friends, Some(2));
+
+        let transfer: TransferView = serde_json::from_value(serde_json::json!({
+            "id": Uuid::from_u128(9),
+            "subject_kind": "area",
+            "from_user_id": Uuid::from_u128(4),
+            "status": "Offered",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        let _ = window.update(Message::Social(social_panel::Message::TransfersLoaded(Ok(
+            (vec![transfer.clone()], vec![transfer]),
+        ))));
+        assert_eq!(
+            window.pending(),
+            Pending {
+                clans: None,
+                friends: Some(3),
+            },
+            "offers the user made wait on someone else"
+        );
+
+        // The Friends tab's own lists count over the daemon's read; the
+        // Clans tab, not loaded, shows the daemon's.
+        let counted = Pending {
+            clans: Some(2),
+            friends: Some(7),
+        };
+        assert_eq!(
+            window.waiting(counted),
+            Pending {
+                clans: Some(2),
+                friends: Some(3),
+            }
+        );
     }
 }

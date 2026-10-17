@@ -158,6 +158,7 @@ fn router(state: Shared) -> Router {
         .route("/me/api-keys/:key_id", delete(identity::delete_api_key))
         .route("/me/sessions", get(identity::list_sessions))
         .route("/me/sessions/:session_id", delete(identity::delete_session))
+        .route("/me/pending", get(super::pending::pending))
         // social
         .route("/users/lookup", get(social::lookup))
         .route("/friends", get(social::list_friends))

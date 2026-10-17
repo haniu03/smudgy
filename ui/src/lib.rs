@@ -115,6 +115,7 @@ fn preview_build_stamp() -> String {
 }
 
 use crate::cloud_account::CloudAccount;
+use crate::components::pending_invitations::{self, Pending};
 use crate::discord_presence::DiscordPresence;
 use crate::session_store::SessionStore;
 use crate::windows::map_editor_window::{self, MapEditorWindow, SharedClipboard};
@@ -197,6 +198,9 @@ struct Smudgy {
     /// for a map, or its Share dialog, while no editor was open.
     pending_map_area: Option<windows::map_editor_window::Message>,
     settings_windows: BTreeMap<window::Id, SettingsWindow>,
+    /// The invitations and offers waiting in Settings › Clans and Friends,
+    /// counted beside the toolbar's Settings item.
+    pending_invitations: pending_invitations::Watch,
     /// Areas the user excludes from room identification, mirrored from
     /// settings.json. The authoritative copy for fan-out to live mappers.
     /// This is the **derived** effective set — exactly the `disabled == true`
@@ -583,6 +587,10 @@ enum Message {
     AreaPrefsReconcileTick,
     /// `GET /me/area-prefs` landed: merge (last-write-wins) into the local set.
     AreaPrefsFetched(Result<Vec<AreaPref>, CloudError>),
+    /// Periodic trigger to count the invitations and offers waiting again.
+    PendingInvitationsTick,
+    /// The counts landed, for the account they were read under.
+    PendingInvitationsFetched(Option<pending_invitations::Account>, Pending),
     /// A `PUT /me/area-prefs/{id}` push completed; adopt the server-stamped
     /// `updated_at` (or, on a uniform 404 / error, leave the local pref as-is).
     AreaPrefPushed {
@@ -909,6 +917,7 @@ fn init(
             map_editor_windows: BTreeMap::new(),
             pending_map_area: None,
             settings_windows: BTreeMap::new(),
+            pending_invitations: pending_invitations::Watch::default(),
             disabled_map_areas,
             area_prefs,
             area_prefs_push_parked: HashSet::new(),
@@ -1260,6 +1269,15 @@ fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
         // tick lands at +24h; launch already refreshed via `CloudAccount::new`).
         subs.push(
             iced::time::every(Duration::from_secs(86_400)).map(|_| Message::SessionRefreshTick),
+        );
+    }
+
+    // Recount what waits on the user's answer once an hour, so an invitation
+    // that arrives while nothing else asks still reaches the toolbar.
+    if smudgy.pending_invitations.account().is_some() {
+        subs.push(
+            iced::time::every(pending_invitations::POLL_INTERVAL)
+                .map(|_| Message::PendingInvitationsTick),
         );
     }
 
@@ -2218,7 +2236,29 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
     if workspace_dirty {
         smudgy.workspace.schedule.mark();
     }
+    // Whatever signed an account in or out, verified it, or swapped its
+    // credential, the counts start over and are read again for it.
+    let account = pending_invitations::Account::of(
+        &smudgy.account.snapshot(),
+        smudgy.account.credential_generation(),
+    );
+    if smudgy.pending_invitations.follow(account) && account.is_some() {
+        return Task::batch([task, fetch_pending_invitations(smudgy)]);
+    }
     task
+}
+
+/// Counts what waits on the followed account's answer, if one is followed:
+/// at launch or sign-in, once an hour, and as Settings or a map editor opens.
+fn fetch_pending_invitations(smudgy: &Smudgy) -> Task<Message> {
+    let account = smudgy.pending_invitations.account();
+    if account.is_none() {
+        return Task::none();
+    }
+    let client = smudgy.account.handles().client;
+    Task::perform(pending_invitations::fetch(client), move |counts| {
+        Message::PendingInvitationsFetched(account, counts)
+    })
 }
 
 /// Start one workspace geometry poll over every live smudgy window (three
@@ -3350,6 +3390,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 .focused_widgets
                 .insert(id, master.clone());
             Task::batch([
+                fetch_pending_invitations(smudgy),
                 Task::done(Message::SettingsWindowMessage(
                     id,
                     settings_window::Message::TabSelected(settings_window::Tab::Audio),
@@ -5181,10 +5222,11 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 location,
             );
             smudgy.map_editor_windows.insert(id, window);
-            match smudgy.pending_map_area.take() {
+            let shown = match smudgy.pending_map_area.take() {
                 Some(message) => Task::done(Message::MapEditorWindowMessage(id, message)),
                 None => Task::none(),
-            }
+            };
+            Task::batch([shown, fetch_pending_invitations(smudgy)])
         }
         Message::CreateSettingsWindow => {
             // Reuse an existing settings window rather than stacking copies.
@@ -5196,18 +5238,24 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             }
         }
         Message::NewSettingsWindow(id) => {
-            let mut window = SettingsWindow::new(smudgy.account.handles());
-            let prefetch = window
-                .prefetch()
-                .map(move |msg| Message::SettingsWindowMessage(id, msg));
-            smudgy.settings_windows.insert(id, window);
-            prefetch
+            smudgy
+                .settings_windows
+                .insert(id, SettingsWindow::new(smudgy.account.handles()));
+            fetch_pending_invitations(smudgy)
         }
         Message::SettingsWindowMessage(id, msg) => {
             if let Some(window) = smudgy.settings_windows.get_mut(&id) {
+                let pending_before = window.pending();
                 let update = window
                     .update(msg)
                     .map_message(move |msg| Message::SettingsWindowMessage(id, msg));
+                // A count the window just learned (a tab loaded, an invitation
+                // answered) is the newest; one it merely still holds is not.
+                let pending_after = window.pending();
+                if pending_after != pending_before {
+                    let account = smudgy.pending_invitations.account();
+                    smudgy.pending_invitations.absorb(account, pending_after);
+                }
 
                 let event_task = match update.event {
                     Some(SettingsWindowEvent::SessionEstablished(session)) => {
@@ -5349,6 +5397,11 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
         Message::SessionRefreshTick => smudgy.account.refresh_session().map(Message::Account),
         Message::UpdateCheckTick => smudgy.account.check_for_updates().map(Message::Account),
         Message::AreaPrefsReconcileTick => reconcile_area_prefs(smudgy),
+        Message::PendingInvitationsTick => fetch_pending_invitations(smudgy),
+        Message::PendingInvitationsFetched(account, counts) => {
+            smudgy.pending_invitations.absorb(account, counts);
+            Task::none()
+        }
         Message::AreaPrefsFetched(result) => {
             let server = match result {
                 Ok(server) => server,
@@ -7908,12 +7961,11 @@ fn settings_window_view<'a>(
     window: &'a SettingsWindow,
     id: window::Id,
 ) -> Element<'a, Message> {
-    #[cfg(not(feature = "web-audio-cpal"))]
-    let _ = smudgy;
+    let counted = smudgy.pending_invitations.counts();
     #[cfg(feature = "web-audio-cpal")]
     if window.tab() == settings_window::Tab::Audio {
         let nav = window
-            .nav()
+            .nav(counted)
             .map(move |message| Message::SettingsWindowMessage(id, message));
         let body = iced::widget::row![
             iced::widget::container(nav).padding(12),
@@ -7929,7 +7981,7 @@ fn settings_window_view<'a>(
             .into();
     }
     window
-        .view()
+        .view(counted)
         .map(move |message| Message::SettingsWindowMessage(id, message))
 }
 
@@ -7950,7 +8002,7 @@ fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
                 .and_then(|hover| hover.target.as_ref()),
         };
         let window_content = window
-            .view(&smudgy.sessions, drag)
+            .view(&smudgy.sessions, drag, smudgy.pending_invitations.total())
             .map(move |message| Message::SmudgyWindowMessage(id, message));
         #[cfg(feature = "web-audio-cpal")]
         let window_content: Element<'_, Message> = {
