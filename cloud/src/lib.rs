@@ -25,8 +25,8 @@ use derive_more::{Add, Display, From, Into};
 // Re-export core types
 pub use backends::{
     AreaMergeCommit, AreaMergeOutcome, AreaMergePlan, AreaMergeSource, CachedCloudMapper,
-    CloudMapper, CompositeBackend, Credential, CredentialSource, LocalBackend, MapperBackend,
-    RoomRemap, TieredAreas, Translate, apply_area_merge,
+    CloudMapper, CompositeBackend, Credential, CredentialSource, InventoryEntry, LocalBackend,
+    MapperBackend, RoomRemap, Translate, apply_area_merge,
 };
 pub use cloud_api::CloudApiClient;
 pub use color::{canonicalize_css_color, parse_css_color};

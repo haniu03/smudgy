@@ -19,11 +19,12 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, atomic::Ordering},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use log::warn;
 
+use super::retry::{Failures, RETRY_WINDOW, next_retry};
 use super::{Inner, ReplayMode, area_cache::AreaCache};
 use crate::{AreaId, CloudError, CloudResult, SourceId, SyncRow, backends::MapperBackend};
 
@@ -62,45 +63,6 @@ pub struct SyncStatus {
     /// When the engine next retries on its own after a failed tick. `None`
     /// when it won't: synced, signed out, or past the retry window.
     pub next_retry: Option<Instant>,
-}
-
-/// First wait of the automatic retry after a failed tick.
-const RETRY_BASE: Duration = Duration::from_secs(2);
-/// Longest wait between automatic retries.
-const RETRY_CAP: Duration = Duration::from_mins(2);
-/// How long a run of failed ticks keeps retrying on its own, unless the
-/// service answers 503: a 503 retries for as long as it lasts.
-const RETRY_WINDOW: Duration = Duration::from_mins(10);
-
-/// A run of consecutive failed ticks.
-#[derive(Debug, Clone, Copy)]
-struct Failures {
-    since: tokio::time::Instant,
-    count: u32,
-}
-
-/// When the engine retries after `err` ends `failures`, if it does. Only
-/// transport failures retry: a 503 after its `Retry-After` (or the backoff,
-/// when it sent none) for as long as it lasts, anything else with
-/// exponential backoff until the run has lasted [`RETRY_WINDOW`].
-fn next_retry(
-    err: &CloudError,
-    failures: Failures,
-    now: tokio::time::Instant,
-) -> Option<tokio::time::Instant> {
-    if !err.is_transport_error() {
-        return None;
-    }
-    let backoff = RETRY_BASE
-        .saturating_mul(2u32.saturating_pow(failures.count.saturating_sub(1).min(16)))
-        .min(RETRY_CAP);
-    let jitter = Duration::from_millis(u64::from(super::pending::fastrand_ms() % 1_000));
-    let wait = match err {
-        CloudError::ServiceUnavailable { retry_after, .. } => retry_after.unwrap_or(backoff),
-        _ if now.duration_since(failures.since) >= RETRY_WINDOW => return None,
-        _ => backoff,
-    };
-    Some(now + wait + jitter)
 }
 
 /// Spawns the polling task on the current tokio runtime. The task holds only
@@ -154,6 +116,10 @@ struct Engine {
     last_auth_generation: Option<u64>,
     /// The current run of failed ticks, if the last one failed.
     failures: Option<Failures>,
+    /// The latest transport failure of a refetch this tick put off. A tick
+    /// that synced every row but one retries on its own, as a failed tick
+    /// would, so the map it couldn't fetch still arrives.
+    deferred_failure: Option<CloudError>,
     /// When to retry the failed tick on its own, if at all.
     retry_at: Option<tokio::time::Instant>,
 }
@@ -165,6 +131,7 @@ impl Engine {
             prev_rows: HashMap::new(),
             last_auth_generation: None,
             failures: None,
+            deferred_failure: None,
             retry_at: None,
         }
     }
@@ -174,6 +141,7 @@ impl Engine {
             changes.borrow_and_update();
         }
         self.retry_at = None;
+        self.deferred_failure = None;
         set_state(inner, SyncState::Syncing);
 
         let auth_generation = inner.backend.auth_generation();
@@ -270,13 +238,34 @@ impl Engine {
         } else {
             SyncState::Idle
         };
-        self.failures = None;
+        let (last_error, next_retry) = match self.deferred_failure.take() {
+            None => {
+                self.failures = None;
+                (None, None)
+            }
+            Some(err) => {
+                warn!("Sync tick put off a map it couldn't fetch: {err}");
+                let now = tokio::time::Instant::now();
+                let failures = Failures::after(self.failures, now);
+                self.failures = Some(failures);
+                self.retry_at = next_retry(&err, failures, now, RETRY_WINDOW);
+                (Some(err.to_string()), self.retry_at)
+            }
+        };
         inner.sync_status.store(Arc::new(SyncStatus {
             state,
-            last_error: None,
+            last_error,
             last_sync: Some(Instant::now()),
-            next_retry: None,
+            next_retry: next_retry.map(tokio::time::Instant::into_std),
         }));
+    }
+
+    /// Keeps a refetch's transport failure for the end of the tick, which
+    /// then schedules a retry.
+    fn note_deferred_failure(&mut self, err: CloudError) {
+        if err.is_transport_error() {
+            self.deferred_failure = Some(err);
+        }
     }
 
     fn record_failure(&mut self, inner: &Inner, err: &CloudError) {
@@ -291,18 +280,9 @@ impl Engine {
             set_status(inner, SyncState::LoggedOut, Some(err.to_string()));
         } else if err.is_transport_error() {
             let now = tokio::time::Instant::now();
-            let failures = self.failures.map_or(
-                Failures {
-                    since: now,
-                    count: 1,
-                },
-                |run| Failures {
-                    since: run.since,
-                    count: run.count.saturating_add(1),
-                },
-            );
+            let failures = Failures::after(self.failures, now);
             self.failures = Some(failures);
-            self.retry_at = next_retry(err, failures, now);
+            self.retry_at = next_retry(err, failures, now, RETRY_WINDOW);
             let last_sync = inner.sync_status.load().last_sync;
             inner.sync_status.store(Arc::new(SyncStatus {
                 state: SyncState::Offline,
@@ -467,6 +447,7 @@ impl Engine {
                 }
                 Err(err) => {
                     warn!("Recovery refetch of area {area_id} failed: {err}");
+                    self.note_deferred_failure(err);
                     deferred.insert(area_id);
                 }
             }
@@ -504,6 +485,7 @@ impl Engine {
                 Err(CloudError::CredentialChanged) => return false,
                 Err(err) => {
                     warn!("Sync refetch of area {area_id} failed: {err}");
+                    self.note_deferred_failure(err);
                     deferred.insert(*area_id);
                 }
             }
@@ -549,6 +531,7 @@ impl Engine {
                     Err(CloudError::CredentialChanged) => return false,
                     Err(err) => {
                         warn!("Sync refetch of area {area_id} failed: {err}");
+                        self.note_deferred_failure(err);
                         dirtied.insert(area_id);
                     }
                 }
@@ -654,8 +637,8 @@ pub(super) async fn refetch_area(
         && !inner.backend.ephemeral_area_ids().contains(area_id);
     let fetched = if cloud_area {
         inner
-            .backend
-            .get_area_at_generation(area_id, auth_generation)
+            .fetcher
+            .get(&*inner.backend, *area_id, auth_generation)
             .await
     } else {
         inner.backend.get_area(area_id).await
@@ -862,52 +845,6 @@ mod tests {
     use std::{path::PathBuf, time::Duration};
     use tokio::sync::Semaphore;
     use uuid::Uuid;
-
-    #[test]
-    fn a_failed_tick_retries_on_the_services_terms() {
-        let since = tokio::time::Instant::now();
-        // How long after `err` the engine waits, `count` failures into a run
-        // that has lasted `lasted`.
-        let wait = |err: &CloudError, count, lasted| {
-            let now = since + lasted;
-            next_retry(err, Failures { since, count }, now).map(|at| at - now)
-        };
-        let about = |wait: Option<Duration>, low: Duration| {
-            wait.is_some_and(|wait| wait >= low && wait < low + Duration::from_secs(1))
-        };
-        let busy = |retry_after| CloudError::ServiceUnavailable {
-            message: "Service temporarily unavailable".to_string(),
-            retry_after,
-        };
-
-        // A 503 waits its Retry-After, however long the run has lasted.
-        let five = Duration::from_secs(5);
-        assert!(about(wait(&busy(Some(five)), 1, Duration::ZERO), five));
-        assert!(about(
-            wait(&busy(Some(five)), 40, Duration::from_hours(3)),
-            five
-        ));
-        // Without one it backs off, still without end.
-        assert!(about(
-            wait(&busy(None), 3, Duration::from_hours(3)),
-            Duration::from_secs(8)
-        ));
-
-        // Any other transport failure backs off to the cap, for ten minutes.
-        let offline = CloudError::NetworkError("offline".to_string());
-        assert!(about(wait(&offline, 1, Duration::ZERO), RETRY_BASE));
-        assert!(about(
-            wait(&offline, 2, Duration::ZERO),
-            Duration::from_secs(4)
-        ));
-        assert!(about(wait(&offline, 30, Duration::from_mins(9)), RETRY_CAP));
-        assert_eq!(wait(&offline, 31, RETRY_WINDOW), None);
-
-        // A verdict or a sign-out waits for the user.
-        let refused = CloudError::Unauthorized("Invalid session".to_string());
-        assert_eq!(wait(&refused, 1, Duration::ZERO), None);
-        assert_eq!(wait(&CloudError::UpgradeRequired, 1, Duration::ZERO), None);
-    }
 
     #[test]
     fn stale_refetch_detection_uses_the_shared_revision() {
@@ -1478,6 +1415,32 @@ mod tests {
         let status = mapper.sync_status();
         assert_eq!(status.state, SyncState::Idle);
         assert_eq!(status.next_retry, None);
+    }
+
+    /// A tick that syncs its rows but can't fetch one map retries on its own,
+    /// so the map arrives with no sync request.
+    #[tokio::test]
+    async fn a_map_a_tick_could_not_fetch_is_retried() {
+        let backend = ScriptedBackend::new();
+        let mapper = new_mapper(&backend).await;
+        let area_id = AreaId(Uuid::new_v4());
+        let area = sample_area(area_id, 1, Some(SHARED_VIEW), Some("t1"));
+        backend.put_area(area.clone());
+        backend.set_rows(vec![ScriptedBackend::row_for(&area)]);
+        *backend.gets_offline.lock() = true;
+        tick(&mapper).await;
+        let status = mapper.sync_status();
+        assert_eq!(status.state, SyncState::Idle);
+        assert!(status.next_retry.is_some(), "{status:?}");
+        assert!(mapper.get_current_atlas().get_area(&area_id).is_none());
+
+        *backend.gets_offline.lock() = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while mapper.get_current_atlas().get_area(&area_id).is_none() {
+            assert!(Instant::now() < deadline, "the map arrives on its own");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(mapper.sync_status().next_retry, None);
     }
 
     /// The sync fallback for an unverified account lists every tier; a cloud

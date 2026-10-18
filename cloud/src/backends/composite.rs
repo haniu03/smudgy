@@ -32,7 +32,7 @@ use parking_lot::RwLock;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use super::{AreaMergeCommit, AreaMergePlan, EphemeralBackend, MapperBackend, TieredAreas};
+use super::{AreaMergeCommit, AreaMergePlan, EphemeralBackend, InventoryEntry, MapperBackend};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CloudResult, CreateAreaRequest, MapStorage, SourceId, SyncRow,
@@ -308,29 +308,36 @@ impl MapperBackend for CompositeBackend {
     async fn list_areas(&self) -> CloudResult<Vec<Area>> {
         // A list that silently left out the cloud tier would read as every
         // cloud map gone, so a cloud failure fails it; the startup load
-        // keeps the tiers apart through `list_areas_by_tier`.
-        let TieredAreas {
-            mut required,
-            cloud,
-        } = self.list_areas_by_tier().await?;
-        required.extend(cloud?);
-        Ok(required)
+        // lists the tiers apart through `list_cloud_areas`.
+        let mut all = self.list_device_areas().await?;
+        all.extend(self.list_cloud_areas().await?);
+        Ok(all)
     }
 
-    async fn list_areas_by_tier(&self) -> CloudResult<TieredAreas> {
-        // Ephemeral and local always; cloud only when signed in. A refused
-        // credential is signed out too: the cloud tier lists nothing.
-        let mut required = self.ephemeral.list_areas().await?;
-        required.extend(self.local.list_areas().await?);
-        let cloud = if self.cloud.has_credential() {
-            match self.cloud.list_areas().await {
-                Err(err) if signed_out(&err) => Ok(Vec::new()),
-                listed => listed,
-            }
+    async fn list_device_areas(&self) -> CloudResult<Vec<Area>> {
+        let mut all = self.ephemeral.list_areas().await?;
+        all.extend(self.local.list_areas().await?);
+        Ok(all)
+    }
+
+    async fn list_cloud_areas(&self) -> CloudResult<Vec<Area>> {
+        // Cloud only when signed in. A refused credential is signed out too:
+        // the cloud tier lists nothing.
+        if !self.cloud.has_credential() {
+            return Ok(Vec::new());
+        }
+        match self.cloud.list_areas().await {
+            Err(err) if signed_out(&err) => Ok(Vec::new()),
+            listed => listed,
+        }
+    }
+
+    async fn remembered_inventory(&self) -> Option<Vec<InventoryEntry>> {
+        if self.cloud.has_credential() {
+            self.cloud.remembered_inventory().await
         } else {
-            Ok(Vec::new())
-        };
-        Ok(TieredAreas { required, cloud })
+            None
+        }
     }
 
     async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
@@ -1204,8 +1211,8 @@ mod tests {
     }
 
     /// A list that left out the cloud tier would read as every cloud map
-    /// gone, so a cloud failure fails it; the tiers on this device still
-    /// answer through `list_areas_by_tier`.
+    /// gone, so a cloud failure fails it; `list_cloud_areas` keeps the
+    /// failure to the cloud tier.
     #[tokio::test]
     async fn a_cloud_list_failure_fails_the_list_and_spares_the_device_tiers() {
         let root = temp_root();
@@ -1225,15 +1232,21 @@ mod tests {
         // Folder lists answer with what they could read; `list_atlases_in`
         // is the one that says a tier couldn't be read.
         assert!(composite.list_atlases().await.is_ok());
-        let tiered = composite.list_areas_by_tier().await.expect("device tiers");
-        assert_eq!(
-            tiered.required.iter().map(|a| a.id).collect::<Vec<_>>(),
-            vec![local_id]
-        );
         assert!(matches!(
-            tiered.cloud,
+            composite.list_cloud_areas().await,
             Err(CloudError::ServiceUnavailable { .. })
         ));
+        assert_eq!(
+            composite
+                .local
+                .list_areas()
+                .await
+                .expect("the local tier")
+                .iter()
+                .map(|a| a.id)
+                .collect::<Vec<_>>(),
+            vec![local_id]
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1256,10 +1269,8 @@ mod tests {
         composite.list_atlases().await.expect("signed out lists");
         assert!(
             composite
-                .list_areas_by_tier()
+                .list_cloud_areas()
                 .await
-                .expect("tiers")
-                .cloud
                 .expect("an empty cloud tier")
                 .is_empty()
         );

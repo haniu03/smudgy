@@ -29,15 +29,29 @@ pub use composite::CompositeBackend;
 pub use ephemeral::EphemeralBackend;
 pub use local::LocalBackend;
 
-/// A [`MapperBackend::list_areas_by_tier`] answer.
-#[derive(Debug, Clone)]
-pub struct TieredAreas {
-    /// The areas of the tiers that must answer: a composite backend's
-    /// session and local tiers, or a single-tier backend's whole list.
-    pub required: Vec<Area>,
-    /// A composite backend's cloud tier: its areas, or why the map service
-    /// couldn't list them. Signed out, it lists nothing.
-    pub cloud: CloudResult<Vec<Area>>,
+/// One map of the cloud list a backend remembers from its last complete
+/// answer ([`MapperBackend::remembered_inventory`]): enough to count the
+/// cloud maps and know their names while the map service can't list them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InventoryEntry {
+    pub id: AreaId,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clan_id: Option<Uuid>,
+}
+
+impl InventoryEntry {
+    #[must_use]
+    pub fn of(area: &Area) -> Self {
+        Self {
+            id: area.id,
+            name: area.name.clone(),
+            user_id: area.user_id,
+            clan_id: area.clan_id,
+        }
+    }
 }
 
 /// The refusal every backend without Secrets gives.
@@ -134,14 +148,33 @@ pub trait MapperBackend: Send + Sync {
     /// callers act on what it leaves out.
     async fn list_areas(&self) -> CloudResult<Vec<Area>>;
 
-    /// Every area, the cloud tier's failure kept apart from the tiers on
-    /// this device, so a caller can use those while the map service can't
-    /// be read. Default: one tier's whole list, its failure failing all.
-    async fn list_areas_by_tier(&self) -> CloudResult<TieredAreas> {
-        Ok(TieredAreas {
-            required: self.list_areas().await?,
-            cloud: Ok(Vec::new()),
-        })
+    /// The areas of the tiers on this device, which answer whether or not
+    /// the map service does: a composite backend's local and session
+    /// tiers, or the whole list of a backend that doesn't sync.
+    async fn list_device_areas(&self) -> CloudResult<Vec<Area>> {
+        if self.supports_sync() {
+            Ok(Vec::new())
+        } else {
+            self.list_areas().await
+        }
+    }
+
+    /// The areas the map service lists, so a caller can show the maps on
+    /// this device before, or without, its answer: a composite backend's
+    /// cloud tier (nothing while signed out), or the whole list of a
+    /// backend that syncs.
+    async fn list_cloud_areas(&self) -> CloudResult<Vec<Area>> {
+        if self.supports_sync() {
+            self.list_areas().await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The cloud list as last answered in full, kept on this device for
+    /// while the map service can't list it. `None` when none is kept.
+    async fn remembered_inventory(&self) -> Option<Vec<InventoryEntry>> {
+        None
     }
 
     async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails>;

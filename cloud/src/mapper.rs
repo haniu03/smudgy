@@ -27,8 +27,7 @@
 //! the stores. Store commits finish before session publication takes its locks.
 
 use crate::backends::{
-    AreaMergeCommit, AreaMergePlan, AreaMergeSource, MapperBackend, RoomRemap, TieredAreas,
-    area_edits,
+    AreaMergeCommit, AreaMergePlan, AreaMergeSource, MapperBackend, RoomRemap, area_edits,
     source_document::{EditContext, SourceDocument, exits},
 };
 use crate::cloud_api::{SecretGrant, SecretGrantChange, SecretSummary};
@@ -61,7 +60,9 @@ use uuid::Uuid;
 pub mod area_cache;
 pub mod atlas_cache;
 pub mod exit_cache;
+mod fetcher;
 mod legacy_recovery;
+mod loading;
 mod local_projection;
 pub use legacy_recovery::LegacyCloudRecovery;
 mod merge;
@@ -69,6 +70,7 @@ mod merge;
 use merge::MERGE_DRAIN_TIMEOUT;
 mod projection;
 mod recovery;
+mod retry;
 mod secrets;
 use projection::{CommittedChange, MetadataChange};
 use recovery::{MergeRecovery, SessionRecovery};
@@ -1498,14 +1500,38 @@ pub struct AreaLoadStat {
     pub shared: bool,
 }
 
-#[derive(Debug, Clone)]
+/// A load's progress ([`Mapper::load_progress`]).
+#[derive(Debug, Clone, Default)]
 pub struct LoadMapsSummary {
     pub list_duration: Duration,
+    /// The maps loaded so far.
     pub areas: Vec<AreaLoadStat>,
-    /// Why the cloud maps aren't in this load, when the map service couldn't
+    /// Why the cloud maps aren't in this load, while the map service can't
     /// list them for a reason other than being signed out. The session and
-    /// local maps loaded regardless; cloud maps already shown stay shown.
+    /// local maps load regardless; cloud maps already shown stay shown.
     pub cloud_unavailable: Option<CloudError>,
+    /// Which load this is: each load the mapper starts counts one more.
+    pub load: u64,
+    /// How many maps the load means to show, once known: the maps on this
+    /// device and the session's, with the cloud list's, or while the
+    /// service can't list them, with the last list it gave.
+    pub total: Option<usize>,
+    /// Every map has had a first try, or the cloud list failed its first.
+    pub first_pass: bool,
+    /// Nothing more will load without a retry: every map loaded, or the
+    /// rest stopped trying.
+    pub settled: bool,
+    /// Maps that stopped trying, counting the cloud list when it did;
+    /// [`Mapper::retry_loading`] tries them again.
+    pub stopped: usize,
+    /// The latest reason a map couldn't load, while one still waits.
+    pub failure: Option<CloudError>,
+    /// The local maps made while the map service couldn't list the cloud
+    /// maps that share a name with a cloud map, once the list answered.
+    pub duplicates: Vec<String>,
+    /// What ended the load early: the maps on this device couldn't be read,
+    /// or the credential changed.
+    pub fatal: Option<CloudError>,
 }
 
 /// Sync statistics for diagnostics
@@ -1808,10 +1834,10 @@ pub struct Inner {
     /// One teaching warning when the ephemeral room cap refuses a creation.
     ephemeral_cap_warned: AtomicBool,
 
-    /// Initial-load gate for presence-checked imports: `None` until the first
-    /// load completes, then its result for scripts and the startup summary.
-    initial_load: tokio::sync::watch::Sender<Option<CloudResult<LoadMapsSummary>>>,
-    load_gate: tokio::sync::Mutex<()>,
+    /// Fetches cloud maps a few Libraries at a time, for loads and syncs.
+    fetcher: Arc<fetcher::Fetcher>,
+    /// The maps' loads ([`loading`]): the latest one's progress and task.
+    loads: loading::Loads,
     /// Serializes presence-checked imports so two concurrent seeds cannot
     /// both miss (and then both import) the same area name.
     import_gate: tokio::sync::Mutex<()>,
@@ -1937,6 +1963,7 @@ impl Drop for Inner {
         for task in self.background_tasks.get_mut().drain(..) {
             task.abort();
         }
+        self.loads.abort();
     }
 }
 
@@ -2018,8 +2045,8 @@ impl Mapper {
             accounted_operations: Mutex::new(accounted_operations),
             pending,
             ephemeral_cap_warned: AtomicBool::new(false),
-            initial_load: tokio::sync::watch::channel(None).0,
-            load_gate: tokio::sync::Mutex::new(()),
+            fetcher: Arc::new(fetcher::Fetcher::new()),
+            loads: loading::Loads::new(),
             import_gate: tokio::sync::Mutex::new(()),
             mutation_gate: Mutex::new(()),
             room_reservations: Mutex::new(HashMap::new()),
@@ -2678,22 +2705,44 @@ impl Mapper {
         self.inner.area_effective_access(area_id)
     }
 
-    pub fn load_all_areas(&self) -> impl Future<Output = CloudResult<LoadMapsSummary>> {
-        self.inner.load_all_areas()
-    }
-
-    /// Load startup maps once, sharing work with scripts that await readiness.
-    /// An incomplete load fails within 30 seconds; background cloud sync can
-    /// still populate the cache. Explicit `load_all_areas` calls load again.
+    /// Loads every map again, and returns once each has had a first try.
+    /// Maps the map service couldn't serve keep loading in the background.
     ///
     /// # Errors
-    /// Returns the initial map load error.
+    /// The maps on this device couldn't be read, or the credential changed.
+    pub fn load_all_areas(&self) -> impl Future<Output = CloudResult<LoadMapsSummary>> {
+        let inner = self.inner.clone();
+        async move { inner.load_all_areas().await }
+    }
+
+    /// The session's wait for its maps, shared with scripts that await
+    /// readiness: starts the first load, or joins it, and returns once
+    /// nothing more will load without a retry, or 20 seconds after it began,
+    /// with the maps loaded so far. Loading continues in the background;
+    /// [`Self::load_progress`] follows it.
+    ///
+    /// # Errors
+    /// The maps on this device couldn't be read, or the credential changed.
     pub async fn load_initial_areas(&self) -> CloudResult<LoadMapsSummary> {
-        self.inner.load_initial_areas(Duration::from_secs(30)).await
+        self.inner
+            .load_initial_areas(loading::INITIAL_LOAD_WAIT)
+            .await
+    }
+
+    /// Follows the latest load's progress.
+    #[must_use]
+    pub fn load_progress(&self) -> tokio::sync::watch::Receiver<LoadMapsSummary> {
+        self.inner.loads.subscribe()
+    }
+
+    /// Tries again, now, every map still waiting to load and every one that
+    /// stopped trying.
+    pub fn retry_loading(&self) {
+        self.inner.retry_loading();
     }
 
     /// Wait for initial loading and make current local changes visible here.
-    /// Starts or retries loading if needed; after success, reuses the loaded maps.
+    /// Starts loading if needed; after the session's wait, reuses its maps.
     ///
     /// # Errors
     /// Reports a failed initial map load.
@@ -3842,55 +3891,6 @@ impl Inner {
         }
     }
 
-    /// Load all areas from backend into cache
-    /// # Errors
-    /// Returns error if backend operations fail
-    pub async fn load_all_areas(&self) -> CloudResult<LoadMapsSummary> {
-        let _gate = self.load_gate.lock().await;
-        self.load_areas().await
-    }
-
-    async fn load_initial_areas(&self, timeout: Duration) -> CloudResult<LoadMapsSummary> {
-        let load = async {
-            let _gate = self.load_gate.lock().await;
-            if let Some(Ok(summary)) = self.initial_load.borrow().as_ref() {
-                return Ok(summary.clone());
-            }
-            self.load_areas().await
-        };
-        if let Ok(result) = tokio::time::timeout(timeout, load).await {
-            result
-        } else {
-            let error = CloudError::NetworkError("map loading timed out".into());
-            // Never call a partial inventory ready: presence-checked imports
-            // must fail instead of seeding duplicates into an unknown atlas.
-            // A concurrent loader may already have completed successfully.
-            self.initial_load.send_if_modified(|outcome| {
-                if matches!(outcome, Some(Ok(_))) {
-                    return false;
-                }
-                *outcome = Some(Err(error.clone()));
-                true
-            });
-            self.request_sync();
-            Err(error)
-        }
-    }
-
-    async fn load_areas(&self) -> CloudResult<LoadMapsSummary> {
-        let result = self.load_all_areas_inner().await;
-        if result.is_ok() {
-            local_projection::adopt_and_wait(self).await;
-        }
-        // Open the initial-load gate either way: presence-checked imports wait
-        // on it. Retain the summary so startup can reuse a script's load.
-        self.initial_load.send_replace(Some(result.clone()));
-        if result.is_ok() {
-            self.report_abandoned_relocations();
-        }
-        result
-    }
-
     /// Surfaces relocation destinations still bearing the in-progress name
     /// marker — debris of a crash mid-copy, indistinguishable from real
     /// maps but for the marker. Reported, never swept: on the cloud tier
@@ -3915,209 +3915,6 @@ impl Inner {
                 stranded.join(", ")
             );
         }
-    }
-
-    async fn load_all_areas_inner(&self) -> CloudResult<LoadMapsSummary> {
-        let auth_generation = self.backend.auth_generation();
-        let list_start = Instant::now();
-        // The maps on this device load whether or not the map service
-        // answers; the sync engine brings the cloud maps in once it does.
-        let TieredAreas {
-            required: mut areas,
-            cloud,
-        } = self.backend.list_areas_by_tier().await?;
-        let cloud_unavailable = match cloud {
-            Ok(cloud) => {
-                areas.extend(cloud);
-                None
-            }
-            Err(err) => {
-                warn!("Cloud maps could not be listed: {err}");
-                Some(err)
-            }
-        };
-        let listed_local = self.backend.local_snapshot();
-        let list_duration = list_start.elapsed();
-
-        let mut fetched_areas = HashMap::with_capacity(areas.len());
-        let mut stats = Vec::with_capacity(areas.len());
-
-        for area in areas {
-            if listed_local
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.contains_area(area.id))
-            {
-                continue;
-            }
-            let load_start = Instant::now();
-            match self.backend.get_area(&area.id).await {
-                Ok(details) => {
-                    let load_duration = load_start.elapsed();
-                    let source = self.backend.last_area_source(&area.id);
-                    // Classify from the list row (which carries the viewer-scoped access block
-                    // and the owner handle); either signal flagging non-ownership means shared.
-                    let shared =
-                        area.owner_nickname.is_some() || area.access.is_some_and(|a| !a.is_owner);
-
-                    stats.push(AreaLoadStat {
-                        area_id: area.id,
-                        name: details.area.name.clone(),
-                        revision: details.area.rev,
-                        load_duration,
-                        source,
-                        shared,
-                    });
-
-                    fetched_areas.insert(area.id, details);
-                }
-                Err(err) => {
-                    warn!("Failed to load area {}: {err}", area.id);
-                }
-            }
-        }
-
-        if self.backend.auth_generation() != auth_generation {
-            return Err(CloudError::CredentialChanged);
-        }
-        self.recover_deletes_for_load(&mut fetched_areas, &mut stats, auth_generation)
-            .await?;
-        // Adopt revisions and fold queued work under the same gate used by
-        // mutation compilation. Entry scripts racing initial load can neither
-        // lose an optimistic edit nor have its create/update meaning silently
-        // changed by the fetched document.
-        let mutation_guard = self.mutation_gate.lock();
-        if self.backend.auth_generation() != auth_generation {
-            return Err(CloudError::CredentialChanged);
-        }
-        // Use one current local generation under mutation coordination. The
-        // listing and remote fetches above may span several local commits.
-        let current_local = self.backend.local_snapshot();
-        if let Some(local) = &current_local {
-            let mut projection = self.local_projection.lock();
-            if let Some(listed) = &listed_local {
-                projection
-                    .known
-                    .extend(listed.areas().map(|details| details.area.id));
-            }
-            projection
-                .known
-                .extend(local.areas().map(|details| details.area.id));
-            fetched_areas.retain(|id, _| !projection.known.contains(id));
-            for details in local.areas() {
-                stats.push(AreaLoadStat {
-                    area_id: details.area.id,
-                    name: details.area.name.clone(),
-                    revision: details.area.rev,
-                    load_duration: Duration::ZERO,
-                    source: self.backend.last_area_source(&details.area.id),
-                    shared: false,
-                });
-            }
-        }
-        let mut new_cache = HashMap::with_capacity(fetched_areas.len());
-        // Local publication has one owner. Preserve its current view until
-        // complete-generation adoption can pass the session's fences. A
-        // cloud tier that couldn't be listed leaves its maps as shown too:
-        // the sync engine's row set decides which ones the viewer lost.
-        {
-            let projection = self.local_projection.lock();
-            let ephemeral = if cloud_unavailable.is_some() {
-                self.backend.ephemeral_area_ids()
-            } else {
-                HashSet::new()
-            };
-            for area in self.atlas_cache.load().areas() {
-                let area_id = *area.get_id();
-                let unlisted_cloud = cloud_unavailable.is_some() && !ephemeral.contains(&area_id);
-                if projection.known.contains(&area_id) || unlisted_cloud {
-                    new_cache.insert(area_id, area);
-                }
-            }
-        }
-        for (area_id, details) in fetched_areas {
-            self.pending.abort_recovered_delete(area_id)?;
-            // A full load buffers several GETs; an ACK may have advanced this
-            // area's revision while another document was still loading.
-            self.pending.note_confirmed_rev(area_id, details.area.rev);
-            let (area, _) = self.project_confirmed(
-                &details,
-                ReplayMode::StopAtFailure,
-                current_local.as_deref(),
-            );
-            self.pending.recovery_base_loaded(area_id);
-            new_cache.insert(area_id, area);
-        }
-        // Carry every exclusion axis across the wholesale rebuild.
-        self.publish_cache(|cache| Arc::new(cache.rebuild_with_areas(new_cache.clone())));
-        local_projection::adopt_locked(self);
-        drop(mutation_guard);
-
-        // The wholesale store can race the sync engine (e.g. re-inserting an
-        // area the engine removed between our list and store). Nudge the
-        // engine: its next tick prunes anything the fresh row set no longer
-        // covers, so any membership drift heals immediately.
-        self.request_sync();
-
-        Ok(LoadMapsSummary {
-            list_duration,
-            areas: stats,
-            cloud_unavailable,
-        })
-    }
-
-    /// Resolve interrupted remote deletes omitted by an offline composite list.
-    /// Local delete recovery belongs to the generation adopter's writer barrier.
-    async fn recover_deletes_for_load(
-        &self,
-        fetched_areas: &mut HashMap<AreaId, AreaWithDetails>,
-        stats: &mut Vec<AreaLoadStat>,
-        auth_generation: u64,
-    ) -> CloudResult<()> {
-        for area_id in self.pending.recovery_area_ids() {
-            if self.is_local_projection(area_id)
-                || fetched_areas.contains_key(&area_id)
-                || !self.pending.has_delete_intent(area_id)
-            {
-                continue;
-            }
-            let cloud_intent = self.pending.delete_intent_is_cloud(area_id);
-            let fetched = if cloud_intent {
-                self.backend
-                    .get_area_at_generation(&area_id, auth_generation)
-                    .await
-            } else {
-                self.backend_for_area(area_id).get_area(&area_id).await
-            };
-            match fetched {
-                Ok(details) => {
-                    let shared = details.area.owner_nickname.is_some()
-                        || details.area.access.is_some_and(|access| !access.is_owner);
-                    stats.push(AreaLoadStat {
-                        area_id,
-                        name: details.area.name.clone(),
-                        revision: details.area.rev,
-                        load_duration: Duration::ZERO,
-                        source: self.backend.last_area_source(&area_id),
-                        shared,
-                    });
-                    fetched_areas.insert(area_id, details);
-                }
-                Err(
-                    CloudError::NotFoundOrNoAccess
-                    | CloudError::PermissionDenied(_)
-                    | CloudError::AreaNotFound(_),
-                ) => {
-                    self.recover_unavailable_area(area_id)?;
-                }
-                Err(CloudError::CredentialChanged) => {
-                    return Err(CloudError::CredentialChanged);
-                }
-                Err(error) => {
-                    warn!("Could not yet reconcile interrupted delete for area {area_id}: {error}");
-                }
-            }
-        }
-        Ok(())
     }
 
     // === READ OPERATIONS (Instant, Lock-Free) ===
@@ -4525,39 +4322,14 @@ impl Inner {
         Ok(areas.iter().map(|details| details.area.id).collect())
     }
 
-    /// Waits for the first [`Inner::load_all_areas`] to complete. Presence-checked imports gate on
-    /// this so they never compare against a not-yet-populated atlas — package entry scripts run
-    /// before the session loads its maps, and an empty atlas would make every name look absent.
-    ///
-    /// # Errors
-    /// Errors when the initial load failed, or loaded without the cloud list; a caller should
-    /// skip its import rather than seed blind into an unknown atlas.
-    async fn wait_for_initial_load(&self) -> CloudResult<()> {
-        let mut gate = self.initial_load.subscribe();
-        let outcome = gate.wait_for(Option::is_some).await.map_err(|_| {
-            crate::CloudError::InternalError(
-                "mapper dropped before its initial area load".to_string(),
-            )
-        })?;
-        match outcome.as_ref().expect("load outcome is present") {
-            // Without the cloud list, a name missing from the atlas may
-            // still be one of the viewer's cloud maps.
-            Ok(LoadMapsSummary {
-                cloud_unavailable: Some(err),
-                ..
-            })
-            | Err(err) => Err(err.clone()),
-            Ok(_) => Ok(()),
-        }
-    }
-
     /// Presence-checked import — the offer-once seeding primitive. Imports (via
     /// [`Inner::import_areas`]) only the areas whose name no resident area already bears, and
     /// reports the rest as skipped.
     ///
     /// Three properties make this safe to call unconditionally, from any load order:
     /// - It waits for the initial area load, so an entry script's seed compares against the real
-    ///   atlas rather than the empty pre-load cache.
+    ///   atlas rather than the empty pre-load cache, and against every name the cloud list gave,
+    ///   loaded or not.
     /// - The presence check reads the **unfiltered** resident set: shared, manually-disabled, and
     ///   per-server scope-excluded areas all count as present, so a map parked for another server
     ///   entry (or hidden from identification) is never re-imported as a duplicate.
@@ -4565,18 +4337,21 @@ impl Inner {
     ///   same name cannot both miss it and both import.
     ///
     /// # Errors
-    /// Errors when the initial area load failed or the local backend's persistence fails.
+    /// Errors when the initial area load failed or couldn't list the cloud maps (a caller should
+    /// skip its import rather than seed blind into an unknown atlas), or the local backend's
+    /// persistence fails.
     pub async fn import_areas_if_absent(
         &self,
         areas: Vec<AreaWithDetails>,
     ) -> CloudResult<AreasImportedIfAbsent> {
-        self.wait_for_initial_load().await?;
+        let listed = self.wait_for_known_maps().await?;
         let _gate = self.import_gate.lock().await;
-        let existing: HashSet<String> = self
+        let mut existing: HashSet<String> = self
             .get_current_atlas()
             .areas()
             .map(|area| area.get_name().to_string())
             .collect();
+        existing.extend(listed.iter().cloned());
         let (missing, present): (Vec<_>, Vec<_>) = areas
             .into_iter()
             .partition(|details| !existing.contains(&details.area.name));
@@ -6778,6 +6553,10 @@ mod tests {
         hold_listing: tokio::sync::watch::Sender<bool>,
         /// When set, `list_areas` fails with it.
         fail_listing: Mutex<Option<CloudError>>,
+        /// When set, reading that area fails with that error.
+        fail_get: Mutex<Option<(AreaId, CloudError)>>,
+        /// The inventory `remembered_inventory` answers with.
+        remembered: Mutex<Option<Vec<crate::InventoryEntry>>>,
         /// One `(operation id, operation count)` entry per received
         /// envelope, in arrival order.
         mutations: Mutex<Vec<(Uuid, usize)>>,
@@ -6823,6 +6602,8 @@ mod tests {
                 omit_from_list: Mutex::new(HashSet::new()),
                 hold_listing: tokio::sync::watch::channel(false).0,
                 fail_listing: Mutex::new(None),
+                fail_get: Mutex::new(None),
+                remembered: Mutex::new(None),
                 mutations: Mutex::new(Vec::new()),
                 fail_with: Mutex::new(None),
                 deletes: Mutex::new(Vec::new()),
@@ -6948,11 +6729,20 @@ mod tests {
         }
 
         async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
+            if let Some((failing, error)) = self.fail_get.lock().as_ref()
+                && failing == area_id
+            {
+                return Err(error.clone());
+            }
             self.areas
                 .lock()
                 .get(area_id)
                 .cloned()
                 .ok_or(CloudError::NotFoundOrNoAccess)
+        }
+
+        async fn remembered_inventory(&self) -> Option<Vec<crate::InventoryEntry>> {
+            self.remembered.lock().clone()
         }
 
         async fn update_area(&self, _area_id: &AreaId, _updates: AreaUpdates) -> CloudResult<()> {
@@ -8316,11 +8106,15 @@ mod tests {
                     .await
             }
         });
-        let result = mapper
+        // The session starts with the maps loaded so far.
+        let started = mapper
             .inner
             .load_initial_areas(Duration::from_millis(100))
-            .await;
-        assert!(matches!(result, Err(CloudError::NetworkError(_))));
+            .await
+            .expect("the session starts");
+        assert!(!started.settled);
+        assert_eq!(started.total, None, "the cloud list hasn't answered");
+        assert_eq!(started.areas.len(), 1);
         assert!(mapper.get_current_atlas().get_area(&local_id).is_some());
         assert!(mapper.get_current_atlas().get_area(&cloud_id).is_none());
         assert!(matches!(
@@ -8328,8 +8122,14 @@ mod tests {
             Err(CloudError::NetworkError(_))
         ));
 
+        // The load carries on in the background.
         cloud.hold_listing.send_replace(false);
-        mapper.load_initial_areas().await.unwrap();
+        let mut progress = mapper.load_progress();
+        progress
+            .wait_for(|summary| summary.settled)
+            .await
+            .expect("the load settles");
+        assert_eq!(progress.borrow().total, Some(2));
         assert!(mapper.get_current_atlas().get_area(&cloud_id).is_some());
         let retried = mapper
             .import_areas_if_absent(vec![sample_area(cloud_id, "duplicate")])
@@ -8363,7 +8163,11 @@ mod tests {
             temp_cache_dir(),
         );
 
-        let summary = mapper.load_initial_areas().await.expect("local maps load");
+        let summary = mapper
+            .inner
+            .load_initial_areas(Duration::from_millis(200))
+            .await
+            .expect("local maps load");
         assert!(matches!(
             summary.cloud_unavailable,
             Some(CloudError::ServiceUnavailable { .. })
@@ -8399,6 +8203,165 @@ mod tests {
         assert!(atlas.get_area(&local_id).is_some());
     }
 
+    /// A mapper over a fresh local tier and `cloud` as its cloud tier.
+    fn over_cloud(cloud: &Arc<FixedBackend>) -> Mapper {
+        let local = Arc::new(LocalBackend::new(temp_cache_dir()));
+        Mapper::new(
+            Arc::new(crate::CompositeBackend::new(local, cloud.clone())),
+            temp_cache_dir(),
+        )
+    }
+
+    /// A cloud map whose failures outlast the retry window stops trying,
+    /// and `retry_loading` brings it in.
+    #[tokio::test]
+    async fn a_map_that_stopped_trying_loads_on_retry() {
+        let (quick, stuck) = (AreaId(Uuid::new_v4()), AreaId(Uuid::new_v4()));
+        let cloud = Arc::new(FixedBackend::new(vec![
+            sample_area(quick, "quick"),
+            sample_area(stuck, "stuck"),
+        ]));
+        *cloud.fail_get.lock() = Some((stuck, CloudError::NetworkError("offline".into())));
+        let mapper = over_cloud(&cloud);
+        *mapper.inner.loads.retry_window.lock() = Duration::ZERO;
+
+        let summary = mapper
+            .inner
+            .load_initial_areas(Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(summary.settled, "{summary:?}");
+        assert_eq!(summary.stopped, 1);
+        assert_eq!(summary.total, Some(2));
+        assert_eq!(summary.areas.len(), 1);
+        assert!(matches!(summary.failure, Some(CloudError::NetworkError(_))));
+        assert!(mapper.get_current_atlas().get_area(&quick).is_some());
+        assert!(mapper.get_current_atlas().get_area(&stuck).is_none());
+
+        *cloud.fail_get.lock() = None;
+        let mut progress = mapper.load_progress();
+        mapper.retry_loading();
+        progress
+            .wait_for(|summary| summary.settled && summary.stopped == 0)
+            .await
+            .unwrap();
+        assert!(progress.borrow().failure.is_none());
+        assert_eq!(progress.borrow().areas.len(), 2);
+        assert!(mapper.get_current_atlas().get_area(&stuck).is_some());
+    }
+
+    /// A map service that can't be reached at all starts the session at once
+    /// with the maps on this device; a busy one is waited for.
+    #[tokio::test]
+    async fn an_unreachable_service_starts_the_session_at_once() {
+        let cloud = Arc::new(FixedBackend::new(vec![sample_area(
+            AreaId(Uuid::new_v4()),
+            "far",
+        )]));
+        *cloud.fail_listing.lock() = Some(CloudError::NetworkError("connection refused".into()));
+        let mapper = over_cloud(&cloud);
+        let started = std::time::Instant::now();
+        let summary = mapper
+            .inner
+            .load_initial_areas(Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(!summary.settled);
+        assert!(matches!(
+            summary.cloud_unavailable,
+            Some(CloudError::NetworkError(_))
+        ));
+
+        let busy = Arc::new(FixedBackend::new(Vec::new()));
+        *busy.fail_listing.lock() = Some(CloudError::ServiceUnavailable {
+            message: "Service temporarily unavailable".to_string(),
+            retry_after: Some(Duration::from_mins(1)),
+        });
+        let mapper = over_cloud(&busy);
+        let started = std::time::Instant::now();
+        let summary = mapper
+            .inner
+            .load_initial_areas(Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(300), "waited");
+        assert!(summary.cloud_unavailable.is_some());
+    }
+
+    /// While the map service can't list the cloud maps, the last list it
+    /// gave says how many there are.
+    #[tokio::test]
+    async fn an_unreadable_cloud_list_counts_the_maps_it_last_gave() {
+        let cloud = Arc::new(FixedBackend::new(Vec::new()));
+        *cloud.fail_listing.lock() = Some(CloudError::ServiceUnavailable {
+            message: "Service temporarily unavailable".to_string(),
+            retry_after: Some(Duration::from_secs(5)),
+        });
+        let entry = |name: &str| crate::InventoryEntry {
+            id: AreaId(Uuid::new_v4()),
+            name: name.to_string(),
+            user_id: Some(Uuid::new_v4()),
+            clan_id: None,
+        };
+        *cloud.remembered.lock() = Some(vec![entry("Tower"), entry("Keep")]);
+        let mapper = over_cloud(&cloud);
+        mapper
+            .create_area_at("Home".to_string(), MapDestination::loose(MapStorage::Local))
+            .await
+            .unwrap();
+
+        let summary = mapper.load_all_areas().await.unwrap();
+        assert!(summary.cloud_unavailable.is_some());
+        assert_eq!(summary.total, Some(3), "{summary:?}");
+        assert_eq!(summary.areas.len(), 1);
+    }
+
+    /// Local maps made while the cloud list failed that share a cloud map's
+    /// name are named once it answers.
+    #[tokio::test]
+    async fn maps_made_while_the_cloud_list_failed_are_named_when_it_answers() {
+        let mut haven = sample_area(AreaId(Uuid::new_v4()), "gate");
+        haven.area.name = "Haven".to_string();
+        let mut tower = sample_area(AreaId(Uuid::new_v4()), "stair");
+        tower.area.name = "Tower".to_string();
+        let cloud = Arc::new(FixedBackend::new(vec![haven, tower]));
+        *cloud.fail_listing.lock() = Some(CloudError::ServiceUnavailable {
+            message: "Service temporarily unavailable".to_string(),
+            retry_after: Some(Duration::from_millis(50)),
+        });
+        let mapper = over_cloud(&cloud);
+        mapper
+            .create_area_at(
+                "Tower".to_string(),
+                MapDestination::loose(MapStorage::Local),
+            )
+            .await
+            .unwrap();
+        let first = mapper.load_all_areas().await.unwrap();
+        assert!(first.cloud_unavailable.is_some());
+
+        mapper
+            .create_area_at(
+                "Haven".to_string(),
+                MapDestination::loose(MapStorage::Local),
+            )
+            .await
+            .unwrap();
+        mapper
+            .create_area_at(
+                "Harbor".to_string(),
+                MapDestination::loose(MapStorage::Local),
+            )
+            .await
+            .unwrap();
+        let mut progress = mapper.load_progress();
+        *cloud.fail_listing.lock() = None;
+        progress.wait_for(|summary| summary.settled).await.unwrap();
+        assert_eq!(progress.borrow().duplicates, vec!["Haven".to_string()]);
+        assert_eq!(progress.borrow().total, Some(5));
+    }
+
     #[tokio::test]
     async fn startup_deadline_also_bounds_waiting_for_another_loader() {
         let cloud = Arc::new(FixedBackend::new(vec![]));
@@ -8409,17 +8372,15 @@ mod tests {
             async move { mapper.load_all_areas().await }
         });
         tokio::task::yield_now().await;
-        assert!(mapper.inner.load_gate.try_lock().is_err());
-        assert!(
-            mapper
-                .inner
-                .load_initial_areas(Duration::from_millis(20))
-                .await
-                .is_err()
-        );
+        let joined = mapper
+            .inner
+            .load_initial_areas(Duration::from_millis(20))
+            .await
+            .expect("the session starts while the refresh lists");
+        assert!(!joined.first_pass);
         cloud.hold_listing.send_replace(false);
         refresh.await.unwrap().unwrap();
-        mapper.load_initial_areas().await.unwrap();
+        assert!(mapper.load_initial_areas().await.unwrap().settled);
     }
 
     #[tokio::test]

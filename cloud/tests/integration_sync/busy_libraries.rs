@@ -62,18 +62,12 @@ async fn a_busy_library_holds_an_edit_for_its_retry_after() {
     assert_eq!(mapper.area_save_status(area), AreaSaveStatus::Saved);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_busy_map_list_loads_local_maps_and_the_cloud_maps_follow() {
-    let server = MockServer::spawn().await;
-    let owner = server.create_user("busy-list@example.com", "busy-list", true);
-    let cloud_map = server.create_area(&owner, "Far Tower");
-    server.add_room(cloud_map, 1, "Stair");
-    // The map list, and the engine's first two row fetches, find their
-    // Library busy.
-    server.busy_next("GET", "/areas", 1, 1);
-    server.busy_next("GET", "/sync", 2, 1);
-
-    let cache = TempCacheDir::new("busy-list");
+/// A mapper over a local tier holding "Home" and the mock's cloud tier.
+async fn composite_mapper(
+    server: &super::support::MockHandle,
+    api_key: &str,
+    cache: &TempCacheDir,
+) -> (Mapper, AreaId) {
     let local = Arc::new(LocalBackend::new(cache.path().join("local")));
     let local_map = local
         .create_area(smudgy_cloud::CreateAreaRequest {
@@ -88,27 +82,52 @@ async fn a_busy_map_list_loads_local_maps_and_the_cloud_maps_follow() {
         .unwrap()
         .id;
     let cloud = Arc::new(CachedCloudMapper::new(
-        CloudMapper::new(server.base_url.clone(), owner.api_key.clone()),
+        CloudMapper::new(server.base_url.clone(), api_key.to_string()),
         cache.path().join("cloud"),
     ));
     let mapper = Mapper::new(
         Arc::new(CompositeBackend::new(local, cloud)),
         cache.path().join("mapper"),
     );
+    (mapper, local_map)
+}
 
-    let summary = mapper.load_initial_areas().await.expect("local maps load");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_map_list_is_retried_and_its_maps_follow() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("busy-list@example.com", "busy-list", true);
+    let cloud_map = server.create_area(&owner, "Far Tower");
+    server.add_room(cloud_map, 1, "Stair");
+    // The map list finds its Library busy twice; the sync engine's rows
+    // stay busy throughout, so only the load brings the cloud map.
+    server.busy_next("GET", "/areas", 2, 1);
+    server.busy_next("GET", "/sync", 1_000, 1);
+    let cache = TempCacheDir::new("busy-list");
+    let (mapper, local_map) = composite_mapper(&server, &owner.api_key, &cache).await;
+
+    let mut progress = mapper.load_progress();
+    let session = tokio::spawn({
+        let mapper = mapper.clone();
+        async move { mapper.load_initial_areas().await }
+    });
+    progress
+        .wait_for(|summary| summary.first_pass)
+        .await
+        .expect("a first pass");
+    let first = progress.borrow().clone();
     assert!(
         matches!(
-            summary.cloud_unavailable,
+            first.cloud_unavailable,
             Some(CloudError::ServiceUnavailable {
                 retry_after: Some(retry_after),
                 ..
             }) if retry_after == Duration::from_secs(1)
         ),
         "{:?}",
-        summary.cloud_unavailable
+        first.cloud_unavailable
     );
     assert!(mapper.get_current_atlas().get_area(&local_map).is_some());
+    assert!(mapper.get_current_atlas().get_area(&cloud_map).is_none());
     assert!(
         matches!(
             mapper.import_areas_if_absent(Vec::new()).await,
@@ -117,17 +136,56 @@ async fn a_busy_map_list_loads_local_maps_and_the_cloud_maps_follow() {
         "no seeding against a list that left out the cloud maps"
     );
 
-    // No sync request: the engine retries on its own, a second or two
-    // after each busy answer.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while mapper.get_current_atlas().get_area(&cloud_map).is_none() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the cloud map arrives without a sync request: {:?}",
-            mapper.sync_status()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    // The session's wait covers the retries: it starts with every map.
+    let summary = session.await.unwrap().expect("the session starts");
+    assert!(summary.settled, "{summary:?}");
+    assert_eq!(summary.total, Some(2));
+    assert_eq!(summary.areas.len(), 2);
+    assert!(summary.cloud_unavailable.is_none());
+    assert!(mapper.get_current_atlas().get_area(&cloud_map).is_some());
+    assert_eq!(server.requests_to("GET", "/areas"), 3);
+    mapper
+        .import_areas_if_absent(Vec::new())
+        .await
+        .expect("seeding checks against the listed maps");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_map_its_library_cannot_serve_yet_follows_the_rest() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("busy-map@example.com", "busy-map", true);
+    let quick = server.create_area(&owner, "Quick");
+    let slow = server.create_area(&owner, "Slow");
+    server.busy_next("GET", &format!("/areas/{slow}"), 2, 1);
+    server.busy_next("GET", "/sync", 1_000, 1);
+    let cache = TempCacheDir::new("busy-map");
+    let (mapper, _) = composite_mapper(&server, &owner.api_key, &cache).await;
+
+    let mut progress = mapper.load_progress();
+    let session = tokio::spawn({
+        let mapper = mapper.clone();
+        async move { mapper.load_initial_areas().await }
+    });
+    progress
+        .wait_for(|summary| summary.first_pass)
+        .await
+        .expect("a first pass");
+    {
+        let first = progress.borrow();
+        assert_eq!(first.total, Some(3));
+        assert_eq!(first.areas.len(), 2, "{first:?}");
+        assert!(matches!(
+            first.failure,
+            Some(CloudError::ServiceUnavailable { .. })
+        ));
     }
-    assert!(server.requests_to("GET", "/sync") >= 3);
-    assert!(mapper.get_current_atlas().get_area(&local_map).is_some());
+    assert!(mapper.get_current_atlas().get_area(&quick).is_some());
+    assert!(mapper.get_current_atlas().get_area(&slow).is_none());
+
+    let summary = session.await.unwrap().expect("the session starts");
+    assert!(summary.settled, "{summary:?}");
+    assert_eq!(summary.areas.len(), 3);
+    assert!(summary.failure.is_none());
+    assert!(mapper.get_current_atlas().get_area(&slow).is_some());
+    assert_eq!(server.requests_to("GET", &format!("/areas/{slow}")), 3);
 }

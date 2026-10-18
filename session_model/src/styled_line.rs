@@ -377,6 +377,9 @@ pub enum AppLink {
     /// unconfigured-package notice's "Configure it now."). Carries the
     /// installed specifier, which is what the packages pane selects by.
     ConfigurePackage(Arc<str>),
+    /// Try again to load the maps that stopped trying (the load row's
+    /// "Retry").
+    RetryMapLoading,
 }
 
 /// What a click on a linked range of a line does.

@@ -1409,9 +1409,14 @@ impl ManagedSession {
         // fully available on disk. Both tiers are fanned together so this
         // session's tree shows local and cloud folders side by side.
         let mapper = {
+            // The account this device last signed in as names whose
+            // remembered map list stands in while the service can't answer.
             let cloud = CachedCloudMapper::new(
                 CloudMapper::with_credentials(base_url.to_string(), credentials),
                 map_cache_dir.clone(),
+            )
+            .expecting_viewer(
+                smudgy_core::models::auth::load_account().and_then(|account| account.user_id),
             );
             let local = LocalBackend::new(local_map_dir);
             let backend = CompositeBackend::new(Arc::new(local), Arc::new(cloud));
@@ -2094,6 +2099,12 @@ impl ManagedSession {
             LinkAction::App(AppLink::Connect) => return Task::done(Message::Reconnect),
             LinkAction::App(AppLink::ConfigurePackage(specifier)) => {
                 return Task::done(Message::ConfigurePackage(specifier));
+            }
+            LinkAction::App(AppLink::RetryMapLoading) => {
+                if let Some(mapper) = &self.mapper {
+                    mapper.retry_loading();
+                }
+                return Task::none();
             }
             LinkAction::ServerSend(command) => {
                 if self.server_config.borrow().allows_server_link(None) {
