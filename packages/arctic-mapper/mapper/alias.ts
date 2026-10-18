@@ -24,10 +24,12 @@ import { mapEvent, type RoomEvent } from "./events.ts";
 import { requestExistingRoomConnection } from "./widget.tsx";
 
 import promptEvent from 'smudgy:events/kapusniak/arctic-prompt/prompt';
+import { areasLoaded } from "smudgy:events/map";
 
 import {
     Direction,
     DirectionLetter,
+    type MoveCommand,
     MoveCommands,
     OppositeDirection,
 } from "./mapper.ts";
@@ -1469,8 +1471,10 @@ async function createNewRoomInDirection(
     return exitIds;
 }
 
-async function handleRoomEvent(roomEvent: RoomEvent) {
-    const direction = state.popMoveCommand();
+async function handleRoomEvent(
+    roomEvent: RoomEvent,
+    direction: MoveCommand | undefined = state.popMoveCommand(),
+) {
 
     if (state.state === State.Off) {
         return;
@@ -1657,7 +1661,10 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
 }
 
 let mapUpdateQueue = Promise.resolve();
+/** The room last seen, to look for again when maps arrive. */
+let lastRoomEvent: RoomEvent | null = null;
 mapEvent.on("room", (roomEvent: RoomEvent) => {
+    lastRoomEvent = roomEvent;
     mapUpdateQueue = mapUpdateQueue
         .then(() => handleRoomEvent(roomEvent))
         .then(async () => {
@@ -1669,6 +1676,20 @@ mapEvent.on("room", (roomEvent: RoomEvent) => {
             }
         })
         .then(() => hintShortcut(roomEvent))
+        .catch((error) => {
+            echo(`Automatic map update failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+});
+
+// A map that arrives after the session started can hold the room we're in: when the
+// last room seen matched nothing, look for it again, as a look rather than a move.
+areasLoaded.on(() => {
+    const roomEvent = lastRoomEvent;
+    if (state.room !== null || roomEvent === null) {
+        return;
+    }
+    mapUpdateQueue = mapUpdateQueue
+        .then(() => handleRoomEvent(roomEvent, "look"))
         .catch((error) => {
             echo(`Automatic map update failed: ${error instanceof Error ? error.message : String(error)}`);
         });

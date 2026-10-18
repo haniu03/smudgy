@@ -104,7 +104,7 @@ globalThis.__recordingFlow = {
         createTrigger() {}, createHotkey() {}, send() {}, sendRaw() {}, capture() {}, buffer: {}, line: {},
         getSessions: () => [], session: { id: 1 },
     },
-    params: { get: () => undefined }, events: { room: { on() {} } },
+    params: { get: () => undefined }, events: { room: { on() {} }, areasLoaded: { on() {} } },
     prompt: { on() {} }, widgets: { extractMarkdownLinks: () => [] },
     widget: { requestExistingRoomConnection: async () => connectDecision },
     layout: { ...layoutModel, ...layoutGeometry, layoutSnapshotKey, loadLayoutModel, planLayoutModel: plan,

@@ -51,6 +51,7 @@ globalThis.__tagSearchTest = {
         Direction: {}, DirectionLetter: {}, MoveCommands: {}, OppositeDirection: {},
     },
     events: { RoomEvent: undefined, mapEvent: { on() {} } },
+    mapEvents: { areasLoaded: { on() {} } },
     widget: { requestExistingRoomConnection() {} },
     widgets: { extractMarkdownLinks() {} },
     layout: { ...layoutModel, ...layoutGeometry, layoutSnapshotKey, planAreaChange() {}, loadLayoutModel() {} },
@@ -60,6 +61,7 @@ const mocks = new Map([
     ["smudgy:core", "core"], ["smudgy:widgets", "widgets"],
     ["smudgy:@map-layout", "layout"], ["./mapper.ts", "mapper"],
     ["./events.ts", "events"], ["./widget.tsx", "widget"],
+    ["smudgy:events/map", "mapEvents"],
     ["smudgy:events/kapusniak/arctic-prompt/prompt", "prompt"],
 ]);
 registerHooks({

@@ -1,6 +1,6 @@
 {
     "name": "auto-mapper",
-    "version": "0.3.8",
+    "version": "0.3.9",
     "description": "Follows your position from GMCP or MSDP room data and auto-draws durable local maps as you explore.",
     "min_smudgy_version": "0.5.8",
     "dependencies": [
