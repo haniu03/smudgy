@@ -118,6 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the rest of the line intact; before, `say don't` went to the game untouched.
   The editor's Try-it says when that happened. Switching a Command alias
   between Auto, Simple, and Advanced keeps its argument rows.
+- **Map syncing retries on its own.** After a failed sync, Smudgy tries again
+  by itself: for as long as the map service says it's busy, and for up to 10
+  minutes after a connection problem. Edits made while the service is busy
+  save once it's ready.
 - **Hidden panes wait in the new Layout menu.** The toolbar's Layouts button is
   now **Layout**, and it opens a menu instead of a dialog. A pane you hide with
   its tab's hide control, or that a script hides or creates hidden, leaves the
@@ -168,6 +172,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cloud maps no longer disappear when the map service has trouble.** A failed
+  request could hide every cloud map until the next successful sync. If cloud
+  maps can't be loaded, sessions now start with local maps, and the cloud maps
+  load once the map service responds.
+- **Packages no longer add duplicate starter maps during a map service
+  outage.** A package that adds maps the first time you play now holds off
+  while your cloud maps can't be checked.
+- **A busy map service is reported as busy.** Error messages now read "The map
+  service is busy. Try again shortly." instead of saying the service was
+  holding changes.
 - **Deleting a server no longer hides folders on every other server.** A folder
   shown only on the deleted server goes back to showing on every server.
 - The "Whole line as one argument" parsing mode on an Advanced command alias
