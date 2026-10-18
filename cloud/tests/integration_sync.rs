@@ -8,6 +8,8 @@
 //! `sync_now`).
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
+#[path = "integration_sync/busy_libraries.rs"]
+mod busy_libraries;
 #[path = "integration_sync/create_area_properties.rs"]
 mod create_area_properties;
 #[path = "integration_sync/legacy_recovery.rs"]

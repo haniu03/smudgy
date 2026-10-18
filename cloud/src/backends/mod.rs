@@ -29,6 +29,17 @@ pub use composite::CompositeBackend;
 pub use ephemeral::EphemeralBackend;
 pub use local::LocalBackend;
 
+/// A [`MapperBackend::list_areas_by_tier`] answer.
+#[derive(Debug, Clone)]
+pub struct TieredAreas {
+    /// The areas of the tiers that must answer: a composite backend's
+    /// session and local tiers, or a single-tier backend's whole list.
+    pub required: Vec<Area>,
+    /// A composite backend's cloud tier: its areas, or why the map service
+    /// couldn't list them. Signed out, it lists nothing.
+    pub cloud: CloudResult<Vec<Area>>,
+}
+
 /// The refusal every backend without Secrets gives.
 fn secrets_unsupported() -> CloudError {
     CloudError::InvalidInput("only cloud maps have Secrets".to_string())
@@ -119,7 +130,19 @@ pub trait MapperBackend: Send + Sync {
         )))
     }
 
+    /// Every area, or an error: a list is complete or it fails, since
+    /// callers act on what it leaves out.
     async fn list_areas(&self) -> CloudResult<Vec<Area>>;
+
+    /// Every area, the cloud tier's failure kept apart from the tiers on
+    /// this device, so a caller can use those while the map service can't
+    /// be read. Default: one tier's whole list, its failure failing all.
+    async fn list_areas_by_tier(&self) -> CloudResult<TieredAreas> {
+        Ok(TieredAreas {
+            required: self.list_areas().await?,
+            cloud: Ok(Vec::new()),
+        })
+    }
 
     async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails>;
 

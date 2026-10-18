@@ -1,5 +1,5 @@
 use anyhow::Result;
-use smudgy_cloud::Mapper;
+use smudgy_cloud::{CloudError, Mapper};
 use smudgy_session_model::input_policy::redact;
 use smudgy_session_model::send_failure::{
     ConnectionIntent as SendConnectionIntent, ReconnectState, SendFailureAction,
@@ -296,9 +296,29 @@ fn close_runtime_action_queue(receiver: &mut UnboundedReceiver<RuntimeAction>) {
 mod runtime_helper_tests {
     use std::sync::Arc;
 
-    use super::{IsolateId, RuntimeAction, close_runtime_action_queue, redact};
+    use super::{
+        CloudError, IsolateId, RuntimeAction, close_runtime_action_queue,
+        cloud_maps_pending_notice, redact,
+    };
     use crate::session::SessionId;
     use crate::session::styled_line::LinkTooltipState;
+
+    #[test]
+    fn unlisted_cloud_maps_are_announced_as_retrying() {
+        let busy = CloudError::ServiceUnavailable {
+            message: "Service temporarily unavailable".to_string(),
+            retry_after: None,
+        };
+        assert_eq!(
+            cloud_maps_pending_notice(&busy),
+            "Cloud maps are not loaded yet. The map service is busy. Retrying…"
+        );
+        let offline = CloudError::NetworkError("connection refused".to_string());
+        assert_eq!(
+            cloud_maps_pending_notice(&offline),
+            "Cloud maps are not loaded yet. Network error: connection refused. Retrying…"
+        );
+    }
 
     #[test]
     fn masks_each_secret_but_leaves_other_text() {
@@ -344,6 +364,16 @@ mod runtime_helper_tests {
 /// retracted line be rewritten without duplication. The `BufWriter` is flushed
 /// first so the underlying `File` cursor is authoritative before the seek.
 /// What one mapper load came to, for the load row's map clause.
+/// The session-start warning for cloud maps the map service couldn't list;
+/// the sync engine keeps retrying until it can.
+fn cloud_maps_pending_notice(error: &CloudError) -> String {
+    let reason = match error {
+        CloudError::ServiceUnavailable { .. } => "The map service is busy.".to_string(),
+        other => format!("{other}."),
+    };
+    format!("Cloud maps are not loaded yet. {reason} Retrying…")
+}
+
 pub(crate) struct MapsLoaded {
     pub(crate) areas: usize,
     pub(crate) shared: usize,
@@ -4051,9 +4081,10 @@ impl Inner<'_> {
         }
 
         // Always load: the mapper's local tier serves maps with no credential
-        // (and `list_areas` swallows cloud auth errors), so a signed-out
-        // session still loads its local maps. Cloud maps join via the sync
-        // engine once the user logs in.
+        // (a signed-out or refused cloud tier lists nothing), so a signed-out
+        // session still loads its local maps, and so does one the map
+        // service can't answer. Cloud maps join via the sync engine once the
+        // user logs in or the service answers.
         if let Some(mapper) = self.mapper.clone() {
             let started = Instant::now();
             match mapper.load_initial_areas().await {
@@ -4078,6 +4109,12 @@ impl Inner<'_> {
                         elapsed,
                     };
                     self.refresh_load_row(Some(&maps), Progress::Done);
+                    if let Some(error) = &summary.cloud_unavailable {
+                        self.echo_system_row_sync(SystemRow::plain_notice(
+                            Severity::Warn,
+                            &cloud_maps_pending_notice(error),
+                        ));
+                    }
                 }
                 // A map failure is its own warning: the load row keeps
                 // reporting what DID load rather than being overwritten by an

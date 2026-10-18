@@ -309,10 +309,21 @@ async fn credentials_first(State(state): State<Shared>, request: Request, next: 
 /// server's `enforce_client_version`. No-op unless a test raised the floor via
 /// [`MockHandle::set_min_client_version`].
 async fn version_gate(State(state): State<Shared>, request: Request, next: Next) -> Response {
-    state.lock().http_requests.push((
-        request.method().to_string(),
-        request.uri().path().to_string(),
-    ));
+    let busy = {
+        let mut st = state.lock();
+        let (method, path) = (
+            request.method().to_string(),
+            request.uri().path().to_string(),
+        );
+        st.http_requests.push((method.clone(), path.clone()));
+        st.busy
+            .iter_mut()
+            .find(|(m, p, remaining, _)| *m == method && *p == path && *remaining > 0)
+            .map(|(_, _, remaining, retry_after)| {
+                *remaining -= 1;
+                *retry_after
+            })
+    };
     let (rejection, upgrade) = {
         let st = state.lock();
         let headers = request.headers();
@@ -322,6 +333,13 @@ async fn version_gate(State(state): State<Shared>, request: Request, next: Next)
         )
     };
     if let Some(response) = rejection {
+        return response;
+    }
+    if let Some(retry_after) = busy {
+        let mut response = super::http::err(503, "Service temporarily unavailable");
+        response
+            .headers_mut()
+            .insert("retry-after", HeaderValue::from(retry_after));
         return response;
     }
     let mut response = next.run(request).await;
@@ -885,6 +903,16 @@ impl MockHandle {
 
     pub fn unseal(&self, area: AreaId) {
         self.state.lock().sealed_maps.remove(&area.0);
+    }
+
+    /// The next `n` requests to `method path` find their Library busy: 503
+    /// `unavailable` with `Retry-After: retry_after_seconds`, before
+    /// anything applies. The server always asks for 5 seconds.
+    pub fn busy_next(&self, method: &str, path: &str, n: u32, retry_after_seconds: u64) {
+        self.state
+            .lock()
+            .busy
+            .push((method.to_string(), path.to_string(), n, retry_after_seconds));
     }
 
     /// How many requests reached `method path` so far.

@@ -275,6 +275,7 @@ impl CloudMapper {
     }
 
     async fn error_for(status: u16, response: reqwest::Response) -> CloudError {
+        let headers = response.headers().clone();
         let text = response.text().await.unwrap_or_default();
         let body = serde_json::from_str::<serde_json::Value>(&text).ok();
         let message = body
@@ -289,7 +290,7 @@ impl CloudMapper {
         // The CAS conflicts carry their fields in a structured `details`
         // object beside the machine-readable `error` code.
         let details = body.as_ref().and_then(|value| value.get("details"));
-        CloudError::from_response(status, &message, details)
+        CloudError::from_response(status, &message, details).with_retry_after(&headers)
     }
 
     /// Helper method to make GET requests

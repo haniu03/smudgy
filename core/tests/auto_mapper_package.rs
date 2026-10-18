@@ -1921,7 +1921,7 @@ async fn auto_mapper_retries_into_a_local_area_when_the_bound_map_refuses_writes
     // one area read-only to the backend without disabling new local map creation. A
     // future-format document is deliberately refused on every platform.
     mapper
-        .import_areas_if_absent(Vec::new())
+        .ready()
         .await
         .expect("wait for the initial local map load");
     let bound_path = map_root

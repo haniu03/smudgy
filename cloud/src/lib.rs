@@ -26,7 +26,7 @@ use derive_more::{Add, Display, From, Into};
 pub use backends::{
     AreaMergeCommit, AreaMergeOutcome, AreaMergePlan, AreaMergeSource, CachedCloudMapper,
     CloudMapper, CompositeBackend, Credential, CredentialSource, LocalBackend, MapperBackend,
-    RoomRemap, Translate, apply_area_merge,
+    RoomRemap, TieredAreas, Translate, apply_area_merge,
 };
 pub use cloud_api::CloudApiClient;
 pub use color::{canonicalize_css_color, parse_css_color};

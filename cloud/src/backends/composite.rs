@@ -32,7 +32,7 @@ use parking_lot::RwLock;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use super::{AreaMergeCommit, AreaMergePlan, EphemeralBackend, MapperBackend};
+use super::{AreaMergeCommit, AreaMergePlan, EphemeralBackend, MapperBackend, TieredAreas};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CloudResult, CreateAreaRequest, MapStorage, SourceId, SyncRow,
@@ -154,6 +154,13 @@ impl CompositeBackend {
         );
         Ok(rows)
     }
+}
+
+/// Whether a cloud refusal leaves the viewer as good as signed out of it:
+/// the credential refused, or the account not yet verified. The cloud tier
+/// then lists nothing rather than failing the tiers on this device.
+fn signed_out(err: &CloudError) -> bool {
+    err.is_auth_error() || matches!(err, CloudError::EmailNotVerified)
 }
 
 /// A stable sync row for an area no `/sync` covers.
@@ -299,20 +306,31 @@ impl MapperBackend for CompositeBackend {
     }
 
     async fn list_areas(&self) -> CloudResult<Vec<Area>> {
-        // Ephemeral and local always; cloud only when signed in. A cloud
-        // failure must not sink the other tiers — the sync engine surfaces
-        // cloud connectivity.
-        let mut all = self.ephemeral.list_areas().await?;
-        let local = self.local.list_areas().await?;
+        // A list that silently left out the cloud tier would read as every
+        // cloud map gone, so a cloud failure fails it; the startup load
+        // keeps the tiers apart through `list_areas_by_tier`.
+        let TieredAreas {
+            mut required,
+            cloud,
+        } = self.list_areas_by_tier().await?;
+        required.extend(cloud?);
+        Ok(required)
+    }
 
-        all.extend(local);
-        if self.cloud.has_credential() {
+    async fn list_areas_by_tier(&self) -> CloudResult<TieredAreas> {
+        // Ephemeral and local always; cloud only when signed in. A refused
+        // credential is signed out too: the cloud tier lists nothing.
+        let mut required = self.ephemeral.list_areas().await?;
+        required.extend(self.local.list_areas().await?);
+        let cloud = if self.cloud.has_credential() {
             match self.cloud.list_areas().await {
-                Ok(cloud) => all.extend(cloud),
-                Err(err) => log::warn!("composite: cloud list_areas failed: {err}"),
+                Err(err) if signed_out(&err) => Ok(Vec::new()),
+                listed => listed,
             }
-        }
-        Ok(all)
+        } else {
+            Ok(Vec::new())
+        };
+        Ok(TieredAreas { required, cloud })
     }
 
     async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
@@ -976,6 +994,8 @@ mod tests {
         areas: Mutex<Vec<Area>>,
         details: Mutex<std::collections::HashMap<AreaId, AreaWithDetails>>,
         sync: Mutex<CloudResult<Option<Vec<SyncRow>>>>,
+        /// When set, `list_areas` and `list_atlases` fail with it.
+        list_error: Mutex<Option<CloudError>>,
         has_cred: bool,
     }
 
@@ -985,8 +1005,13 @@ mod tests {
                 areas: Mutex::new(Vec::new()),
                 details: Mutex::new(std::collections::HashMap::new()),
                 sync: Mutex::new(Ok(Some(Vec::new()))),
+                list_error: Mutex::new(None),
                 has_cred,
             }
+        }
+
+        fn fail_lists(&self, error: CloudError) {
+            *self.list_error.lock() = Some(error);
         }
 
         fn add_area(&self, area: AreaWithDetails) {
@@ -1007,7 +1032,16 @@ mod tests {
             Ok(area)
         }
         async fn list_areas(&self) -> CloudResult<Vec<Area>> {
+            if let Some(error) = self.list_error.lock().clone() {
+                return Err(error);
+            }
             Ok(self.areas.lock().clone())
+        }
+        async fn list_atlases(&self) -> CloudResult<Vec<AtlasListItem>> {
+            if let Some(error) = self.list_error.lock().clone() {
+                return Err(error);
+            }
+            Ok(Vec::new())
         }
         async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
             self.details
@@ -1164,6 +1198,70 @@ mod tests {
             composite.get_area(&cloud_id).await.unwrap().area.name,
             "Cloud",
             "cloud id routes to the cloud tier"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A list that left out the cloud tier would read as every cloud map
+    /// gone, so a cloud failure fails it; the tiers on this device still
+    /// answer through `list_areas_by_tier`.
+    #[tokio::test]
+    async fn a_cloud_list_failure_fails_the_list_and_spares_the_device_tiers() {
+        let root = temp_root();
+        let (local, local_id) = local_with_one_area(&root).await;
+        let cloud = Arc::new(StubCloud::new(true));
+        cloud.add_area(owned_area(AreaId(Uuid::new_v4()), "Cloud", 1));
+        cloud.fail_lists(CloudError::ServiceUnavailable {
+            message: "Service temporarily unavailable".to_string(),
+            retry_after: Some(std::time::Duration::from_secs(5)),
+        });
+        let composite = CompositeBackend::new(local, cloud);
+
+        assert!(matches!(
+            composite.list_areas().await,
+            Err(CloudError::ServiceUnavailable { .. })
+        ));
+        // Folder lists answer with what they could read; `list_atlases_in`
+        // is the one that says a tier couldn't be read.
+        assert!(composite.list_atlases().await.is_ok());
+        let tiered = composite.list_areas_by_tier().await.expect("device tiers");
+        assert_eq!(
+            tiered.required.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![local_id]
+        );
+        assert!(matches!(
+            tiered.cloud,
+            Err(CloudError::ServiceUnavailable { .. })
+        ));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A refused credential is signed out: the cloud tier lists nothing and
+    /// the device tiers answer as complete.
+    #[tokio::test]
+    async fn a_refused_credential_lists_no_cloud_maps() {
+        let root = temp_root();
+        let (local, local_id) = local_with_one_area(&root).await;
+        let cloud = Arc::new(StubCloud::new(true));
+        cloud.fail_lists(CloudError::Unauthorized("Invalid session".to_string()));
+        let composite = CompositeBackend::new(local, cloud);
+
+        let listed = composite.list_areas().await.expect("signed out lists");
+        assert_eq!(
+            listed.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![local_id]
+        );
+        composite.list_atlases().await.expect("signed out lists");
+        assert!(
+            composite
+                .list_areas_by_tier()
+                .await
+                .expect("tiers")
+                .cloud
+                .expect("an empty cloud tier")
+                .is_empty()
         );
 
         std::fs::remove_dir_all(&root).ok();

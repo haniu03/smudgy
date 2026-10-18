@@ -2702,15 +2702,18 @@ impl PendingQueue {
         verdict
     }
 
-    /// Reports a 503 on the in-flight head: the service holds writes to the
-    /// subject for a moment (a transfer's seal, or a hold on every write).
-    /// The head backs off and retries without spending its transport
-    /// attempts, so a hold never parks it as `CouldNotSave`.
+    /// Reports a 503 on the in-flight head: the service is unavailable to
+    /// the subject for a moment (a busy map store, a transfer's seal, or a
+    /// hold on every write). The head waits the server's `retry_after` when
+    /// it sent one, and otherwise backs off; either way it retries without
+    /// spending its transport attempts, so a hold never parks it as
+    /// `CouldNotSave`.
     pub(crate) fn service_unavailable(
         &self,
         area_id: AreaId,
         operation_id: OperationId,
         now: Instant,
+        retry_after: Option<Duration>,
     ) {
         {
             let mut state = self.state.lock();
@@ -2724,8 +2727,9 @@ impl PendingQueue {
                     }
                     head.held = head.held.saturating_add(1);
                     let jitter = Duration::from_millis(u64::from(fastrand_ms()) % 100);
+                    let delay = retry_after.unwrap_or_else(|| retry_delay(head.held));
                     area.phase = AreaPhase::Backoff {
-                        until: now + retry_delay(head.held) + jitter,
+                        until: now + delay + jitter,
                         held: true,
                     };
                 }
@@ -3437,7 +3441,7 @@ impl PendingQueue {
 /// Millisecond jitter without a real RNG dependency: the low bits of the
 /// monotonic clock are unpredictable enough to de-synchronize retry storms.
 #[allow(clippy::cast_possible_truncation)]
-fn fastrand_ms() -> u32 {
+pub(super) fn fastrand_ms() -> u32 {
     (Instant::now().elapsed().subsec_nanos() ^ std::process::id()) as u32
 }
 
@@ -3513,7 +3517,7 @@ mod tests {
         q.enqueue(area, operation).expect("enqueue");
         let now = Instant::now();
         assert!(q.take_ready(now).0.is_some());
-        q.service_unavailable(area, operation_id, now);
+        q.service_unavailable(area, operation_id, now, None);
         assert_eq!(q.save_status(area), AreaSaveStatus::Held(1));
         assert!(q.take_ready(now + Duration::from_hours(1)).0.is_some());
         let _ = q.transport_failure(area, operation_id, now);
@@ -3555,7 +3559,7 @@ mod tests {
                 q.take_ready(now).0.is_none(),
                 "one request at a time while in flight"
             );
-            q.service_unavailable(area, operation_id, now);
+            q.service_unavailable(area, operation_id, now, None);
             assert!(
                 q.take_ready(now).0.is_none(),
                 "a held write waits out its backoff"
@@ -3571,6 +3575,33 @@ mod tests {
         assert_eq!(
             q.transport_failure(area, operation_id, now),
             TransportVerdict::BackedOff
+        );
+    }
+
+    #[test]
+    fn a_held_write_waits_as_long_as_the_server_asked() {
+        let q = PendingQueue::new();
+        let area = AreaId(Uuid::new_v4());
+        let operation = envelope("op");
+        let operation_id = operation.operation_id;
+        q.enqueue(area, operation).expect("enqueue");
+        let now = Instant::now();
+        assert!(q.take_ready(now).0.is_some());
+        q.service_unavailable(area, operation_id, now, Some(Duration::from_secs(5)));
+        assert!(
+            q.take_ready(now + Duration::from_millis(4_900)).0.is_none(),
+            "not before the server's delay"
+        );
+        assert!(
+            q.take_ready(now + Duration::from_millis(5_100)).0.is_some(),
+            "once the delay and its jitter pass"
+        );
+        // A later hold without a delay falls back to the backoff schedule.
+        q.service_unavailable(area, operation_id, now, None);
+        assert!(
+            q.take_ready(now + retry_delay(2) + Duration::from_millis(100))
+                .0
+                .is_some()
         );
     }
 
