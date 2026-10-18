@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more than one server you can pick which of your MUDs use the clan's maps in
   the clan's Settings tab. Moving a map or folder into a clan that isn't on any
   server yet takes the servers the map or folder was on.
+- **Command aliases default to a new Auto mode.** Auto captures everything
+  typed after the command word as one `$args` capture (`matches.args` in a
+  script), with no argument rows to set up, and it still fires when the rest
+  of the line has an unbalanced quote or brace. Simple and Advanced remain for
+  aliases that want named arguments, and an existing alias keeps the mode it
+  was saved with. The `command` tag in scripts is unchanged. An aliases file
+  that contains an Auto alias does not load in older versions of smudgy.
+
 - User scripts and Smudgy package modules can import `@name` or `@name/subpath`
   as shorthand for `smudgy:@name` or `smudgy:@name/subpath`. Static imports,
   re-exports, and dynamic imports share the same package instance and checks.
@@ -105,6 +113,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Command aliases no longer miss on an unterminated quote or brace.** A
+  quote or brace that nothing closes is kept as text and the alias fires with
+  the rest of the line intact; before, `say don't` went to the game untouched.
+  The editor's Try-it says when that happened. Switching a Command alias
+  between Auto, Simple, and Advanced keeps its argument rows.
 - **Hidden panes wait in the new Layout menu.** The toolbar's Layouts button is
   now **Layout**, and it opens a menu instead of a dialog. A pane you hide with
   its tab's hide control, or that a script hides or creates hidden, leaves the
@@ -157,6 +170,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Deleting a server no longer hides folders on every other server.** A folder
   shown only on the deleted server goes back to showing on every server.
+- The "Whole line as one argument" parsing mode on an Advanced command alias
+  never fired with anything after the command word, because the word itself
+  was folded into the single argument. The word now matches on its own and the
+  rest of the line goes, verbatim, to the one argument that claims it. The
+  editor allows a single argument under that parsing, since a second one could
+  never be filled.
 - **The connection rule no longer flips to "Disconnected" when a connect attempt
   is replaced mid-dial.** A newer attempt's "Connecting to …" is left alone when
   the attempt it replaced reports its own end.

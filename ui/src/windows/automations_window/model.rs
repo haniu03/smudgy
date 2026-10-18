@@ -507,7 +507,7 @@ impl Default for AliasMatcherDraft {
             command_override: None,
             args: Vec::new(),
             parse: ParseMode::All,
-            cmd_mode: CmdMode::Simple,
+            cmd_mode: CmdMode::Auto,
             pattern_source: String::new(),
             anchor_start: true,
             anchor_end: true,
@@ -549,6 +549,9 @@ impl AliasMatcherDraft {
                 draft.args.clone_from(args);
                 draft.parse = *parse;
                 draft.cmd_mode = *mode;
+                // The row invariants hold on screen whatever the file says,
+                // as they would after the next edit.
+                draft.normalize_args();
             }
             AliasMatcherSource::Pattern {
                 source,
@@ -612,6 +615,16 @@ impl AliasMatcherDraft {
             if word.contains(char::is_whitespace) {
                 return Err(crate::i18n::t!("editor-command-name-spaces"));
             }
+            // "Whole line as one argument" yields one token after the word, so
+            // a second argument could never be fed — and a second Required one
+            // would make the alias swallow every line with a usage echo. Only
+            // Advanced can see the picker, so only Advanced is held to it.
+            if self.cmd_mode == CmdMode::Advanced
+                && self.parse == ParseMode::Raw
+                && self.args.len() > 1
+            {
+                return Err(crate::i18n::t!("editor-raw-one-argument"));
+            }
         }
         match self.to_matcher() {
             None => Ok(self.regex_source.clone()),
@@ -620,26 +633,26 @@ impl AliasMatcherDraft {
         }
     }
 
-    /// README §2 invariants on the argument rows, applied after every args
-    /// mutation: `Rest` only in the last position (earlier ones demote to
-    /// `Optional`), and Simple mode forces every argument `Optional` with the
-    /// last one `Rest`.
+    /// The row invariants, applied after every args mutation. Switching
+    /// modes never destroys rows: Auto runs its own fixed capture (see
+    /// [`Self::effective_args`]) and leaves the author's rows waiting for a
+    /// switch back, holding only the rest-last rule so they stay valid.
     pub fn normalize_args(&mut self) {
-        let len = self.args.len();
-        for (i, arg) in self.args.iter_mut().enumerate() {
-            if arg.kind == ArgKind::Rest && i + 1 != len {
-                arg.kind = ArgKind::Optional;
-            }
+        match self.cmd_mode {
+            CmdMode::Auto => matchers::normalize_rows(&mut self.args, false),
+            mode => mode.normalize(&mut self.args),
         }
-        if self.cmd_mode == CmdMode::Simple {
-            for (i, arg) in self.args.iter_mut().enumerate() {
-                arg.kind = if i + 1 == len {
-                    ArgKind::Rest
-                } else {
-                    ArgKind::Optional
-                };
-            }
-        }
+    }
+
+    /// The rows that actually run ([`CmdMode::normalize`]): Auto's fixed
+    /// `args` capture, or the draft's rows. Everything the editor shows about
+    /// captures — the Usage line, Try-it, the generated example — reads these,
+    /// not the stored rows, so it cannot disagree with the runtime.
+    #[must_use]
+    pub fn effective_args(&self) -> Vec<ArgSpec> {
+        let mut args = self.args.clone();
+        self.cmd_mode.normalize(&mut args);
+        args
     }
 }
 
@@ -1946,9 +1959,110 @@ mod tests {
         }
 
         #[test]
+        fn auto_mode_is_the_default_and_runs_one_rest_argument() {
+            let draft = AliasMatcherDraft::default();
+            assert_eq!(draft.kind, AliasKind::Command);
+            assert_eq!(draft.cmd_mode, CmdMode::Auto);
+            assert!(draft.args.is_empty());
+            assert_eq!(draft.effective_args(), CmdMode::auto_args());
+            assert!(matches!(
+                draft.to_matcher(),
+                Some(AliasMatcherSource::Command {
+                    mode: CmdMode::Auto,
+                    ..
+                })
+            ));
+
+            // Switching modes never destroys rows: Auto leaves an Advanced
+            // draft's rows in place (running its own capture meanwhile), and
+            // switching back finds them.
+            let rows = vec![
+                ArgSpec {
+                    name: "a".to_string(),
+                    kind: ArgKind::Required,
+                },
+                ArgSpec {
+                    name: "b".to_string(),
+                    kind: ArgKind::Optional,
+                },
+            ];
+            let mut draft = AliasMatcherDraft {
+                cmd_mode: CmdMode::Advanced,
+                args: rows.clone(),
+                ..AliasMatcherDraft::default()
+            };
+            draft.cmd_mode = CmdMode::Auto;
+            draft.normalize_args();
+            assert_eq!(draft.args, rows);
+            assert_eq!(draft.effective_args(), CmdMode::auto_args());
+            // The save keeps the author's rows too.
+            assert!(matches!(
+                draft.to_matcher(),
+                Some(AliasMatcherSource::Command { args, mode: CmdMode::Auto, .. }) if args == rows
+            ));
+            draft.cmd_mode = CmdMode::Advanced;
+            draft.normalize_args();
+            assert_eq!(draft.args, rows);
+            assert_eq!(draft.effective_args(), rows);
+
+            // A stored Auto sidecar with rows keeps them in the draft; what
+            // runs is still the one `args` capture.
+            let stored = AliasMatcherSource::Command {
+                name: None,
+                args: vec![ArgSpec {
+                    name: "target".to_string(),
+                    kind: ArgKind::Required,
+                }],
+                parse: ParseMode::All,
+                mode: CmdMode::Auto,
+            };
+            let draft =
+                AliasMatcherDraft::from_definition(&alias(r"^say(?:\s|$)", Some(stored)), "say");
+            assert_eq!(draft.kind, AliasKind::Command);
+            assert!(!draft.degraded);
+            assert_eq!(draft.args[0].name, "target");
+            assert_eq!(draft.effective_args(), CmdMode::auto_args());
+        }
+
+        #[test]
+        fn whole_line_parsing_allows_a_single_argument() {
+            let two = vec![
+                ArgSpec {
+                    name: "a".to_string(),
+                    kind: ArgKind::Required,
+                },
+                ArgSpec {
+                    name: "b".to_string(),
+                    kind: ArgKind::Required,
+                },
+            ];
+            let mut draft = AliasMatcherDraft {
+                cmd_mode: CmdMode::Advanced,
+                parse: ParseMode::Raw,
+                args: two.clone(),
+                ..AliasMatcherDraft::default()
+            };
+            // Two rows under Raw: the save is refused.
+            assert!(draft.to_pattern("greet").is_err());
+            draft.args.truncate(1);
+            assert!(draft.to_pattern("greet").is_ok());
+            // Any other parsing takes the rows.
+            draft.args = two.clone();
+            draft.parse = ParseMode::All;
+            assert!(draft.to_pattern("greet").is_ok());
+            // Simple cannot see the picker, so a Raw left over from Advanced
+            // does not trap it.
+            draft.parse = ParseMode::Raw;
+            draft.cmd_mode = CmdMode::Simple;
+            draft.normalize_args();
+            assert!(draft.to_pattern("greet").is_ok());
+        }
+
+        #[test]
         fn simple_mode_normalizes_args_to_optional_then_rest() {
             let mut draft = AliasMatcherDraft {
                 kind: AliasKind::Command,
+                cmd_mode: CmdMode::Simple,
                 command_override: None,
                 args: vec![
                     ArgSpec {

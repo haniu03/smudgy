@@ -2151,6 +2151,8 @@ impl AutomationsWindow {
             Message::SetArgName(i, name) => {
                 if let Some(arg) = self.alias_draft.args.get_mut(i) {
                     arg.name = name;
+                    // Auto's one row keeps its fixed name.
+                    self.alias_draft.normalize_args();
                 }
                 Update::none()
             }
@@ -7538,7 +7540,11 @@ mod tab_traversal_tests {
 
         let mut window = state_test_window("state-rename-test");
         let _ = window.new_alias();
-        // A Command argument named `target` is a matched value.
+        // A Command argument named `target` is a matched value (Advanced:
+        // the default Auto face has no rows to add to).
+        let _ = window.update(Message::SetCmdMode(
+            smudgy_core::models::matchers::CmdMode::Advanced,
+        ));
         let _ = window.update(Message::AddArg);
         let _ = window.update(Message::SetArgName(0, "target".to_string()));
 

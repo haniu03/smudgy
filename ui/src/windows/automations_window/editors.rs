@@ -2555,7 +2555,7 @@ impl AutomationsWindow {
         let draft = &self.alias_draft;
         match draft.kind {
             AliasKind::Command => draft
-                .args
+                .effective_args()
                 .iter()
                 .map(|arg| Some(arg.name.clone()))
                 .collect(),
@@ -3817,6 +3817,14 @@ impl AutomationsWindow {
         let draft = &self.alias_draft;
         let mode_radios = row![
             radio(
+                crate::i18n::ts!("editor-cmd-auto"),
+                CmdMode::Auto,
+                Some(draft.cmd_mode),
+                Message::SetCmdMode,
+            )
+            .size(14.0)
+            .text_size(13.0),
+            radio(
                 crate::i18n::ts!("editor-cmd-simple"),
                 CmdMode::Simple,
                 Some(draft.cmd_mode),
@@ -3854,6 +3862,46 @@ impl AutomationsWindow {
                 .into(),
         ));
 
+        // Auto has no rows to edit: its one `args` capture is fixed, so the
+        // Arguments row is left out; the Usage line already shows the capture.
+        if draft.cmd_mode != CmdMode::Auto {
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-arguments"),
+                self.alias_arg_rows().into(),
+            ));
+        }
+
+        // The Usage row (label included) is omitted while the command word is
+        // empty — an unnamed new alias has nothing to show yet.
+        let word = draft.command_word(alias_name);
+        if !word.is_empty() {
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-usage"),
+                column![
+                    text(matchers::usage_line(word, &draft.effective_args()))
+                        .size(13.0)
+                        .font(fonts::GEIST_MONO_VF),
+                    text(crate::i18n::t!("editor-command-completion-note"))
+                        .size(12.0)
+                        .style(common::muted),
+                ]
+                .spacing(4.0)
+                .into(),
+            ));
+        }
+        if draft.cmd_mode == CmdMode::Advanced {
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-parsing"),
+                self.parsing_picker(),
+            ));
+        }
+        body
+    }
+
+    /// The Simple and Advanced faces' argument rows: a name per row, the
+    /// kind picker (Advanced only), a remove button, and the add button.
+    fn alias_arg_rows<'a>(&'a self) -> Column<'a, Message, Theme> {
+        let draft = &self.alias_draft;
         let mut args = Column::new().spacing(6.0);
         let last = draft.args.len().saturating_sub(1);
         for (i, arg) in draft.args.iter().enumerate() {
@@ -3910,35 +3958,17 @@ impl AutomationsWindow {
                 .align_y(Vertical::Center),
             )
             .style(button_style::secondary)
-            .on_press(Message::AddArg),
+            // "Whole line as one argument" feeds exactly one row (see
+            // `AliasMatcherDraft::to_pattern`), so the button rests once it
+            // has one.
+            .on_press_maybe(
+                (!(draft.cmd_mode == CmdMode::Advanced
+                    && draft.parse == matchers::ParseMode::Raw
+                    && !draft.args.is_empty()))
+                .then_some(Message::AddArg),
+            ),
         );
-        body = body.push(field_row(crate::i18n::ts!("editor-arguments"), args.into()));
-
-        // The Usage row (label included) is omitted while the command word is
-        // empty — an unnamed new alias has nothing to show yet.
-        let word = draft.command_word(alias_name);
-        if !word.is_empty() {
-            body = body.push(field_row(
-                crate::i18n::ts!("editor-usage"),
-                column![
-                    text(matchers::usage_line(word, &draft.args))
-                        .size(13.0)
-                        .font(fonts::GEIST_MONO_VF),
-                    text(crate::i18n::t!("editor-command-completion-note"))
-                        .size(12.0)
-                        .style(common::muted),
-                ]
-                .spacing(4.0)
-                .into(),
-            ));
-        }
-        if draft.cmd_mode == CmdMode::Advanced {
-            body = body.push(field_row(
-                crate::i18n::ts!("editor-parsing"),
-                self.parsing_picker(),
-            ));
-        }
-        body
+        args
     }
 
     /// The Parsing picker (D7): a custom overlay dropdown, because the rows
@@ -4222,14 +4252,31 @@ impl AutomationsWindow {
                         NodeStatus::Disabled,
                     );
                 }
-                let spec = CommandSpec {
-                    name: name.to_string(),
-                    args: draft.args.clone(),
-                    parse: draft.parse,
-                };
+                // Built the way the runtime builds it, so Auto's fixed
+                // capture and tokenizer are what the verdict tests.
+                let spec =
+                    CommandSpec::new(name.to_string(), draft.cmd_mode, &draft.args, draft.parse);
+
                 match matchers::assign(sample, &spec.name, &spec.args, spec.parse) {
                     CommandOutcome::Fired { .. } => {
-                        (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
+                        // Leniency is worth a word: the author who typed a
+                        // quote expecting it to group should see it did not.
+                        let verdict = crate::i18n::t!("editor-would-fire");
+                        let note = match matchers::tokenize(sample.trim(), spec.parse).kept_literal
+                        {
+                            Some(matchers::KeptLiteral::UnterminatedQuote) => {
+                                Some(crate::i18n::t!("editor-kept-quote"))
+                            }
+                            Some(matchers::KeptLiteral::UnbalancedBrace) => {
+                                Some(crate::i18n::t!("editor-kept-brace"))
+                            }
+                            None => None,
+                        };
+                        let verdict = match note {
+                            Some(note) => format!("{verdict} · {note}"),
+                            None => verdict,
+                        };
+                        (verdict, NodeStatus::Ok)
                     }
                     CommandOutcome::NotFired(miss) => command_miss_verdict(name, &miss),
                 }
@@ -6860,7 +6907,7 @@ fn render_references(captures: &[Option<String>], language: ScriptLang) -> Vec<S
 
 /// The Try-it verdict for a Command miss, in the deck's words.
 fn command_miss_verdict(name: &str, miss: &matchers::CommandMiss) -> (String, NodeStatus) {
-    use matchers::{CommandMiss, TokenizeError};
+    use matchers::CommandMiss;
     match miss {
         CommandMiss::Empty => (
             crate::i18n::t!("editor-enter-command"),
@@ -6877,14 +6924,6 @@ fn command_miss_verdict(name: &str, miss: &matchers::CommandMiss) -> (String, No
         CommandMiss::Unclaimed { text } => (
             crate::i18n::t!("editor-unclaimed", "text" => text.clone()),
             NodeStatus::Disabled,
-        ),
-        CommandMiss::Tokenize(TokenizeError::UnterminatedQuote) => (
-            crate::i18n::t!("editor-unterminated-quote"),
-            NodeStatus::Error,
-        ),
-        CommandMiss::Tokenize(TokenizeError::UnbalancedBraces) => (
-            crate::i18n::t!("editor-unbalanced-braces"),
-            NodeStatus::Error,
         ),
     }
 }
@@ -7565,6 +7604,9 @@ mod tests {
 
         // Both groups at once: a Command argument mounts Matched values beside State values.
         let _ = window.new_alias();
+        // Advanced: the default Auto face has no rows to add to. The baseline
+        // follows the switch, which adds the Parsing row above the editor.
+        let _ = window.update(Message::SetCmdMode(CmdMode::Advanced));
         let baseline = action_editor_path(&window);
         let _ = window.update(Message::AddArg);
         let _ = window.update(Message::SetArgName(0, "target".to_string()));
