@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Scripts can see and wait for maps that are still loading.** `mapper.areas`
+  and `mapper.getAreaById` include cloud maps still loading, with
+  `area.loading` set and no rooms yet, and a write to one waits until it has
+  loaded. `mapper.ready({ all: true })` waits until every map has finished
+  loading, and `mapper.ready({ id })` until one has; both resolve even if maps
+  fail to load, so check `area.loading` afterwards. `areasLoaded` from
+  `smudgy:events/map` names maps as they arrive after the session starts,
+  including maps newly shared with you.
 - **Local maps made during an outage are pointed out.** When the map service
   answers again, Smudgy names any local map you made in the meantime that
   shares a name with one of your cloud maps.
@@ -121,6 +129,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the rest of the line intact; before, `say don't` went to the game untouched.
   The editor's Try-it says when that happened. Switching a Command alias
   between Auto, Simple, and Advanced keeps its argument rows.
+- **Packages can add starter maps while Smudgy cloud is unavailable.**
+  `mapper.importAreasIfAbsent` checks names against your cloud maps as they
+  were when they last loaded, instead of holding off.
 - **Cloud maps load in the background.** Cloud maps now load several at a time
   and appear as they arrive. If they're still loading after 20 seconds, the
   session starts with the maps loaded so far, and its first line counts the

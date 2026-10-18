@@ -1274,6 +1274,14 @@ impl AtlasCache {
         !self.area_is_excluded(area_id)
     }
 
+    /// Whether a map not yet loaded, `area`, would take part: not turned off
+    /// and not kept for another server, by its own atlas and clan.
+    pub(super) fn includes_unloaded(&self, area: &AreaCache) -> bool {
+        let area_id = area.get_id();
+        !self.exclusions.disabled.contains(area_id)
+            && !self.exclusions.scope_excludes(area_id, area)
+    }
+
     /// Whether either axis excludes `area_id` from identification/routing. The
     /// scope axis is resolved by looking the map up to read its atlas and clan.
     fn area_is_excluded(&self, area_id: &AreaId) -> bool {

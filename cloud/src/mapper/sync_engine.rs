@@ -681,6 +681,9 @@ pub(super) async fn refetch_area(
         });
         if !replaced_during_fetch && !outdated_source {
             inner.replay_pending_over_locked(*area_id, &details, ReplayMode::StopAtFailure);
+            if cloud_area && token_now.is_none() {
+                inner.note_arrivals(vec![*area_id]);
+            }
             if inner.pending.recovery_base_loaded(*area_id) {
                 inner
                     .sync_stats

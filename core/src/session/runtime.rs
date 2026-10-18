@@ -428,6 +428,24 @@ impl MapsLoaded {
     }
 }
 
+/// The maps arrived since `receiver` was last asked, each once. Batches
+/// dropped for a slow listener are skipped: the maps they named are on the
+/// map regardless.
+fn take_arrivals(
+    receiver: &mut tokio::sync::broadcast::Receiver<Arc<[smudgy_cloud::AreaId]>>,
+) -> Vec<smudgy_cloud::AreaId> {
+    use tokio::sync::broadcast::error::TryRecvError;
+    let mut seen = std::collections::HashSet::new();
+    let mut area_ids = Vec::new();
+    loop {
+        match receiver.try_recv() {
+            Ok(batch) => area_ids.extend(batch.iter().filter(|id| seen.insert(**id)).copied()),
+            Err(TryRecvError::Lagged(_)) => {}
+            Err(TryRecvError::Empty | TryRecvError::Closed) => return area_ids,
+        }
+    }
+}
+
 /// The session's maps still loading after it started.
 struct MapLoadWatch {
     progress: tokio::sync::watch::Receiver<LoadMapsSummary>,
@@ -1706,6 +1724,7 @@ impl Runtime {
             // and read back by `getCurrentLocation`. Preserved across reload (cloned below).
             let current_location = CurrentLocation::default();
             let mapper_events = mapper_events::subscribe(mapper.as_ref());
+            let map_arrivals = mapper.as_ref().map(Mapper::subscribe_arrivals);
 
             let pane_registry = local_pane_registry;
 
@@ -1931,6 +1950,7 @@ impl Runtime {
                 load_row: Some(load_row),
                 load_summary,
                 map_load: None,
+                map_arrivals,
                 connection_row: None,
                 connection_target: None,
                 current_location: current_location.clone(),
@@ -2047,6 +2067,7 @@ impl Runtime {
                 // The MSSP producer likewise.
                 let old_mssp_producer =
                     std::mem::replace(&mut inner.mssp, mssp::MsspProducer::new());
+                let old_map_arrivals = inner.map_arrivals.take();
                 let mut old_session_runtime_rx =
                     std::mem::replace(&mut inner.session_runtime_rx, {
                         // Create a dummy receiver that will be immediately replaced
@@ -2335,6 +2356,7 @@ impl Runtime {
                     load_row: Some(reload_row),
                     load_summary: new_load_summary,
                     map_load: None,
+                    map_arrivals: old_map_arrivals,
                     connection_row: old_connection_row,
                     connection_target: old_connection_target,
                     current_location: current_location.clone(), // Preserve current location across reload
@@ -2744,6 +2766,9 @@ struct Inner<'a> {
     load_summary: LoadSummary,
     /// The session's maps still loading after it started, if any are.
     map_load: Option<MapLoadWatch>,
+    /// Maps arriving after the session started, for `map:areasLoaded`.
+    /// Heard from before any script runs, and kept across reloads.
+    map_arrivals: Option<tokio::sync::broadcast::Receiver<Arc<[smudgy_cloud::AreaId]>>>,
     /// The connection rule: one row cycling `Opened offline · Connect` →
     /// `Connecting to host…` → `Connected to host`. `Some` while that row is
     /// still the live one to replace; a disconnect starts a fresh rule
@@ -3825,6 +3850,14 @@ impl Inner<'_> {
         self.replace_system_row_sync(SystemRow::group(id, progress, text, children));
     }
 
+    /// The `map:areasLoaded` delivery for maps that arrived since last asked.
+    fn take_map_arrivals(&mut self) -> Option<RuntimeAction> {
+        let area_ids = take_arrivals(self.map_arrivals.as_mut()?);
+        (!area_ids.is_empty()).then(|| RuntimeAction::MapperAreasLoaded {
+            area_ids: Arc::from(area_ids),
+        })
+    }
+
     /// Follows the session's maps still loading after it started: counts
     /// them on the load row, and says so once they all have.
     fn poll_map_load(&mut self) {
@@ -4373,6 +4406,12 @@ impl Inner<'_> {
                     mapper_events::insert_remaps(frame, remaps);
                 } else {
                     action_stack.push(remaps);
+                }
+            }
+            if let Some(arrived) = self.take_map_arrivals() {
+                match action_stack.last_mut() {
+                    Some(frame) => frame.push_back(arrived),
+                    None => action_stack.push(VecDeque::from([arrived])),
                 }
             }
             // A receiver can disappear between any two actions. Stop after the

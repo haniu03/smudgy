@@ -2032,6 +2032,13 @@ impl Inner<'_> {
                 }).to_string();
                 Ok(self.run_host_event("map:merged", &payload))
             }
+            RuntimeAction::MapperAreasLoaded { area_ids } => {
+                let payload = serde_json::json!({
+                    "areaIds": area_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                })
+                .to_string();
+                Ok(self.run_host_event("map:areasLoaded", &payload))
+            }
             RuntimeAction::MapRoomClicked {
                 area_id,
                 room_number,
