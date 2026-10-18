@@ -395,14 +395,81 @@ pub enum ParseMode {
     Raw,
 }
 
-/// Whether the Command editor showed its Simple or Advanced face. Editor
-/// state only — both modes produce the same runtime shape.
+/// Which face the Command editor showed, and which rows the runtime parses
+/// with (see [`CommandSpec::new`]).
+///
+/// `Advanced` runs the stored `args` rows as the author wrote them. `Simple`
+/// runs its rows too, held optional-then-rest, and hides the Parsing picker.
+/// `Auto`, the default, ignores the rows: the whole rest of the line lands in
+/// one capture named `args` (`$args` / `matches.args`). The stored rows and
+/// `parse` are authoring state that every mode keeps, so switching modes in
+/// the editor never loses them. A `command` tag alias never uses `Auto`; its
+/// usage-line notation is `Advanced` by construction.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CmdMode {
     #[default]
+    Auto,
     Simple,
     Advanced,
+}
+
+impl CmdMode {
+    /// The name of `Auto`'s single capture.
+    pub const AUTO_ARG_NAME: &'static str = "args";
+
+    /// `Auto`'s fixed argument list: one rest-of-line argument named `args`.
+    #[must_use]
+    pub fn auto_args() -> Vec<ArgSpec> {
+        vec![ArgSpec {
+            name: Self::AUTO_ARG_NAME.to_string(),
+            kind: ArgKind::Rest,
+        }]
+    }
+
+    /// What a sidecar with no `mode` key means. `Auto` is the default for a
+    /// *new* alias, but every editor save writes the key, so an absent one
+    /// is a hand-written, package, or script-saved sidecar from before modes
+    /// meant anything at runtime — when the rows and `parse` ran exactly as
+    /// written, which is what `Advanced` still does.
+    #[must_use]
+    pub const fn legacy() -> Self {
+        Self::Advanced
+    }
+
+    /// The rows this mode runs, derived from the stored ones: `Auto` replaces
+    /// them with [`Self::auto_args`]; the other modes apply
+    /// [`normalize_rows`]. Used by [`CommandSpec::new`] before every match
+    /// and by the editor for everything it shows, so a hand-edited sidecar
+    /// runs the way the editor would show it.
+    pub fn normalize(self, args: &mut Vec<ArgSpec>) {
+        match self {
+            Self::Auto => *args = Self::auto_args(),
+            Self::Simple => normalize_rows(args, true),
+            Self::Advanced => normalize_rows(args, false),
+        }
+    }
+}
+
+/// The argument-row invariants (README §2): `Rest` may only end the list
+/// (earlier ones demote to `Optional`), and `simple` additionally forces every
+/// row `Optional` with the last one `Rest`.
+pub fn normalize_rows(args: &mut [ArgSpec], simple: bool) {
+    let len = args.len();
+    for (i, arg) in args.iter_mut().enumerate() {
+        if arg.kind == ArgKind::Rest && i + 1 != len {
+            arg.kind = ArgKind::Optional;
+        }
+    }
+    if simple {
+        for (i, arg) in args.iter_mut().enumerate() {
+            arg.kind = if i + 1 == len {
+                ArgKind::Rest
+            } else {
+                ArgKind::Optional
+            };
+        }
+    }
 }
 
 /// How one Command argument consumes tokens. `Rest` may only appear in the
@@ -442,7 +509,8 @@ pub enum AliasMatcherSource {
         args: Vec<ArgSpec>,
         #[serde(default)]
         parse: ParseMode,
-        #[serde(default)]
+        /// Absent means [`CmdMode::legacy`], not [`CmdMode::default`].
+        #[serde(default = "CmdMode::legacy")]
         mode: CmdMode,
     },
     Pattern {
@@ -828,6 +896,19 @@ pub struct CommandSpec {
     pub parse: ParseMode,
 }
 
+impl CommandSpec {
+    /// The spec a sidecar's mode implies (see [`CmdMode`]): the rows pass
+    /// through [`CmdMode::normalize`], and the parse mode is used as stored.
+    /// The editor's Try-it and the runtime both build their spec here, so
+    /// they cannot disagree.
+    #[must_use]
+    pub fn new(name: String, mode: CmdMode, args: &[ArgSpec], parse: ParseMode) -> Self {
+        let mut args = args.to_vec();
+        mode.normalize(&mut args);
+        Self { name, args, parse }
+    }
+}
+
 impl AliasMatcherSource {
     /// The word this sidecar matches on: the pinned override, or — the
     /// ordinary case — the alias's own name. `None` for a Pattern.
@@ -846,12 +927,16 @@ impl AliasMatcherSource {
     pub fn command_spec(&self, alias_name: &str) -> Option<CommandSpec> {
         match self {
             Self::Command {
-                name, args, parse, ..
-            } => Some(CommandSpec {
-                name: name.as_deref().unwrap_or(alias_name).to_string(),
-                args: args.clone(),
-                parse: *parse,
-            }),
+                name,
+                args,
+                parse,
+                mode,
+            } => Some(CommandSpec::new(
+                name.as_deref().unwrap_or(alias_name).to_string(),
+                *mode,
+                args,
+                *parse,
+            )),
             Self::Pattern { .. } => None,
         }
     }
@@ -866,12 +951,22 @@ pub struct Token {
     pub start: usize,
 }
 
-/// A Command tokenizer failure. Distinct from a mere non-match: the editor
-/// surfaces these verbatim in the Try-it verdict.
+/// A grouping character the tokenizer kept as literal text because nothing
+/// closed it (`matching-logic.md` §1). Never a miss: the line still tokenizes
+/// with the character in place, so the alias still fires. The editor's Try-it
+/// mentions it; the runtime does not care.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenizeError {
+pub enum KeptLiteral {
     UnterminatedQuote,
-    UnbalancedBraces,
+    UnbalancedBrace,
+}
+
+/// The tokenizer's output: the tokens, and whether leniency was needed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Tokenized {
+    pub tokens: Vec<Token>,
+    /// The first grouping character kept literal, if any.
+    pub kept_literal: Option<KeptLiteral>,
 }
 
 /// Why a Command alias did not fire.
@@ -884,15 +979,10 @@ pub enum CommandMiss {
     WrongFirstWord,
     /// A required argument had no token — the D10 outcome: the runtime echoes
     /// the usage line locally and swallows the input.
-    MissingRequired {
-        name: String,
-    },
+    MissingRequired { name: String },
     /// Tokens remain after every argument was satisfied and there is no
     /// `Rest` argument to claim them; the typed line falls through.
-    Unclaimed {
-        text: String,
-    },
-    Tokenize(TokenizeError),
+    Unclaimed { text: String },
 }
 
 /// The result of matching one typed line against a Command.
@@ -908,32 +998,51 @@ pub enum CommandOutcome {
     NotFired(CommandMiss),
 }
 
+/// The `Raw` tokenizer — "Whole line as one argument": the command word is
+/// still its own token (the first whitespace-delimited word, which [`assign`]
+/// checks), and everything after it is one verbatim token — no escapes, no
+/// grouping, inner spacing kept.
+fn tokenize_raw(input: &str) -> Vec<Token> {
+    let word_start = input.len() - input.trim_start().len();
+    let line = &input[word_start..];
+    if line.is_empty() {
+        return Vec::new();
+    }
+    let word_len = line.find(char::is_whitespace).unwrap_or(line.len());
+    let mut tokens = vec![Token {
+        value: line[..word_len].to_string(),
+        start: word_start,
+    }];
+    let tail = &line[word_len..];
+    let rest = tail.trim();
+    if !rest.is_empty() {
+        tokens.push(Token {
+            value: rest.to_string(),
+            start: word_start + word_len + (tail.len() - tail.trim_start().len()),
+        });
+    }
+    tokens
+}
+
 /// Splits a Command's argument text into tokens per the parse mode
 /// (`matching-logic.md` §1). Backslash escapes the next character in every
-/// context; quotes do not nest, braces do.
-///
-/// # Errors
-///
-/// Returns [`TokenizeError`] for an unterminated quote or unbalanced braces.
-#[allow(clippy::missing_panics_doc)] // the depth bookkeeping cannot underflow
-pub fn tokenize(input: &str, parse: ParseMode) -> Result<Vec<Token>, TokenizeError> {
-    let spaces_split = parse != ParseMode::Raw;
+/// context; quotes do not nest, braces do. Lenient: a quote or brace that
+/// nothing closes is literal text (reported in [`Tokenized::kept_literal`]),
+/// never a failure — a typed `say don't worry` must fire.
+#[must_use]
+pub fn tokenize(input: &str, parse: ParseMode) -> Tokenized {
     let quotes_group = matches!(parse, ParseMode::Quotes | ParseMode::All);
     let braces_group = matches!(parse, ParseMode::Braces | ParseMode::All);
 
-    if !spaces_split {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            return Ok(Vec::new());
-        }
-        return Ok(vec![Token {
-            value: trimmed.to_string(),
-            start: input.len() - input.trim_start().len(),
-        }]);
+    if parse == ParseMode::Raw {
+        return Tokenized {
+            tokens: tokenize_raw(input),
+            kept_literal: None,
+        };
     }
 
     let chars: Vec<(usize, char)> = input.char_indices().collect();
-    let mut tokens = Vec::new();
+    let mut out = Tokenized::default();
     let mut i = 0;
     while i < chars.len() {
         while i < chars.len() && chars[i].1.is_whitespace() {
@@ -946,38 +1055,16 @@ pub fn tokenize(input: &str, parse: ParseMode) -> Result<Vec<Token>, TokenizeErr
         let mut value = String::new();
 
         if braces_group && chars[i].1 == '{' {
-            let mut depth = 0i32;
-            loop {
-                if i >= chars.len() {
-                    break;
-                }
-                let c = chars[i].1;
-                if c == '\\' && i + 1 < chars.len() {
-                    value.push(chars[i + 1].1);
-                    i += 2;
-                    continue;
-                }
-                if c == '{' {
-                    depth += 1;
-                    if depth == 1 {
-                        i += 1;
-                        continue;
-                    }
-                } else if c == '}' {
-                    depth -= 1;
-                    if depth == 0 {
-                        i += 1;
-                        break;
-                    }
-                }
-                value.push(c);
-                i += 1;
+            if let Some((group, next)) = brace_group(&chars, i) {
+                out.tokens.push(Token {
+                    value: group,
+                    start,
+                });
+                i = next;
+                continue;
             }
-            if depth != 0 {
-                return Err(TokenizeError::UnbalancedBraces);
-            }
-            tokens.push(Token { value, start });
-            continue;
+            // Unbalanced: the `{` opens a bare token instead.
+            out.kept_literal.get_or_insert(KeptLiteral::UnbalancedBrace);
         }
 
         // A bare token runs to the next whitespace; a quoted segment inside it
@@ -986,28 +1073,14 @@ pub fn tokenize(input: &str, parse: ParseMode) -> Result<Vec<Token>, TokenizeErr
         while i < chars.len() && !chars[i].1.is_whitespace() {
             let c = chars[i].1;
             if quotes_group && (c == '"' || c == '\'') {
-                let quote = c;
-                i += 1;
-                let mut closed = false;
-                while i < chars.len() {
-                    let c = chars[i].1;
-                    if c == '\\' && i + 1 < chars.len() {
-                        value.push(chars[i + 1].1);
-                        i += 2;
-                        continue;
-                    }
-                    if c == quote {
-                        i += 1;
-                        closed = true;
-                        break;
-                    }
-                    value.push(c);
-                    i += 1;
+                if let Some((segment, next)) = quoted(&chars, i) {
+                    value.push_str(&segment);
+                    i = next;
+                    continue;
                 }
-                if !closed {
-                    return Err(TokenizeError::UnterminatedQuote);
-                }
-                continue;
+                // Unterminated: the quote is just a character of the token.
+                out.kept_literal
+                    .get_or_insert(KeptLiteral::UnterminatedQuote);
             }
             if c == '\\' && i + 1 < chars.len() {
                 value.push(chars[i + 1].1);
@@ -1017,9 +1090,64 @@ pub fn tokenize(input: &str, parse: ParseMode) -> Result<Vec<Token>, TokenizeErr
             value.push(c);
             i += 1;
         }
-        tokens.push(Token { value, start });
+        out.tokens.push(Token { value, start });
     }
-    Ok(tokens)
+    out
+}
+
+/// The brace group opening at `chars[open]`: its unescaped content (braces
+/// nest) and the index after the closing brace, or `None` when nothing
+/// closes it.
+fn brace_group(chars: &[(usize, char)], open: usize) -> Option<(String, usize)> {
+    let mut value = String::new();
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < chars.len() {
+        let c = chars[i].1;
+        if c == '\\' && i + 1 < chars.len() {
+            value.push(chars[i + 1].1);
+            i += 2;
+            continue;
+        }
+        if c == '{' {
+            depth += 1;
+            if depth == 1 {
+                i += 1;
+                continue;
+            }
+        } else if c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some((value, i + 1));
+            }
+        }
+        value.push(c);
+        i += 1;
+    }
+    None
+}
+
+/// The quoted segment opening at `chars[open]`: its unescaped content and the
+/// index after the closing quote, or `None` when nothing closes it. Quotes do
+/// not nest, and a segment may span whitespace — that is its purpose.
+fn quoted(chars: &[(usize, char)], open: usize) -> Option<(String, usize)> {
+    let quote = chars[open].1;
+    let mut value = String::new();
+    let mut i = open + 1;
+    while i < chars.len() {
+        let c = chars[i].1;
+        if c == '\\' && i + 1 < chars.len() {
+            value.push(chars[i + 1].1);
+            i += 2;
+            continue;
+        }
+        if c == quote {
+            return Some((value, i + 1));
+        }
+        value.push(c);
+        i += 1;
+    }
+    None
 }
 
 /// Matches one typed line against a Command: tokenize, check the command
@@ -1030,10 +1158,7 @@ pub fn tokenize(input: &str, parse: ParseMode) -> Result<Vec<Token>, TokenizeErr
 #[must_use]
 pub fn assign(input: &str, name: &str, specs: &[ArgSpec], parse: ParseMode) -> CommandOutcome {
     let trimmed = input.trim();
-    let tokens = match tokenize(trimmed, parse) {
-        Ok(tokens) => tokens,
-        Err(err) => return CommandOutcome::NotFired(CommandMiss::Tokenize(err)),
-    };
+    let tokens = tokenize(trimmed, parse).tokens;
     let Some(first) = tokens.first() else {
         return CommandOutcome::NotFired(CommandMiss::Empty);
     };
@@ -1532,7 +1657,7 @@ mod tests {
 
         fn values(input: &str, parse: ParseMode) -> Vec<String> {
             tokenize(input, parse)
-                .expect("tokenizes")
+                .tokens
                 .into_iter()
                 .map(|t| t.value)
                 .collect()
@@ -1549,10 +1674,18 @@ mod tests {
             assert_eq!(values("big   ugly", Spaces), ["big", "ugly"]);
             assert_eq!(values(r#""big ugly" troll"#, Quotes), ["big ugly", "troll"]);
             assert_eq!(values("'big ugly' troll", Quotes), ["big ugly", "troll"]);
+            // Nothing closes the quote: it is kept as text and the line still
+            // tokenizes, so the alias still fires.
             assert_eq!(
-                tokenize(r#""big ugly troll"#, Quotes),
-                Err(TokenizeError::UnterminatedQuote)
+                tokenize(r#""big ugly troll"#, Quotes).kept_literal,
+                Some(KeptLiteral::UnterminatedQuote)
             );
+            assert_eq!(
+                values(r#""big ugly troll"#, Quotes),
+                ["\"big", "ugly", "troll"]
+            );
+            assert_eq!(values("say don't worry", Quotes), ["say", "don't", "worry"]);
+            assert_eq!(tokenize("say don't worry", Spaces).kept_literal, None);
             assert_eq!(values(r#"say \"hi\""#, Quotes), ["say", "\"hi\""]);
             // A closed quote glues into the surrounding bare run.
             assert_eq!(
@@ -1568,9 +1701,12 @@ mod tests {
                 ["cast {magic missile}", "now"]
             );
             assert_eq!(
-                tokenize("{big ugly", Braces),
-                Err(TokenizeError::UnbalancedBraces)
+                tokenize("{big ugly", Braces).kept_literal,
+                Some(KeptLiteral::UnbalancedBrace)
             );
+            assert_eq!(values("{big ugly", Braces), ["{big", "ugly"]);
+            assert_eq!(values("{big ugly} {troll", Braces), ["big ugly", "{troll"]);
+            assert_eq!(tokenize("{big ugly} troll", Braces).kept_literal, None);
             assert_eq!(
                 values(r#""big ugly" troll"#, Braces),
                 ["\"big", "ugly\"", "troll"]
@@ -1579,8 +1715,22 @@ mod tests {
                 values(r#""big ugly" {a "gift"}"#, All),
                 ["big ugly", "a \"gift\""]
             );
-            assert_eq!(values("big ugly troll", Raw), ["big ugly troll"]);
-            assert_eq!(values("  big  ugly  ", Raw), ["big  ugly"]);
+            // Whole line as one argument: the command word splits off and the
+            // rest is verbatim — no grouping, no escapes, inner spacing kept.
+            assert_eq!(
+                values("greet big ugly troll", Raw),
+                ["greet", "big ugly troll"]
+            );
+            assert_eq!(values("  greet  big  ugly  ", Raw), ["greet", "big  ugly"]);
+            assert_eq!(
+                values(r#"greet "big \"ugly" {troll"#, Raw),
+                ["greet", r#""big \"ugly" {troll"#]
+            );
+            assert_eq!(values("greet", Raw), ["greet"]);
+            assert!(values("   ", Raw).is_empty());
+            // The rest token's offset slices the raw remainder, as `Rest` does.
+            let tokens = tokenize("greet   big ugly", Raw).tokens;
+            assert_eq!(&"greet   big ugly"[tokens[1].start..], "big ugly");
         }
     }
 
@@ -1687,6 +1837,36 @@ mod tests {
                 ),
                 CommandOutcome::NotFired(CommandMiss::Unclaimed { .. })
             ));
+
+            // An unterminated quote is text, not a miss (it used to send the
+            // line to the game untouched).
+            let o = assign(r#"tell "Big Troll hi"#, "tell", &req_rest, all);
+            assert_eq!(arg(&o, "person").as_deref(), Some("\"Big"));
+            assert_eq!(arg(&o, "mood").as_deref(), Some("Troll hi"));
+
+            // Whole line as one argument (Raw): one verbatim token after the
+            // word, for whichever single argument claims it.
+            let raw = ParseMode::Raw;
+            let o = assign(r#"greet "big ugly" {troll"#, "greet", &rest, raw);
+            assert_eq!(arg(&o, "person").as_deref(), Some(r#""big ugly" {troll"#));
+            let o = assign("greet big ugly troll", "greet", &required, raw);
+            assert_eq!(arg(&o, "person").as_deref(), Some("big ugly troll"));
+            let o = assign("greet", "greet", &optional, raw);
+            assert_eq!(arg(&o, "person"), None);
+            assert!(matches!(
+                assign("greet", "greet", &required, raw),
+                CommandOutcome::NotFired(CommandMiss::MissingRequired { .. })
+            ));
+            // The word still has to match on its own.
+            assert!(matches!(
+                assign("greetings all", "greet", &rest, raw),
+                CommandOutcome::NotFired(CommandMiss::WrongFirstWord)
+            ));
+            // There is only ever one token to hand out: a second argument
+            // goes unfed rather than splitting the line.
+            let o = assign("greet Mira warmly", "greet", &req_rest, raw);
+            assert_eq!(arg(&o, "person").as_deref(), Some("Mira warmly"));
+            assert_eq!(arg(&o, "mood"), None);
 
             // Metacharacter names match as whole words, case-sensitively.
             let star_rest = [spec("person", Rest)];
@@ -1935,6 +2115,90 @@ mod tests {
         }
 
         #[test]
+        fn auto_mode_captures_the_rest_of_the_line_as_args() {
+            // Whatever rows and parse mode the sidecar carries, Auto runs one
+            // rest argument named `args` with the never-failing tokenizer.
+            let rows = vec![ArgSpec {
+                name: "target".to_string(),
+                kind: ArgKind::Required,
+            }];
+            let auto = AliasMatcherSource::Command {
+                name: None,
+                args: rows.clone(),
+                parse: ParseMode::All,
+                mode: CmdMode::Auto,
+            };
+            let spec = auto.command_spec("say").unwrap();
+            assert_eq!(spec.args, CmdMode::auto_args());
+            assert_eq!(spec.parse, ParseMode::All);
+            assert_eq!(usage_line(&spec.name, &spec.args), "say [args...]");
+
+            let fired = |line: &str| match assign(line, &spec.name, &spec.args, spec.parse) {
+                CommandOutcome::Fired { args } => args,
+                miss @ CommandOutcome::NotFired(_) => panic!("{line:?}: {miss:?}"),
+            };
+            let args = |value: Option<&str>| vec![("args".to_string(), value.map(str::to_string))];
+            assert_eq!(fired("say hello  there"), args(Some("hello  there")));
+            // An unbalanced quote or brace is text, not a miss.
+            assert_eq!(fired(r#"say don't "worry"#), args(Some(r#"don't "worry"#)));
+            assert_eq!(fired("say {hi"), args(Some("{hi")));
+            assert_eq!(fired("say"), args(None));
+            assert_eq!(
+                assign("sayx hi", &spec.name, &spec.args, spec.parse),
+                CommandOutcome::NotFired(CommandMiss::WrongFirstWord)
+            );
+
+            // Advanced runs the rows and parse mode as written.
+            let advanced = AliasMatcherSource::Command {
+                name: None,
+                args: rows.clone(),
+                parse: ParseMode::Quotes,
+                mode: CmdMode::Advanced,
+            };
+            let spec = advanced.command_spec("say").unwrap();
+            assert_eq!(spec.args, rows);
+            assert_eq!(spec.parse, ParseMode::Quotes);
+
+            // Simple's rows run the way the editor shows them
+            // (optional-then-rest), even when a hand-edited sidecar stored a
+            // Required; its stored parse mode is used as is.
+            let simple = AliasMatcherSource::Command {
+                name: None,
+                args: rows,
+                parse: ParseMode::Quotes,
+                mode: CmdMode::Simple,
+            };
+            let spec = simple.command_spec("say").unwrap();
+            assert_eq!(spec.parse, ParseMode::Quotes);
+            assert_eq!(spec.args[0].kind, ArgKind::Rest);
+            assert!(matches!(
+                assign("say", &spec.name, &spec.args, spec.parse),
+                CommandOutcome::Fired { .. }
+            ));
+
+            // Advanced still demotes a Rest that is not last, as the editor
+            // would have.
+            let mid_rest = AliasMatcherSource::Command {
+                name: None,
+                args: vec![
+                    ArgSpec {
+                        name: "a".to_string(),
+                        kind: ArgKind::Rest,
+                    },
+                    ArgSpec {
+                        name: "b".to_string(),
+                        kind: ArgKind::Required,
+                    },
+                ],
+                parse: ParseMode::All,
+                mode: CmdMode::Advanced,
+            };
+            let spec = mid_rest.command_spec("say").unwrap();
+            assert_eq!(spec.args[0].kind, ArgKind::Optional);
+            assert_eq!(spec.args[1].kind, ArgKind::Required);
+        }
+
+        #[test]
         fn minimal_command_json_fills_defaults() {
             let matcher: AliasMatcherSource =
                 serde_json::from_str(r#"{"kind":"command"}"#).unwrap();
@@ -1944,7 +2208,9 @@ mod tests {
                     name: None,
                     args: Vec::new(),
                     parse: ParseMode::All,
-                    mode: CmdMode::Simple,
+                    // Absent on disk means a sidecar from before modes had
+                    // runtime meaning: its rows and parse run as written.
+                    mode: CmdMode::Advanced,
                 }
             );
             // An absent override inherits the alias name; the field only
@@ -1952,8 +2218,20 @@ mod tests {
             assert_eq!(matcher.command_word("greet"), Some("greet"));
             assert_eq!(
                 serde_json::to_string(&matcher).unwrap(),
-                r#"{"kind":"command","parse":"all","mode":"simple"}"#
+                r#"{"kind":"command","parse":"all","mode":"advanced"}"#
             );
+
+            // The new default is only what a new alias starts as.
+            assert_eq!(CmdMode::default(), CmdMode::Auto);
+            let auto: AliasMatcherSource =
+                serde_json::from_str(r#"{"kind":"command","mode":"auto"}"#).unwrap();
+            assert!(matches!(
+                auto,
+                AliasMatcherSource::Command {
+                    mode: CmdMode::Auto,
+                    ..
+                }
+            ));
 
             let pinned: AliasMatcherSource =
                 serde_json::from_str(r#"{"kind":"command","name":"*"}"#).unwrap();

@@ -2317,11 +2317,12 @@ declare module "smudgy:core" {
    * the {@link Matches} object (an absent optional reads `""`); `m[0]` is the
    * line as typed, and in a string body `$name` substitutes each argument.
    *
-   * The behavior matches an editor-made Command alias: typing the word with a
-   * missing required argument echoes the usage line and consumes the input
-   * without running the body; extra words nothing claims fall through to the
-   * game; words split on spaces, with quotes or braces grouping a multi-word
-   * argument; and the command word tab-completes in the input.
+   * The behavior matches an editor-made Command alias in its Advanced mode:
+   * typing the word with a missing required argument echoes the usage line
+   * and consumes the input without running the body; extra words nothing
+   * claims fall through to the game; words split on spaces, with quotes or
+   * braces grouping a multi-word argument (the editor's Auto and Simple modes
+   * split on spaces only); and the command word tab-completes in the input.
    *
    * Interpolated `${values}` are always literal word text, never syntax, so
    * the word can come from data. A body that fails to parse throws. The alias
