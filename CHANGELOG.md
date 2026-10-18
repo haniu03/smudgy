@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Local maps made during an outage are pointed out.** When the map service
+  answers again, Smudgy names any local map you made in the meantime that
+  shares a name with one of your cloud maps.
 - **A clan's maps show on the game the clan plays.** A clan lists the hosts its
   game answers on, under "Plays on" in Settings › Clans; a game reached under
   several names lists each. A clan made while you're connected starts with that
@@ -118,6 +121,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the rest of the line intact; before, `say don't` went to the game untouched.
   The editor's Try-it says when that happened. Switching a Command alias
   between Auto, Simple, and Advanced keeps its argument rows.
+- **Cloud maps load in the background.** Cloud maps now load several at a time
+  and appear as they arrive. If they're still loading after 20 seconds, the
+  session starts with the maps loaded so far, and its first line counts the
+  rest as they arrive. Maps that fail to load retry automatically, with a Retry
+  link if they keep failing.
 - **Map syncing retries on its own.** After a failed sync, Smudgy tries again
   by itself: for as long as the map service says it's busy, and for up to 10
   minutes after a connection problem. Edits made while the service is busy
