@@ -271,6 +271,9 @@ pub enum Message {
     /// The toolbar sync indicator, pressed while idle; wakes the mapper for an
     /// immediate sync (the engine has no periodic poll).
     SyncNowRequested,
+    /// Try again now to load the maps still loading and those that stopped
+    /// trying.
+    RetryMapLoading,
     KeepMineRequested,
     KeepTheirsRequested,
     RetrySaveRequested,
@@ -620,6 +623,9 @@ pub struct MapEditorWindow {
     /// New-room Link gestures keyed by their CAS operation, so a collision
     /// on the new room's number can make the link again under another.
     pending_new_room_links: HashMap<OperationId, modals::LinkDraft>,
+    /// The open map, when it was opened while still loading: it opens again,
+    /// framed on its rooms, once it arrives.
+    opened_loading: Option<AreaId>,
     /// A number-collision operation being discarded before its link is made
     /// again against the fresh projection.
     recovering_new_room_link: Option<(OperationId, modals::LinkDraft, RoomNumber)>,
@@ -974,6 +980,7 @@ impl MapEditorWindow {
             automatic_route_preview: None,
             automatic_routes_maybe_stale: HashSet::new(),
             pending_new_room_links: HashMap::new(),
+            opened_loading: None,
             recovering_new_room_link: None,
             modal: None,
             renaming_area: None,
@@ -1713,6 +1720,7 @@ impl MapEditorWindow {
         self.clear_automatic_route_state();
         self.automatic_routes_maybe_stale.clear();
         self.editor.set_area(Some(area_id));
+        self.opened_loading = self.mapper.area_is_loading(area_id).then_some(area_id);
         let editable = self.canvas_editable();
         self.editor.set_editable(editable);
         // Undo history is area-local by design.
@@ -1727,6 +1735,63 @@ impl MapEditorWindow {
         // This-server tree homes it here.
         let event = self.associate_opened_area(area_id);
         Update::new(self.panel_fetches(), event)
+    }
+
+    /// The open map, opened while still loading, has arrived: open it again,
+    /// so the canvas frames its rooms and its tools follow what it allows.
+    fn show_arrived_area(&mut self, atlas: &AtlasCache) {
+        let Some(area_id) = self.opened_loading else {
+            return;
+        };
+        if self.editor.area_id() != Some(area_id) {
+            self.opened_loading = None;
+            return;
+        }
+        if atlas.get_area(&area_id).is_none() {
+            return;
+        }
+        self.opened_loading = None;
+        self.editor.set_area(Some(area_id));
+        let editable = self.canvas_editable();
+        self.editor.set_editable(editable);
+        if !editable && self.editor.tool() != Tool::Select {
+            self.editor.set_tool(Tool::Select);
+        }
+        self.inspector.resync(&self.mapper, &self.editor);
+    }
+
+    /// The canvas note for an open map that is still loading, or that stopped
+    /// trying: what is happening, and Retry for the latter.
+    fn loading_note(&self) -> Option<ThemedElement<'_, Message>> {
+        let area_id = self.editor.area_id()?;
+        if let Some(error) = self.mapper.area_load_failure(area_id) {
+            return Some(
+                center(
+                    column![
+                        text(crate::i18n::t!("mapper-canvas-load-failed")).size(14),
+                        text(crate::components::cloud_errors::display_error(&error))
+                            .size(12)
+                            .style(theme::builtins::text::danger),
+                        button(text(crate::i18n::t!("action-retry")).size(14))
+                            .style(theme::builtins::button::primary)
+                            .on_press(Message::RetryMapLoading),
+                    ]
+                    .spacing(6)
+                    .align_x(iced::Alignment::Center),
+                )
+                .into(),
+            );
+        }
+        self.mapper.area_is_loading(area_id).then(|| {
+            center(
+                text(crate::i18n::t!("mapper-canvas-loading"))
+                    .size(14)
+                    .style(|theme: &crate::Theme| iced::widget::text::Style {
+                        color: Some(theme.styles.text.normal.scale_alpha(0.6)),
+                    }),
+            )
+            .into()
+        })
     }
 
     /// After the open map is deleted: the first map left, if any.
@@ -2871,6 +2936,7 @@ impl MapEditorWindow {
                 // mismatch here means an external change worth resyncing
                 // the inspector for.
                 let atlas = self.mapper.get_current_atlas();
+                self.show_arrived_area(&atlas);
                 self.pending_new_room_links.retain(|operation_id, draft| {
                     self.mapper
                         .is_operation_pending(draft.area_id, *operation_id)
@@ -3433,6 +3499,10 @@ impl MapEditorWindow {
             }
             Message::SyncNowRequested => {
                 self.mapper.sync_now();
+                Update::none()
+            }
+            Message::RetryMapLoading => {
+                self.mapper.retry_loading();
                 Update::none()
             }
             Message::CopyIncludeBoundaryChanged(value) => {
@@ -4620,7 +4690,9 @@ impl MapEditorWindow {
                     .get_area(&area_id)
                     .is_some_and(|area| map_panel::room_count(&area) == 0)
             });
-            if empty && self.can_edit_active_area() {
+            if let Some(note) = self.loading_note() {
+                stack(vec![canvas, note]).into()
+            } else if empty && self.can_edit_active_area() {
                 stack(vec![
                     canvas,
                     center(

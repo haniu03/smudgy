@@ -29,31 +29,6 @@ pub use composite::CompositeBackend;
 pub use ephemeral::EphemeralBackend;
 pub use local::LocalBackend;
 
-/// One map of the cloud list a backend remembers from its last complete
-/// answer ([`MapperBackend::remembered_inventory`]): enough to count the
-/// cloud maps and know their names while the map service can't list them.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct InventoryEntry {
-    pub id: AreaId,
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<Uuid>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clan_id: Option<Uuid>,
-}
-
-impl InventoryEntry {
-    #[must_use]
-    pub fn of(area: &Area) -> Self {
-        Self {
-            id: area.id,
-            name: area.name.clone(),
-            user_id: area.user_id,
-            clan_id: area.clan_id,
-        }
-    }
-}
-
 /// The refusal every backend without Secrets gives.
 fn secrets_unsupported() -> CloudError {
     CloudError::InvalidInput("only cloud maps have Secrets".to_string())
@@ -172,8 +147,10 @@ pub trait MapperBackend: Send + Sync {
     }
 
     /// The cloud list as last answered in full, kept on this device for
-    /// while the map service can't list it. `None` when none is kept.
-    async fn remembered_inventory(&self) -> Option<Vec<InventoryEntry>> {
+    /// while the map service can't list it: each map's list row, enough to
+    /// count the cloud maps and show them in their folders. `None` when none
+    /// is kept.
+    async fn remembered_inventory(&self) -> Option<Vec<Area>> {
         None
     }
 

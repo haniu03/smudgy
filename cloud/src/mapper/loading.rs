@@ -31,9 +31,7 @@ use super::{
     local_projection,
     retry::{self, Failures},
 };
-use crate::{
-    Area, AreaId, AreaWithDetails, CloudError, CloudResult, InventoryEntry, backends::MapperBackend,
-};
+use crate::{Area, AreaId, AreaWithDetails, CloudError, CloudResult, backends::MapperBackend};
 
 /// How long a session waits for its maps before starting with those loaded.
 pub(super) const INITIAL_LOAD_WAIT: Duration = Duration::from_secs(20);
@@ -124,6 +122,10 @@ impl Loads {
         inventory.stopped.clear();
     }
 
+    fn stopped_reason(&self, area_id: AreaId) -> Option<CloudError> {
+        self.inventory.lock().stopped.get(&area_id).cloned()
+    }
+
     fn note_stopped(&self, area_id: AreaId, err: CloudError) {
         self.inventory.lock().stopped.insert(area_id, err);
     }
@@ -176,30 +178,6 @@ fn session_can_start(summary: &LoadMapsSummary) -> bool {
         .as_ref()
         .is_some_and(|err| !matches!(err, CloudError::ServiceUnavailable { .. }));
     summary.settled || (summary.first_pass && unreachable)
-}
-
-/// The list row a remembered inventory entry stands for.
-fn remembered_row(entry: &InventoryEntry) -> Area {
-    Area {
-        id: entry.id,
-        user_id: entry.user_id,
-        atlas_id: None,
-        atlas_name: None,
-        name: entry.name.clone(),
-        created_at: DateTime::<Utc>::UNIX_EPOCH,
-        rev: 0,
-        projection_token: None,
-        access: None,
-        owner_nickname: None,
-        copied_from_area_id: None,
-        copied_from_rev: None,
-        copied_at: None,
-        family_token: None,
-        clan_id: entry.clan_id,
-        clan_name: None,
-        actions: None,
-        clan_ownership: crate::clan_maps::ClanOwnership::default(),
-    }
 }
 
 /// What one load has done so far.
@@ -470,6 +448,14 @@ impl Inner {
     pub(super) async fn ready_for(&self, area_id: AreaId) {
         // Whichever way the wait ends, the map is as ready as it will be.
         let _ = tokio::time::timeout(READY_WAIT_LIMIT, self.wait_for_area(area_id)).await;
+    }
+
+    /// Why `area_id`, a cloud map still to load, stopped trying, if it did.
+    pub(super) fn area_load_failure(&self, area_id: AreaId) -> Option<CloudError> {
+        if self.atlas_cache.load().get_area(&area_id).is_some() {
+            return None;
+        }
+        self.loads.stopped_reason(area_id)
     }
 
     /// Whether `area_id` is a cloud map still to load: listed, and not shown.
@@ -881,95 +867,88 @@ async fn run(weak: Weak<Inner>, load: u64) {
     let mut list_failures: Option<Failures> = None;
     let mut unavailable_since: Option<DateTime<Utc>> = None;
     let mut recovered = false;
-    let (listed, shown_before) =
-        loop {
-            let Some(shown_before) = weak.upgrade().map(|inner| {
-                inner
-                    .atlas_cache
-                    .load()
-                    .areas()
-                    .map(|area| *area.get_id())
-                    .collect::<HashSet<_>>()
-            }) else {
-                return;
-            };
-            let started = Instant::now();
-            match backend.list_cloud_areas().await {
-                Ok(listed) => {
-                    tally.list_duration = started.elapsed();
-                    break (listed, shown_before);
-                }
-                Err(CloudError::CredentialChanged) => {
-                    return end(&weak, &mut tally, CloudError::CredentialChanged);
-                }
-                Err(err) => {
-                    warn!("Cloud maps could not be listed: {err}");
-                    unavailable_since.get_or_insert_with(Utc::now);
-                    if !tally.cloud_counted
-                        && let Some(remembered) = backend.remembered_inventory().await
-                    {
-                        if let Some(inner) = weak.upgrade() {
-                            inner.fetcher.note_libraries(remembered.iter().map(|entry| {
-                                (entry.id, Library::of(entry.clan_id, entry.user_id))
-                            }));
-                        }
-                        tally
-                            .expected
-                            .extend(remembered.iter().map(|entry| entry.id));
-                        tally.cloud_counted = true;
-                        if let Some(inner) = weak.upgrade() {
-                            inner
-                                .loads
-                                .set_rows(remembered.iter().map(remembered_row), true);
-                        }
+    let (listed, shown_before) = loop {
+        let Some(shown_before) = weak.upgrade().map(|inner| {
+            inner
+                .atlas_cache
+                .load()
+                .areas()
+                .map(|area| *area.get_id())
+                .collect::<HashSet<_>>()
+        }) else {
+            return;
+        };
+        let started = Instant::now();
+        match backend.list_cloud_areas().await {
+            Ok(listed) => {
+                tally.list_duration = started.elapsed();
+                break (listed, shown_before);
+            }
+            Err(CloudError::CredentialChanged) => {
+                return end(&weak, &mut tally, CloudError::CredentialChanged);
+            }
+            Err(err) => {
+                warn!("Cloud maps could not be listed: {err}");
+                unavailable_since.get_or_insert_with(Utc::now);
+                if !tally.cloud_counted
+                    && let Some(remembered) = backend.remembered_inventory().await
+                {
+                    tally.expected.extend(remembered.iter().map(|row| row.id));
+                    tally.cloud_counted = true;
+                    if let Some(inner) = weak.upgrade() {
+                        inner.fetcher.note_libraries(
+                            remembered.iter().map(|row| (row.id, Library::of_area(row))),
+                        );
+                        inner.loads.set_rows(remembered, true);
                     }
-                    tally.cloud_unavailable = Some(err.clone());
-                    if !recovered {
-                        recovered = true;
-                        let Some(inner) = weak.upgrade() else { return };
-                        let named: HashSet<AreaId> = device_ids.iter().copied().collect();
-                        match inner.recover_deletes(&named, auth_generation).await {
-                            Ok(present) => {
-                                if let Err(err) =
-                                    inner.show_fetched(present, auth_generation, &mut tally)
-                                {
-                                    drop(inner);
-                                    return end(&weak, &mut tally, err);
-                                }
-                            }
-                            Err(err) => {
+                }
+                tally.cloud_unavailable = Some(err.clone());
+                if !recovered {
+                    recovered = true;
+                    let Some(inner) = weak.upgrade() else { return };
+                    let named: HashSet<AreaId> = device_ids.iter().copied().collect();
+                    match inner.recover_deletes(&named, auth_generation).await {
+                        Ok(present) => {
+                            if let Err(err) =
+                                inner.show_fetched(present, auth_generation, &mut tally)
+                            {
                                 drop(inner);
                                 return end(&weak, &mut tally, err);
                             }
                         }
-                    }
-                    tally.first_pass = true;
-                    let now = Instant::now();
-                    let failures = Failures::after(list_failures, now);
-                    list_failures = Some(failures);
-                    let next = retry::next_retry(&err, failures, now, window);
-                    if next.is_none() {
-                        tally.stopped = 1;
-                        tally.settled = true;
-                    }
-                    if let Some(inner) = weak.upgrade() {
-                        if next.is_none() {
-                            inner.loads.stop_all(Some(&err));
-                        }
-                        inner.report(&tally);
-                    }
-                    wait_until(&retry_now, next).await;
-                    if next.is_none() {
-                        list_failures = None;
-                        if let Some(inner) = weak.upgrade() {
-                            inner.loads.stop_all(None);
+                        Err(err) => {
+                            drop(inner);
+                            return end(&weak, &mut tally, err);
                         }
                     }
-                    tally.stopped = 0;
-                    tally.settled = false;
                 }
+                tally.first_pass = true;
+                let now = Instant::now();
+                let failures = Failures::after(list_failures, now);
+                list_failures = Some(failures);
+                let next = retry::next_retry(&err, failures, now, window);
+                if next.is_none() {
+                    tally.stopped = 1;
+                    tally.settled = true;
+                }
+                if let Some(inner) = weak.upgrade() {
+                    if next.is_none() {
+                        inner.loads.stop_all(Some(&err));
+                    }
+                    inner.report(&tally);
+                }
+                wait_until(&retry_now, next).await;
+                if next.is_none() {
+                    list_failures = None;
+                    if let Some(inner) = weak.upgrade() {
+                        inner.loads.stop_all(None);
+                    }
+                }
+                tally.stopped = 0;
+                tally.settled = false;
             }
-        };
+        }
+    };
 
     // The cloud list answered.
     let listed_ids: HashSet<AreaId> = listed.iter().map(|area| area.id).collect();

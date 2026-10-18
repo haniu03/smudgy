@@ -16,6 +16,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use iced::widget::{
     Column, button, column, container, row, scrollable, space, text, text_input, tooltip,
@@ -24,9 +25,10 @@ use iced::{Length, Padding, alignment::Vertical};
 use smudgy_cloud::cloud_api::ShareGrantRow;
 use smudgy_cloud::mapper::AtlasCache;
 use smudgy_cloud::mapper::area_cache::AreaCache;
-use smudgy_cloud::{AreaId, AtlasId, AtlasListItem, MapStorage, Uuid};
+use smudgy_cloud::{AreaId, AtlasId, AtlasListItem, LoadMapsSummary, MapStorage, Uuid};
 
 use crate::assets::{bootstrap_icons, fonts};
+use crate::components::cloud_errors::display_error;
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::widgets::dropdown::Dropdown;
@@ -338,7 +340,7 @@ pub struct OwnedGroups {
 }
 
 /// Groups the viewer's OWN areas into their folders, split into local and
-/// shared. Shared rows are excluded — they group by sharer (see
+/// shared, with the cloud maps still `loading` among them. Shared rows are excluded — they group by sharer (see
 /// [`shared_groups`]). Ephemeral (session) areas are excluded too: the
 /// editor's tree only shows maps that outlive the session, so a session map
 /// can't be toggled into the per-area preference lists or picked as a folder
@@ -346,6 +348,7 @@ pub struct OwnedGroups {
 #[must_use]
 pub fn owned_groups(
     atlas: &AtlasCache,
+    loading: &[Arc<AreaCache>],
     atlases: &[AtlasListItem],
     local_atlases: &HashSet<AtlasId>,
     local_areas: &HashSet<AreaId>,
@@ -354,6 +357,7 @@ pub fn owned_groups(
 ) -> OwnedGroups {
     let maps = atlas
         .areas()
+        .chain(loading.iter().cloned())
         .filter(|area| is_own_map(area) && !ephemeral.contains(area.get_id()))
         .map(|area| {
             let access = area.effective_access();
@@ -497,6 +501,7 @@ pub fn session_maps(
 #[must_use]
 pub fn shared_groups(
     atlas: &AtlasCache,
+    loading: &[Arc<AreaCache>],
     sharers: Option<&SharerIndex>,
     family_members: &std::collections::HashSet<AreaId>,
     in_clan_folders: &std::collections::HashSet<AreaId>,
@@ -512,7 +517,7 @@ pub fn shared_groups(
     // Keyed on the sharer's user id (uuid), never the display handle.
     let mut shared: HashMap<Uuid, Accum> = HashMap::new();
 
-    for area in atlas.areas() {
+    for area in atlas.areas().chain(loading.iter().cloned()) {
         let access = area.effective_access();
         let meta = area.meta();
         let area_id = *area.get_id();
@@ -615,6 +620,52 @@ pub fn shared_groups(
         .collect();
     groups.sort_by(|(a_id, a), (b_id, b)| name_order(&a.label, a_id, &b.label, b_id));
     groups.into_iter().map(|(_, group)| group).collect()
+}
+
+/// What the line under the list header says while maps load: how many of how
+/// many, and whether to offer Retry (once nothing more loads on its own).
+/// `None` once every map has loaded, or while the total isn't known.
+#[must_use]
+pub fn load_line_state(summary: &LoadMapsSummary) -> Option<(usize, usize, bool)> {
+    let total = summary.total?;
+    let complete = summary.settled
+        && summary.stopped == 0
+        && summary.cloud_unavailable.is_none()
+        && summary.fatal.is_none();
+    if summary.load == 0 || complete {
+        return None;
+    }
+    let retry = summary.settled && summary.stopped > 0;
+    Some((summary.areas.len().min(total), total, retry))
+}
+
+/// The brief line under the list header while maps load: "80/120 loaded",
+/// and "· Retry" once some stopped trying. Nothing once all have loaded.
+fn load_line(window: &MapEditorWindow) -> Option<ThemedElement<'_, Message>> {
+    let progress = window.mapper.load_progress();
+    let (loaded, total, retry) = load_line_state(&progress.borrow())?;
+    let mut line = row![
+        text(crate::i18n::t!(
+            "area-list-load-progress",
+            "loaded" => loaded,
+            "total" => total
+        ))
+        .size(12)
+        .style(|theme: &crate::Theme| iced::widget::text::Style {
+            color: Some(theme.styles.text.normal.scale_alpha(0.6)),
+        })
+    ]
+    .spacing(4)
+    .align_y(Vertical::Center);
+    if retry {
+        line = line.push(text("\u{00b7}").size(12)).push(
+            button(text(crate::i18n::t!("action-retry")).size(12))
+                .style(builtins::button::link)
+                .padding(0)
+                .on_press(Message::RetryMapLoading),
+        );
+    }
+    Some(container(line).padding([0, 8]).into())
 }
 
 /// A subtle, dimmed badge text used for inline row annotations.
@@ -727,10 +778,13 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     // "copy" badge; computed once for the whole list.
     let family_members = window.family_members();
     let ephemeral = window.mapper.session_area_ids();
+    // Cloud maps still loading list in their places like the rest.
+    let loading = window.mapper.loading_areas();
     // Read from the mapper rather than the tick-refreshed snapshot, so a
     // folder made a moment ago lands in the right group straight away.
     let mut owned = owned_groups(
         &atlas,
+        &loading,
         &window.atlases,
         &window.mapper.local_atlas_ids(),
         &window.mapper.local_area_ids(),
@@ -739,9 +793,15 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     );
     // Each clan's folders list between the viewer's own maps and "Shared
     // by".
-    let mut clans = clan_maps::clan_groups(window, &atlas, &family_members, &ephemeral);
-    let in_clans = clan_maps::in_clan_folders(&atlas);
-    let mut shared = shared_groups(&atlas, window.sharers.as_ref(), &family_members, &in_clans);
+    let mut clans = clan_maps::clan_groups(window, &atlas, &loading, &family_members, &ephemeral);
+    let in_clans = clan_maps::in_clan_folders(&atlas, &loading);
+    let mut shared = shared_groups(
+        &atlas,
+        &loading,
+        window.sharers.as_ref(),
+        &family_members,
+        &in_clans,
+    );
     let query = window.map_list_filter.trim().to_lowercase();
     filter_folders(&mut owned.local, &query);
     filter_folders(&mut owned.shared, &query);
@@ -789,11 +849,13 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
         list =
             list.push(container(text(crate::i18n::t!("area-list-no-matches")).size(12)).padding(8));
     }
-    let chrome = column![
-        header,
-        filter_control(window),
-        scrollable(list).height(Length::Fill)
-    ];
+    let mut chrome = column![header];
+    if let Some(line) = load_line(window) {
+        chrome = chrome.push(line);
+    }
+    let chrome = chrome
+        .push(filter_control(window))
+        .push(scrollable(list).height(Length::Fill));
 
     container(chrome)
         .style(builtins::container::opaque)
@@ -1463,6 +1525,20 @@ fn area_row<'a>(
         ));
     }
 
+    // A cloud map still loading says so; one that stopped trying says it
+    // couldn't load, and why on hover.
+    if let Some(error) = window.mapper.area_load_failure(area.id) {
+        item = item.push(tooltip(
+            text(crate::i18n::t!("area-list-load-failed"))
+                .size(10)
+                .style(builtins::text::danger),
+            text(display_error(&error)).size(12),
+            tooltip::Position::Bottom,
+        ));
+    } else if window.mapper.area_is_loading(area.id) {
+        item = item.push(badge(crate::i18n::t!("mapper-loading")));
+    }
+
     // Family badge: this map is one of several copies sharing an origin.
     if area.in_family {
         item = item.push(tooltip(
@@ -1612,6 +1688,41 @@ mod tests {
     use super::*;
     use chrono::{Duration, Utc};
     use smudgy_cloud::cloud_api::ShareGrant;
+
+    /// The line under the list header counts maps while they load, offers
+    /// Retry once some stopped trying, and goes once every map has loaded.
+    #[test]
+    fn the_load_line_counts_maps_until_all_have_loaded() {
+        let stat = || smudgy_cloud::AreaLoadStat {
+            area_id: AreaId(Uuid::new_v4()),
+            name: String::new(),
+            revision: 1,
+            load_duration: std::time::Duration::ZERO,
+            source: smudgy_cloud::AreaLoadSource::Unknown,
+            shared: false,
+        };
+        let mut summary = LoadMapsSummary {
+            load: 1,
+            total: Some(3),
+            areas: vec![stat(), stat()],
+            ..LoadMapsSummary::default()
+        };
+        assert_eq!(load_line_state(&summary), Some((2, 3, false)));
+        summary.settled = true;
+        summary.stopped = 1;
+        assert_eq!(load_line_state(&summary), Some((2, 3, true)));
+        summary.stopped = 0;
+        summary.areas.push(stat());
+        assert_eq!(load_line_state(&summary), None, "all loaded");
+        summary.total = None;
+        summary.settled = false;
+        assert_eq!(load_line_state(&summary), None, "no total known");
+        assert_eq!(
+            load_line_state(&LoadMapsSummary::default()),
+            None,
+            "no load yet"
+        );
+    }
 
     fn uuid(n: u128) -> Uuid {
         Uuid::from_u128(n)
@@ -2128,7 +2239,7 @@ mod tests {
             folder_item(2, "Roads", Some(7)),
         ];
         let none = HashSet::new();
-        let groups = owned_groups(&atlas, &atlases, &HashSet::new(), &none, &none, &none);
+        let groups = owned_groups(&atlas, &[], &atlases, &HashSet::new(), &none, &none, &none);
         assert!(groups.local.is_empty());
         assert_eq!(
             shape(&groups.shared),

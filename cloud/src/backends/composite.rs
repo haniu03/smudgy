@@ -32,7 +32,7 @@ use parking_lot::RwLock;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use super::{AreaMergeCommit, AreaMergePlan, EphemeralBackend, InventoryEntry, MapperBackend};
+use super::{AreaMergeCommit, AreaMergePlan, EphemeralBackend, MapperBackend};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CloudResult, CreateAreaRequest, MapStorage, SourceId, SyncRow,
@@ -332,7 +332,7 @@ impl MapperBackend for CompositeBackend {
         }
     }
 
-    async fn remembered_inventory(&self) -> Option<Vec<InventoryEntry>> {
+    async fn remembered_inventory(&self) -> Option<Vec<Area>> {
         if self.cloud.has_credential() {
             self.cloud.remembered_inventory().await
         } else {

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The map editor shows maps that are still loading.** They appear in the map
+  list with a "Loading…" badge, and a line under the list's header counts them
+  as they arrive. Opening one shows a note until it arrives. A map that
+  couldn't load says why, and can be retried. While Smudgy cloud is
+  unavailable, your cloud maps show this way too. When syncing is offline, the
+  toolbar says so, with the time of the next retry.
 - **Scripts can see and wait for maps that are still loading.** `mapper.areas`
   and `mapper.getAreaById` include cloud maps still loading, with
   `area.loading` set and no rooms yet, and a write to one waits until it has

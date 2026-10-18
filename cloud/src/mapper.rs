@@ -2768,6 +2768,13 @@ impl Mapper {
         self.inner.area_is_loading(area_id)
     }
 
+    /// Why `area_id`, a cloud map still to load, stopped trying, if it did;
+    /// [`Self::retry_loading`] tries it again.
+    #[must_use]
+    pub fn area_load_failure(&self, area_id: AreaId) -> Option<CloudError> {
+        self.inner.area_load_failure(area_id)
+    }
+
     /// A cloud map still to load, as an area with its list row and no
     /// rooms; `None` once it has loaded, or when `area_id` names none.
     #[must_use]
@@ -6614,7 +6621,7 @@ mod tests {
         /// When set, reading that area fails with that error.
         fail_get: Mutex<Option<(AreaId, CloudError)>>,
         /// The inventory `remembered_inventory` answers with.
-        remembered: Mutex<Option<Vec<crate::InventoryEntry>>>,
+        remembered: Mutex<Option<Vec<Area>>>,
         /// One `(operation id, operation count)` entry per received
         /// envelope, in arrival order.
         mutations: Mutex<Vec<(Uuid, usize)>>,
@@ -6799,7 +6806,7 @@ mod tests {
                 .ok_or(CloudError::NotFoundOrNoAccess)
         }
 
-        async fn remembered_inventory(&self) -> Option<Vec<crate::InventoryEntry>> {
+        async fn remembered_inventory(&self) -> Option<Vec<Area>> {
             self.remembered.lock().clone()
         }
 
@@ -8447,12 +8454,9 @@ mod tests {
             message: "Service temporarily unavailable".to_string(),
             retry_after: Some(Duration::from_secs(5)),
         });
-        *cloud.remembered.lock() = Some(vec![crate::InventoryEntry {
-            id: AreaId(Uuid::new_v4()),
-            name: "Tower".to_string(),
-            user_id: None,
-            clan_id: None,
-        }]);
+        let mut tower = sample_area(AreaId(Uuid::new_v4()), "stair").area;
+        tower.name = "Tower".to_string();
+        *cloud.remembered.lock() = Some(vec![tower]);
         let mapper = over_cloud(&cloud);
         mapper.load_all_areas().await.unwrap();
 
@@ -8478,11 +8482,10 @@ mod tests {
             message: "Service temporarily unavailable".to_string(),
             retry_after: Some(Duration::from_secs(5)),
         });
-        let entry = |name: &str| crate::InventoryEntry {
-            id: AreaId(Uuid::new_v4()),
-            name: name.to_string(),
-            user_id: Some(Uuid::new_v4()),
-            clan_id: None,
+        let entry = |name: &str| {
+            let mut row = sample_area(AreaId(Uuid::new_v4()), "room").area;
+            row.name = name.to_string();
+            row
         };
         *cloud.remembered.lock() = Some(vec![entry("Tower"), entry("Keep")]);
         let mapper = over_cloud(&cloud);

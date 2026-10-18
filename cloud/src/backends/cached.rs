@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use tokio::task;
 use uuid::Uuid;
 
-use super::{AreaMergeCommit, AreaMergePlan, InventoryEntry, MapperBackend, cloud::CloudMapper};
+use super::{AreaMergeCommit, AreaMergePlan, MapperBackend, cloud::CloudMapper};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CloudResult, CreateAreaRequest, MapStorage, SourceId, SyncRow,
@@ -37,7 +37,7 @@ const INVENTORY_FILE: &str = "inventory.json";
 /// [`INVENTORY_FILE`]'s contents.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RememberedInventory {
-    areas: Vec<InventoryEntry>,
+    areas: Vec<Area>,
 }
 
 /// What we last learned about an area's server-side state: the token over
@@ -95,8 +95,9 @@ where
     /// before `/me` proves the viewer, as long as that credential is still
     /// the one in use.
     expected_viewer: Option<(Uuid, u64)>,
-    /// The inventory last written, so an unchanged list rewrites nothing.
-    written_inventory: parking_lot::Mutex<Option<Vec<InventoryEntry>>>,
+    /// The inventory last written, encoded, so an unchanged list rewrites
+    /// nothing.
+    written_inventory: parking_lot::Mutex<Option<Vec<u8>>>,
 }
 
 impl<T> fmt::Debug for CachedBackend<T>
@@ -182,13 +183,8 @@ where
         if !self.disk_namespace_is_proven() {
             return;
         }
-        let entries: Vec<InventoryEntry> = areas.iter().map(InventoryEntry::of).collect();
-        if self.written_inventory.lock().as_ref() == Some(&entries) {
-            return;
-        }
-        let dir = self.viewer_dir();
         let contents = match serde_json::to_vec(&RememberedInventory {
-            areas: entries.clone(),
+            areas: areas.to_vec(),
         }) {
             Ok(contents) => contents,
             Err(err) => {
@@ -196,15 +192,20 @@ where
                 return;
             }
         };
+        if self.written_inventory.lock().as_ref() == Some(&contents) {
+            return;
+        }
+        let dir = self.viewer_dir();
+        let staged_contents = contents.clone();
         let written = task::spawn_blocking(move || -> io::Result<()> {
             fs::create_dir_all(&dir)?;
             let staged = dir.join(format!("{INVENTORY_FILE}.tmp"));
-            fs::write(&staged, contents)?;
+            fs::write(&staged, staged_contents)?;
             fs::rename(&staged, dir.join(INVENTORY_FILE))
         })
         .await;
         match written {
-            Ok(Ok(())) => *self.written_inventory.lock() = Some(entries),
+            Ok(Ok(())) => *self.written_inventory.lock() = Some(contents),
             Ok(Err(err)) => warn!("Failed to remember the map inventory: {err}"),
             Err(err) => warn!("Failed to remember the map inventory: {err}"),
         }
@@ -606,7 +607,7 @@ where
         Ok(areas)
     }
 
-    async fn remembered_inventory(&self) -> Option<Vec<InventoryEntry>> {
+    async fn remembered_inventory(&self) -> Option<Vec<Area>> {
         let path = self.inventory_dir()?.join(INVENTORY_FILE);
         let read = task::spawn_blocking(move || -> CloudResult<Option<RememberedInventory>> {
             match fs::read(&path) {
@@ -1709,7 +1710,10 @@ mod tests {
         // A later session, before `/me`: the expected account's list answers.
         let later =
             CachedBackend::new(backend.clone(), cache_dir.clone()).expecting_viewer(Some(viewer));
-        assert_eq!(later.remembered_inventory().await, Some(kept));
+        let ids = |rows: Option<Vec<Area>>| {
+            rows.map(|rows| rows.iter().map(|row| row.id).collect::<Vec<_>>())
+        };
+        assert_eq!(ids(later.remembered_inventory().await), ids(Some(kept)));
         let other = CachedBackend::new(backend.clone(), cache_dir.clone())
             .expecting_viewer(Some(Uuid::new_v4()));
         assert!(
