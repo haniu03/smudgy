@@ -851,6 +851,13 @@ interface Area {
     readonly uuid: string;
     readonly name: string;
     /**
+     * The map is listed but its rooms haven't arrived yet: it has its id, name
+     * and storage, and no rooms. Read live, so a kept Area reports when its map
+     * has loaded; take a fresh one from `mapper.getAreaById` for its rooms, or
+     * wait with `mapper.ready({ id })`.
+     */
+    readonly loading: boolean;
+    /**
      * For a Secret's own area, or your Private additions', the map it belongs to;
      * absent on a map. A Secret's rooms are rooms like any other: routes, the
      * current location and `getAreaById` all take its area id.
@@ -986,11 +993,19 @@ interface CreateAtlasOptions {
  */
 interface Mapper {
     /**
-     * Wait until this session's maps are ready for startup lookups or updates.
-     * Loads maps if startup has not done so; later calls use loaded maps.
+     * Resolves once the session has started and the mapper is initialized.
+     * If maps are still downloading after 20 seconds at session start, this
+     * can mean that not all maps have loaded. Pass `{ all: true }` to resolve
+     * only when all maps have finished loading, or `{ id }` to resolve when
+     * that map has.
+     *
+     * With either option, `ready` resolves even if maps fail to load: once
+     * they stop trying, once the map service's list has no map with that
+     * `id`, or after 10 minutes at most. Check `area.loading` to tell whether
+     * a map actually loaded.
      * Requires `mapper:read`.
      */
-    ready(): Promise<void>;
+    ready(options?: { all?: boolean; id?: AreaIdLike }): Promise<void>;
     /**
      * Reload maps, including changes made to local files outside the app.
      * Updated maps are available to this session when the call resolves.
@@ -1026,7 +1041,8 @@ interface Mapper {
      *  location names an area without a specific room: somewhere unmapped. Without the
      *  `secrets` capability, a room of a Secret or of Private additions reads that way too. */
     getCurrentLocation(): { area: AreaId; room?: RoomNumber } | undefined;
-    /** All active areas (areas marked inactive are excluded). */
+    /** All active areas (areas marked inactive are excluded). Cloud maps
+     *  still loading are listed with `loading` set and no rooms yet. */
     readonly areas: Area[];
     /**
      * The area with this id. A Secret's id names the Secret's own area: its own
@@ -1303,11 +1319,12 @@ interface Mapper {
     /** Import one exported area as a new local area; returns its id. */
     importArea(area: AreaJson): Promise<AreaId>;
     /** Import exported areas, skipping any whose **name** is already resident
-     *  in the mapper. Shared maps, deactivated maps, and maps assigned to
-     *  other server entries count too. Waits for the session's maps to finish
-     *  loading first, so it is safe to call as a package starts, on every
-     *  start, without creating duplicates. Returns the ids of the areas
-     *  imported and the names skipped. */
+     *  in the mapper. Shared maps, deactivated maps, maps assigned to other
+     *  server entries, and cloud maps still loading count too; while the map
+     *  service can't list your cloud maps, the last list it gave stands in.
+     *  Waits for the session's maps to finish loading first, so it is safe to
+     *  call as a package starts, on every start, without creating duplicates.
+     *  Returns the ids of the areas imported and the names skipped. */
     importAreasIfAbsent(areas: AreaJson[]): Promise<AreasImportedIfAbsent>;
 }
 

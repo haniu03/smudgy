@@ -1,5 +1,5 @@
 use anyhow::Result;
-use smudgy_cloud::Mapper;
+use smudgy_cloud::{CloudError, LoadMapsSummary, Mapper};
 use smudgy_session_model::input_policy::redact;
 use smudgy_session_model::send_failure::{
     ConnectionIntent as SendConnectionIntent, ReconnectState, SendFailureAction,
@@ -80,7 +80,7 @@ pub use script_engine::layout_fold;
 // copies) read and warm the same store.
 use super::system_row::{
     Progress, SESSION_ROW_ID, Severity, SystemRow, SystemRowId, SystemText, next_system_row_id,
-    push_loaded_clause,
+    plural, push_loaded_clause,
 };
 pub use script_engine::package_cache;
 use script_engine::{LoadSummary, ScriptEngine, ScriptEngineParams};
@@ -296,9 +296,65 @@ fn close_runtime_action_queue(receiver: &mut UnboundedReceiver<RuntimeAction>) {
 mod runtime_helper_tests {
     use std::sync::Arc;
 
-    use super::{IsolateId, RuntimeAction, close_runtime_action_queue, redact};
+    use super::{
+        CloudError, IsolateId, MapsLoaded, RuntimeAction, close_runtime_action_queue,
+        duplicate_names_notice, maps_still_loading_notice, redact,
+    };
     use crate::session::SessionId;
     use crate::session::styled_line::LinkTooltipState;
+    use std::time::Duration;
+
+    fn loading(areas: usize, total: Option<usize>) -> MapsLoaded {
+        MapsLoaded {
+            areas,
+            shared: 0,
+            elapsed: Duration::ZERO,
+            total,
+            stopped: 0,
+            complete: false,
+        }
+    }
+
+    #[test]
+    fn a_session_that_starts_before_its_maps_says_how_far_they_got() {
+        let busy = CloudError::ServiceUnavailable {
+            message: "Service temporarily unavailable".to_string(),
+            retry_after: None,
+        };
+        let offline = CloudError::NetworkError("connection refused".to_string());
+        assert_eq!(
+            maps_still_loading_notice(&loading(40, Some(120)), Some(&busy)),
+            "40/120 maps loaded, map service is busy. Will continue to load maps in the background."
+        );
+        assert_eq!(
+            maps_still_loading_notice(&loading(40, Some(120)), None),
+            "40/120 maps loaded, map service is busy. Will continue to load maps in the background."
+        );
+        assert_eq!(
+            maps_still_loading_notice(&loading(3, Some(9)), Some(&offline)),
+            "3/9 maps loaded, map service can't be reached. Will continue to load maps in the background."
+        );
+        assert_eq!(
+            maps_still_loading_notice(&loading(3, None), Some(&busy)),
+            "Cloud maps are not loaded yet. The map service is busy. Retrying…"
+        );
+        assert_eq!(
+            maps_still_loading_notice(&loading(3, None), Some(&offline)),
+            "Cloud maps are not loaded yet. Network error: connection refused. Retrying…"
+        );
+    }
+
+    #[test]
+    fn maps_made_during_an_outage_are_named_once_the_cloud_answers() {
+        assert_eq!(
+            duplicate_names_notice(&["Midgaard".to_string(), "Haven".to_string()]),
+            "2 maps made while the map service was unavailable share a name with a cloud map: Midgaard, Haven."
+        );
+        assert_eq!(
+            duplicate_names_notice(&["Haven".to_string()]),
+            "1 map made while the map service was unavailable shares a name with a cloud map: Haven."
+        );
+    }
 
     #[test]
     fn masks_each_secret_but_leaves_other_text() {
@@ -348,6 +404,134 @@ pub(crate) struct MapsLoaded {
     pub(crate) areas: usize,
     pub(crate) shared: usize,
     pub(crate) elapsed: Duration,
+    /// How many maps the load means to show, once known.
+    pub(crate) total: Option<usize>,
+    /// Maps that stopped trying; the row offers to retry them.
+    pub(crate) stopped: usize,
+    /// Every map the load means to show has loaded.
+    pub(crate) complete: bool,
+}
+
+impl MapsLoaded {
+    fn of(summary: &LoadMapsSummary, elapsed: Duration) -> Self {
+        Self {
+            areas: summary.areas.len(),
+            shared: summary.areas.iter().filter(|stat| stat.shared).count(),
+            elapsed,
+            total: summary.total,
+            stopped: summary.stopped,
+            complete: summary.settled
+                && summary.stopped == 0
+                && summary.cloud_unavailable.is_none()
+                && summary.fatal.is_none(),
+        }
+    }
+}
+
+/// The maps arrived since `receiver` was last asked, each once. Batches
+/// dropped for a slow listener are skipped: the maps they named are on the
+/// map regardless.
+fn take_arrivals(
+    receiver: &mut tokio::sync::broadcast::Receiver<Arc<[smudgy_cloud::AreaId]>>,
+) -> Vec<smudgy_cloud::AreaId> {
+    use tokio::sync::broadcast::error::TryRecvError;
+    let mut seen = std::collections::HashSet::new();
+    let mut area_ids = Vec::new();
+    loop {
+        match receiver.try_recv() {
+            Ok(batch) => area_ids.extend(batch.iter().filter(|id| seen.insert(**id)).copied()),
+            Err(TryRecvError::Lagged(_)) => {}
+            Err(TryRecvError::Empty | TryRecvError::Closed) => return area_ids,
+        }
+    }
+}
+
+/// The session's maps still loading after it started.
+struct MapLoadWatch {
+    progress: tokio::sync::watch::Receiver<LoadMapsSummary>,
+    /// The load row, which counts them.
+    row: SystemRowId,
+    /// When the session began waiting for its maps.
+    started: Instant,
+    duplicates_announced: bool,
+}
+
+/// The load row's map clause: the maps loaded and, while some are still to
+/// load, out of how many, with a "Retry" once some stopped trying.
+fn push_maps_clause(text: SystemText, maps: &MapsLoaded, first: &mut bool) -> SystemText {
+    if maps.complete {
+        let text = push_loaded_clause(
+            text,
+            maps.areas,
+            "map area",
+            "map areas",
+            Some(maps.elapsed),
+            first,
+        );
+        return if maps.shared > 0 {
+            text.muted(&format!(
+                " ({} owned, {} shared)",
+                maps.areas - maps.shared,
+                maps.shared
+            ))
+        } else {
+            text
+        };
+    }
+    let text = if *first {
+        *first = false;
+        text.text("Loaded ")
+    } else {
+        text.text(", ")
+    };
+    let label = match maps.total {
+        Some(total) => format!("{}/{total} map areas", maps.areas),
+        None => plural(maps.areas, "map area", "map areas"),
+    };
+    let text = text.strong(&label);
+    if maps.stopped > 0 {
+        text.muted(&format!(" ({} couldn't load) ", maps.stopped))
+            .link("Retry", LinkAction::App(AppLink::RetryMapLoading))
+    } else {
+        text.muted(" (loading\u{2026})")
+    }
+}
+
+/// The notice for a session that started before its maps loaded. `error`
+/// is the latest reason a map, or the cloud list, couldn't load.
+fn maps_still_loading_notice(maps: &MapsLoaded, error: Option<&CloudError>) -> String {
+    let Some(total) = maps.total else {
+        let reason = match error {
+            None | Some(CloudError::ServiceUnavailable { .. }) => {
+                "The map service is busy.".to_string()
+            }
+            Some(other) => format!("{other}."),
+        };
+        return format!("Cloud maps are not loaded yet. {reason} Retrying\u{2026}");
+    };
+    let service = match error {
+        None | Some(CloudError::ServiceUnavailable { .. }) => "map service is busy",
+        Some(_) => "map service can't be reached",
+    };
+    format!(
+        "{}/{total} maps loaded, {service}. Will continue to load maps in the background.",
+        maps.areas
+    )
+}
+
+/// The notice for local maps made while the map service couldn't list the
+/// cloud maps that share a cloud map's name.
+fn duplicate_names_notice(names: &[String]) -> String {
+    let (maps, share) = if names.len() == 1 {
+        ("map", "shares")
+    } else {
+        ("maps", "share")
+    };
+    format!(
+        "{} {maps} made while the map service was unavailable {share} a name with a cloud map: {}.",
+        names.len(),
+        names.join(", ")
+    )
 }
 
 /// Send one system-row update straight to the UI, outside the row ledger —
@@ -1540,6 +1724,7 @@ impl Runtime {
             // and read back by `getCurrentLocation`. Preserved across reload (cloned below).
             let current_location = CurrentLocation::default();
             let mapper_events = mapper_events::subscribe(mapper.as_ref());
+            let map_arrivals = mapper.as_ref().map(Mapper::subscribe_arrivals);
 
             let pane_registry = local_pane_registry;
 
@@ -1764,6 +1949,8 @@ impl Runtime {
                 },
                 load_row: Some(load_row),
                 load_summary,
+                map_load: None,
+                map_arrivals,
                 connection_row: None,
                 connection_target: None,
                 current_location: current_location.clone(),
@@ -1880,6 +2067,7 @@ impl Runtime {
                 // The MSSP producer likewise.
                 let old_mssp_producer =
                     std::mem::replace(&mut inner.mssp, mssp::MsspProducer::new());
+                let old_map_arrivals = inner.map_arrivals.take();
                 let mut old_session_runtime_rx =
                     std::mem::replace(&mut inner.session_runtime_rx, {
                         // Create a dummy receiver that will be immediately replaced
@@ -2167,6 +2355,8 @@ impl Runtime {
                     // load row; the connection rule outlives the rebuild.
                     load_row: Some(reload_row),
                     load_summary: new_load_summary,
+                    map_load: None,
+                    map_arrivals: old_map_arrivals,
                     connection_row: old_connection_row,
                     connection_target: old_connection_target,
                     current_location: current_location.clone(), // Preserve current location across reload
@@ -2574,6 +2764,11 @@ struct Inner<'a> {
     load_row: Option<SystemRowId>,
     /// What the engine loaded, for the clauses of [`Self::load_row`].
     load_summary: LoadSummary,
+    /// The session's maps still loading after it started, if any are.
+    map_load: Option<MapLoadWatch>,
+    /// Maps arriving after the session started, for `map:areasLoaded`.
+    /// Heard from before any script runs, and kept across reloads.
+    map_arrivals: Option<tokio::sync::broadcast::Receiver<Arc<[smudgy_cloud::AreaId]>>>,
     /// The connection rule: one row cycling `Opened offline · Connect` →
     /// `Connecting to host…` → `Connected to host`. `Some` while that row is
     /// still the live one to replace; a disconnect starts a fresh rule
@@ -3603,6 +3798,15 @@ impl Inner<'_> {
         let Some(id) = self.load_row else {
             return;
         };
+        self.render_load_row(id, maps, progress);
+        if progress == Progress::Done {
+            self.load_row = None;
+        }
+    }
+
+    /// Replaces load row `id` with its clauses: packages, script modules,
+    /// and `maps`.
+    fn render_load_row(&mut self, id: SystemRowId, maps: Option<&MapsLoaded>, progress: Progress) {
         let summary = self.load_summary.clone();
         let mut first = true;
         let mut text = SystemText::new(Severity::Info);
@@ -3623,21 +3827,7 @@ impl Inner<'_> {
             &mut first,
         );
         if let Some(maps) = maps {
-            text = push_loaded_clause(
-                text,
-                maps.areas,
-                "map area",
-                "map areas",
-                Some(maps.elapsed),
-                &mut first,
-            );
-            if maps.shared > 0 {
-                text = text.muted(&format!(
-                    " ({} owned, {} shared)",
-                    maps.areas - maps.shared,
-                    maps.shared
-                ));
-            }
+            text = push_maps_clause(text, maps, &mut first);
         } else if progress == Progress::Pending {
             if !first {
                 text = text.text("; ");
@@ -3658,8 +3848,50 @@ impl Inner<'_> {
             })
             .collect();
         self.replace_system_row_sync(SystemRow::group(id, progress, text, children));
-        if progress == Progress::Done {
-            self.load_row = None;
+    }
+
+    /// The `map:areasLoaded` delivery for maps that arrived since last asked.
+    fn take_map_arrivals(&mut self) -> Option<RuntimeAction> {
+        let area_ids = take_arrivals(self.map_arrivals.as_mut()?);
+        (!area_ids.is_empty()).then(|| RuntimeAction::MapperAreasLoaded {
+            area_ids: Arc::from(area_ids),
+        })
+    }
+
+    /// Follows the session's maps still loading after it started: counts
+    /// them on the load row, and says so once they all have.
+    fn poll_map_load(&mut self) {
+        let Some(watch) = self.map_load.as_mut() else {
+            return;
+        };
+        if !watch.progress.has_changed().unwrap_or(false) {
+            return;
+        }
+        let summary = watch.progress.borrow_and_update().clone();
+        let row = watch.row;
+        let maps = MapsLoaded::of(&summary, watch.started.elapsed());
+        let announce = !summary.duplicates.is_empty() && !watch.duplicates_announced;
+        watch.duplicates_announced |= announce;
+        let progress = if maps.complete || summary.settled {
+            Progress::Done
+        } else {
+            Progress::Pending
+        };
+        self.render_load_row(row, Some(&maps), progress);
+        if announce {
+            self.echo_system_row_sync(SystemRow::plain_notice(
+                Severity::Warn,
+                &duplicate_names_notice(&summary.duplicates),
+            ));
+        }
+        if maps.complete {
+            if let Some(total) = maps.total {
+                self.echo_system_row_sync(SystemRow::plain_notice(
+                    Severity::Info,
+                    &format!("All {total} maps loaded."),
+                ));
+            }
+            self.map_load = None;
         }
     }
 
@@ -4051,9 +4283,10 @@ impl Inner<'_> {
         }
 
         // Always load: the mapper's local tier serves maps with no credential
-        // (and `list_areas` swallows cloud auth errors), so a signed-out
-        // session still loads its local maps. Cloud maps join via the sync
-        // engine once the user logs in.
+        // (a signed-out or refused cloud tier lists nothing), so a signed-out
+        // session still loads its local maps, and so does one the map
+        // service can't answer. Cloud maps join via the sync engine once the
+        // user logs in or the service answers.
         if let Some(mapper) = self.mapper.clone() {
             let started = Instant::now();
             match mapper.load_initial_areas().await {
@@ -4072,12 +4305,36 @@ impl Inner<'_> {
                             stat.source
                         );
                     }
-                    let maps = MapsLoaded {
-                        areas: summary.areas.len(),
-                        shared: summary.areas.iter().filter(|s| s.shared).count(),
-                        elapsed,
-                    };
-                    self.refresh_load_row(Some(&maps), Progress::Done);
+                    let maps = MapsLoaded::of(&summary, elapsed);
+                    if maps.complete {
+                        self.refresh_load_row(Some(&maps), Progress::Done);
+                    } else if let Some(row) = self.load_row.take() {
+                        // The session starts with the maps loaded so far;
+                        // the row keeps counting as the rest arrive.
+                        self.render_load_row(row, Some(&maps), Progress::Pending);
+                        let error = summary
+                            .cloud_unavailable
+                            .as_ref()
+                            .or(summary.failure.as_ref());
+                        self.echo_system_row_sync(SystemRow::plain_notice(
+                            Severity::Warn,
+                            &maps_still_loading_notice(&maps, error),
+                        ));
+                        let mut progress = mapper.load_progress();
+                        progress.mark_unchanged();
+                        self.map_load = Some(MapLoadWatch {
+                            progress,
+                            row,
+                            started,
+                            duplicates_announced: !summary.duplicates.is_empty(),
+                        });
+                    }
+                    if !summary.duplicates.is_empty() {
+                        self.echo_system_row_sync(SystemRow::plain_notice(
+                            Severity::Warn,
+                            &duplicate_names_notice(&summary.duplicates),
+                        ));
+                    }
                 }
                 // A map failure is its own warning: the load row keeps
                 // reporting what DID load rather than being overwritten by an
@@ -4142,12 +4399,19 @@ impl Inner<'_> {
             let mapper_event_wake = mapper_event_notify.notified();
             tokio::pin!(mapper_event_wake);
             mapper_event_wake.as_mut().enable();
+            self.poll_map_load();
             let remaps = mapper_events::drain(&self.mapper_events, &self.current_location);
             if !remaps.is_empty() {
                 if let Some(frame) = action_stack.last_mut() {
                     mapper_events::insert_remaps(frame, remaps);
                 } else {
                     action_stack.push(remaps);
+                }
+            }
+            if let Some(arrived) = self.take_map_arrivals() {
+                match action_stack.last_mut() {
+                    Some(frame) => frame.push_back(arrived),
+                    None => action_stack.push(VecDeque::from([arrived])),
                 }
             }
             // A receiver can disappear between any two actions. Stop after the

@@ -213,9 +213,13 @@ pub fn is_clan_folder(window: &MapEditorWindow, atlas_id: AtlasId) -> bool {
 
 /// Every clan map the viewer sees. "Shared by" leaves these out.
 #[must_use]
-pub fn in_clan_folders(atlas: &AtlasCache) -> HashSet<AreaId> {
+pub fn in_clan_folders(
+    atlas: &AtlasCache,
+    loading: &[std::sync::Arc<smudgy_cloud::mapper::area_cache::AreaCache>],
+) -> HashSet<AreaId> {
     atlas
         .areas()
+        .chain(loading.iter().cloned())
         .filter(|area| area.meta().clan_id.is_some())
         .map(|area| *area.get_id())
         .collect()
@@ -916,11 +920,13 @@ impl ListedMap {
 pub fn clan_groups(
     window: &MapEditorWindow,
     atlas: &AtlasCache,
+    loading: &[std::sync::Arc<smudgy_cloud::mapper::area_cache::AreaCache>],
     family_members: &HashSet<AreaId>,
     ephemeral: &HashSet<AreaId>,
 ) -> Vec<ClanGroup> {
     let maps: Vec<ListedMap> = atlas
         .areas()
+        .chain(loading.iter().cloned())
         .filter(|area| !ephemeral.contains(area.get_id()))
         .map(|area| {
             let access = area.effective_access();

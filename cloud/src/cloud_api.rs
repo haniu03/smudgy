@@ -815,6 +815,7 @@ impl CloudApiClient {
     /// Extracts the envelope `error` string (falling back to the raw body)
     /// and maps the status onto [`CloudError`].
     async fn error_for(status: u16, response: reqwest::Response) -> CloudError {
+        let headers = response.headers().clone();
         let text = response.text().await.unwrap_or_default();
         let message = serde_json::from_str::<Value>(&text)
             .ok()
@@ -825,7 +826,7 @@ impl CloudApiClient {
                     .map(ToString::to_string)
             })
             .unwrap_or(text);
-        CloudError::from_status(status, &message)
+        CloudError::from_status(status, &message).with_retry_after(&headers)
     }
 
     pub(crate) async fn get<T>(&self, path: &str) -> CloudResult<T>

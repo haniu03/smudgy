@@ -20,9 +20,17 @@ const rooms = [1, 2, 3].map(roomNumber => ({
 } as unknown as Room));
 const area = { id: "area", name: "Area", room: (number: number) => rooms[number - 1] } as Area;
 let path: [string, number][] = [];
+/** The rooms the mapper finds for what was seen: none until the room's map loads. */
+let matching: Room[] = [];
+const areasLoadedHandlers: Function[] = [];
 globalThis.__movementTest = {
     core: {
-        mapper: { getCurrentLocation: () => undefined, getAreaById: () => area, getPathBetweenRooms: () => path },
+        mapper: {
+            getCurrentLocation: () => undefined, getAreaById: () => area, getPathBetweenRooms: () => path,
+            setCurrentLocation() {},
+            listRoomsByTitleDescriptionAndVisibleExits: () => matching,
+            listRoomsByTitleAndDescription: () => matching,
+        },
         echo() {}, send: currentSession.send, sendRaw: (command: string) => sent.push(command),
         getSessions: () => sessions, session: currentSession,
         capture: (value: boolean) => captures.push(value), buffer: {}, line: {},
@@ -32,7 +40,7 @@ globalThis.__movementTest = {
             hotkeys.set([...key.modifiers, key.key].join("+"), run),
     },
     params: { get: () => undefined },
-    events: { room: { on() {} } },
+    events: { room: { on() {} }, areasLoaded: { on: (handler: Function) => areasLoadedHandlers.push(handler) } },
     prompt: { on() {} },
     widgets: { extractMarkdownLinks: (text: string) => noteLinks.get(text) ?? [] },
     widget: { requestExistingRoomConnection() {} },
@@ -84,7 +92,7 @@ const exit = (fromDirection: string, toRoomNumber: number, extra = {}) => ({
 }) as Exit;
 beforeEach(() => {
     sent.length = 0; captures.length = 0; path = [];
-    noteSends.length = 0; noteEntries = []; noteLinks.clear();
+    noteSends.length = 0; noteEntries = []; noteLinks.clear(); matching = [];
     for (const room of rooms) room.exits.length = 0;
     state.clearMoveQueue(); state.state = State.Following;
     state.area = area; state.room = rooms[0]; state.seenExits = null;
@@ -173,4 +181,26 @@ test("solo speedwalks preserve custom commands and modify only bare directions w
     sent.length = 0;
     speedwalk(rooms[1], rooms[0]);
     assert.deepEqual(sent, ["say ready\n", "n\n", "enter hole\n", "down alone\n", "look\n"]);
+});
+
+test("a room seen before its map loaded is found again when maps arrive", async () => {
+    const { mapEvent } = await import("./events.ts");
+    const seen = {
+        title: "Room 2", description: [], objects: [], mobs: [], exits: "", line_number: 0,
+        prompt_line_number: 0, prompt: "",
+    };
+    state.room = null;
+    state.possibleRooms = [];
+    mapEvent.emit("room", seen);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(state.room, null, "nothing loaded matches it yet");
+
+    // The map holding it arrives; a queued move stays queued.
+    matching = [rooms[1]];
+    state.moveQueue.push(Direction.North);
+    const queued = state.moveQueue.length;
+    for (const handler of areasLoadedHandlers) handler({ areaIds: ["area"] });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(state.room, rooms[1]);
+    assert.equal(state.moveQueue.length, queued, "looked for again, not moved");
 });

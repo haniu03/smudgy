@@ -31,6 +31,15 @@ fn has_json_extension(name: &str) -> bool {
 /// can contain optimistic overlays from queues written before recovery existed.
 pub const CACHE_FORMAT_NAMESPACE: &str = "v5";
 
+/// The viewer directory's copy of its last complete cloud list.
+const INVENTORY_FILE: &str = "inventory.json";
+
+/// [`INVENTORY_FILE`]'s contents.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RememberedInventory {
+    areas: Vec<Area>,
+}
+
 /// What we last learned about an area's server-side state: the token over
 /// the caller's projection, which moves with content and with access alike.
 /// A cache hit requires the cached copy to carry the same token.
@@ -81,6 +90,14 @@ where
     area_io: RwLock<HashMap<AreaId, Arc<tokio::sync::Mutex<()>>>>,
     known: RwLock<HashMap<AreaId, KnownAreaState>>,
     last_sources: RwLock<HashMap<AreaId, AreaLoadSource>>,
+    /// The account this device last signed in as, with the credential
+    /// generation it was given under: whose remembered inventory to read
+    /// before `/me` proves the viewer, as long as that credential is still
+    /// the one in use.
+    expected_viewer: Option<(Uuid, u64)>,
+    /// The inventory last written, encoded, so an unchanged list rewrites
+    /// nothing.
+    written_inventory: parking_lot::Mutex<Option<Vec<u8>>>,
 }
 
 impl<T> fmt::Debug for CachedBackend<T>
@@ -128,6 +145,69 @@ where
             area_io: RwLock::new(HashMap::new()),
             known: RwLock::new(HashMap::new()),
             last_sources: RwLock::new(HashMap::new()),
+            expected_viewer: None,
+            written_inventory: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Names the account this device last signed in as, whose remembered
+    /// inventory answers while the map service can't prove the viewer.
+    #[must_use]
+    pub fn expecting_viewer(mut self, viewer: Option<Uuid>) -> Self {
+        let generation = self.inner.auth_generation();
+        self.expected_viewer = viewer.map(|viewer| (viewer, generation));
+        self
+    }
+
+    /// The disk directory of the viewer whose inventory may be read now:
+    /// the proven one, or the expected one under its own credential.
+    fn inventory_dir(&self) -> Option<PathBuf> {
+        if self.disk_namespace_is_proven() {
+            return Some(self.viewer_dir());
+        }
+        let (viewer, generation) = self.expected_viewer?;
+        (self.inner.auth_generation() == generation).then(|| {
+            self.cache_dir
+                .join(CACHE_FORMAT_NAMESPACE)
+                .join(viewer.to_string())
+        })
+    }
+
+    fn disk_namespace_is_proven(&self) -> bool {
+        !self.inner.supports_sync() || self.viewer.read().is_some()
+    }
+
+    /// Keeps `areas`, a complete cloud list, as the viewer's remembered
+    /// inventory.
+    async fn remember_inventory(&self, areas: &[Area]) {
+        if !self.disk_namespace_is_proven() {
+            return;
+        }
+        let contents = match serde_json::to_vec(&RememberedInventory {
+            areas: areas.to_vec(),
+        }) {
+            Ok(contents) => contents,
+            Err(err) => {
+                warn!("Failed to encode the map inventory: {err}");
+                return;
+            }
+        };
+        if self.written_inventory.lock().as_ref() == Some(&contents) {
+            return;
+        }
+        let dir = self.viewer_dir();
+        let staged_contents = contents.clone();
+        let written = task::spawn_blocking(move || -> io::Result<()> {
+            fs::create_dir_all(&dir)?;
+            let staged = dir.join(format!("{INVENTORY_FILE}.tmp"));
+            fs::write(&staged, staged_contents)?;
+            fs::rename(&staged, dir.join(INVENTORY_FILE))
+        })
+        .await;
+        match written {
+            Ok(Ok(())) => *self.written_inventory.lock() = Some(contents),
+            Ok(Err(err)) => warn!("Failed to remember the map inventory: {err}"),
+            Err(err) => warn!("Failed to remember the map inventory: {err}"),
         }
     }
 
@@ -136,7 +216,7 @@ where
 
         // Disk persistence is best-effort: a read-only or full disk must not
         // turn a successful network fetch into a failed read.
-        let disk_namespace_is_proven = !self.inner.supports_sync() || self.viewer.read().is_some();
+        let disk_namespace_is_proven = self.disk_namespace_is_proven();
         if disk_namespace_is_proven {
             if let Err(err) = self.write_area_to_disk(area, &token).await {
                 warn!(
@@ -523,7 +603,31 @@ where
             return Err(CloudError::CredentialChanged);
         }
         self.remember_server_state(&areas).await;
+        self.remember_inventory(&areas).await;
         Ok(areas)
+    }
+
+    async fn remembered_inventory(&self) -> Option<Vec<Area>> {
+        let path = self.inventory_dir()?.join(INVENTORY_FILE);
+        let read = task::spawn_blocking(move || -> CloudResult<Option<RememberedInventory>> {
+            match fs::read(&path) {
+                Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        })
+        .await;
+        match read {
+            Ok(Ok(remembered)) => remembered.map(|remembered| remembered.areas),
+            Ok(Err(err)) => {
+                warn!("Failed to read the remembered map inventory: {err}");
+                None
+            }
+            Err(err) => {
+                warn!("Failed to read the remembered map inventory: {err}");
+                None
+            }
+        }
     }
 
     async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
@@ -1573,6 +1677,52 @@ mod tests {
 
         assert_eq!(backend.get_calls.load(Ordering::Relaxed), 2);
 
+        fs::remove_dir_all(cache_dir).ok();
+    }
+
+    /// A complete cloud list is kept for its viewer, and read back for the
+    /// account the device expects before `/me` proves it, but only under the
+    /// credential that account signed in with.
+    #[tokio::test]
+    async fn a_complete_list_is_remembered_for_the_expected_viewer() {
+        let area_id = AreaId(Uuid::new_v4());
+        let viewer = Uuid::new_v4();
+        let backend = MockBackend {
+            cloud_origin: Some("https://cloud.test".to_string()),
+            ..MockBackend::new(vec![sample_area_with_rev(area_id, 1)])
+        };
+        backend.set_viewer(Some(viewer));
+        let cache_dir = temp_cache_dir();
+        let cached = CachedBackend::new(backend.clone(), cache_dir.clone());
+        cached.list_areas().await.expect("a list before /me");
+        assert!(
+            cached.remembered_inventory().await.is_none(),
+            "an unproven viewer keeps nothing"
+        );
+        cached.viewer_identity().await.expect("identity");
+        cached.list_areas().await.expect("list");
+        let kept = cached.remembered_inventory().await.expect("kept");
+        assert_eq!(
+            kept.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![area_id]
+        );
+
+        // A later session, before `/me`: the expected account's list answers.
+        let later =
+            CachedBackend::new(backend.clone(), cache_dir.clone()).expecting_viewer(Some(viewer));
+        let ids = |rows: Option<Vec<Area>>| {
+            rows.map(|rows| rows.iter().map(|row| row.id).collect::<Vec<_>>())
+        };
+        assert_eq!(ids(later.remembered_inventory().await), ids(Some(kept)));
+        let other = CachedBackend::new(backend.clone(), cache_dir.clone())
+            .expecting_viewer(Some(Uuid::new_v4()));
+        assert!(
+            other.remembered_inventory().await.is_none(),
+            "another account's list stays its own"
+        );
+        // Signed in afresh, the device no longer knows whose list it is.
+        backend.generation.fetch_add(1, Ordering::AcqRel);
+        assert!(later.remembered_inventory().await.is_none());
         fs::remove_dir_all(cache_dir).ok();
     }
 

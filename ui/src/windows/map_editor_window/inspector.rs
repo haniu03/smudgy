@@ -3964,6 +3964,28 @@ pub(super) fn focus_step(window: iced::window::Id, back: bool) -> Task<super::Me
 /// The inspector pane: an atlas's panel while one is chosen in the map list,
 /// else the open map's panel, a Secret's or Private's page, or the canvas
 /// selection's view under a link back to the map's panel.
+/// The open map's name and how its loading goes, for a cloud map still
+/// loading or one that stopped trying; `None` for any other.
+fn loading_view(window: &MapEditorWindow) -> Option<Column<'_, super::Message, crate::Theme>> {
+    let area_id = window.editor.area_id()?;
+    let area = window.mapper.loading_area(area_id)?;
+    let mut panel = Column::new()
+        .padding(12)
+        .spacing(6)
+        .push(text(area.get_name().to_string()).size(16));
+    panel = match window.mapper.area_load_failure(area_id) {
+        Some(error) => panel
+            .push(text(crate::i18n::t!("mapper-canvas-load-failed")).size(12))
+            .push(
+                text(crate::components::cloud_errors::display_error(&error))
+                    .size(12)
+                    .style(builtins::text::danger),
+            ),
+        None => panel.push(super::panels::note(crate::i18n::t!("mapper-loading"))),
+    };
+    Some(panel)
+}
+
 pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> {
     let atlas = window.mapper.get_current_atlas();
     let area = window.editor.area_id().and_then(|id| atlas.get_area(&id));
@@ -3978,9 +4000,13 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> {
             (Panel::Selection, Some(area)) => Column::new()
                 .push(super::panels::back_link(area.get_name()))
                 .push(selection_view(window)),
-            (Panel::NoMap | Panel::Map | Panel::Place(_) | Panel::Selection, _) => Column::new()
-                .padding(12)
-                .push(text(crate::i18n::t!("inspector-no-area-selected"))),
+            (Panel::NoMap | Panel::Map | Panel::Place(_) | Panel::Selection, _) => {
+                loading_view(window).unwrap_or_else(|| {
+                    Column::new()
+                        .padding(12)
+                        .push(text(crate::i18n::t!("inspector-no-area-selected")))
+                })
+            }
         };
 
     container(scrollable(content).height(Length::Fill))

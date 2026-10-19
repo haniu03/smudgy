@@ -47,7 +47,9 @@ pub fn display_error(err: &CloudError) -> String {
         CloudError::NetworkError(detail) => {
             crate::i18n::t!("cloud-error-network", "detail" => detail)
         }
-        CloudError::ServiceUnavailable(_) => crate::i18n::t!("cloud-error-service-unavailable"),
+        CloudError::ServiceUnavailable { .. } => {
+            crate::i18n::t!("cloud-error-service-unavailable")
+        }
         CloudError::SerializationError(detail) => {
             crate::i18n::t!("cloud-error-serialization", "detail" => detail)
         }

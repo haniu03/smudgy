@@ -12,6 +12,7 @@
 
 use std::cell::Cell;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1921,7 +1922,7 @@ async fn auto_mapper_retries_into_a_local_area_when_the_bound_map_refuses_writes
     // one area read-only to the backend without disabling new local map creation. A
     // future-format document is deliberately refused on every platform.
     mapper
-        .import_areas_if_absent(Vec::new())
+        .ready()
         .await
         .expect("wait for the initial local map load");
     let bound_path = map_root
@@ -2302,6 +2303,226 @@ async fn auto_mapper_refused_relink_keeps_the_exit() {
             "600's north exit is deleted only in the write that recreates it.\n{transcript}"
         );
     }
+
+    tx.send(RuntimeAction::Shutdown).ok();
+}
+
+/// A cloud tier kept in a directory of its own: it lists nothing until `listed`
+/// is set, and holds every map read until `open` is.
+struct GatedCloud {
+    inner: LocalBackend,
+    listed: AtomicBool,
+    open: tokio::sync::watch::Sender<bool>,
+}
+
+#[async_trait]
+impl MapperBackend for GatedCloud {
+    async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
+        self.inner.create_area(request).await
+    }
+
+    async fn list_areas(&self) -> CloudResult<Vec<Area>> {
+        if self.listed.load(Ordering::SeqCst) {
+            self.inner.list_areas().await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
+        let mut open = self.open.subscribe();
+        let _ = open.wait_for(|open| *open).await;
+        self.inner.get_area(area_id).await
+    }
+
+    async fn update_area(&self, area_id: &AreaId, updates: AreaUpdates) -> CloudResult<()> {
+        self.inner.update_area(area_id, updates).await
+    }
+
+    async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
+        self.inner.delete_area(area_id).await
+    }
+
+    async fn execute_mutation(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+    ) -> CloudResult<MutationResult> {
+        self.inner.execute_mutation(area_id, envelope).await
+    }
+}
+
+/// A fix in a zone whose cloud map is still loading waits for the map: once it
+/// arrives, the room already on it is followed, and no second map of the zone
+/// or second copy of the room is drawn.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end walk, read top to bottom
+async fn auto_mapper_waits_for_the_zones_cloud_map_to_load() {
+    const LOADING_SERVER: &str = "AutoMapperLoading";
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    std::fs::create_dir_all(smudgy_home.join(LOADING_SERVER).join("modules")).unwrap();
+    std::fs::create_dir_all(smudgy_home.join(LOADING_SERVER).join("logs")).unwrap();
+    std::fs::write(
+        smudgy_home.join(LOADING_SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
+    copy_package_source(LOADING_SERVER);
+    shared_packages::install_package(
+        LOADING_SERVER,
+        "smudgy://local/auto-mapper",
+        UpdateMode::Auto,
+        true,
+    )
+    .unwrap();
+
+    // The zone's map, with a room the walk will report, saved where the cloud
+    // tier reads from.
+    let map_root = smudgy_home.join("map-test-loading");
+    let seeding = Mapper::new(
+        Arc::new(LocalBackend::new(map_root.join("cloud"))),
+        map_root.join("seed-cache"),
+    );
+    seeding.ready().await.expect("seed mapper ready");
+    let zone_map = seeding
+        .create_area_at(
+            "old-town".to_string(),
+            MapDestination::loose(MapStorage::Local),
+        )
+        .await
+        .expect("create the zone's map");
+    let seed = seeding
+        .upsert_room(
+            RoomKey::new(zone_map, RoomNumber(1)),
+            RoomUpdates {
+                title: Some("West Plaza".to_string()),
+                external_id: Some(Some("200".to_string())),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("seed room should enqueue");
+    if let Some(operation_id) = seed.operation_id() {
+        seeding
+            .wait_for_mutation(operation_id)
+            .await
+            .expect("seed room acknowledged");
+    }
+    drop(seeding);
+
+    let local = Arc::new(LocalBackend::new(map_root.join("local")));
+    let cloud = Arc::new(GatedCloud {
+        inner: LocalBackend::new(map_root.join("cloud")),
+        listed: AtomicBool::new(false),
+        open: tokio::sync::watch::Sender::new(false),
+    });
+    let backend: Arc<dyn MapperBackend + Send + Sync> =
+        Arc::new(CompositeBackend::new(local, cloud.clone()));
+    let mapper = Mapper::new(backend, map_root.join("cache"));
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(9343_u32),
+        server_name: Arc::new(LOADING_SERVER.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: Some(mapper.clone()),
+        package_client: Some(PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        )),
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+    mapper.ready().await.expect("the session's maps loaded");
+
+    // The cloud list now names the zone's map, which can't be read yet.
+    cloud.listed.store(true, Ordering::SeqCst);
+    let loader = mapper.clone();
+    let load = tokio::spawn(async move { loader.load_all_areas().await });
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the zone's map to be listed",
+        |_| mapper.area_is_loading(zone_map),
+    )
+    .await;
+    assert_eq!(mapper.area_storage(&zone_map), MapStorage::Cloud);
+
+    tx.send(RuntimeAction::GmcpEnabled).unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 200, "name": "West Plaza", "zone": "old-town", "exits": {} }"#,
+    ))
+    .unwrap();
+    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(event) = events.next().await {
+            if let SessionEvent::UpdateBuffer(updates) = &event.event {
+                collect(updates, &mut lines);
+            }
+        }
+    })
+    .await;
+    let transcript = lines.join("\n");
+    let atlas = mapper.get_current_atlas();
+    assert!(
+        atlas.find_room_by_external_id("200").is_none(),
+        "the fix waits while the zone's map is loading.\n{transcript}"
+    );
+    assert_eq!(
+        atlas.areas().len(),
+        0,
+        "no map of the zone is drawn while its map is loading.\n{transcript}"
+    );
+
+    cloud.open.send_replace(true);
+    wait_until_current_room(
+        &mut events,
+        &mut lines,
+        "the room on the loaded map to be followed",
+        &mapper,
+        "200",
+    )
+    .await;
+    load.await
+        .expect("load task")
+        .expect("the zone's map loaded");
+    let transcript = lines.join("\n");
+
+    let atlas = mapper.get_current_atlas();
+    let (key, _) = atlas
+        .find_room_by_external_id("200")
+        .unwrap_or_else(|| panic!("room 200 is on the zone's map.\n{transcript}"));
+    assert_eq!(
+        key.area_id, zone_map,
+        "the room followed is the one on the zone's map.\n{transcript}"
+    );
+    assert_eq!(
+        atlas.areas().len(),
+        1,
+        "the zone's map is the only map.\n{transcript}"
+    );
+    assert_eq!(
+        atlas.get_area(&zone_map).expect("zone's map").room_count(),
+        1,
+        "the room was not drawn again.\n{transcript}"
+    );
 
     tx.send(RuntimeAction::Shutdown).ok();
 }

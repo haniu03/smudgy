@@ -433,6 +433,25 @@ function sameExit(a: ExitId, b: ExitId): boolean {
     return a === b;
 }
 
+/** Waits for the zone's map while it is a cloud map still loading: until it arrives, its
+ *  rooms can't be found, so a room already on it would be drawn again. The fix queue
+ *  waits with it, holding every later fix too. */
+async function waitForZoneMap(zone: string | null): Promise<void> {
+    const key = zoneKey(zone);
+    const bound = zoneAreas.get(key);
+    let loading: AreaId | undefined;
+    if (bound) {
+        try {
+            if (mapper.getAreaById(bound).loading) loading = bound;
+        } catch {
+            return;
+        }
+    } else {
+        loading = mapper.areas.find((area) => area.loading && zoneKey(area.name) === key)?.id;
+    }
+    if (loading !== undefined) await mapper.ready({ id: loading });
+}
+
 async function zoneArea(zone: string | null): Promise<AreaId> {
     const key = zoneKey(zone);
     const bound = zoneAreas.get(key);
@@ -1409,6 +1428,7 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
 
 async function handleRoomFix(fix: RoomFix | null, fixAt: number): Promise<void> {
     if (!fix) return;
+    await waitForZoneMap(fix.zone);
     const idDir = arrivalDirection(fix);
     const dir = takeMovement(fix, idDir, fixAt);
     const known = fix.id !== null ? mapper.findRoomByExternalId(fix.id) : undefined;

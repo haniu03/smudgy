@@ -499,6 +499,11 @@ pub enum RuntimeAction {
         into: AreaId,
         rooms: Arc<[smudgy_cloud::RoomRemap]>,
     },
+    /// Maps that arrived after the session started: late from its load, or
+    /// newly readable through a sync. Fires `map:areasLoaded`.
+    MapperAreasLoaded {
+        area_ids: Arc<[AreaId]>,
+    },
     /// A mapper navigation op (speedwalk / find-nearest) resolved a destination
     /// in this area — a demonstrated navigation intent the UI daemon weighs for
     /// per-server map scoping (bind-on-use). Advisory only; carries no map

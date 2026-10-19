@@ -501,6 +501,12 @@ pub struct PendingTransferRecord {
 #[derive(Debug, Default)]
 pub struct MockState {
     pub http_requests: Vec<(String, String)>,
+    /// Test hook: requests that find their Library busy, as
+    /// `(method, path, remaining, retry_after_seconds)`. Each answers 503
+    /// `unavailable` with that `Retry-After` before anything applies, as the
+    /// server answers a call the runtime marked retryable or a read past its
+    /// budget (the server always sends 5).
+    pub busy: Vec<(String, String, u32, u64)>,
     pub users: Vec<UserRecord>,
     /// Raw token -> key record (the real server stores sha256 digests).
     pub api_keys: HashMap<String, ApiKeyRecord>,

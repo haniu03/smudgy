@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use crate::{AreaId, ExitId, LabelId, ShapeId, mapper::RoomKey};
 
@@ -39,11 +40,15 @@ pub enum CloudError {
     /// Network/HTTP error
     NetworkError(String),
 
-    /// 503 — the service holds writes for a moment: a transfer's seal on
-    /// the subject (`write_freeze`), or a hold on every write. A transport
-    /// failure that retrying outlasts, so queued writes wait for it without
-    /// spending their attempts.
-    ServiceUnavailable(String),
+    /// 503 — the service is unavailable for a moment: a busy map store, a
+    /// transfer's seal on the subject (`write_freeze`), or a hold on every
+    /// write. A transport failure that retrying outlasts, so queued writes
+    /// wait for it without spending their attempts. `retry_after` is the
+    /// server's `Retry-After`, when it sent one.
+    ServiceUnavailable {
+        message: String,
+        retry_after: Option<Duration>,
+    },
 
     /// Serialization error
     SerializationError(String),
@@ -223,8 +228,8 @@ impl fmt::Display for CloudError {
             CloudError::InvalidInput(msg) => write!(f, "Invalid input: {msg}"),
             CloudError::DatabaseError(msg) => write!(f, "Database error: {msg}"),
             CloudError::NetworkError(msg) => write!(f, "Network error: {msg}"),
-            CloudError::ServiceUnavailable(msg) => {
-                write!(f, "The map service is briefly holding changes: {msg}")
+            CloudError::ServiceUnavailable { message, .. } => {
+                write!(f, "The map service is busy: {message}")
             }
             CloudError::SerializationError(msg) => write!(f, "Serialization error: {msg}"),
             CloudError::AuthenticationError(msg) => write!(f, "Authentication error: {msg}"),
@@ -468,7 +473,10 @@ impl CloudError {
             (409, _) => Self::NameUnavailable(message.to_string()),
             (413, _) => Self::TooLarge(message.to_string()),
             (426, _) => Self::UpgradeRequired,
-            (503, _) => Self::ServiceUnavailable(message.to_string()),
+            (503, _) => Self::ServiceUnavailable {
+                message: message.to_string(),
+                retry_after: None,
+            },
             _ => Self::NetworkError(format!("HTTP {status}: {message}")),
         }
     }
@@ -484,7 +492,10 @@ impl CloudError {
     /// off (offline, DNS, timeouts) as opposed to server verdicts.
     #[must_use]
     pub const fn is_transport_error(&self) -> bool {
-        matches!(self, Self::NetworkError(_) | Self::ServiceUnavailable(_))
+        matches!(
+            self,
+            Self::NetworkError(_) | Self::ServiceUnavailable { .. }
+        )
     }
 
     /// True when the server rejected this client as too old (426). The only
@@ -494,7 +505,38 @@ impl CloudError {
     pub const fn is_upgrade_required(&self) -> bool {
         matches!(self, Self::UpgradeRequired)
     }
+
+    /// How long the server asked the client to wait before trying again,
+    /// when it answered 503 with a `Retry-After`.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::ServiceUnavailable { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// Adds the response's `Retry-After` to a 503; any other error is
+    /// returned unchanged. Only the delay-seconds form is read, and a delay
+    /// past [`MAX_RETRY_AFTER`] is held to it.
+    #[must_use]
+    pub fn with_retry_after(self, headers: &reqwest::header::HeaderMap) -> Self {
+        match self {
+            Self::ServiceUnavailable { message, .. } => Self::ServiceUnavailable {
+                message,
+                retry_after: headers
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_AFTER)),
+            },
+            other => other,
+        }
+    }
 }
+
+/// The longest `Retry-After` the client honors.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_mins(10);
 
 // Conversion from common error types
 impl From<serde_json::Error> for CloudError {
@@ -641,12 +683,50 @@ mod tests {
     fn a_write_freeze_is_a_transport_failure_never_a_sign_out() {
         let error = CloudError::from_status(503, "Service temporarily unavailable");
         assert!(
-            matches!(&error, CloudError::ServiceUnavailable(_)),
+            matches!(&error, CloudError::ServiceUnavailable { .. }),
             "{error:?}"
         );
         assert!(error.is_transport_error(), "retried as a network failure");
         assert!(!error.is_auth_error());
         assert!(!error.is_upgrade_required());
+        assert_eq!(error.retry_after(), None);
+    }
+
+    #[test]
+    fn a_503_carries_the_servers_retry_after() {
+        let headers = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(value).unwrap(),
+            );
+            headers
+        };
+        let busy = || CloudError::from_status(503, "Service temporarily unavailable");
+        assert_eq!(
+            busy().with_retry_after(&headers("5")).retry_after(),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            busy().with_retry_after(&headers("86400")).retry_after(),
+            Some(MAX_RETRY_AFTER),
+            "an outsized delay is held to the cap"
+        );
+        assert_eq!(
+            busy()
+                .with_retry_after(&headers("Wed, 21 Oct 2026 07:28:00 GMT"))
+                .retry_after(),
+            None,
+            "the date form is not read"
+        );
+        assert_eq!(
+            busy()
+                .with_retry_after(&reqwest::header::HeaderMap::new())
+                .retry_after(),
+            None
+        );
+        let refused = CloudError::from_status(500, "boom").with_retry_after(&headers("5"));
+        assert_eq!(refused.retry_after(), None, "only a 503 carries a delay");
     }
 
     #[test]

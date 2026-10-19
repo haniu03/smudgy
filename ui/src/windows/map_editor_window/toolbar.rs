@@ -6,7 +6,7 @@ use iced::widget::{button, column, container, row, space, text, tooltip};
 use iced::{Length, Padding};
 use smudgy_cloud::MapStorage;
 use smudgy_cloud::clans::action;
-use smudgy_cloud::mapper::AreaSaveStatus;
+use smudgy_cloud::mapper::{AreaSaveStatus, SyncState};
 use smudgy_map_widget::map_editor::Tool;
 
 use crate::assets::{bootstrap_icons, fonts};
@@ -349,6 +349,19 @@ fn parked_reason(window: &MapEditorWindow, message: String) -> String {
 /// status; otherwise it doubles as a **Sync** button that triggers an immediate
 /// sync — the engine no longer polls on a timer, so this is how the user pulls
 /// remote changes (and retries after a failure) on demand.
+/// The wall-clock time, as hours and minutes, of `next_retry`, an instant
+/// `now` measures, when the wall clock reads `wall_now`.
+#[must_use]
+pub fn retry_clock(
+    next_retry: Option<std::time::Instant>,
+    now: std::time::Instant,
+    wall_now: chrono::DateTime<chrono::Local>,
+) -> Option<String> {
+    let wait = next_retry?.saturating_duration_since(now);
+    let at = wall_now + chrono::Duration::from_std(wait).ok()?;
+    Some(at.format("%H:%M").to_string())
+}
+
 fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     let status = window
         .editor
@@ -363,7 +376,22 @@ fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     let error: StyleFn = |theme: &crate::Theme| iced::widget::text::Style {
         color: Some(theme.styles.text.error),
     };
+    // With nothing of the open map's waiting to save, the indicator says
+    // when syncing is offline, and when it tries again.
+    let sync = window.mapper.sync_status();
     let (codepoint, label, color) = match &status {
+        AreaSaveStatus::Saved if sync.state == SyncState::Offline => (
+            bootstrap_icons::EXCLAMATION_TRIANGLE,
+            match retry_clock(
+                sync.next_retry,
+                std::time::Instant::now(),
+                chrono::Local::now(),
+            ) {
+                Some(time) => crate::i18n::t!("mapper-status-sync-retrying", "time" => time),
+                None => crate::i18n::t!("mapper-status-sync-offline"),
+            },
+            error,
+        ),
         AreaSaveStatus::Saved => (
             bootstrap_icons::CLOUD_CHECK,
             crate::i18n::t!("mapper-status-saved"),
@@ -459,5 +487,30 @@ fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
             tooltip::Position::Bottom,
         )
         .into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_clock;
+    use chrono::TimeZone;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_next_retry_reads_as_a_wall_clock_time() {
+        let now = Instant::now();
+        let wall = chrono::Local
+            .with_ymd_and_hms(2026, 10, 18, 12, 0, 0)
+            .unwrap();
+        assert_eq!(
+            retry_clock(Some(now + Duration::from_secs(240)), now, wall).as_deref(),
+            Some("12:04")
+        );
+        assert_eq!(retry_clock(None, now, wall), None);
+        assert_eq!(
+            retry_clock(Some(now), now + Duration::from_secs(5), wall).as_deref(),
+            Some("12:00"),
+            "a retry already due reads as now"
+        );
     }
 }

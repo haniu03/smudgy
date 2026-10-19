@@ -3477,6 +3477,15 @@ declare module "smudgy:events/map" {
   export const room: EventConsumer<{ areaId: AreaId; roomNumber: number | null }>;
 
   /**
+   * Fires as maps arrive after the session started: maps still loading when it
+   * started, a map newly shared with you, or a clan map you gained access to.
+   * One delivery names each batch of maps that arrived together. Maps made in
+   * this session (created, imported or copied) do not arrive this way.
+   * `mapper.getAreaById(id)` finds each.
+   */
+  export const areasLoaded: EventConsumer<{ areaIds: AreaId[] }>;
+
+  /**
    * Fires when the user clicks a room in a session map view (a `MapView`
    * widget): the left button pressed and released over the same room.
    * `areaId` and `roomNumber` name the room as the `mapper` API does, so

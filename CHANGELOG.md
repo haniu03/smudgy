@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The map editor shows maps that are still loading.** They appear in the map
+  list with a "Loading…" badge, and a line under the list's header counts them
+  as they arrive. Opening one shows a note until it arrives. A map that
+  couldn't load says why, and can be retried. While Smudgy cloud is
+  unavailable, your cloud maps show this way too. When syncing is offline, the
+  toolbar says so, with the time of the next retry.
+- **Scripts can see and wait for maps that are still loading.** `mapper.areas`
+  and `mapper.getAreaById` include cloud maps still loading, with
+  `area.loading` set and no rooms yet, and a write to one waits until it has
+  loaded. `mapper.ready({ all: true })` waits until every map has finished
+  loading, and `mapper.ready({ id })` until one has; both resolve even if maps
+  fail to load, so check `area.loading` afterwards. `areasLoaded` from
+  `smudgy:events/map` names maps as they arrive after the session starts,
+  including maps newly shared with you.
+- **Local maps made during an outage are pointed out.** When the map service
+  answers again, Smudgy names any local map you made in the meantime that
+  shares a name with one of your cloud maps.
 - **A clan's maps show on the game the clan plays.** A clan lists the hosts its
   game answers on, under "Plays on" in Settings › Clans; a game reached under
   several names lists each. A clan made while you're connected starts with that
@@ -118,6 +135,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the rest of the line intact; before, `say don't` went to the game untouched.
   The editor's Try-it says when that happened. Switching a Command alias
   between Auto, Simple, and Advanced keeps its argument rows.
+- **Packages can add starter maps while Smudgy cloud is unavailable.**
+  `mapper.importAreasIfAbsent` checks names against your cloud maps as they
+  were when they last loaded, instead of holding off.
+- **Cloud maps load in the background.** Cloud maps now load several at a time
+  and appear as they arrive. If they're still loading after 20 seconds, the
+  session starts with the maps loaded so far, and its first line counts the
+  rest as they arrive. Maps that fail to load retry automatically, with a Retry
+  link if they keep failing.
+- **Map syncing retries on its own.** After a failed sync, Smudgy tries again
+  by itself: for as long as the map service says it's busy, and for up to 10
+  minutes after a connection problem. Edits made while the service is busy
+  save once it's ready.
 - **Hidden panes wait in the new Layout menu.** The toolbar's Layouts button is
   now **Layout**, and it opens a menu instead of a dialog. A pane you hide with
   its tab's hide control, or that a script hides or creates hidden, leaves the
@@ -168,6 +197,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cloud maps no longer disappear when the map service has trouble.** A failed
+  request could hide every cloud map until the next successful sync. If cloud
+  maps can't be loaded, sessions now start with local maps, and the cloud maps
+  load once the map service responds.
+- **Packages no longer add duplicate starter maps during a map service
+  outage.** A package that adds maps the first time you play now holds off
+  while your cloud maps can't be checked.
+- **A busy map service is reported as busy.** Error messages now read "The map
+  service is busy. Try again shortly." instead of saying the service was
+  holding changes.
 - **Deleting a server no longer hides folders on every other server.** A folder
   shown only on the deleted server goes back to showing on every server.
 - The "Whole line as one argument" parsing mode on an Advanced command alias

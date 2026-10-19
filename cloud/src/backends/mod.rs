@@ -119,7 +119,40 @@ pub trait MapperBackend: Send + Sync {
         )))
     }
 
+    /// Every area, or an error: a list is complete or it fails, since
+    /// callers act on what it leaves out.
     async fn list_areas(&self) -> CloudResult<Vec<Area>>;
+
+    /// The areas of the tiers on this device, which answer whether or not
+    /// the map service does: a composite backend's local and session
+    /// tiers, or the whole list of a backend that doesn't sync.
+    async fn list_device_areas(&self) -> CloudResult<Vec<Area>> {
+        if self.supports_sync() {
+            Ok(Vec::new())
+        } else {
+            self.list_areas().await
+        }
+    }
+
+    /// The areas the map service lists, so a caller can show the maps on
+    /// this device before, or without, its answer: a composite backend's
+    /// cloud tier (nothing while signed out), or the whole list of a
+    /// backend that syncs.
+    async fn list_cloud_areas(&self) -> CloudResult<Vec<Area>> {
+        if self.supports_sync() {
+            self.list_areas().await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The cloud list as last answered in full, kept on this device for
+    /// while the map service can't list it: each map's list row, enough to
+    /// count the cloud maps and show them in their folders. `None` when none
+    /// is kept.
+    async fn remembered_inventory(&self) -> Option<Vec<Area>> {
+        None
+    }
 
     async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails>;
 

@@ -11,6 +11,7 @@ const {
     op_smudgy_mapper_list_area_ids,
     op_smudgy_mapper_refresh_areas,
     op_smudgy_mapper_ready,
+    op_smudgy_mapper_area_loading,
     op_smudgy_mapper_list_area_room_numbers,
     op_smudgy_mapper_list_rooms_by_title_and_description,
     op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits,
@@ -898,11 +899,20 @@ function destinationForOp(destination: MapDestination) {
 /** Maps for the current session. Sessions sharing local maps see each other's changes
  * automatically. Cloud changes prompt sessions using the same service and account to refresh. */
 const mapper = {
-    /** Wait until this session's maps are ready for startup lookups or updates.
-     * Loads maps if startup has not done so; later calls use loaded maps.
+    /** Resolves once the session has started and the mapper is initialized.
+     * If maps are still downloading after 20 seconds at session start, this
+     * can mean that not all maps have loaded. Pass `{ all: true }` to resolve
+     * only when all maps have finished loading, or `{ id }` to resolve when
+     * that map has.
+     *
+     * With either option, `ready` resolves even if maps fail to load: once
+     * they stop trying, once the map service's list has no map with that
+     * `id`, or after 10 minutes at most. Check `area.loading` to tell whether
+     * a map actually loaded.
      * Requires `mapper:read`. */
-    ready(): Promise<void> {
-        return op_smudgy_mapper_ready();
+    ready(options?: { all?: boolean; id?: AreaIdLike }): Promise<void> {
+        const id = options?.id === undefined ? null : normalizeId<AreaId>(options.id, "an AreaId");
+        return op_smudgy_mapper_ready(options?.all === true, id);
     },
 
     /** Reload maps, including changes made to local files outside the app.
@@ -989,7 +999,8 @@ const mapper = {
     },
 
     /** Active areas only; areas marked inactive are excluded (use
-     * `getAreaById` to reach one explicitly). */
+     * `getAreaById` to reach one explicitly). Cloud maps still loading are
+     * listed with `loading` set and no rooms yet. */
     get areas(): Area[] {
         return op_smudgy_mapper_list_area_ids().map((id: AreaId) => new Area(op_smudgy_mapper_get_area_by_id(id)));
     },
@@ -2035,6 +2046,13 @@ class Area {
 
     get name(): string {
         return op_smudgy_mapper_get_area_name(this.#obj);
+    }
+
+    /** The map is listed but its rooms haven't arrived yet. Read live, so a
+     * kept Area reports when its map has loaded; take a fresh one from
+     * `mapper.getAreaById` for its rooms, or wait with `mapper.ready({ id })`. */
+    get loading(): boolean {
+        return op_smudgy_mapper_area_loading(this.id) === true;
     }
 
     /** For a Secret's area (or your Private additions'), the map it belongs to;

@@ -1,9 +1,21 @@
-/** Area names use the same exact-then-prefix rule for both speedwalk forms. */
+/** Area names use the same rule for both speedwalk forms, case-insensitive: an exact name,
+ *  else the first name that starts with the text, else the first whose words each typed
+ *  word starts in turn, so `l vi` names "Lost Village" and not "Lost Valley". */
 export function findAreaByName(areas: readonly Area[], prefix: string): Area | undefined {
     const wanted = prefix.trim().toLowerCase();
     if (!wanted) return undefined;
+    const typed = words(wanted);
     return areas.find(area => area.name.toLowerCase() === wanted)
-        ?? areas.find(area => area.name.toLowerCase().startsWith(wanted));
+        ?? areas.find(area => area.name.toLowerCase().startsWith(wanted))
+        ?? areas.find(area => startsEachWord(words(area.name.toLowerCase()), typed));
+}
+
+function words(text: string): string[] {
+    return text.trim().split(/\s+/);
+}
+
+function startsEachWord(name: string[], typed: string[]): boolean {
+    return typed.every((word, index) => name[index]?.startsWith(word) ?? false);
 }
 
 type RouteMapper = Pick<Mapper, "getPathBetweenRooms" | "getAreaById">;

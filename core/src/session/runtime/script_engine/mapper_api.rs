@@ -52,6 +52,7 @@ deno_core::extension!(
       op_smudgy_mapper_list_area_ids,
       op_smudgy_mapper_refresh_areas,
       op_smudgy_mapper_ready,
+      op_smudgy_mapper_area_loading,
       op_smudgy_mapper_create_area,
       op_smudgy_mapper_get_area_storage,
       op_smudgy_mapper_get_atlas_storage,
@@ -358,19 +359,34 @@ fn op_smudgy_mapper_list_area_ids(state: &mut OpState) -> Result<Vec<ScriptUuid>
         // them inactive or per-server scoping excludes them — so enumeration
         // (`mapper.areas`) honors the same participation the lookup tables do.
         // Explicit `getAreaById` still resolves an excluded area by id.
+        // Cloud maps still loading are listed too, as `loading` areas with
+        // no rooms yet, under the same participation rules.
         Ok(atlas
             .areas()
             .filter(|area| atlas.is_area_included(area.get_id()))
             .map(|area| ScriptUuid(area.get_id().0))
+            .chain(
+                mapper
+                    .loading_areas()
+                    .iter()
+                    .map(|area| ScriptUuid(area.get_id().0)),
+            )
             .collect::<Vec<_>>())
     } else {
         Ok(vec![])
     }
 }
 
-/// Wait for startup maps and current same-app local changes.
-#[op2(async(lazy), fast)]
-async fn op_smudgy_mapper_ready(state: Rc<RefCell<OpState>>) -> Result<(), MapperError> {
+/// Wait for startup maps and current same-app local changes; with `all`, until
+/// nothing more is coming, and with `id`, until that map is as loaded as it
+/// will be.
+#[op2(async(lazy))]
+async fn op_smudgy_mapper_ready(
+    state: Rc<RefCell<OpState>>,
+    all: bool,
+    #[string] id: Option<String>,
+) -> Result<(), MapperError> {
+    let area_id = id.as_deref().map(parse_id).transpose()?.map(AreaId);
     let mapper = {
         let state = state.borrow();
         ensure_mapper(&state, false)?;
@@ -379,7 +395,44 @@ async fn op_smudgy_mapper_ready(state: Rc<RefCell<OpState>>) -> Result<(), Mappe
             .cloned()
             .ok_or(MapperError::MapperNotEnabled)?
     };
-    mapper.ready().await.map_err(operation_failed("load maps"))
+    let ready = match (all, area_id) {
+        (true, _) => mapper.ready_all().await,
+        (false, Some(area_id)) => mapper.ready_for(area_id).await,
+        (false, None) => mapper.ready().await,
+    };
+    ready.map_err(operation_failed("load maps"))
+}
+
+/// Live read backing `Area.loading`: whether the id names a cloud map still
+/// to load.
+#[op2(fast)]
+fn op_smudgy_mapper_area_loading(state: &OpState, #[string] id: &str) -> Result<bool, MapperError> {
+    let area_id = AreaId(parse_id(id)?);
+    Ok(state
+        .try_borrow::<Mapper>()
+        .is_some_and(|mapper| mapper.area_is_loading(area_id)))
+}
+
+/// Holds a write to a cloud map still loading until it has loaded, so it
+/// lands in the map instead of failing as an unknown one. A map that stopped
+/// trying refuses the write with why. A write to any other map goes ahead at
+/// once, waiting on nothing, so writes keep the order they were made in.
+async fn wait_while_loading(
+    state: &Rc<RefCell<OpState>>,
+    area_id: &str,
+) -> Result<(), MapperError> {
+    let Ok(id) = parse_id(area_id) else {
+        // The op reports a malformed id itself.
+        return Ok(());
+    };
+    let mapper = state.borrow().try_borrow::<Mapper>().cloned();
+    match mapper {
+        Some(mapper) if mapper.area_is_loading(AreaId(id)) => mapper
+            .wait_for_area(AreaId(id))
+            .await
+            .map_err(operation_failed("load the map")),
+        _ => Ok(()),
+    }
 }
 
 /// Explicitly reload maps, including external changes to local files.
@@ -673,6 +726,10 @@ fn op_smudgy_mapper_get_area_storage(
         .ok_or(MapperError::MapperNotEnabled)?;
     let area_id = area_wrapper.0.get_id();
     if mapper.get_current_atlas().get_area(area_id).is_none() {
+        // Only the cloud lists maps that are still loading.
+        if mapper.area_is_loading(*area_id) {
+            return Ok(storage_str(smudgy_cloud::MapStorage::Cloud));
+        }
         return Err(MapperError::AreaNotFound);
     }
     Ok(storage_str(mapper.area_storage(area_id)))
@@ -768,6 +825,9 @@ async fn op_smudgy_mapper_relocate_areas(
     #[serde] destination: JsMapDestination,
     move_source: bool,
 ) -> Result<Vec<ScriptUuid>, MapperError> {
+    for id in &source_ids {
+        wait_while_loading(&state, &id.0.to_string()).await?;
+    }
     let mapper = {
         let state = state.borrow();
         ensure_mapper(&state, true)?;
@@ -893,20 +953,24 @@ fn op_smudgy_mapper_get_area_by_id(
     state: Rc<RefCell<OpState>>,
     #[string] id: &str,
 ) -> Result<JSArea, MapperError> {
-    let atlas = {
+    let mapper = {
         let state = state.borrow();
         ensure_mapper(&state, false)?;
-        let mapper = state.try_borrow::<Mapper>();
-        mapper.map(smudgy_cloud::Mapper::get_current_atlas)
+        state.try_borrow::<Mapper>().cloned()
     };
 
-    if let Some(atlas) = atlas {
+    if let Some(mapper) = mapper {
+        let atlas = mapper.get_current_atlas();
         let id = AreaId(parse_id(&id)?);
         // A Secret's or Private additions' own area this isolate cannot see is not found, as
         // an id naming nothing is not.
         let sources = sources_for(&state.borrow());
         if let Some(area) = atlas.get_area(&id).filter(|_| atlas.sees(sources, &id)) {
             return Ok(JSArea(area.clone()));
+        }
+        // A cloud map still loading: its id and name, and no rooms yet.
+        if let Some(area) = mapper.loading_area(id) {
+            return Ok(JSArea(area));
         }
         return Err(MapperError::AreaNotFound);
     }
@@ -919,6 +983,7 @@ async fn op_smudgy_mapper_delete_area(
     state: Rc<RefCell<OpState>>,
     #[string] area_id: String,
 ) -> Result<(), MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let mapper = {
         let state = state.borrow();
         ensure_mapper(&state, true)?;
@@ -947,6 +1012,7 @@ async fn op_smudgy_mapper_rename_area(
     #[string] area_id: String,
     #[string] name: String,
 ) -> Result<(), MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let mapper = {
         let state = state.borrow();
         ensure_mapper(&state, true)?;
@@ -1500,6 +1566,7 @@ async fn op_smudgy_mapper_set_room_title(
     room_number: i32,
     #[string] title: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let (mapper, submission) = submit_room_update(
         &state,
         &area_id,
@@ -1520,6 +1587,7 @@ async fn op_smudgy_mapper_set_room_external_id(
     room_number: i32,
     #[string] external_id: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let binding = if external_id.is_empty() {
         None
     } else {
@@ -1604,6 +1672,7 @@ async fn op_smudgy_mapper_set_room_description(
     room_number: i32,
     #[string] description: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let (mapper, submission) = submit_room_update(
         &state,
         &area_id,
@@ -1624,6 +1693,7 @@ async fn op_smudgy_mapper_set_room_color(
     room_number: i32,
     #[string] color: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let (mapper, submission) = submit_room_update(
         &state,
         &area_id,
@@ -1644,6 +1714,7 @@ async fn op_smudgy_mapper_set_room_level(
     room_number: i32,
     level: i32,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let (mapper, submission) = submit_room_update(
         &state,
         &area_id,
@@ -1664,6 +1735,7 @@ async fn op_smudgy_mapper_set_room_x(
     room_number: i32,
     x: f32,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let (mapper, submission) = submit_room_update(
         &state,
         &area_id,
@@ -1684,6 +1756,7 @@ async fn op_smudgy_mapper_set_room_y(
     room_number: i32,
     y: f32,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let (mapper, submission) = submit_room_update(
         &state,
         &area_id,
@@ -1705,6 +1778,7 @@ async fn op_smudgy_mapper_set_room_property(
     #[string] name: String,
     #[string] value: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -1736,6 +1810,7 @@ async fn op_smudgy_mapper_set_area_property(
     #[string] name: String,
     #[string] value: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -1760,6 +1835,7 @@ async fn op_smudgy_mapper_add_room_tag(
     room_number: i32,
     #[string] tag: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -1790,6 +1866,7 @@ async fn op_smudgy_mapper_remove_room_tag(
     room_number: i32,
     #[string] tag: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -1819,6 +1896,7 @@ async fn op_smudgy_mapper_create_room(
     #[string] area_id: String,
     #[serde] params: JSRoomParams,
 ) -> Result<i32, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -1869,6 +1947,7 @@ async fn op_smudgy_mapper_update_room(
     room_number: i32,
     #[serde] params: JSRoomParams,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -1901,6 +1980,7 @@ async fn op_smudgy_mapper_update_rooms(
     #[string] area_id: String,
     #[serde] updates: Vec<(i32, JSRoomParams)>,
 ) -> Result<Vec<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -1935,6 +2015,7 @@ async fn op_smudgy_mapper_create_room_exit(
     room_number: i32,
     #[serde] params: JSExitCreateParams,
 ) -> Result<ScriptUuid, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -1990,6 +2071,7 @@ async fn op_smudgy_mapper_set_room_exit(
     #[string] exit_id: String,
     #[serde] mut params: JSExitUpdateParams,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -2049,6 +2131,7 @@ async fn op_smudgy_mapper_merge_rooms(
     keep_room_number: i32,
     remove_room_number: i32,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let mapper = {
         let state = state.borrow();
         ensure_mapper(&state, true)?;
@@ -2203,6 +2286,7 @@ async fn op_smudgy_mapper_delete_room(
     #[string] area_id: String,
     room_number: i32,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -2231,6 +2315,7 @@ async fn op_smudgy_mapper_delete_room_exit(
     room_number: i32,
     #[string] exit_id: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -2745,6 +2830,7 @@ async fn op_smudgy_mapper_mutate_area(
     #[serde] operations: Vec<JSAreaBatchOperation>,
     #[string] description: String,
 ) -> Result<JsMutateAreaOutcome, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let area_id = AreaId(parse_id(&area_id)?);
     let state = state.borrow();
     ensure_mapper(&state, true)?;
@@ -2854,6 +2940,7 @@ async fn op_smudgy_mapper_create_link(
     #[string] area_id: String,
     #[serde] params: JSLinkCreateParams,
 ) -> Result<ScriptUuid, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     let mapper = state
@@ -2923,6 +3010,7 @@ async fn op_smudgy_mapper_set_connection(
     #[string] connection_id: String,
     #[serde] params: JSConnectionUpdateParams,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     let mapper = state
@@ -2959,6 +3047,7 @@ async fn op_smudgy_mapper_unlink_exit(
     #[string] area_id: String,
     #[string] exit_id: String,
 ) -> Result<ScriptUuid, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     let mapper = state
@@ -2997,6 +3086,7 @@ async fn op_smudgy_mapper_pair_connections(
     #[string] keep_connection_id: String,
     #[string] merge_connection_id: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     let mapper = state
@@ -3036,6 +3126,7 @@ async fn op_smudgy_mapper_delete_link(
     #[string] area_id: String,
     #[string] connection_id: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     let mapper = state
@@ -3311,6 +3402,7 @@ async fn op_smudgy_mapper_create_label(
     #[string] area_id: String,
     #[serde] params: JSLabelParams,
 ) -> Result<ScriptUuid, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let mapper = {
         let state = state.borrow();
         ensure_mapper(&state, true)?;
@@ -3346,6 +3438,7 @@ async fn op_smudgy_mapper_create_shape(
     #[string] area_id: String,
     #[serde] params: JSShapeParams,
 ) -> Result<ScriptUuid, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let mapper = {
         let state = state.borrow();
         ensure_mapper(&state, true)?;
@@ -3381,6 +3474,7 @@ async fn op_smudgy_mapper_delete_label(
     #[string] area_id: String,
     #[string] label_id: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -3404,6 +3498,7 @@ async fn op_smudgy_mapper_delete_shape(
     #[string] area_id: String,
     #[string] shape_id: String,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -3429,6 +3524,7 @@ async fn op_smudgy_mapper_set_label(
     #[string] label_id: String,
     #[serde] params: JSLabelUpdateParams,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -3458,6 +3554,7 @@ async fn op_smudgy_mapper_set_shape(
     #[string] shape_id: String,
     #[serde] params: JSShapeUpdateParams,
 ) -> Result<Option<ScriptUuid>, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
@@ -3560,6 +3657,7 @@ async fn op_smudgy_mapper_export_area(
     state: Rc<RefCell<OpState>>,
     #[string] area_id: String,
 ) -> Result<AreaWithDetails, MapperError> {
+    wait_while_loading(&state, &area_id).await?;
     let area_id = AreaId(parse_id(&area_id)?);
     let mapper = {
         let state = state.borrow();
