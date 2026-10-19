@@ -196,6 +196,7 @@ mapped route (closed doors are opened on the way, movement commands used):
 >inn a           Nearest INN, taking directional steps alone
 >inn@sol alone   INN in the named area, taking directional steps alone
 >@sol             Nearest room of the first area whose NAME starts with "sol"
+>@l vi            Word by word: "Lost Village" (not "Lost Valley")
 >@sol alo        Walk to the named area alone
 >$zurek          Walk to the target named Zurek
 >$z a            Walk to the uniquely matching target alone
@@ -203,7 +204,9 @@ mapped route (closed doors are opened on the way, movement commands used):
 
 Tag speedwalks (`>inn`) match room flags set with `map room flag set <FLAG>`.
 Area speedwalks (`>@sol`) match area names instead — case-insensitive, exact
-name beating a longer prefix. Combine a tag filter and an area with `>tags@area`;
+name beating a longer prefix. Failing both, each word you type can start the
+same word of the name, so `>@l vi` reaches "Lost Village" without typing
+`>@lost vi`. Combine a tag filter and an area with `>tags@area`;
 tag abbreviations then expand within the named area. Area names may contain spaces.
 An optional final `alone` (or `a`, `al`, `alo`, `alon`) applies to directional
 movement steps, including directions within mapped exit commands. Door-opening

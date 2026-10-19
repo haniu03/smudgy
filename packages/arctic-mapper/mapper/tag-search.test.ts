@@ -154,6 +154,27 @@ test("area prefixes and names containing spaces use the existing matching rule",
     assert.equal(findAreaByName(areas, "  travel  "), area);
 });
 
+test("each typed word can start the same word of an area name", () => {
+    const valley = makeArea("valley", "Lost Valley");
+    makeRoom(valley, 1, ["INN"], 1);
+    const village = makeArea("village", "Lost Village");
+    const target = makeRoom(village, 1, ["INN"], 2);
+    run(">@l vi");
+    run(">inn@lo  vil");
+    run(">@L Vi a");
+    assert.deepEqual(walks, [target, target, target]);
+    assert.deepEqual(soloWalks, [false, false, true]);
+    assert.equal(findAreaByName(areas, "vi"), undefined, "words match from the name's first");
+    assert.equal(findAreaByName(areas, "l vi x"), undefined, "more words than the name has");
+});
+
+test("a name that starts with the text beats one matched word by word", () => {
+    makeArea("hollow", "Muddy Hollow");
+    const hut = makeArea("hut", "Mud Hut");
+    assert.equal(findAreaByName(areas, "mud h"), hut);
+    assert.equal(findAreaByName(areas, "mu ho")?.name, "Muddy Hollow");
+});
+
 test("compound filters require all tags and reject excluded tags", () => {
     const bar = makeArea("bar", "Bar");
     makeRoom(bar, 1, ["INN", "SHOP", "PEACE"], 1);
