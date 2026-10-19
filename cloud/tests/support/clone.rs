@@ -306,6 +306,7 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
                 }
             }
         }
+        super::room_labels::rebind(clone, &room_ids);
     }
 }
 

@@ -116,24 +116,6 @@ impl TapSource for Value {
     }
 }
 
-pub fn embedded_label_json(l: &LabelRecord) -> Value {
-    json!({
-        "id": l.id,
-        "level": l.level,
-        "x": l.x,
-        "y": l.y,
-        "width": l.width,
-        "height": l.height,
-        "horizontal_alignment": l.horizontal_alignment,
-        "vertical_alignment": l.vertical_alignment,
-        "text": l.text,
-        "color": l.color,
-        "background_color": l.background_color,
-        "font_size": l.font_size,
-        "font_weight": l.font_weight,
-    })
-}
-
 pub fn embedded_shape_json(s: &ShapeRecord) -> Value {
     json!({
         "id": s.id,
@@ -1051,6 +1033,7 @@ pub async fn create_label(
 
     let label = LabelRecord {
         id: Uuid::new_v4(),
+        room: None,
         level: req.level.unwrap_or(0),
         x: req.x,
         y: req.y,
@@ -1063,8 +1046,9 @@ pub async fn create_label(
         background_color: req.background_color.unwrap_or_else(|| "white".to_string()),
         font_size: req.font_size.unwrap_or(12),
         font_weight: req.font_weight.unwrap_or(400),
+        created_at: Utc::now(),
     };
-    let response = embedded_label_json(&label);
+    let response = super::room_labels::wire(&label, None, None);
     st.areas
         .get_mut(&area_id)
         .expect("area exists")
@@ -1132,10 +1116,22 @@ pub async fn update_label(
         return not_found();
     }
 
-    let area = st.areas.get_mut(&area_id).expect("area exists");
-    let Some(label) = area.labels.iter_mut().find(|l| l.id == label_id) else {
+    // A label attached to a room the caller cannot read is one that does
+    // not exist.
+    let area = &st.areas[&area_id];
+    if !area
+        .labels
+        .iter()
+        .any(|l| l.id == label_id && super::room_labels::readable(&st, viewer, area, l))
+    {
         return err(404, "Label not found");
-    };
+    }
+    let area = st.areas.get_mut(&area_id).expect("area exists");
+    let label = area
+        .labels
+        .iter_mut()
+        .find(|l| l.id == label_id)
+        .expect("just found");
     if let Some(v) = req.level {
         label.level = v;
     }
@@ -1172,7 +1168,13 @@ pub async fn update_label(
     if let Some(v) = req.font_weight {
         label.font_weight = v;
     }
-    let response = embedded_label_json(label);
+    let area = &st.areas[&area_id];
+    let response = area
+        .labels
+        .iter()
+        .find(|l| l.id == label_id)
+        .and_then(|label| super::room_labels::shown(&st, viewer, area, label))
+        .expect("a label the caller reads");
     st.bump(Some(area_id));
     ok(response)
 }
@@ -1203,11 +1205,19 @@ pub async fn delete_label(
     if !caps.can_edit {
         return not_found();
     }
-    let area = st.areas.get_mut(&area_id).expect("area exists");
-    let Some(idx) = area.labels.iter().position(|l| l.id == label_id) else {
+    let area = &st.areas[&area_id];
+    let Some(idx) = area
+        .labels
+        .iter()
+        .position(|l| l.id == label_id && super::room_labels::readable(&st, viewer, area, l))
+    else {
         return err(404, "Label not found");
     };
-    area.labels.remove(idx);
+    st.areas
+        .get_mut(&area_id)
+        .expect("area exists")
+        .labels
+        .remove(idx);
     st.bump(Some(area_id));
     ok(Value::Null)
 }

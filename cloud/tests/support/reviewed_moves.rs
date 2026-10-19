@@ -448,14 +448,16 @@ fn review(
         Source::Secret(i) => &area.secrets[i].shapes,
         Source::Private(user) => &area.private_sources[&user].shapes,
     };
-    if request
-        .labels
-        .iter()
-        .any(|id| !labels.iter().any(|r| r.id == id.0))
-        || request
-            .shapes
+    // A label attached to a room the caller cannot read is one that does
+    // not exist.
+    if request.labels.iter().any(|id| {
+        !labels
             .iter()
-            .any(|id| !shapes.iter().any(|r| r.id == id.0))
+            .any(|r| r.id == id.0 && super::room_labels::readable(st, user, area, r))
+    }) || request
+        .shapes
+        .iter()
+        .any(|id| !shapes.iter().any(|r| r.id == id.0))
     {
         return Err(not_found());
     }

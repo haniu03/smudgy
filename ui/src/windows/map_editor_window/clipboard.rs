@@ -200,6 +200,7 @@ impl MapEditorWindow {
                 cut.map,
                 &selection,
                 smudgy_map_widget::viewport::snap_offset(offset),
+                &[],
             );
             if command.is_none() {
                 return Update::none();

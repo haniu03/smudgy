@@ -154,15 +154,19 @@ fn upsert_room_details<'a>(
 }
 
 /// Deletes a room and mirrors the server's cascade within the area:
-/// inbound destinations are nulled, orphaned Connections deleted, and
-/// Connections kept alive by a surviving member converted to dangling.
-/// Exits in other areas that led to the room are cleared by edits of those
-/// areas, which the mapper queues behind the deletion.
+/// inbound destinations are nulled, orphaned Connections deleted,
+/// Connections kept alive by a surviving member converted to dangling, and
+/// labels attached to the room freed where they are drawn. Exits in other
+/// areas that led to the room are cleared by edits of those areas, which
+/// the mapper queues behind the deletion.
 pub(crate) fn delete_room_in(
     area: &mut AreaWithDetails,
     address: RoomAddress,
     context: &EditContext,
 ) {
+    if let Some(site) = context.site(area, address) {
+        free_labels_on(&mut area.labels, address, site);
+    }
     if address.source == context.source {
         area.rooms.retain(|room| room.room_number != address.number);
     }
@@ -183,6 +187,33 @@ pub(crate) fn delete_room_in(
     }
     let survivors = exit_topologies_in(area, None, context);
     connection_lifecycle::repair_after_room_delete(address, &survivors, &mut area.connections);
+}
+
+/// The room a label is attached to: one the writer's source owns or one it
+/// may name on the map, as other attachments name rooms.
+fn label_room_site(
+    details: &AreaWithDetails,
+    context: &EditContext,
+    area_id: AreaId,
+    room: RoomAddress,
+) -> CloudResult<RoomSite> {
+    context
+        .site(details, room)
+        .ok_or(CloudError::RoomNotFound(RoomKey::new(area_id, room.number)))
+}
+
+/// Frees the labels attached to the room at `address`, which stood at
+/// `site`, at the map coordinates they are drawn at.
+pub(crate) fn free_labels_on(labels: &mut [Label], address: RoomAddress, site: RoomSite) {
+    for label in labels
+        .iter_mut()
+        .filter(|label| label.room() == Some(address))
+    {
+        label.set_room(None);
+        label.x += site.x;
+        label.y += site.y;
+        label.level = site.level;
+    }
 }
 
 /// The rooms an envelope deletes: the room of every `DeleteRoom` among its
@@ -971,6 +1002,8 @@ pub(crate) fn maintain_routes_after_room_moves_in(
 pub(crate) fn label_from_args(args: LabelArgs) -> Label {
     Label {
         id: args.id.unwrap_or_else(|| LabelId(Uuid::new_v4())),
+        room_number: args.room_number,
+        room_source: args.room_source,
         level: args.level,
         x: args.x,
         y: args.y,
@@ -1036,8 +1069,19 @@ pub(crate) fn apply_mutation_in(
             body,
         } => {
             owned(*room_number, *room_source)?;
-            let room = upsert_room_details(details, *room_number, body);
-            Ok(OpResult::Room { room: room.clone() })
+            let room = upsert_room_details(details, *room_number, body).clone();
+            // A label attached to the room is drawn on its level.
+            if body.level.is_some() {
+                let address = RoomAddress::new(context.source, *room_number);
+                for label in details
+                    .labels
+                    .iter_mut()
+                    .filter(|label| label.room() == Some(address))
+                {
+                    label.level = room.level;
+                }
+            }
+            Ok(OpResult::Room { room })
         }
         AreaMutation::CreateRoom {
             room_number,
@@ -1394,17 +1438,37 @@ pub(crate) fn apply_mutation_in(
             })
         }
         AreaMutation::CreateLabel { body } => {
-            let label = label_from_args(body.clone());
+            let mut label = label_from_args(body.clone());
+            // An attached label takes its room's level, as the server's does.
+            if let Some(room) = label.room() {
+                label.level = label_room_site(details, context, area_id, room)?.level;
+            }
             details.labels.push(label.clone());
             Ok(OpResult::Label { label })
         }
         AreaMutation::UpdateLabel { label_id, body } => {
-            let label = details
+            let index = details
                 .labels
-                .iter_mut()
-                .find(|label| label.id == *label_id)
+                .iter()
+                .position(|label| label.id == *label_id)
                 .ok_or(CloudError::LabelNotFound(*label_id))?;
+            // Attached, it takes the room's level; freed, it keeps the level
+            // it was drawn on unless the update names one.
+            let level = match body.room() {
+                Some(Some(room)) => Some(label_room_site(details, context, area_id, room)?.level),
+                Some(None) => body.level.or_else(|| {
+                    details.labels[index]
+                        .room()
+                        .and_then(|room| context.site(details, room))
+                        .map(|site| site.level)
+                }),
+                None => None,
+            };
+            let label = &mut details.labels[index];
             *label = body.clone().apply(label);
+            if let Some(level) = level {
+                label.level = level;
+            }
             Ok(OpResult::Label {
                 label: label.clone(),
             })

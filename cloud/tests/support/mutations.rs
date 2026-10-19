@@ -35,13 +35,15 @@ use uuid::Uuid;
 
 use super::areas::{
     DIRECTIONS, H_ALIGN, SHAPE_TYPES, V_ALIGN, check_enum, double_option, embedded_exit_json,
-    embedded_label_json, embedded_shape_json, require_caps,
+    embedded_shape_json, require_caps,
 };
 use super::connections::{
     self, NewExitLink, attach_for_new_exit, cleanup_after_exit_delete, maintain_after_retarget,
 };
 use super::http::{authenticate, bad_request, err, err_with_details, not_found, ok, parse_area_id};
 use super::mock_server::Shared;
+use super::room_labels;
+use super::source_refs::{self as refs, Source};
 use super::state::{
     AreaPropRecord, AreaRecord, Caps, ConnectionRecord, DoorRecord, EndpointRecord, ExitRecord,
     LabelRecord, MockState, MutationReceipt, RoomPropRecord, RoomRecord, STAND_IN, ShapeRecord,
@@ -525,6 +527,41 @@ fn check_kept_fields(envelope: &Value) -> Result<(), Response> {
     Ok(())
 }
 
+/// Refuses, as the server's envelope parser does, a label body whose room
+/// does not parse (format-3 §2.2): a `room_source` that names no source,
+/// and a `room_source` without a `room_number`, including beside the
+/// `"room_number": null` that frees a label. Checked over the raw JSON,
+/// before the map is looked up.
+fn check_label_rooms(envelope: &Value) -> Result<(), Response> {
+    let invalid = |reason: &str| Err(bad_request(&format!("invalid mutation envelope: {reason}")));
+    let Some(payload) = envelope.get("payload").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for op in payload {
+        if !matches!(
+            op.get("op").and_then(Value::as_str),
+            Some("create_label" | "update_label")
+        ) {
+            continue;
+        }
+        let Some(body) = op.get("body").and_then(Value::as_object) else {
+            continue;
+        };
+        let named = body.get("room_source").filter(|value| !value.is_null());
+        if let Some(named) = named
+            && !named.as_str().is_some_and(|named| {
+                named == "map" || named == "private" || Uuid::parse_str(named).is_ok()
+            })
+        {
+            return invalid("unknown source");
+        }
+        if named.is_some() && body.get("room_number").is_none_or(Value::is_null) {
+            return invalid("`room_source` needs `room_number`");
+        }
+    }
+    Ok(())
+}
+
 /// A door's states (format-3 §2.1); no door is `null`, never a state.
 const DOOR_STATES: [&str; 3] = ["open", "closed", "locked"];
 
@@ -689,6 +726,14 @@ struct CreateLabelBody {
     /// Client-minted entity id (v2 contract); minted here when absent.
     #[serde(default)]
     id: Option<Uuid>,
+    /// The room the label is attached to, named as `room_data` names one;
+    /// with it, `x` and `y` are the offset from the room's center. Absent,
+    /// the request hashes as one written before labels could be attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    room_number: Option<i32>,
+    /// The attached room's source; absent for a map room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    room_source: Option<String>,
     level: Option<i32>,
     x: f32,
     y: f32,
@@ -705,6 +750,17 @@ struct CreateLabelBody {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UpdateLabelBody {
+    /// Absent keeps the label's room; null frees it, at the body's `x` and
+    /// `y` and on its room's level unless the body names one; a number
+    /// attaches it to that room of `room_source`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    room_number: Option<Option<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    room_source: Option<String>,
     level: Option<i32>,
     x: Option<f32>,
     y: Option<f32>,
@@ -776,6 +832,9 @@ struct ApplyCtx {
     /// Rooms of the written Secret the envelope deleted: other maps' exits
     /// into them go after the commit.
     released: std::cell::RefCell<BTreeSet<i32>>,
+    /// Own rooms a Secret's or Private write deleted, as they stood: other
+    /// sources' labels attached to them are freed after the commit.
+    gone: std::cell::RefCell<Vec<RoomRecord>>,
 }
 
 /// How revisions must move for one applied operation (`ops::OpOutcome`).
@@ -859,7 +918,9 @@ pub async fn area_mutations(
         );
     }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
-        && let Err(refusal) = check_exit_bodies(&value).and_then(|()| check_kept_fields(&value))
+        && let Err(refusal) = check_exit_bodies(&value)
+            .and_then(|()| check_kept_fields(&value))
+            .and_then(|()| check_label_rooms(&value))
     {
         return refusal;
     }
@@ -1013,6 +1074,7 @@ pub async fn area_mutations(
         secret: None,
         dirty: std::cell::RefCell::default(),
         released: std::cell::RefCell::default(),
+        gone: std::cell::RefCell::default(),
     };
     let mut working: Working = st.areas.clone();
     let mut results: Vec<Value> = Vec::with_capacity(envelope.payload.len());
@@ -1096,29 +1158,50 @@ pub async fn area_mutations(
             }));
         }
     }
-    // Secrets the write changed in passing move too, reported only to
-    // their readers: to anyone else the response is the one the same write
-    // would get on a map without them.
+    // Secrets and Private sources the write changed in passing move too,
+    // reported only to their readers: to anyone else the response is the
+    // one the same write would get on a map without them. Each map's
+    // Secrets come in creation order, then Private, as the server lists
+    // sources.
+    let mut secrets_changed: Vec<(Uuid, Uuid)> = secrets_changed.into_iter().collect();
+    secrets_changed.sort_by_key(|(map_id, id)| {
+        let place = st
+            .areas
+            .get(map_id)
+            .and_then(|map| map.secrets.iter().position(|secret| secret.id == *id));
+        (*map_id, place.unwrap_or(usize::MAX))
+    });
     for (map_id, secret_id) in secrets_changed {
         let Some(map) = st.areas.get_mut(&map_id) else {
             continue;
         };
-        let Some(secret) = map.secrets.iter_mut().find(|secret| secret.id == secret_id) else {
+        let Some(secret) = map
+            .secrets
+            .iter_mut()
+            .chain(map.private_sources.values_mut())
+            .find(|secret| secret.id == secret_id)
+        else {
             continue;
         };
         secret.rev += 1;
         let rev = secret.rev;
         let map = &st.areas[&map_id];
-        let secret = map
-            .secrets
-            .iter()
-            .find(|secret| secret.id == secret_id)
-            .expect("just moved");
-        if !st.secret_actions(viewer, map, secret).is_empty() {
+        let wire = if let Some(secret) = map.secrets.iter().find(|secret| secret.id == secret_id) {
+            (!st.secret_actions(viewer, map, secret).is_empty()).then(|| secret_id.to_string())
+        } else {
+            map.private_sources
+                .get(&viewer)
+                .is_some_and(|private| {
+                    private.id == secret_id
+                        && refs::readable(&st, viewer, map, Source::Private(viewer))
+                })
+                .then(|| "private".to_string())
+        };
+        if let Some(wire) = wire {
             versions.push(json!({
                 "resource": "source",
                 "id": map_id,
-                "source": secret_id.to_string(),
+                "source": wire,
                 "rev": rev,
                 "deleted": false,
             }));
@@ -1265,6 +1348,7 @@ fn write_source(
         secret: Some(record.id),
         dirty: std::cell::RefCell::default(),
         released: std::cell::RefCell::default(),
+        gone: std::cell::RefCell::default(),
     };
     let mut results: Vec<Value> = Vec::with_capacity(envelope.payload.len());
     let mut changed = false;
@@ -1297,6 +1381,43 @@ fn write_source(
         secret.rev += 1;
     }
     let rev = secret.rev;
+    let mut versions = vec![json!({
+        "resource": "source",
+        "id": area_id,
+        "source": wire,
+        "rev": rev,
+        "deleted": false,
+    })];
+    // Labels other sources attach to the rooms the write deleted are freed
+    // where they are drawn, and those sources move once each, reported to
+    // their readers after the written source (format-3 §4.2).
+    let gone = ctx.gone.take();
+    if !gone.is_empty() {
+        let area = st.areas.get_mut(&area_id).unwrap();
+        let mut freed: BTreeSet<Source> = BTreeSet::new();
+        for room in &gone {
+            freed.extend(
+                room_labels::free_everywhere(area, room)
+                    .into_iter()
+                    .filter(|other| *other != source),
+            );
+        }
+        for other in &freed {
+            room_labels::bump(area, *other);
+        }
+        let area = &st.areas[&area_id];
+        for other in freed {
+            if refs::readable(st, viewer, area, other) {
+                versions.push(json!({
+                    "resource": "source",
+                    "id": area_id,
+                    "source": refs::wire(area, other),
+                    "rev": super::reviewed_moves::rev(area, other),
+                    "deleted": false,
+                }));
+            }
+        }
+    }
     // Other maps' exits into the Secret's rooms the write deleted go with
     // them, moving no revision (format-3 §4.2).
     let released = ctx.released.take();
@@ -1306,13 +1427,7 @@ fn write_source(
     }
     let result = json!({
         "operation_id": envelope.operation_id,
-        "versions": [{
-            "resource": "source",
-            "id": area_id,
-            "source": wire,
-            "rev": rev,
-            "deleted": false,
-        }],
+        "versions": versions,
         "data": results,
     });
     st.mutation_receipts.insert(
@@ -1424,7 +1539,7 @@ fn apply_op(
         AreaOp::UpsertAreaProperty { name, value } => {
             Ok(apply_upsert_area_property(working, ctx, name, &value))
         }
-        AreaOp::DeleteAreaProperty { name } => apply_delete_area_property(working, ctx, name),
+        AreaOp::DeleteAreaProperty { name } => Ok(apply_delete_area_property(working, ctx, name)),
         AreaOp::CreateExit {
             room_number, body, ..
         } => apply_create_exit(st, working, ctx, room_number, body),
@@ -1445,8 +1560,10 @@ fn apply_op(
         } => apply_unlink(st, working, ctx, exit_id, new_connection_id),
         AreaOp::DeleteLink { connection_id } => apply_delete_link(st, working, ctx, connection_id),
         AreaOp::CreateLabel { body } => apply_create_label(st, working, ctx, body),
-        AreaOp::UpdateLabel { label_id, body } => apply_update_label(working, ctx, label_id, &body),
-        AreaOp::DeleteLabel { label_id } => apply_delete_label(working, ctx, label_id),
+        AreaOp::UpdateLabel { label_id, body } => {
+            apply_update_label(st, working, ctx, label_id, &body)
+        }
+        AreaOp::DeleteLabel { label_id } => apply_delete_label(st, working, ctx, label_id),
         AreaOp::CreateShape { body } => apply_create_shape(st, working, ctx, body),
         AreaOp::UpdateShape { shape_id, body } => apply_update_shape(working, ctx, shape_id, &body),
         AreaOp::DeleteShape { shape_id } => apply_delete_shape(working, ctx, shape_id),
@@ -1905,13 +2022,31 @@ fn apply_delete_room(
     // destinations (any area) nulled, this area's touched Connections
     // converted to dangling or removed as orphans — then the room itself.
     connections::repair_after_room_delete(working, ctx.area_id, room_number);
-    scope_area(working, ctx).rooms.remove(&room_number);
+    let gone = scope_area(working, ctx).rooms.remove(&room_number);
+
+    // Every label attached to the room, in any source, is freed where it is
+    // drawn, and its source moves. A map write holds every source; a
+    // Secret's or Private write frees its own here and the others' after
+    // its commit.
+    let mut secret_bumps = Vec::new();
+    if let Some(gone) = gone {
+        if ctx.writes_map {
+            let area = scope_area(working, ctx);
+            for source in room_labels::free_everywhere(area, &gone) {
+                if let Some(record) = refs::record(area, source) {
+                    secret_bumps.push((ctx.area_id, record.id));
+                }
+            }
+        } else if gone.anchor.is_none() && map_room_of(room_number).is_none() {
+            room_labels::free(&mut scope_area(working, ctx).labels, &gone);
+            ctx.gone.borrow_mut().push(gone);
+        }
+    }
 
     // A map room takes every source's hold on it along: the map's Secrets
     // lose their data and exits on it, and every Secret's exits into it,
     // this map's or another's, lose their destination. Each such Secret
     // moves its revision; only its readers ever hear of it.
-    let mut secret_bumps = Vec::new();
     if ctx.writes_map {
         for secret in &mut scope_area(working, ctx).secrets {
             if super::secrets::forget_map_room(secret, ctx.area_id, room_number) {
@@ -2028,20 +2163,16 @@ fn apply_upsert_area_property(
     OpOutcome::scoped(json!({"entity": "area_property", "name": name}))
 }
 
-fn apply_delete_area_property(
-    working: &mut Working,
-    ctx: &ApplyCtx,
-    name: String,
-) -> Result<OpOutcome, Response> {
+fn apply_delete_area_property(working: &mut Working, ctx: &ApplyCtx, name: String) -> OpOutcome {
     // Deleting a property the source does not have changes nothing
     // (smudgy-cloudflare `deleteAreaProperty`).
     let deleted = scope_area(working, ctx).properties.remove(&name).is_some();
-    Ok(OpOutcome {
+    OpOutcome {
         result: json!({"entity": "area_property_deleted", "name": name}),
         changed: deleted,
         foreign_bumps: Vec::new(),
         secret_bumps: Vec::new(),
-    })
+    }
 }
 
 fn apply_create_exit(
@@ -2799,20 +2930,107 @@ fn validate_connections(area: &AreaRecord, ctx: &ApplyCtx) -> Result<(), Respons
     Ok(())
 }
 
+/// The room a label of the written source is attached to, with the source
+/// owning it: one of the written document's own rooms, or another source's
+/// room as the map holds it. A map write's document is the whole map.
+fn label_room<'a>(
+    st: &'a MockState,
+    working: &'a Working,
+    ctx: &ApplyCtx,
+    identity: Uuid,
+) -> Option<(Source, &'a RoomRecord)> {
+    let doc = &working[&ctx.area_id];
+    if ctx.writes_map {
+        return refs::find(doc, identity);
+    }
+    let written = qualified::written(st, ctx);
+    doc.rooms
+        .iter()
+        .find(|(key, room)| refs::own(written, **key, room) && room.identity == identity)
+        .map(|(_, room)| (written, room))
+        .or_else(|| {
+            refs::find(&st.areas[&ctx.area_id], identity).filter(|(source, _)| *source != written)
+        })
+}
+
+/// Whether the writer reads the room `label` is attached to: always for a
+/// free label and for a room of the written source. A label attached to a
+/// room they cannot read answers writes as one that does not exist.
+fn label_readable(st: &MockState, working: &Working, ctx: &ApplyCtx, label: &LabelRecord) -> bool {
+    let Some(identity) = label.room else {
+        return true;
+    };
+    label_room(st, working, ctx, identity).is_some_and(|(source, _)| {
+        source == qualified::written(st, ctx)
+            || refs::readable(st, ctx.viewer, &st.areas[&ctx.area_id], source)
+    })
+}
+
+/// The room `room_number` of the source `room_source` names (the map when
+/// absent), for a label to attach to: a room of the written source or of
+/// any source the writer reads on the map, as other attachments name rooms.
+/// A missing room or an unreadable source is the uniform 404.
+fn attachable<'a>(
+    st: &'a MockState,
+    working: &'a Working,
+    ctx: &ApplyCtx,
+    room_source: Option<&str>,
+    room_number: i32,
+) -> Result<&'a RoomRecord, Response> {
+    let area = &st.areas[&ctx.area_id];
+    let doc = &working[&ctx.area_id];
+    let written = qualified::written(st, ctx);
+    let named = room_source.unwrap_or("map");
+    let (source, rooms) = if same_source(named, &refs::wire(area, written)) {
+        (written, &doc.rooms)
+    } else {
+        let source = refs::source_for(area, named, ctx.viewer).ok_or_else(not_found)?;
+        if !refs::readable(st, ctx.viewer, area, source) {
+            return Err(not_found());
+        }
+        let held = if ctx.writes_map { doc } else { area };
+        (source, refs::rooms(held, source))
+    };
+    rooms
+        .get(&room_number)
+        .filter(|room| refs::own(source, room_number, room))
+        .ok_or_else(not_found)
+}
+
+/// A label's echo: the wire label, naming its map and its room as the
+/// writer reads them.
+fn label_echo(st: &MockState, working: &Working, ctx: &ApplyCtx, label: &LabelRecord) -> Value {
+    let area = &st.areas[&ctx.area_id];
+    let room = label
+        .room
+        .and_then(|identity| label_room(st, working, ctx, identity))
+        .map(|(source, room)| (room_labels::source_wire(area, source), room));
+    room_labels::wire(label, Some(ctx.area_id), room)
+}
+
 fn apply_create_label(
     st: &MockState,
     working: &mut Working,
     ctx: &ApplyCtx,
     body: CreateLabelBody,
 ) -> Result<OpOutcome, Response> {
+    check_enum(&body.horizontal_alignment, &H_ALIGN, "horizontal alignment")?;
+    check_enum(&body.vertical_alignment, &V_ALIGN, "vertical alignment")?;
+    // An attached label stands on its room's level.
+    let room = match body.room_number {
+        Some(number) => {
+            let room = attachable(st, working, ctx, body.room_source.as_deref(), number)?;
+            Some((room.identity, room.level))
+        }
+        None => None,
+    };
     if let Some(id) = body.id {
         claim_id(st, working, ctx, ContentKind::Label, id)?;
     }
-    check_enum(&body.horizontal_alignment, &H_ALIGN, "horizontal alignment")?;
-    check_enum(&body.vertical_alignment, &V_ALIGN, "vertical alignment")?;
     let label = LabelRecord {
         id: body.id.unwrap_or_else(Uuid::new_v4),
-        level: body.level.unwrap_or(0),
+        room: room.map(|(identity, _)| identity),
+        level: room.map_or(body.level.unwrap_or(0), |(_, level)| level),
         x: body.x,
         y: body.y,
         width: body.width,
@@ -2824,13 +3042,15 @@ fn apply_create_label(
         background_color: body.background_color.unwrap_or_else(|| "white".to_string()),
         font_size: body.font_size.unwrap_or(12),
         font_weight: body.font_weight.unwrap_or(400),
+        created_at: chrono::Utc::now(),
     };
-    let result = json!({"entity": "label", "label": embedded_label_json(&label)});
+    let result = json!({"entity": "label", "label": label_echo(st, working, ctx, &label)});
     scope_area(working, ctx).labels.push(label);
     Ok(OpOutcome::scoped(result))
 }
 
 fn apply_update_label(
+    st: &MockState,
     working: &mut Working,
     ctx: &ApplyCtx,
     label_id: Uuid,
@@ -2842,11 +3062,40 @@ fn apply_update_label(
     if let Some(a) = &body.vertical_alignment {
         check_enum(a, &V_ALIGN, "vertical alignment")?;
     }
-    let area = scope_area(working, ctx);
-    let Some(label) = area.labels.iter_mut().find(|l| l.id == label_id) else {
+    let Some(found) = working[&ctx.area_id]
+        .labels
+        .iter()
+        .find(|l| l.id == label_id)
+        .filter(|label| label_readable(st, working, ctx, label))
+    else {
         return Err(err(404, "Label not found"));
     };
-    if let Some(v) = body.level {
+    // Attached, the label stands on its room's level; freed, it stays on the
+    // level its room was on unless the body names one.
+    let (room, level) = match body.room_number {
+        None => (found.room, body.level),
+        Some(None) => (
+            None,
+            body.level.or_else(|| {
+                found
+                    .room
+                    .and_then(|identity| label_room(st, working, ctx, identity))
+                    .map(|(_, room)| room.level)
+            }),
+        ),
+        Some(Some(number)) => {
+            let room = attachable(st, working, ctx, body.room_source.as_deref(), number)?;
+            (Some(room.identity), Some(room.level))
+        }
+    };
+    let area = scope_area(working, ctx);
+    let label = area
+        .labels
+        .iter_mut()
+        .find(|l| l.id == label_id)
+        .expect("just found");
+    label.room = room;
+    if let Some(v) = level {
         label.level = v;
     }
     if let Some(v) = body.x {
@@ -2882,21 +3131,26 @@ fn apply_update_label(
     if let Some(v) = body.font_weight {
         label.font_weight = v;
     }
+    let label = label.clone();
     Ok(OpOutcome::scoped(
-        json!({"entity": "label", "label": embedded_label_json(label)}),
+        json!({"entity": "label", "label": label_echo(st, working, ctx, &label)}),
     ))
 }
 
 fn apply_delete_label(
+    st: &MockState,
     working: &mut Working,
     ctx: &ApplyCtx,
     label_id: Uuid,
 ) -> Result<OpOutcome, Response> {
-    let area = scope_area(working, ctx);
-    let Some(idx) = area.labels.iter().position(|l| l.id == label_id) else {
+    let Some(idx) = working[&ctx.area_id]
+        .labels
+        .iter()
+        .position(|l| l.id == label_id && label_readable(st, working, ctx, l))
+    else {
         return Err(err(404, "Label not found"));
     };
-    area.labels.remove(idx);
+    scope_area(working, ctx).labels.remove(idx);
     Ok(OpOutcome::scoped(
         json!({"entity": "label_deleted", "label_id": label_id}),
     ))

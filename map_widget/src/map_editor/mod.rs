@@ -4,6 +4,7 @@
 //! delegated to the host window, which owns the undo stack and the
 //! [`Mapper`] write path.
 
+mod label_rooms;
 mod program;
 
 use std::cell::Cell;
@@ -15,8 +16,8 @@ use iced::{
     widget::{Canvas, container},
 };
 use smudgy_cloud::{
-    AreaId, ConnectionId, ConnectionUpdates, ExitDirection, LabelId, MapPoint, Mapper, RoomNumber,
-    ShapeId, SourceId,
+    AreaId, ConnectionId, ConnectionUpdates, ExitDirection, LabelId, MapPoint, Mapper, RoomAddress,
+    RoomNumber, ShapeId, SourceId,
     connection_geometry::ConnectionGeometry,
     mapper::{RoomKey, area_cache::SourceLayer},
 };
@@ -69,7 +70,17 @@ pub enum EditorActivity {
     Idle,
     DraggingConnectionWaypoint,
     DraggingConnectionPort,
+    /// Dragging or drawing labels that attach to the room nearest the
+    /// pointer.
+    PlacingLabels,
 }
+
+/// The key that leaves a dragged label free, as the legend names it.
+const KEEP_FREE_KEY: &str = if cfg!(target_os = "macos") {
+    "\u{2318}"
+} else {
+    "Ctrl"
+};
 
 /// One status-bar hint: an optional key or chord and the action it performs
 /// in the current editor context. `action`, and `key` when it names a
@@ -120,6 +131,22 @@ pub fn resolve_legend(
                 LegendItem {
                     key: "legend-key-drag",
                     action: "legend-snap-port",
+                },
+                LegendItem {
+                    key: "Alt",
+                    action: "legend-move-freely",
+                },
+                LegendItem {
+                    key: "Esc",
+                    action: "legend-cancel",
+                },
+            ];
+        }
+        EditorActivity::PlacingLabels => {
+            return vec![
+                LegendItem {
+                    key: KEEP_FREE_KEY,
+                    action: "legend-keep-label-free",
                 },
                 LegendItem {
                     key: "Alt",
@@ -315,8 +342,13 @@ impl FromIterator<EntityId> for Selection {
 #[derive(Debug, Clone)]
 pub enum MutationRequest {
     /// Move the current selection by a map-space offset (already snapped
-    /// unless the user held Alt).
-    MoveSelection { offset: Vector },
+    /// unless the user held Alt). `attach` names, for a drag of labels
+    /// alone, the room each label attaches to, or `None` to leave it free;
+    /// labels it leaves out keep their rooms.
+    MoveSelection {
+        offset: Vector,
+        attach: Vec<(LabelId, Option<RoomAddress>)>,
+    },
     /// Create a room at a map-space point (already snapped unless the user
     /// held Alt) on the current level.
     PlaceRoom { at: Point },
@@ -330,8 +362,11 @@ pub enum MutationRequest {
         one_way: bool,
     },
     /// Create a label covering a dragged-out map-space rect on the current
-    /// level.
-    CreateLabel { rect: Rectangle },
+    /// level, attached to `room` when there is one.
+    CreateLabel {
+        rect: Rectangle,
+        room: Option<RoomAddress>,
+    },
     /// Create a shape covering a dragged-out map-space rect on the current
     /// level.
     CreateShape { rect: Rectangle },
@@ -400,9 +435,13 @@ pub enum Message {
     SetHovered {
         room: Option<RoomKey>,
         connection: Option<ConnectionId>,
+        /// The topmost entity, whatever it is: an attached label, and the
+        /// labels attached to a room, show their tethers while hovered.
+        entity: Option<EntityId>,
     },
     MoveCommitted {
         offset: Vector,
+        attach: Vec<(LabelId, Option<RoomAddress>)>,
     },
     /// A creation-tool click. `keep_tool` (Shift held) suppresses the
     /// momentary-tool revert to Select.
@@ -423,6 +462,8 @@ pub enum Message {
         kind: RectKind,
         rect: Rectangle,
         keep_tool: bool,
+        /// The room a new label attaches to.
+        room: Option<RoomAddress>,
     },
     ResizeCommitted {
         entity: EntityId,
@@ -499,6 +540,9 @@ pub struct MapEditor {
     /// accent glow so the invisible hit band and click cycling are
     /// discoverable.
     hovered_connection: Option<ConnectionId>,
+    /// The topmost entity under an idle cursor, for the tethers of labels
+    /// attached to rooms.
+    hovered_entity: Option<EntityId>,
     /// The room the user came *from* when the selection transitioned room →
     /// one of its connections. Presentation-only: the inspector shows the
     /// connection from this room's perspective (it is the "From" end),
@@ -544,6 +588,7 @@ impl MapEditor {
             player_location: None,
             hovered_room: None,
             hovered_connection: None,
+            hovered_entity: None,
             connection_anchor: None,
             selected_connection_handle: None,
             automatic_route_preview: None,
@@ -959,17 +1004,24 @@ impl MapEditor {
                 }
                 Update::with_event(Event::SelectionChanged)
             }
-            Message::SetHovered { room, connection } => {
+            Message::SetHovered {
+                room,
+                connection,
+                entity,
+            } => {
                 self.hovered_connection = connection;
+                self.hovered_entity = entity;
                 if self.hovered_room == room {
                     return Update::none();
                 }
                 self.hovered_room = room.clone();
                 Update::with_event(Event::HoveredRoomChanged(room))
             }
-            Message::MoveCommitted { offset } => {
+            Message::MoveCommitted { offset, attach } => {
+                self.activity = EditorActivity::Idle;
                 Update::with_event(Event::RequestMutation(MutationRequest::MoveSelection {
                     offset,
+                    attach,
                 }))
             }
             Message::PlaceRoom { at, keep_tool } => {
@@ -1004,12 +1056,14 @@ impl MapEditor {
                 kind,
                 rect,
                 keep_tool,
+                room,
             } => {
                 if !keep_tool {
                     self.tool = Tool::Select;
                 }
+                self.activity = EditorActivity::Idle;
                 Update::with_event(Event::RequestMutation(match kind {
-                    RectKind::Label => MutationRequest::CreateLabel { rect },
+                    RectKind::Label => MutationRequest::CreateLabel { rect, room },
                     RectKind::Shape => MutationRequest::CreateShape { rect },
                 }))
             }
@@ -1212,8 +1266,10 @@ impl MapEditor {
                     .iter()
                     .rev()
                     .filter(|label| {
-                        label.level == self.level
-                            && rect_contains(label.x, label.y, label.width, label.height, point)
+                        label_rooms::placed_rect(&area, label).is_some_and(|(rect, level)| {
+                            level == self.level
+                                && rect_contains(rect.x, rect.y, rect.width, rect.height, point)
+                        })
                     })
                     .map(|label| EntityId::Label(label.id)),
             );
@@ -1334,8 +1390,9 @@ impl MapEditor {
             .chain(area.source_layers().iter().map(SourceLayer::content))
         {
             for label in holder.get_labels() {
-                if label.level == self.level
-                    && rects_intersect(rect, label.x, label.y, label.width, label.height)
+                if let Some((placed, level)) = label_rooms::placed_rect(&area, label)
+                    && level == self.level
+                    && rects_intersect(rect, placed.x, placed.y, placed.width, placed.height)
                 {
                     hits.push(EntityId::Label(label.id));
                 }
@@ -1431,15 +1488,8 @@ impl MapEditor {
         match entity {
             EntityId::Label(id) => {
                 let (_, label) = area.find_label(&id)?;
-                (label.level == self.level).then_some((
-                    entity,
-                    Rectangle {
-                        x: label.x,
-                        y: label.y,
-                        width: label.width,
-                        height: label.height,
-                    },
-                ))
+                let (rect, level) = label_rooms::placed_rect(&area, label)?;
+                (level == self.level).then_some((entity, rect))
             }
             EntityId::Shape(id) => {
                 let (_, shape) = area.find_shape(&id)?;
@@ -1908,9 +1958,37 @@ mod secret_tests {
         }
     }
 
+    /// A 2 by 0.5 label at offset `(x, y)` from map room `room`, or at map
+    /// coordinates without one.
+    fn label(id: u128, room: Option<i32>, x: f32, y: f32) -> smudgy_cloud::Label {
+        smudgy_cloud::Label {
+            id: smudgy_cloud::LabelId(Uuid::from_u128(id)),
+            room_number: room.map(RoomNumber),
+            room_source: None,
+            level: 0,
+            x,
+            y,
+            width: 2.0,
+            height: 0.5,
+            horizontal_alignment: smudgy_cloud::HorizontalAlignment::Center,
+            vertical_alignment: smudgy_cloud::VerticalAlignment::Center,
+            text: "sign".to_string(),
+            color: String::new(),
+            background_color: String::new(),
+            font_size: 14,
+            font_weight: 400,
+        }
+    }
+
+    /// The map's label attached to its room 2.
+    const MAP_LABEL: u128 = 1;
+    /// The Secret's label attached to the map's room 1.
+    const SECRET_LABEL: u128 = 2;
+
     /// Map rooms 1 at (0, 0) and 2 at (4, 0). A Secret's own rooms 3 at
     /// (0, 4) and 4 at (4, 4) are linked both ways; its room 5 sits on the
-    /// map's room 2.
+    /// map's room 2. The map's label hangs off room 2 at (4.5, -1), the
+    /// Secret's off the map's room 1 at (-1, 0.5).
     async fn editor() -> (MapEditor, SourceId, ConnectionId) {
         let map = AreaId(Uuid::new_v4());
         let secret = SourceId::Secret(Uuid::new_v4());
@@ -1940,7 +2018,7 @@ mod secret_tests {
             format_version: smudgy_cloud::AREA_FORMAT_VERSION,
             properties: Vec::new(),
             rooms: vec![room(1, 0.0, 0.0, Vec::new()), room(2, 4.0, 0.0, Vec::new())],
-            labels: Vec::new(),
+            labels: vec![label(MAP_LABEL, Some(2), 0.5, -1.0)],
             shapes: Vec::new(),
             connections: Vec::new(),
             linked_areas: Vec::new(),
@@ -1972,7 +2050,7 @@ mod secret_tests {
                     room(5, 4.0, 0.0, Vec::new()),
                 ],
                 room_data: Vec::new(),
-                labels: Vec::new(),
+                labels: vec![label(SECRET_LABEL, Some(1), -1.0, 0.5)],
                 shapes: Vec::new(),
                 connections: vec![Connection {
                     id: link,
@@ -1995,6 +2073,110 @@ mod secret_tests {
         let mapper = Mapper::new(Arc::new(OneMap(details)), cache_dir);
         mapper.load_all_areas().await.expect("load the map");
         (MapEditor::new(mapper, Some(map)), secret, link)
+    }
+
+    #[tokio::test]
+    async fn attached_labels_are_drawn_and_hit_at_their_rooms() {
+        let (editor, _, _) = editor().await;
+        let atlas = editor.mapper.get_current_atlas();
+        let area = atlas
+            .get_area(&editor.area_id().expect("a map"))
+            .expect("loaded");
+        let map_label = smudgy_cloud::LabelId(Uuid::from_u128(MAP_LABEL));
+        let secret_label = smudgy_cloud::LabelId(Uuid::from_u128(SECRET_LABEL));
+        let (_, found) = area.find_label(&map_label).expect("the map's label");
+        assert_eq!(
+            area.label_place(found),
+            Some(smudgy_cloud::mapper::area_cache::LabelPlace {
+                x: 4.5,
+                y: -1.0,
+                level: 0,
+            })
+        );
+        assert!(
+            editor
+                .entities_at(Point::new(5.0, -0.8))
+                .contains(&EntityId::Label(map_label))
+        );
+        assert!(
+            editor
+                .entities_at(Point::new(-0.5, 0.7))
+                .contains(&EntityId::Label(secret_label)),
+            "a Secret's label on a map room is hit where that room puts it"
+        );
+        assert_eq!(
+            area.labels_on(PlacedRoom::map(RoomNumber(1)))
+                .map(|(_, label)| label.id)
+                .collect::<Vec<_>>(),
+            vec![secret_label]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_label_finds_the_nearest_room_its_source_may_use() {
+        let (editor, secret, _) = editor().await;
+        let atlas = editor.mapper.get_current_atlas();
+        let area = atlas
+            .get_area(&editor.area_id().expect("a map"))
+            .expect("loaded");
+        let map = |number| PlacedRoom::map(RoomNumber(number));
+        let by_secret_room = Point::new(0.2, 3.6);
+        assert_eq!(
+            editor.label_room_near(&area, by_secret_room, SourceId::Map, None),
+            Some(map(1)),
+            "a map label never takes a Secret's room"
+        );
+        assert_eq!(
+            editor.label_room_near(&area, by_secret_room, secret, None),
+            Some(PlacedRoom::new(secret, RoomNumber(3)))
+        );
+        assert_eq!(
+            editor.label_room_near(&area, Point::new(0.0, -6.0), SourceId::Map, None),
+            None,
+            "beyond reach a label stays free"
+        );
+        let between = Point::new(2.1, 0.0);
+        assert_eq!(
+            editor.label_room_near(&area, between, SourceId::Map, None),
+            Some(map(2))
+        );
+        assert_eq!(
+            editor.label_room_near(&area, between, SourceId::Map, Some(map(1))),
+            Some(map(1)),
+            "the room it is attaching to holds until another is clearly nearer"
+        );
+        assert_eq!(
+            editor.label_room_near(&area, Point::new(2.4, 0.0), SourceId::Map, Some(map(1))),
+            Some(map(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn only_labels_dragged_alone_look_for_rooms() {
+        let (mut editor, _, _) = editor().await;
+        let map_label = smudgy_cloud::LabelId(Uuid::from_u128(MAP_LABEL));
+        let atlas = editor.mapper.get_current_atlas();
+        let area = atlas
+            .get_area(&editor.area_id().expect("a map"))
+            .expect("loaded");
+        editor.select(EntityId::Label(map_label));
+        let mut dragged =
+            editor.dragged_labels(&area, EntityId::Label(map_label), Point::new(5.0, -0.8));
+        assert_eq!(dragged.len(), 1);
+        assert!(dragged[0].leads());
+        assert_eq!(dragged[0].target, Some(PlacedRoom::map(RoomNumber(2))));
+        editor.retarget(&area, &mut dragged, Point::new(0.3, 0.2), false);
+        assert_eq!(dragged[0].target, Some(PlacedRoom::map(RoomNumber(1))));
+        editor.retarget(&area, &mut dragged, Point::new(0.3, 0.2), true);
+        assert_eq!(dragged[0].target, None, "Ctrl leaves it free");
+
+        editor.selection.extend([EntityId::Room(RoomNumber(1))]);
+        assert!(
+            editor
+                .dragged_labels(&area, EntityId::Label(map_label), Point::new(5.0, -0.8))
+                .is_empty(),
+            "labels dragged with a room keep their rooms"
+        );
     }
 
     #[tokio::test]

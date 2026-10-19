@@ -520,6 +520,7 @@ impl MockHandle {
         let area = st.areas.get_mut(&area.0).expect("area exists");
         area.labels.push(LabelRecord {
             id,
+            room: None,
             level: 0,
             x: 0.0,
             y: 0.0,
@@ -532,6 +533,7 @@ impl MockHandle {
             background_color: "white".to_string(),
             font_size: 12,
             font_weight: 400,
+            created_at: Utc::now(),
         });
         id
     }

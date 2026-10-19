@@ -1896,6 +1896,8 @@ type ShapeKind = "Rectangle" | "RoundedRectangle";
 // A text label read back from an area (`area.labels`). Mirrors the `Label` contract interface.
 interface Label {
     readonly id: LabelId;
+    // The map room the label is attached to; its position and level are where it is drawn.
+    readonly room?: number;
     readonly level: number;
     readonly x: number;
     readonly y: number;
@@ -1913,6 +1915,8 @@ interface Label {
 // Fields accepted when creating a label (`createLabel`); position, size, and `text` are
 // required, everything else defaults host-side (level 0, Center/Center, "#ffffff", 16, 400).
 interface LabelArgs {
+    // Attaches the label to this map room; `x` and `y` are where it is drawn.
+    room?: number;
     x: number;
     y: number;
     width: number;
@@ -1929,6 +1933,8 @@ interface LabelArgs {
 
 // Fields accepted when updating a label (`setLabel`). Any omitted field is left unchanged.
 interface LabelUpdates {
+    // Attaches the label to this map room, or frees it with `null`.
+    room?: number | null;
     x?: number;
     y?: number;
     width?: number;

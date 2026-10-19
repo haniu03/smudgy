@@ -1269,6 +1269,8 @@ fn grouped_connection_batches<'a>(
 fn label_args(label: &crate::Label) -> LabelArgs {
     LabelArgs {
         id: Some(label.id),
+        room_number: label.room_number,
+        room_source: label.room_source,
         level: label.level,
         x: label.x,
         y: label.y,
@@ -1518,6 +1520,7 @@ fn freshen_source_bundle(
         |source: Option<SourceId>| source.map(|source| if source == old { own } else { source });
     for label in &mut bundle.labels {
         label.id = LabelId(uuid::Uuid::new_v4());
+        label.room_source = renamed(label.room_source);
     }
     for shape in &mut bundle.shapes {
         shape.id = ShapeId(uuid::Uuid::new_v4());
@@ -1600,7 +1603,16 @@ fn freshen_source_references(documents: &mut [AreaWithDetails], id_map: &HashMap
         let map = document.area.id;
         let rewrite = |rooms: &mut Vec<crate::RoomWithDetails>,
                        data: &mut Vec<crate::RoomData>,
-                       connections: &mut Vec<Connection>| {
+                       connections: &mut Vec<Connection>,
+                       labels: &mut Vec<crate::Label>| {
+            // A label attached to a room the copy leaves out stays behind.
+            labels.retain(|label| {
+                label.room_number.is_none()
+                    || sources.contains_key(&(map, label.room_source.unwrap_or(SourceId::Map)))
+            });
+            for label in labels.iter_mut() {
+                label.room_source = label.room_source.map(|source| sources[&(map, source)]);
+            }
             data.retain(|data| {
                 sources.contains_key(&(map, data.room_source.unwrap_or(SourceId::Map)))
             });
@@ -1658,6 +1670,7 @@ fn freshen_source_references(documents: &mut [AreaWithDetails], id_map: &HashMap
             &mut document.rooms,
             &mut document.room_data,
             &mut document.connections,
+            &mut document.labels,
         );
         for bundle in &mut document.sources {
             let source = sources[&(map, bundle.source)];
@@ -1665,6 +1678,7 @@ fn freshen_source_references(documents: &mut [AreaWithDetails], id_map: &HashMap
                 &mut bundle.rooms,
                 &mut bundle.room_data,
                 &mut bundle.connections,
+                &mut bundle.labels,
             );
             bundle.source = source;
         }

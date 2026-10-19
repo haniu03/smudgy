@@ -1439,6 +1439,7 @@ fn departure_copy(
             header.secrets.push(copied);
         }
     }
+    super::room_labels::drop_unheld(&mut header);
     st.areas.insert(copy_id, header);
     true
 }

@@ -1128,10 +1128,19 @@ impl Door {
     }
 }
 
-/// Text label on area
+/// Text label on area. A label is free, at map coordinates, or attached to
+/// a room ([`Label::room`]); an attached label's `x` and `y` are its
+/// top-left corner's offset from the room's center, and it is drawn on the
+/// room's level.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Label {
     pub id: LabelId,
+    /// The number of the room the label is attached to; absent when free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_number: Option<RoomNumber>,
+    /// The attached room's source; absent for a map room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_source: Option<SourceId>,
     pub level: i32,
     pub x: f32,
     pub y: f32,
@@ -1144,6 +1153,22 @@ pub struct Label {
     pub background_color: String,
     pub font_size: i32,
     pub font_weight: i32,
+}
+
+impl Label {
+    /// The room the label is attached to, if any.
+    #[must_use]
+    pub fn room(&self) -> Option<RoomAddress> {
+        self.room_number
+            .map(|number| RoomAddress::from_wire(self.room_source, number))
+    }
+
+    /// Attaches the label to `room`, or frees it with `None`. Its `x`, `y`
+    /// and `level` are left for the caller to restate in the new frame.
+    pub fn set_room(&mut self, room: Option<RoomAddress>) {
+        self.room_number = room.map(|room| room.number);
+        self.room_source = room.and_then(RoomAddress::wire_source);
+    }
 }
 
 /// Graphical shape on area
@@ -1352,6 +1377,12 @@ pub struct LabelArgs {
     /// Client-minted identity; see [`ExitArgs::id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<LabelId>,
+    /// The room the new label is attached to, as on [`Label`]; with one,
+    /// `x` and `y` are the offset from its center.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_number: Option<RoomNumber>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_source: Option<SourceId>,
     pub level: i32,
     pub x: f32,
     pub y: f32,
@@ -1366,9 +1397,37 @@ pub struct LabelArgs {
     pub font_weight: i32,
 }
 
+impl LabelArgs {
+    /// The room the new label is attached to, if any.
+    #[must_use]
+    pub fn room(&self) -> Option<RoomAddress> {
+        self.room_number
+            .map(|number| RoomAddress::from_wire(self.room_source, number))
+    }
+
+    /// Attaches the new label to `room`, or leaves it free with `None`.
+    pub fn set_room(&mut self, room: Option<RoomAddress>) {
+        self.room_number = room.map(|room| room.number);
+        self.room_source = room.and_then(RoomAddress::wire_source);
+    }
+}
+
 /// Label creation/update data
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct LabelUpdates {
+    /// Absent keeps the label's room; `Some(None)` (wire `null`) frees it;
+    /// `Some(Some(n))` attaches it to room `n` of `room_source`. Set both
+    /// with [`LabelUpdates::with_room`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_option"
+    )]
+    pub room_number: Option<Option<RoomNumber>>,
+    /// The source of the room `room_number` attaches the label to; absent
+    /// for a map room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_source: Option<SourceId>,
     pub level: Option<i32>,
     pub x: Option<f32>,
     pub y: Option<f32>,
@@ -1384,11 +1443,33 @@ pub struct LabelUpdates {
 }
 
 impl LabelUpdates {
+    /// Attaches the label to `room`, or frees it with `None`.
+    #[must_use]
+    pub fn with_room(mut self, room: Option<RoomAddress>) -> Self {
+        self.room_number = Some(room.map(|room| room.number));
+        self.room_source = room.and_then(RoomAddress::wire_source);
+        self
+    }
+
+    /// The room change this update makes: `None` keeps the label's room,
+    /// `Some(None)` frees it.
+    #[must_use]
+    pub fn room(&self) -> Option<Option<RoomAddress>> {
+        self.room_number
+            .map(|number| number.map(|number| RoomAddress::from_wire(self.room_source, number)))
+    }
+
     /// Returns a copy of `label` with every `Some` field applied.
     #[must_use]
     pub fn apply(self, label: &Label) -> Label {
+        let (room_number, room_source) = match self.room_number {
+            Some(number) => (number, number.and(self.room_source)),
+            None => (label.room_number, label.room_source),
+        };
         Label {
             id: label.id,
+            room_number,
+            room_source,
             level: self.level.unwrap_or(label.level),
             x: self.x.unwrap_or(label.x),
             y: self.y.unwrap_or(label.y),

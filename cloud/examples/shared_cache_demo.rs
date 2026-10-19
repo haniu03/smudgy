@@ -105,6 +105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a label
     let label_args = LabelArgs {
         id: None,
+        room_number: None,
+        room_source: None,
         level: 0,
         x: 25.0,
         y: -10.0,

@@ -561,6 +561,8 @@ async fn run(
             src,
             LabelArgs {
                 id: None,
+                room_number: None,
+                room_source: None,
                 level: 0,
                 x: 4.0,
                 y: -10.0,

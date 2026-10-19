@@ -12,6 +12,8 @@
 mod busy_libraries;
 #[path = "integration_sync/create_area_properties.rs"]
 mod create_area_properties;
+#[path = "integration_sync/label_rooms.rs"]
+mod label_rooms;
 #[path = "integration_sync/legacy_recovery.rs"]
 mod legacy_recovery;
 #[path = "integration_sync/link_clears.rs"]
