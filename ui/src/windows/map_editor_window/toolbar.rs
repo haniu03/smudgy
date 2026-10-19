@@ -1,16 +1,17 @@
-//! The editor toolbar: the tools, the level stepper and undo/redo on the
-//! left; the map's save status, Active switch and actions on the right.
+//! The editor toolbar, in two rows: the open map, with its name, Active
+//! switch and actions; under it the editing controls, with the tools, the
+//! level stepper, undo/redo and where new content goes. The map's save
+//! status is in the footer (see [`super::save_status`]).
 
 use iced::alignment::Vertical;
-use iced::widget::{button, column, container, row, space, text, tooltip};
-use iced::{Length, Padding};
+use iced::font::Weight;
+use iced::widget::{button, column, container, row, rule, space, text, tooltip};
+use iced::{Font, Length, Padding};
 use smudgy_cloud::MapStorage;
 use smudgy_cloud::clans::action;
-use smudgy_cloud::mapper::{AreaSaveStatus, SyncState};
 use smudgy_map_widget::map_editor::Tool;
 
 use crate::assets::{bootstrap_icons, fonts};
-use crate::components::cloud_errors::display_error;
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::widgets::dropdown::Dropdown;
@@ -23,6 +24,12 @@ fn icon(codepoint: &'static str) -> iced::widget::Text<'static, crate::Theme> {
     text(codepoint).font(fonts::BOOTSTRAP_ICONS).size(ICON_SIZE)
 }
 
+/// A square icon button, narrower than iced's default padding makes it, so
+/// the editing row fits the canvas at the editor's default size.
+fn icon_button(codepoint: &'static str) -> button::Button<'static, Message, crate::Theme> {
+    button(icon(codepoint)).padding([5, 6])
+}
+
 fn tool_button(
     codepoint: &'static str,
     label: &'static str,
@@ -31,7 +38,7 @@ fn tool_button(
     enabled: bool,
 ) -> ThemedElement<'static, Message> {
     tooltip(
-        button(icon(codepoint))
+        icon_button(codepoint)
             .style(if tool == active_tool {
                 builtins::button::list_item_selected
             } else {
@@ -74,6 +81,69 @@ fn action_button<'a>(
 }
 
 pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
+    let mut rows = column![];
+    if let Some(area_id) = window.editor.area_id() {
+        rows = rows.push(map_row(window, area_id));
+    }
+    container(rows.push(edit_row(window)))
+        .style(builtins::container::opaque)
+        .width(Length::Fill)
+        .into()
+}
+
+/// The open map's row: its name, then its Active switch and actions. A long
+/// name is cut off at the right rather than crowding the actions out.
+fn map_row(window: &MapEditorWindow, area_id: smudgy_cloud::AreaId) -> ThemedElement<'_, Message> {
+    let name = window
+        .mapper
+        .get_current_atlas()
+        .get_area(&area_id)
+        .map(|area| area.get_name().to_string())
+        .unwrap_or_default();
+    let mut bar = row![
+        container(
+            text(name)
+                .size(18)
+                .font(Font {
+                    weight: Weight::Semibold,
+                    ..fonts::GEIST_VF
+                })
+                .wrapping(text::Wrapping::None)
+        )
+        .padding([0, 4])
+        .width(Length::Fill)
+        .clip(true),
+        active_switch(window, area_id),
+        space::horizontal().width(8.0),
+    ]
+    .align_y(Vertical::Center)
+    .padding(4)
+    .spacing(4);
+    if window.can_share_active_area() && window.mapper.area_storage(&area_id) == MapStorage::Cloud {
+        bar = bar.push(action_button(
+            bootstrap_icons::SHARE,
+            crate::i18n::t!("mapper-share"),
+            Message::ShareDialogRequested,
+            false,
+        ));
+    }
+    if let Some(menu) = map_menu(window, area_id) {
+        bar = bar.push(menu);
+    }
+    bar.into()
+}
+
+/// A thin rule between two groups of the editing row.
+fn divider<'a>() -> ThemedElement<'a, Message> {
+    container(rule::vertical(1))
+        .height(18)
+        .padding([0, 4])
+        .into()
+}
+
+/// The editing row: the tools, the level stepper, undo/redo, and where new
+/// content goes.
+fn edit_row(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     let active_tool = window.editor.tool();
     // Rooms, labels and shapes go where "Add to" says; links still go into
     // the map.
@@ -121,7 +191,7 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
 
     let level = row![
         tooltip(
-            button(icon(bootstrap_icons::CHEVRON_DOWN))
+            icon_button(bootstrap_icons::CHEVRON_DOWN)
                 .style(builtins::button::toolbar)
                 .on_press(Message::LevelDown),
             crate::i18n::ts!("mapper-level-down"),
@@ -129,7 +199,7 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
         ),
         text(crate::i18n::t!("mapper-level", "level" => window.editor.level())).size(14),
         tooltip(
-            button(icon(bootstrap_icons::CHEVRON_UP))
+            icon_button(bootstrap_icons::CHEVRON_UP)
                 .style(builtins::button::toolbar)
                 .on_press(Message::LevelUp),
             crate::i18n::ts!("mapper-level-up"),
@@ -143,14 +213,14 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     // places it writes (also enforced in the Hotkey::Undo/Redo handlers).
     let history = row![
         tooltip(
-            button(icon(bootstrap_icons::ARROW_COUNTERCLOCKWISE))
+            icon_button(bootstrap_icons::ARROW_COUNTERCLOCKWISE)
                 .style(builtins::button::toolbar)
                 .on_press_maybe((window.can_undo() && window.may_undo()).then_some(Message::Undo)),
             crate::i18n::ts!("mapper-undo"),
             tooltip::Position::Bottom,
         ),
         tooltip(
-            button(icon(bootstrap_icons::ARROW_CLOCKWISE))
+            icon_button(bootstrap_icons::ARROW_CLOCKWISE)
                 .style(builtins::button::toolbar)
                 .on_press_maybe((window.can_redo() && window.may_redo()).then_some(Message::Redo)),
             crate::i18n::ts!("mapper-redo"),
@@ -159,44 +229,14 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     ]
     .spacing(2);
 
-    let mut bar = row![].align_y(Vertical::Center).padding(4).spacing(4);
+    let mut bar = row![tools, divider(), level, divider(), history]
+        .align_y(Vertical::Center)
+        .padding(4)
+        .spacing(4);
     if let Some(picker) = super::secrets::add_to_picker(window) {
-        bar = bar.push(picker);
-        bar = bar.push(space::horizontal().width(16.0));
+        bar = bar.push(divider()).push(picker);
     }
-    bar = bar.extend([
-        tools.into(),
-        space::horizontal().width(16.0).into(),
-        level.into(),
-        space::horizontal().width(16.0).into(),
-        history.into(),
-        space::horizontal().into(),
-        sync_indicator(window),
-    ]);
-
-    if let Some(area_id) = window.editor.area_id() {
-        bar = bar.push(space::horizontal().width(12.0));
-        bar = bar.push(active_switch(window, area_id));
-        bar = bar.push(space::horizontal().width(12.0));
-        if window.can_share_active_area()
-            && window.mapper.area_storage(&area_id) == MapStorage::Cloud
-        {
-            bar = bar.push(action_button(
-                bootstrap_icons::SHARE,
-                crate::i18n::t!("mapper-share"),
-                Message::ShareDialogRequested,
-                false,
-            ));
-        }
-        if let Some(menu) = map_menu(window, area_id) {
-            bar = bar.push(menu);
-        }
-    }
-
-    container(bar)
-        .style(builtins::container::opaque)
-        .width(Length::Fill)
-        .into()
+    bar.into()
 }
 
 /// Whether the map is used to find your location: a switch showing its
@@ -334,183 +374,57 @@ fn map_menu(
     Some(Dropdown::new(trigger, menu, Message::MapMenuToggled(false)).into())
 }
 
-/// Why the edited map's writes are parked, in the viewer's language: the
-/// server's refusal through [`display_error`], or the queue's own `message`
-/// for a park the server did not refuse.
-fn parked_reason(window: &MapEditorWindow, message: String) -> String {
-    window
-        .editor
-        .area_id()
-        .and_then(|area_id| window.mapper.parked_error(area_id))
-        .map_or(message, |error| display_error(&error))
-}
-
-/// The mapper's cloud-sync readout. While a tick is in flight it is a passive
-/// status; otherwise it doubles as a **Sync** button that triggers an immediate
-/// sync — the engine no longer polls on a timer, so this is how the user pulls
-/// remote changes (and retries after a failure) on demand.
-/// The wall-clock time, as hours and minutes, of `next_retry`, an instant
-/// `now` measures, when the wall clock reads `wall_now`.
-#[must_use]
-pub fn retry_clock(
-    next_retry: Option<std::time::Instant>,
-    now: std::time::Instant,
-    wall_now: chrono::DateTime<chrono::Local>,
-) -> Option<String> {
-    let wait = next_retry?.saturating_duration_since(now);
-    let at = wall_now + chrono::Duration::from_std(wait).ok()?;
-    Some(at.format("%H:%M").to_string())
-}
-
-fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
-    let status = window
-        .editor
-        .area_id()
-        .map_or(AreaSaveStatus::Saved, |area_id| {
-            window.mapper.area_save_status(area_id)
-        });
-    type StyleFn = fn(&crate::Theme) -> iced::widget::text::Style;
-    let normal: StyleFn = |theme: &crate::Theme| iced::widget::text::Style {
-        color: Some(theme.styles.text.normal.scale_alpha(0.7)),
-    };
-    let error: StyleFn = |theme: &crate::Theme| iced::widget::text::Style {
-        color: Some(theme.styles.text.error),
-    };
-    // With nothing of the open map's waiting to save, the indicator says
-    // when syncing is offline, and when it tries again.
-    let sync = window.mapper.sync_status();
-    let (codepoint, label, color) = match &status {
-        AreaSaveStatus::Saved if sync.state == SyncState::Offline => (
-            bootstrap_icons::EXCLAMATION_TRIANGLE,
-            match retry_clock(
-                sync.next_retry,
-                std::time::Instant::now(),
-                chrono::Local::now(),
-            ) {
-                Some(time) => crate::i18n::t!("mapper-status-sync-retrying", "time" => time),
-                None => crate::i18n::t!("mapper-status-sync-offline"),
-            },
-            error,
-        ),
-        AreaSaveStatus::Saved => (
-            bootstrap_icons::CLOUD_CHECK,
-            crate::i18n::t!("mapper-status-saved"),
-            normal,
-        ),
-        AreaSaveStatus::Saving(pending) => (
-            bootstrap_icons::CLOUD_UPLOAD,
-            crate::i18n::t!("mapper-status-saving", "count" => *pending),
-            normal,
-        ),
-        AreaSaveStatus::Offline(pending) => (
-            bootstrap_icons::EXCLAMATION_TRIANGLE,
-            crate::i18n::t!("mapper-status-offline", "count" => *pending),
-            error,
-        ),
-        AreaSaveStatus::Held(pending) => (
-            bootstrap_icons::CLOUD_UPLOAD,
-            crate::i18n::t!("mapper-status-held", "count" => *pending),
-            normal,
-        ),
-        AreaSaveStatus::ConflictNeedsReview => (
-            bootstrap_icons::EXCLAMATION_TRIANGLE,
-            crate::i18n::t!("mapper-status-conflict"),
-            error,
-        ),
-        AreaSaveStatus::CouldNotSave { .. } => (
-            bootstrap_icons::EXCLAMATION_TRIANGLE,
-            crate::i18n::t!("mapper-status-could-not-save"),
-            error,
-        ),
-    };
-
-    let content = row![
-        text(codepoint)
-            .font(fonts::BOOTSTRAP_ICONS)
-            .size(13.0)
-            .style(color),
-        text(label).size(12).style(color),
-    ]
-    .spacing(4)
-    .align_y(Vertical::Center);
-
-    match status {
-        AreaSaveStatus::ConflictNeedsReview => row![
-            container(content).padding([2, 6]),
-            button(text(crate::i18n::t!("mapper-save-keep-mine")).size(11))
-                .style(builtins::button::secondary)
-                .on_press(Message::KeepMineRequested),
-            button(text(crate::i18n::t!("mapper-save-keep-theirs")).size(11))
-                .style(builtins::button::secondary)
-                .on_press(Message::KeepTheirsRequested),
-        ]
-        .spacing(4)
-        .align_y(Vertical::Center)
-        .into(),
-        AreaSaveStatus::CouldNotSave { message, retryable } => row![
-            tooltip(
-                container(content).padding([2, 6]),
-                text(parked_reason(window, message)).size(12),
-                tooltip::Position::Bottom,
-            ),
-            button(text(crate::i18n::t!("action-retry")).size(11))
-                .style(builtins::button::secondary)
-                .on_press_maybe(retryable.then_some(Message::RetrySaveRequested)),
-            button(text(crate::i18n::t!("editor-discard")).size(11))
-                .style(builtins::button::secondary)
-                .on_press(Message::DiscardFailedSaveRequested),
-        ]
-        .spacing(4)
-        .align_y(Vertical::Center)
-        .into(),
-        AreaSaveStatus::Saving(_) => tooltip(
-            container(content).padding([2, 6]),
-            crate::i18n::ts!("mapper-pending-tip"),
-            tooltip::Position::Bottom,
-        )
-        .into(),
-        AreaSaveStatus::Saved => tooltip(
-            button(content)
-                .style(builtins::button::subtle)
-                .padding([2, 6])
-                .on_press(Message::SyncNowRequested),
-            crate::i18n::ts!("mapper-sync-tip"),
-            tooltip::Position::Bottom,
-        )
-        .into(),
-        AreaSaveStatus::Offline(_) | AreaSaveStatus::Held(_) => tooltip(
-            button(content)
-                .style(builtins::button::subtle)
-                .padding([2, 6])
-                .on_press(Message::SyncNowRequested),
-            crate::i18n::ts!("mapper-pending-tip"),
-            tooltip::Position::Bottom,
-        )
-        .into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::retry_clock;
-    use chrono::TimeZone;
-    use std::time::{Duration, Instant};
+    use iced::Size;
 
-    #[test]
-    fn the_next_retry_reads_as_a_wall_clock_time() {
-        let now = Instant::now();
-        let wall = chrono::Local
-            .with_ymd_and_hms(2026, 10, 18, 12, 0, 0)
-            .unwrap();
-        assert_eq!(
-            retry_clock(Some(now + Duration::from_secs(240)), now, wall).as_deref(),
-            Some("12:04")
+    use super::super::headless::{layout, renderer, screenshot_if_asked};
+    use super::super::links::fixture::{KEEP, area, maps, secret};
+
+    use super::{edit_row, map_row};
+
+    /// The canvas pane's width when the editor opens at iced's default
+    /// 1024 px window: the map list takes 18% and the inspector 28% of the
+    /// rest, each split giving up half the 4 px pane spacing.
+    const DEFAULT_CANVAS_WIDTH: f32 = 601.0;
+
+    /// The least of a map's name that stays visible beside its actions.
+    const MIN_NAME_WIDTH: f32 = 100.0;
+
+    /// The toolbar's widest case, a Secret chosen in "Add to" and the map
+    /// holding Share and its ⋯ menu, fits the canvas at the editor's
+    /// default size: the editing row whole, and the map's row with room
+    /// left for its name.
+    #[tokio::test]
+    async fn both_rows_fit_the_canvas_at_the_default_window_size() {
+        let mut window = super::super::test_window(maps().await, area(KEEP));
+        window.secrets.add_to = Some((area(KEEP), secret()));
+        screenshot_if_asked(&window, (1024, 768), "toolbar").await;
+        let renderer = renderer().await;
+
+        let edit = layout(
+            edit_row(&window),
+            &renderer,
+            Size::new(f32::INFINITY, 200.0),
         );
-        assert_eq!(retry_clock(None, now, wall), None);
-        assert_eq!(
-            retry_clock(Some(now), now + Duration::from_secs(5), wall).as_deref(),
-            Some("12:00"),
-            "a retry already due reads as now"
+        assert!(
+            edit.size().width <= DEFAULT_CANVAS_WIDTH,
+            "the editing row needs {} px",
+            edit.size().width
+        );
+
+        let wide = 4000.0;
+        let map = layout(
+            map_row(&window, area(KEEP)),
+            &renderer,
+            Size::new(wide, 200.0),
+        );
+        assert_eq!(map.children().len(), 5, "name, Active, gap, Share, ⋯");
+        // All of the row but the name, with the least of the name.
+        let needed = wide - map.children()[0].bounds().width + MIN_NAME_WIDTH;
+        assert!(
+            needed <= DEFAULT_CANVAS_WIDTH,
+            "the map's row needs {needed} px"
         );
     }
 }

@@ -2402,7 +2402,9 @@ struct PropertyHooks {
     on_add: Message,
 }
 
-/// The shared key/value property list editor (rooms and areas).
+/// The shared key/value property list editor (rooms and areas). Each field
+/// is its name over its value and buttons, so a name of any length wraps
+/// within the inspector, however narrow, instead of running under them.
 fn properties_section<'a>(
     rows: &'a [PropertyRow],
     new_name: &'a str,
@@ -2412,7 +2414,7 @@ fn properties_section<'a>(
     from: smudgy_cloud::SourceId,
     anchor: Option<(smudgy_cloud::SourceId, smudgy_cloud::RoomNumber)>,
 ) -> ThemedElement<'a, super::Message> {
-    let mut section = Column::new().spacing(4);
+    let mut section = Column::new().spacing(8);
     section = section.push(field_label(crate::i18n::t!("inspector-properties")));
 
     let on_value_change = hooks.on_value_change;
@@ -2421,17 +2423,14 @@ fn properties_section<'a>(
     let on_new_value = hooks.on_new_value;
 
     for (index, property_row) in rows.iter().enumerate() {
-        let mut widgets = row![
-            text(property_row.name.clone())
-                .size(13)
-                .width(Length::FillPortion(2)),
+        let mut controls = row![
             text_input(
                 crate::i18n::ts!("inspector-value-placeholder"),
                 &property_row.value
             )
             .size(13)
             .on_input(move |value| { super::Message::Inspector(on_value_change(index, value)) })
-            .width(Length::FillPortion(3)),
+            .width(Length::Fill),
             trash_button(super::Message::Inspector(on_delete(index))),
         ]
         .spacing(4)
@@ -2445,9 +2444,17 @@ fn properties_section<'a>(
                 room_source: anchor.map_or(smudgy_cloud::SourceId::Map, |(source, _)| source),
             },
         ) {
-            widgets = widgets.push(move_to);
+            controls = controls.push(move_to);
         }
-        section = section.push(widgets);
+        section = section.push(
+            column![
+                text(property_row.name.clone())
+                    .size(13)
+                    .wrapping(text::Wrapping::WordOrGlyph),
+                controls,
+            ]
+            .spacing(3),
+        );
     }
 
     section = section.push(
@@ -3874,7 +3881,11 @@ pub(super) fn data_fields<'a>(
                 .spacing(4)
                 .push(field_label(crate::i18n::t!("inspector-area-properties")));
             for (name, value) in properties {
-                list = list.push(text(format!("{name}: {value}")).size(12));
+                list = list.push(
+                    text(format!("{name}: {value}"))
+                        .size(12)
+                        .wrapping(text::Wrapping::WordOrGlyph),
+                );
             }
             content = content.push(list);
         }
@@ -4218,6 +4229,81 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
 
 #[cfg(test)]
 mod tests {
+    /// A field name longer than the default inspector is wide.
+    const LONG_NAME: &str = "estimated_last_known_repop_time_in_seconds";
+
+    /// The data fields' width when the editor opens at iced's default
+    /// 1024 px window: the 233 px inspector less the map panel's 12 px
+    /// padding each side and its section's 4 px indent.
+    const DEFAULT_DATA_FIELDS_WIDTH: f32 = 205.0;
+
+    /// The Keep holding a field named [`LONG_NAME`] and a short one.
+    async fn keep_with_a_long_field_name() -> smudgy_cloud::Mapper {
+        use super::super::links::fixture::{serving, the_maps};
+        let maps = the_maps(&["read", "add", "edit", "remove"])
+            .into_iter()
+            .map(|map| {
+                let mut json = serde_json::to_value(map).unwrap();
+                if json["name"] == "Keep" {
+                    json["properties"] = serde_json::json!([
+                        { "name": LONG_NAME, "value": "" },
+                        { "name": "repop_interval", "value": "60" },
+                    ]);
+                }
+                serde_json::from_value(json).unwrap()
+            })
+            .collect();
+        serving(maps).await
+    }
+
+    /// A field name too long for the inspector wraps inside it, above the
+    /// field's value, rather than running under the value and its buttons;
+    /// the value and its buttons fit beside each other.
+    #[tokio::test]
+    async fn a_long_field_name_wraps_above_its_value() {
+        use super::super::headless::{layout, renderer, screenshot_if_asked};
+        use super::super::links::fixture::{KEEP, area};
+        let window = super::super::test_window(keep_with_a_long_field_name().await, area(KEEP));
+        screenshot_if_asked(&window, (1024, 768), "data-fields").await;
+        screenshot_if_asked(&window, (2200, 900), "data-fields").await;
+        let renderer = renderer().await;
+        let keep = window
+            .mapper
+            .get_current_atlas()
+            .get_area(&area(KEEP))
+            .unwrap();
+        let fields = layout(
+            super::data_fields(&window, &keep).into(),
+            &renderer,
+            iced::Size::new(DEFAULT_DATA_FIELDS_WIDTH, f32::INFINITY),
+        );
+        let properties = fields.children().last().unwrap();
+        let index = window
+            .inspector
+            .area_properties
+            .iter()
+            .position(|row| row.name == LONG_NAME)
+            .unwrap();
+        // The section's label, then a field per property.
+        let field = &properties.children()[1 + index];
+        let (name, controls) = (&field.children()[0], &field.children()[1]);
+        let one_line = 13.0 * 1.3;
+        assert!(
+            name.bounds().height > one_line * 1.5,
+            "the name wraps: {:?}",
+            name.bounds()
+        );
+        assert!(controls.bounds().y >= name.bounds().y + name.bounds().height);
+        for control in controls.children() {
+            let right = control.bounds().x + control.bounds().width;
+            assert!(
+                right <= controls.bounds().width + 0.5,
+                "{:?} runs past the inspector",
+                control.bounds()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn secret_room_inspector_shows_map_owned_notes_separately() {
         let (mapper, area_id, secret) = super::super::source_rooms::tests::loaded().await;

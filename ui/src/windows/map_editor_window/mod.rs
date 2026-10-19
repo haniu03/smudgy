@@ -18,6 +18,8 @@ mod context_menu;
 mod default_atlases;
 mod document;
 mod folder_picker;
+#[cfg(test)]
+mod headless;
 mod inspector;
 mod legacy_recovery;
 mod legend;
@@ -37,6 +39,7 @@ mod moves;
 mod multi_select;
 mod panels;
 mod place_fields;
+mod save_status;
 mod secrets;
 mod source_rooms;
 mod tags;
@@ -4637,9 +4640,10 @@ impl MapEditorWindow {
         }
     }
 
-    /// The center panel: the sign-in banner, the toolbar (with one map open),
-    /// the canvas, or with several maps or folders chosen what can be done
-    /// to them all, and the status footer.
+    /// The center panel: the sign-in banner, the toolbar and any save
+    /// awaiting a decision (with one map open), the canvas, or with several
+    /// maps or folders chosen what can be done to them all, and the status
+    /// footer.
     fn center_panel(&self) -> ThemedElement<'_, Message> {
         let mut panel = column![];
 
@@ -4674,8 +4678,12 @@ impl MapEditorWindow {
         }
 
         let multi = self.multi.selection.is_multi();
-        if !multi && self.editor.area_id().is_some() {
+        let one_map = !multi && self.editor.area_id().is_some();
+        if one_map {
             panel = panel.push(toolbar::view(self));
+            if let Some(banner) = save_status::banner(self) {
+                panel = panel.push(banner);
+            }
         }
 
         let body: ThemedElement<'_, Message> = if multi {
@@ -4724,6 +4732,7 @@ impl MapEditorWindow {
                     .as_ref()
                     .map(|(_, notice)| notice.clone()),
                 self.automatic_route_preview.is_some(),
+                one_map.then(|| save_status::readout(self)),
             ))
             .into()
     }
