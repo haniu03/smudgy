@@ -566,6 +566,9 @@ pub struct MockState {
     /// Test hook: fail the next N area reads (`GET /areas/{id}`) with a 500 —
     /// an outage between a sync row and the refetch it calls for.
     pub fail_area_reads: u32,
+    /// Test hook: the group of mutation requests (`POST /areas/{id}/mutations`)
+    /// held until all of them have arrived, with how many have yet to.
+    pub held_mutations: Option<(std::sync::Arc<tokio::sync::Barrier>, usize)>,
     /// Client-version gate floor, mirroring the server's `MIN_CLIENT_VERSION`.
     /// `None` (the default) leaves the gate disabled for every test.
     pub min_client_version: Option<String>,

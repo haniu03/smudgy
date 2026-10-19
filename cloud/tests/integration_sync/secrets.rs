@@ -1006,6 +1006,8 @@ fn labels_in(mapper: &Mapper, area: AreaId, source: &SourceId) -> Vec<LabelId> {
 /// Two sessions of one account draw into Private before it holds anything,
 /// each from a reading without it: the server creates Private with whichever
 /// write lands first, and the other's lands on top of it instead of failing.
+/// The server holds both writes until both have arrived, so neither session
+/// can read the other's Private before sending its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_sessions_race_the_first_private_write() {
     let server = MockServer::spawn().await;
@@ -1038,6 +1040,7 @@ async fn two_sessions_race_the_first_private_write() {
     let (mine, drawn_here) = draw("Mine");
     let (also_mine, drawn_there) = draw("Also mine");
 
+    server.hold_next_mutations(2);
     let here = write_to(&one, area, private, drawn_here);
     let there = write_to(&two, area, private, drawn_there);
     let (here, there) = tokio::join!(one.wait_for_mutation(here), two.wait_for_mutation(there));
