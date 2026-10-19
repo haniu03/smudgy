@@ -828,6 +828,20 @@ pub async fn area_mutations(
         Ok(v) => v,
         Err(e) => return e,
     };
+    // A held request waits for the rest of its group. A group that never
+    // fills is let go, so its test fails on what it sees instead of hanging.
+    let held = {
+        let mut st = state.lock();
+        st.held_mutations.take().map(|(barrier, left)| {
+            if left > 1 {
+                st.held_mutations = Some((barrier.clone(), left - 1));
+            }
+            barrier
+        })
+    };
+    if let Some(barrier) = held {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), barrier.wait()).await;
+    }
     let mut st = state.lock();
     st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {

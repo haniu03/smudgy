@@ -901,6 +901,12 @@ impl MockHandle {
         self.state.lock().fail_area_reads = n;
     }
 
+    /// Holds the next `n` mutation requests until all `n` have arrived, so
+    /// none of them lands before every one was sent.
+    pub fn hold_next_mutations(&self, n: usize) {
+        self.state.lock().held_mutations = Some((Arc::new(tokio::sync::Barrier::new(n)), n));
+    }
+
     /// Every mutation envelope the compound endpoint accepted, in arrival
     /// order: `(operation_id, replayed_from_receipt)`.
     pub fn mutation_requests(&self) -> Vec<(Uuid, bool)> {
