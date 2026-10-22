@@ -1,7 +1,8 @@
 //! The map editor's status footer: the canvas's hints, or for a few
 //! seconds the editor's latest notice in their place, so a notice never
-//! pushes the canvas around. Hint wording comes from
-//! `MapEditor::legend_items`; this module is presentation-only.
+//! pushes the canvas around, and at the right the open map's save status.
+//! Hint wording comes from `MapEditor::legend_items`; this module is
+//! presentation-only.
 
 use iced::Length;
 use iced::alignment::Vertical;
@@ -15,12 +16,13 @@ use super::Message;
 const LEGEND_HEIGHT: f32 = 30.0;
 
 /// The footer: a ready automatic route's Accept/Cancel bar, else the latest
-/// notice, else the hints.
-pub fn view(
+/// notice, else the hints; then `status`, the open map's save status.
+pub fn view<'a>(
     items: Vec<LegendItem>,
     notice: Option<String>,
     route_ready: bool,
-) -> ThemedElement<'static, Message> {
+    status: Option<ThemedElement<'a, Message>>,
+) -> ThemedElement<'a, Message> {
     let mut content = Row::new().spacing(14).align_y(Vertical::Center);
     if route_ready {
         return footer(
@@ -39,10 +41,11 @@ pub fn view(
                         .padding([1, 8])
                         .on_press(Message::AutomaticRouteAccepted),
                 ),
+            status,
         );
     }
     if let Some(notice) = notice {
-        return footer(content.push(text(notice).size(12)));
+        return footer(content.push(text(notice).size(12)), status);
     }
     for item in items {
         let action = crate::i18n::translate(item.action);
@@ -67,11 +70,22 @@ pub fn view(
         content = content.push(hint);
     }
 
-    footer(content)
+    footer(content, status)
 }
 
-fn footer(content: Row<'static, Message, crate::Theme>) -> ThemedElement<'static, Message> {
-    container(content)
+fn footer<'a>(
+    content: Row<'static, Message, crate::Theme>,
+    status: Option<ThemedElement<'a, Message>>,
+) -> ThemedElement<'a, Message> {
+    // A Fill child is laid out after the others, so the status keeps its
+    // width and the hints are cut off at its left edge instead.
+    let mut bar = row![container(content).width(Length::Fill).clip(true)]
+        .spacing(14)
+        .align_y(Vertical::Center);
+    if let Some(status) = status {
+        bar = bar.push(status);
+    }
+    container(bar)
         .width(Length::Fill)
         .height(Length::Fixed(LEGEND_HEIGHT))
         .padding([4, 10])
