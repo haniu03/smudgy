@@ -503,6 +503,7 @@ export async function linkRooms(from: Room, to: Room, direction: Direction, crea
             ids.push(await extendExit(mutation, from, forward));
             if (createReturnExit) ids.push(await extendExit(mutation, to, reverse));
         }, { description: "Link Arctic rooms" });
+        if (ids.length === 2) await pairReciprocalExits(from.areaId, from.roomNumber, ids[0], to.roomNumber, ids[1]);
         return ids;
     }
     const writer = (area: AreaId) => ({
@@ -516,6 +517,24 @@ export async function linkRooms(from: Room, to: Room, direction: Direction, crea
     const ids = [await extendExit(writer(from.areaId), from, forward)];
     if (createReturnExit) ids.push(await extendExit(writer(to.areaId), to, reverse));
     return ids;
+}
+
+/**
+ * Joins two reciprocal exits of one area into one two-way link. The host pairs
+ * an exit with its partner's Connection only when the exit is created, so two
+ * existing stubs pointed at each other stay two one-way links until paired.
+ */
+export async function pairReciprocalExits(
+    areaId: AreaId,
+    from: RoomNumber,
+    forward: ExitId,
+    to: RoomNumber,
+    back: ExitId,
+): Promise<void> {
+    const area = mapper.getAreaById(areaId);
+    const kept = area.room(from)?.exits.find((exit) => exit.id === forward)?.connectionId;
+    const merged = area.room(to)?.exits.find((exit) => exit.id === back)?.connectionId;
+    if (kept && merged && kept !== merged) await mapper.pairConnections(areaId, kept, merged);
 }
 
 export function findRoomsAt(x: number, y: number, level: number, area: Area | null = state.area): Room[] {

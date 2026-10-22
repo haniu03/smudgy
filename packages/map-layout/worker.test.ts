@@ -1656,6 +1656,29 @@ test("a planner plans on a Worker of its own beside the shared queue until it cl
   assert.deepEqual((await shared).positions.get("new"), at(1, 0));
 });
 
+test("a planner plans layout models on a Worker of its own", async () => {
+  const workers: ControlledWorker[] = [];
+  setLayoutWorkerFactoryForTesting(() => {
+    const worker = workers.length === 0 ? new ControlledWorker() : new ExecutingWorker();
+    workers.push(worker);
+    return worker;
+  });
+  const shared = planIntegralLayoutAsync(requestToward("East"));
+  const planner = createLayoutPlanner();
+  const result = await planner.planModel(twoRoomModel(), { type: "reflow", anchor: "start" }, {
+    effort: "thorough",
+  });
+  assert.equal(workers.length, 2, "the model waits behind no shared request");
+  assert.deepEqual(result.positions.get("east"), at(1, 0));
+  assert.equal(result.search?.effort, "thorough");
+  assert.deepEqual(result.patch.moves.map((move) => move.id), ["east"]);
+
+  planner.close();
+  assert.equal(workers[1].terminated, true);
+  workers[0].respondAt(0);
+  assert.deepEqual((await shared).positions.get("new"), at(1, 0));
+});
+
 test("a serialized planning error rejects only its request and leaves the Worker reusable", async () => {
   const worker = new ExecutingWorker();
   let factoryCalls = 0;

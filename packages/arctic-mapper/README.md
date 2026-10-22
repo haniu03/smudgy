@@ -6,7 +6,7 @@ Smudgy support for mapping rooms in ArcticMUD
 
 | Command | Mode |
 |---|---|
-| `map off` | Mapper does nothing |
+| `map off` | Map tracking and editing disabled; room-change notifications remain active |
 | `map follow` | Tracks your position on the existing map; never modifies it |
 | `map active` | Like follow, but `n/e/s/w/u/d` consult the map: closed doors are opened first, and exits with a movement command send that instead |
 | `map record` | Like follow, but unknown rooms are created and linked as you move |
@@ -23,6 +23,28 @@ Room capture accepts a title on its own line or immediately after a prompt.
 It recognizes prompt boundaries directly, so a missing or delayed prompt event
 does not leave the previous room's capture open. Repeated prompt fragments do
 not capture the same room twice.
+
+## Room changes for other packages
+
+Subscribe to the shared event without loading the mapper entry point:
+
+```ts
+import { roomChanged } from "smudgy:events/kapusniak/arctic-mapper";
+roomChanged.on(({ mapped, areaId, roomNumber, title }) => { /* new room */ });
+```
+
+`roomChanged` reports likely physical movement. It combines completed room
+observations with captured directions/following and compares normalized titles
+and descriptions. Repeated `look`, changing contents/doors, failed moves,
+known self-loops, and map/editor refreshes do not count. The first observation
+establishes a baseline, unless it already follows a directional move.
+
+`mapped` is true when the destination resolves on the loaded map; otherwise
+`areaId` and `roomNumber` are null. Darkness and blindness both produce
+`It is pitch black.`: a move followed by that response still counts, with
+`title: null` and a mapped destination only if its exit can be resolved.
+Detection also works with `map off`, reporting destinations as unresolved.
+Without movement evidence, identical-looking unmapped rooms cannot be distinguished.
 
 ## Map & Notes panes
 
@@ -129,7 +151,9 @@ map rooms                        List rooms in the selected area
 map move <direction>             Move the selection along an existing exit
 map path <from> <to>             Path between two rooms (tags: <number> or <area>#<number>)
 map push <direction>             Shift the selected room and everything connected, one step
-map reflow                       Thoroughly search and reflow the current area
+map reflow                       Polish the current area's layout (see Polishing a map)
+map stop                         Stop a running reflow, keeping the best layout found
+map routes [all]                 Route the current area's links (see Routing links)
 map z [auto|levels|projected]    Show or change the live U/D creation preference
 map refresh                      Re-look and re-capture the current room
 map debug [on|off]               Toggle diagnostic logging of capture/tracking decisions
@@ -163,10 +187,7 @@ much as seventeen. Only a worse score triggers the standard integral-grid
 layout pass. The proposed room and its links are included in that comparison;
 the room is created once, after choosing a placement. A planned adjustment is
 applied only when it improves on the simple placement. Across places, existing
-rooms stay fixed even with automatic adjustment enabled. `map reflow`
-adds the bounded thorough tournament: it compares the selected room, an
-unanchored result, rooms around remaining directional violations, and other
-structural anchors before applying one winning patch. The snapshot exists
+rooms stay fixed even with automatic adjustment enabled. The snapshot exists
 only for that operation; ordinary movement does not maintain or recompute a
 shadow map.
 
@@ -180,6 +201,65 @@ identity, door name/state/opening command, movement command, hidden flag, weight
 and connection. This applies both to newly recorded rooms and existing rooms
 found along another route, including the return exit. Existing parallel links
 are retained; multiple eligible unlinked exits require a choice in the map editor.
+
+## Polishing a map
+
+`map reflow` searches for a better layout of the whole current area and puts
+each better layout on the map as soon as it finds one, so the map improves while
+you play. It moves the rooms of the place the current room belongs to (Map,
+Private or a Secret); rooms in other places stay where they are.
+
+```
+Polishing Solace: 94 rooms, 202 exits, now 10/0/0 (4 on the wrong level) (wrong exits/blocked routes/crossings). Type "map stop" to stop.
+Solace 0:10 | constraint search | best 2/0/2 (2 on the wrong level) from 10/0/0 (4 on the wrong level) | 14 layouts, 52310 checks | 2 on the map
+Polished Solace in 0:39: 10/0/0 (4 on the wrong level) -> 2/0/2 (2 on the wrong level).
+```
+
+Each layout is scored by three counts: exits that point the wrong way, routes
+that rooms block, and crossing connections. Two searches run side by side: a
+deep search for the layout with the fewest of these, and an anchored reflow,
+which rearranges the map as it is around a series of anchor rooms, starting
+with the current room. The map takes the better layout of the two. Every ten
+seconds a line gives the time so far, what the search is doing, the best layout
+found against the map as it was, the work behind it, and how many better layouts
+are already on the map. The searches have no time limit. Their work limits
+shrink as maps grow, so a map gets the same search on any computer.
+
+`map stop` stops the search; the map keeps the best layout already on it. A map
+that changes while it is being polished, such as by recording a room in it, also
+keeps what is on it, and the polish stops. One map is polished at a time. Rooms
+flagged `LAYOUT_LOCKED` (`map room flag set LAYOUT_LOCKED`) stay where they are.
+While the search moves rooms, a route drawn in the map editor is drawn straight
+whenever one of its rooms is on another level. When the search ends, the map's
+links are routed as `map routes` routes them, and every link at a room the
+reflow moved is routed afresh: a route drawn by hand and its ports too, since
+they were drawn for where the rooms were. A link at a locked room keeps what it
+has.
+
+## Routing links
+
+Some exits cannot all point the way they lead. When two exits of one room lead
+to the same room, at most one of them can, and no layout fixes that.
+`map routes` draws each link that leaves a wall facing away from the room it
+joins, runs across a room, or crosses another link along a route instead: out
+of its own wall, around the rooms in its way, and into the other room's wall,
+with rounded corners. A link that no longer needs its route is drawn straight
+again. It routes the links between rooms of the place the current room belongs
+to.
+
+```
+Routes in Kagonesti Hinterlands: 18 links routed.
+```
+
+Routes keep to lanes of their own. Where routes run side by side or meet the
+same wall, they are spaced apart, and their ends move along the wall to match.
+Where a stretch has more routes than room for them, those routes are drawn at
+double width, each in a color of its own, chosen the way the map editor colors
+Secrets. A link with a color or width of its own keeps it.
+
+Links between `up` and `down` exits are always drawn straight. Links at a room
+flagged `LAYOUT_LOCKED` stay as they are drawn. Routes drawn by hand in the map
+editor stay as they are too; `map routes all` routes them.
 
 ## Speedwalks
 

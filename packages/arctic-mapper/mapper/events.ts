@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import type { RoomChangedEvent } from "./room-change.ts";
 
 export interface RoomEvent {
     title: string;
@@ -13,6 +14,7 @@ export interface RoomEvent {
 
 export const mapEvent = new EventEmitter<{
     room: [RoomEvent],
+    roomChanged: [RoomChangedEvent],
     visionFailed: [],
     moveFailed: [],
 }>();
