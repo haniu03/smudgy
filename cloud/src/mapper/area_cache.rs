@@ -63,6 +63,15 @@ pub struct AreaMeta {
     pub sources: Arc<[crate::SourceBundle]>,
 }
 
+/// Where a label is drawn ([`AreaCache::label_place`]): its top-left corner
+/// in map coordinates, and its level.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LabelPlace {
+    pub x: f32,
+    pub y: f32,
+    pub level: i32,
+}
+
 /// Content owned by one source, with independently addressed room anchors.
 /// `content` preserves real room addresses; attachments borrow readable anchor
 /// geometry without joining the source's owned room list. `area` is the legacy
@@ -1435,6 +1444,57 @@ impl AreaCache {
                         .map(|label| (Some(layer), label))
                 })
             })
+    }
+
+    /// The room at `address` on this map: one of the map's own rooms, or
+    /// one a readable source owns.
+    #[must_use]
+    pub fn map_room_at(&self, address: RoomAddress) -> Option<&Arc<RoomCache>> {
+        if address.source.is_map() {
+            self.get_room(&address.number)
+        } else {
+            self.document_layer(address.source)?
+                .own_room(address.number)
+        }
+    }
+
+    /// Where `label`, of this map or one of its sources, is drawn. A free
+    /// label is where it says; an attached one follows its room, and is not
+    /// drawn while this map holds no such room.
+    #[must_use]
+    pub fn label_place(&self, label: &Label) -> Option<LabelPlace> {
+        let Some(address) = label.room() else {
+            return Some(LabelPlace {
+                x: label.x,
+                y: label.y,
+                level: label.level,
+            });
+        };
+        let room = self.map_room_at(address)?;
+        Some(LabelPlace {
+            x: room.get_x() + label.x,
+            y: room.get_y() + label.y,
+            level: room.get_level(),
+        })
+    }
+
+    /// The labels of this map and of its sources attached to the room at
+    /// `address`, with the layer holding each (`None` for the map's own).
+    pub fn labels_on(
+        &self,
+        address: RoomAddress,
+    ) -> impl Iterator<Item = (Option<&SourceLayer>, &Label)> {
+        self.labels
+            .iter()
+            .map(|label| (None, label))
+            .chain(self.layers.iter().flat_map(|layer| {
+                layer
+                    .content
+                    .get_labels()
+                    .iter()
+                    .map(move |label| (Some(layer), label))
+            }))
+            .filter(move |(_, label)| label.room() == Some(address))
     }
 
     /// [`Self::find_label`] for shapes.

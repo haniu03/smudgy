@@ -574,6 +574,8 @@ pub(super) fn drawings_by_source(
         restores.push(AreaMutation::CreateLabel {
             body: LabelArgs {
                 id: Some(label_id),
+                room_number: label.room_number,
+                room_source: label.room_source,
                 level: label.level,
                 x: label.x,
                 y: label.y,

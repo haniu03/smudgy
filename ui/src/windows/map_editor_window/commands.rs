@@ -1168,13 +1168,17 @@ async fn acknowledgement(mapper: Mapper, command: CommandId, awaiting: Awaiting)
 // Builders read the *current* cache snapshot to capture inverse state, so
 // they must run before the command is applied.
 
-/// Moves every selected entity by a map-space offset.
+/// Moves every selected entity by a map-space offset. A label in `attach`
+/// attaches to its room, or is freed with `None`, where it lands; any other
+/// keeps its room, and one attached to a room the selection moves follows
+/// it with no write of its own.
 #[must_use]
 pub fn move_selection(
     atlas: &Arc<AtlasCache>,
     area_id: AreaId,
     selection: &Selection,
     offset: Vector,
+    attach: &[(LabelId, Option<RoomAddress>)],
 ) -> Option<Command> {
     let area = atlas.get_area(&area_id)?;
 
@@ -1210,27 +1214,38 @@ pub fn move_selection(
         undo.push(Mutation::UpsertRooms(area_id, room_undo));
     }
 
+    let attach: HashMap<LabelId, Option<RoomAddress>> = attach.iter().copied().collect();
     for label_id in selection.labels() {
         let Some((_, label)) = area.find_label(&label_id) else {
             continue;
         };
-        redo.push(Mutation::UpdateLabel {
-            area_id,
-            id: IdRef::Known(label_id),
-            updates: LabelUpdates {
+        let updates = match attach.get(&label_id) {
+            Some(target) => landed_label(&area, label, offset, *target),
+            None if label
+                .room()
+                .is_some_and(|room| selection.contains(EntityId::from(room))) =>
+            {
+                None
+            }
+            None => Some(LabelUpdates {
                 x: Some(label.x + offset.x),
                 y: Some(label.y + offset.y),
                 ..Default::default()
-            },
+            }),
+        };
+        let Some(updates) = updates else {
+            continue;
+        };
+        let attaching = updates.room_number.is_some();
+        redo.push(Mutation::UpdateLabel {
+            area_id,
+            id: IdRef::Known(label_id),
+            updates,
         });
         undo.push(Mutation::UpdateLabel {
             area_id,
             id: IdRef::Known(label_id),
-            updates: LabelUpdates {
-                x: Some(label.x),
-                y: Some(label.y),
-                ..Default::default()
-            },
+            updates: label_as_it_was(label, attaching),
         });
     }
 
@@ -1267,6 +1282,87 @@ pub fn move_selection(
     } else {
         Some(Command::new(redo, undo))
     }
+}
+
+/// The update that lands `label`, moved by `offset` from where it is
+/// drawn, attached to `target` (or free with `None`): its offset from the
+/// room, or its map position, and the level it is then drawn on. `None`
+/// when the label or the room isn't on the map.
+fn landed_label(
+    area: &smudgy_cloud::mapper::area_cache::AreaCache,
+    label: &smudgy_cloud::Label,
+    offset: Vector,
+    target: Option<RoomAddress>,
+) -> Option<LabelUpdates> {
+    let place = area.label_place(label)?;
+    let (x, y) = (place.x + offset.x, place.y + offset.y);
+    let updates = match target {
+        Some(address) => {
+            let room = area.map_room_at(address)?;
+            LabelUpdates {
+                x: Some(x - room.get_x()),
+                y: Some(y - room.get_y()),
+                level: Some(room.get_level()),
+                ..Default::default()
+            }
+        }
+        None => LabelUpdates {
+            x: Some(x),
+            y: Some(y),
+            level: Some(place.level),
+            ..Default::default()
+        },
+    };
+    Some(if label.room() == target {
+        updates
+    } else {
+        updates.with_room(target)
+    })
+}
+
+/// The update putting back `label`'s position, level and, when `room`, the
+/// room it is attached to (or its being free).
+fn label_as_it_was(label: &smudgy_cloud::Label, room: bool) -> LabelUpdates {
+    let updates = LabelUpdates {
+        x: Some(label.x),
+        y: Some(label.y),
+        level: Some(label.level),
+        ..Default::default()
+    };
+    if room {
+        updates.with_room(label.room())
+    } else {
+        updates
+    }
+}
+
+/// Attaches the label to `room`, or frees it with `None`, where it is
+/// drawn; one undo step. `None` when nothing would change.
+#[must_use]
+pub fn attach_label(
+    atlas: &Arc<AtlasCache>,
+    area_id: AreaId,
+    label_id: LabelId,
+    room: Option<RoomAddress>,
+) -> Option<Command> {
+    let area = atlas.get_area(&area_id)?;
+    let (_, label) = area.find_label(&label_id)?;
+    if label.room() == room {
+        return None;
+    }
+    let updates = landed_label(&area, label, Vector::new(0.0, 0.0), room)?;
+    Some(Command::new(
+        vec![Mutation::UpdateLabel {
+            area_id,
+            id: IdRef::Known(label_id),
+            updates,
+        }],
+        vec![Mutation::UpdateLabel {
+            area_id,
+            id: IdRef::Known(label_id),
+            updates: label_as_it_was(label, true),
+        }],
+    ))
 }
 
 /// One place's part of a delete, with qualified room addresses.
@@ -1587,6 +1683,8 @@ pub fn delete_selection(
         }
     }
 
+    // Drawings come back after every room, which an attached label needs.
+    let mut drawing_undo = Vec::new();
     let mut seeds = Vec::new();
     let mut next_slot: SlotId = 0;
     for label_id in selection.labels() {
@@ -1601,11 +1699,13 @@ pub fn delete_selection(
             area_id,
             id: IdRef::Slot(slot),
         });
-        undo.push(Mutation::CreateLabel {
+        drawing_undo.push(Mutation::CreateLabel {
             area_id,
             args: LabelArgs {
                 // Recreation mints a fresh identity at apply time.
                 id: None,
+                room_number: label.room_number,
+                room_source: label.room_source,
                 level: label.level,
                 x: label.x,
                 y: label.y,
@@ -1637,7 +1737,7 @@ pub fn delete_selection(
             area_id,
             id: IdRef::Slot(slot),
         });
-        undo.push(Mutation::CreateShape {
+        drawing_undo.push(Mutation::CreateShape {
             area_id,
             args: ShapeArgs {
                 // Recreation mints a fresh identity at apply time.
@@ -1663,6 +1763,33 @@ pub fn delete_selection(
         return None;
     }
     undo.extend(source_undo);
+    undo.extend(drawing_undo);
+    // The server frees the labels attached to a deleted room; undo
+    // attaches them to it again.
+    let deleted: HashSet<RoomAddress> = map_rooms
+        .iter()
+        .map(|number| RoomAddress::map(*number))
+        .chain(
+            selection
+                .source_rooms()
+                .map(|(source, number)| RoomAddress::new(source, number)),
+        )
+        .collect();
+    for (layer, label) in deleted.iter().flat_map(|room| area.labels_on(*room)) {
+        if selection.contains(EntityId::Label(label.id))
+            || !super::secrets::can_write(
+                &area,
+                smudgy_cloud::mapper::area_cache::SourceLayer::source_of(layer),
+            )
+        {
+            continue;
+        }
+        undo.push(Mutation::UpdateLabel {
+            area_id,
+            id: IdRef::Known(label.id),
+            updates: label_as_it_was(label, true),
+        });
+    }
 
     let mut command = Command::new(redo, undo);
     for (slot, id) in seeds {
@@ -2618,20 +2745,43 @@ pub fn shift_selection_level(
         let Some((_, label)) = area.find_label(&label_id) else {
             continue;
         };
-        redo.push(Mutation::UpdateLabel {
-            area_id,
-            id: IdRef::Known(label_id),
-            updates: LabelUpdates {
+        // An attached label moves level with its room; moved alone, it
+        // leaves the room, free where it is drawn.
+        let updates = match label.room() {
+            Some(room) if selection.contains(EntityId::from(room)) => continue,
+            Some(_) => {
+                let Some(place) = area.label_place(label) else {
+                    continue;
+                };
+                LabelUpdates {
+                    x: Some(place.x),
+                    y: Some(place.y),
+                    level: Some(place.level + delta),
+                    ..Default::default()
+                }
+                .with_room(None)
+            }
+            None => LabelUpdates {
                 level: Some(label.level + delta),
                 ..Default::default()
             },
+        };
+        let freeing = updates.room_number.is_some();
+        redo.push(Mutation::UpdateLabel {
+            area_id,
+            id: IdRef::Known(label_id),
+            updates,
         });
         undo.push(Mutation::UpdateLabel {
             area_id,
             id: IdRef::Known(label_id),
-            updates: LabelUpdates {
-                level: Some(label.level),
-                ..Default::default()
+            updates: if freeing {
+                label_as_it_was(label, true)
+            } else {
+                LabelUpdates {
+                    level: Some(label.level),
+                    ..Default::default()
+                }
             },
         });
     }
@@ -2760,14 +2910,13 @@ pub fn delete_area_property(
     ))
 }
 
-/// Creates a label covering a map-space rect on the given level, with
-/// legible defaults for inspector refinement.
+/// Creates a label from `args` (see [`new_label_args`]).
 #[must_use]
-pub fn create_label(area_id: AreaId, rect: iced::Rectangle, level: i32) -> Command {
+pub fn create_label(area_id: AreaId, args: LabelArgs) -> Command {
     Command::new(
         vec![Mutation::CreateLabel {
             area_id,
-            args: new_label_args(rect, level),
+            args,
             slot: 0,
         }],
         vec![Mutation::DeleteLabel {
@@ -2777,13 +2926,28 @@ pub fn create_label(area_id: AreaId, rect: iced::Rectangle, level: i32) -> Comma
     )
 }
 
-/// A new label's fields: a placeholder text covering `rect` on `level`.
+/// A new label's fields: a placeholder text covering the map-space `rect`
+/// on `level`, with legible defaults for inspector refinement. Attached to
+/// `room`, it keeps its offset from the room's center and the room's level.
 #[must_use]
-pub fn new_label_args(rect: iced::Rectangle, level: i32) -> LabelArgs {
+pub fn new_label_args(
+    rect: iced::Rectangle,
+    level: i32,
+    room: Option<(RoomAddress, &smudgy_cloud::mapper::room_cache::RoomCache)>,
+) -> LabelArgs {
+    let (x, y, level) = room.map_or((rect.x, rect.y, level), |(_, room)| {
+        (
+            rect.x - room.get_x(),
+            rect.y - room.get_y(),
+            room.get_level(),
+        )
+    });
     LabelArgs {
+        room_number: room.map(|(address, _)| address.number),
+        room_source: room.and_then(|(address, _)| address.wire_source()),
         level,
-        x: rect.x,
-        y: rect.y,
+        x,
+        y,
         width: rect.width,
         height: rect.height,
         text: crate::i18n::t!("inspector-label"),
@@ -2841,13 +3005,20 @@ pub fn resize_entity(
     match entity {
         EntityId::Label(label_id) => {
             let (_, label) = area.find_label(&label_id)?;
+            // An attached label's corner is its offset from its room.
+            let (x, y) = label
+                .room()
+                .and_then(|room| area.map_room_at(room))
+                .map_or((rect.x, rect.y), |room| {
+                    (rect.x - room.get_x(), rect.y - room.get_y())
+                });
             Some(Command::new(
                 vec![Mutation::UpdateLabel {
                     area_id,
                     id: IdRef::Known(label_id),
                     updates: LabelUpdates {
-                        x: Some(rect.x),
-                        y: Some(rect.y),
+                        x: Some(x),
+                        y: Some(y),
                         width: Some(rect.width),
                         height: Some(rect.height),
                         ..Default::default()
@@ -3235,15 +3406,26 @@ pub(super) fn snapshot_document(
         }
     }
 
+    // A label attached to a copied room stays attached to it; any other is
+    // copied where it is drawn.
     let labels = selection
         .labels()
         .filter_map(|label_id| area.get_label(&label_id))
-        .map(|label| LabelArgs {
+        .filter_map(|label| Some((label, area.label_place(label)?)))
+        .map(|(label, place)| {
+            let room = label.room_number.filter(|number| {
+                allow_rooms && label.room_source.is_none() && selected_rooms.contains(number)
+            });
+            (label, place, room)
+        })
+        .map(|(label, place, room)| LabelArgs {
             // Clipboard entries carry no identity; each paste mints its own.
             id: None,
-            level: label.level,
-            x: label.x,
-            y: label.y,
+            room_number: room,
+            room_source: None,
+            level: place.level,
+            x: if room.is_some() { label.x } else { place.x },
+            y: if room.is_some() { label.y } else { place.y },
             width: label.width,
             height: label.height,
             horizontal_alignment: label.horizontal_alignment.clone(),
@@ -3824,13 +4006,27 @@ pub fn paste_into_source(
     );
     for label in &clipboard.labels {
         let id = LabelId(Uuid::new_v4());
+        // A label attached to a pasted room keeps its offset from it.
+        let room = label
+            .room_number
+            .and_then(|number| mapping.get(&number).copied());
         compound.push(AreaMutation::CreateLabel {
-            body: LabelArgs {
-                id: Some(id),
-                level: if same_area { level } else { label.level },
-                x: label.x + offset.x,
-                y: label.y + offset.y,
-                ..label.clone()
+            body: match room {
+                Some(number) => LabelArgs {
+                    id: Some(id),
+                    room_number: Some(number),
+                    room_source,
+                    ..label.clone()
+                },
+                None => LabelArgs {
+                    id: Some(id),
+                    room_number: None,
+                    room_source: None,
+                    level: if same_area { level } else { label.level },
+                    x: label.x + offset.x,
+                    y: label.y + offset.y,
+                    ..label.clone()
+                },
             },
         });
         undo.push(AreaMutation::DeleteLabel { label_id: id });
@@ -3892,6 +4088,8 @@ pub fn edit_label_field(
     let (_, label) = area.find_label(&label_id)?;
 
     let prior = LabelUpdates {
+        room_number: None,
+        room_source: None,
         level: updates.level.map(|_| label.level),
         x: updates.x.map(|_| label.x),
         y: updates.y.map(|_| label.y),
@@ -4217,6 +4415,7 @@ mod tests {
             area_id,
             &selection,
             Vector::new(2.0, -1.0),
+            &[],
         )
         .expect("command");
         let _ = stack.push_and_apply(&mapper, command);
@@ -4243,15 +4442,15 @@ mod tests {
         let selection = select_rooms(&[1]);
 
         let atlas = mapper.get_current_atlas();
-        let command =
-            move_selection(&atlas, area_id, &selection, Vector::new(1.0, 0.0)).expect("command");
+        let command = move_selection(&atlas, area_id, &selection, Vector::new(1.0, 0.0), &[])
+            .expect("command");
         let _ = stack.push_and_apply(&mapper, command);
         let _ = stack.undo(&mapper);
         assert!(stack.can_redo());
 
         let atlas = mapper.get_current_atlas();
-        let command =
-            move_selection(&atlas, area_id, &selection, Vector::new(0.0, 1.0)).expect("command");
+        let command = move_selection(&atlas, area_id, &selection, Vector::new(0.0, 1.0), &[])
+            .expect("command");
         let _ = stack.push_and_apply(&mapper, command);
         assert!(!stack.can_redo());
     }
@@ -4866,13 +5065,16 @@ mod tests {
         // mock (like the deployed server) turns absent backgrounds white.
         let command = create_label(
             area_id,
-            iced::Rectangle {
-                x: 0.0,
-                y: 0.0,
-                width: 4.0,
-                height: 1.0,
-            },
-            0,
+            new_label_args(
+                iced::Rectangle {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 4.0,
+                    height: 1.0,
+                },
+                0,
+                None,
+            ),
         );
         let Mutation::CreateLabel { args, .. } = command.redo[0].clone() else {
             panic!("expected a label create");
@@ -5496,5 +5698,247 @@ mod tests {
             &command.undo[..],
             [Mutation::AreaBatch { operations, .. }] if operations.len() == 1
         ));
+    }
+
+    /// A label of `area_id` at the map position `(x, y)`, attached to
+    /// `room` when there is one.
+    async fn label_at(
+        mapper: &Mapper,
+        area_id: AreaId,
+        (x, y): (f32, f32),
+        room: Option<RoomAddress>,
+    ) -> LabelId {
+        let atlas = mapper.get_current_atlas();
+        let area = atlas.get_area(&area_id).expect("area");
+        let anchor =
+            room.map(|address| (address, area.map_room_at(address).expect("room").as_ref()));
+        let args = new_label_args(
+            iced::Rectangle {
+                x,
+                y,
+                width: 2.0,
+                height: 1.0,
+            },
+            0,
+            anchor,
+        );
+        mapper.create_label(area_id, args).await.expect("label")
+    }
+
+    /// The label's room, where it is drawn and on which level.
+    fn placed_label(
+        mapper: &Mapper,
+        area_id: AreaId,
+        id: LabelId,
+    ) -> (Option<RoomAddress>, f32, f32, i32) {
+        let atlas = mapper.get_current_atlas();
+        let area = atlas.get_area(&area_id).expect("area");
+        let (_, label) = area.find_label(&id).expect("label");
+        let place = area.label_place(label).expect("placed");
+        (label.room(), place.x, place.y, place.level)
+    }
+
+    fn label_offset(mapper: &Mapper, area_id: AreaId, id: LabelId) -> (f32, f32) {
+        let atlas = mapper.get_current_atlas();
+        let area = atlas.get_area(&area_id).expect("area");
+        let (_, label) = area.find_label(&id).expect("label");
+        (label.x, label.y)
+    }
+
+    fn select_label(id: LabelId) -> Selection {
+        std::iter::once(EntityId::Label(id)).collect()
+    }
+
+    #[tokio::test]
+    async fn a_dropped_label_attaches_to_its_room_and_undo_frees_it() {
+        let mapper = test_mapper();
+        let area_id = area_with_rooms(&mapper, &[(1, 4.0, 2.0)]).await;
+        let label = label_at(&mapper, area_id, (1.0, 1.0), None).await;
+        let room = RoomAddress::map(RoomNumber(1));
+        let mut stack = CommandStack::default();
+
+        let command = move_selection(
+            &mapper.get_current_atlas(),
+            area_id,
+            &select_label(label),
+            Vector::new(3.0, 0.0),
+            &[(label, Some(room))],
+        )
+        .expect("command");
+        let _ = stack.push_and_apply(&mapper, command);
+        assert_eq!(
+            placed_label(&mapper, area_id, label),
+            (Some(room), 4.0, 1.0, 0)
+        );
+        assert_eq!(label_offset(&mapper, area_id, label), (0.0, -1.0));
+
+        let _ = stack.undo(&mapper);
+        assert_eq!(placed_label(&mapper, area_id, label), (None, 1.0, 1.0, 0));
+    }
+
+    #[tokio::test]
+    async fn rooms_carry_their_labels_without_writing_them() {
+        let mapper = test_mapper();
+        let area_id = area_with_rooms(&mapper, &[(1, 0.0, 0.0)]).await;
+        let room = RoomAddress::map(RoomNumber(1));
+        let label = label_at(&mapper, area_id, (0.5, -1.0), Some(room)).await;
+
+        let command = move_selection(
+            &mapper.get_current_atlas(),
+            area_id,
+            &select_rooms(&[1]),
+            Vector::new(2.0, 1.0),
+            &[],
+        )
+        .expect("command");
+        assert!(
+            command
+                .redo_mutations()
+                .iter()
+                .all(|mutation| !matches!(mutation, Mutation::UpdateLabel { .. })),
+            "the label follows its room with no write of its own"
+        );
+        let mut stack = CommandStack::default();
+        let _ = stack.push_and_apply(&mapper, command);
+        assert_eq!(
+            placed_label(&mapper, area_id, label),
+            (Some(room), 2.5, 0.0, 0)
+        );
+
+        // Moved with its room, a selected label keeps its offset too.
+        let selection: Selection = [EntityId::Room(RoomNumber(1)), EntityId::Label(label)]
+            .into_iter()
+            .collect();
+        let command = move_selection(
+            &mapper.get_current_atlas(),
+            area_id,
+            &selection,
+            Vector::new(-2.0, -1.0),
+            &[],
+        )
+        .expect("command");
+        let _ = stack.push_and_apply(&mapper, command);
+        assert_eq!(label_offset(&mapper, area_id, label), (0.5, -1.0));
+        assert_eq!(
+            placed_label(&mapper, area_id, label),
+            (Some(room), 0.5, -1.0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_label_dropped_free_leaves_its_room() {
+        let mapper = test_mapper();
+        let area_id = area_with_rooms(&mapper, &[(1, 4.0, 2.0)]).await;
+        let room = RoomAddress::map(RoomNumber(1));
+        let label = label_at(&mapper, area_id, (4.5, 1.0), Some(room)).await;
+        let mut stack = CommandStack::default();
+
+        let command = move_selection(
+            &mapper.get_current_atlas(),
+            area_id,
+            &select_label(label),
+            Vector::new(1.0, 1.0),
+            &[(label, None)],
+        )
+        .expect("command");
+        let _ = stack.push_and_apply(&mapper, command);
+        assert_eq!(placed_label(&mapper, area_id, label), (None, 5.5, 2.0, 0));
+
+        let _ = stack.undo(&mapper);
+        assert_eq!(
+            placed_label(&mapper, area_id, label),
+            (Some(room), 4.5, 1.0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_room_frees_its_labels_and_undo_attaches_them_again() {
+        let mapper = test_mapper();
+        let area_id = area_with_rooms(&mapper, &[(1, 4.0, 2.0), (2, 0.0, 0.0)]).await;
+        let room = RoomAddress::map(RoomNumber(1));
+        let label = label_at(&mapper, area_id, (4.5, 1.0), Some(room)).await;
+        let mut stack = CommandStack::default();
+
+        let command = delete_selection(&mapper.get_current_atlas(), area_id, &select_rooms(&[1]))
+            .expect("command");
+        let _ = stack.push_and_apply(&mapper, command);
+        assert_eq!(placed_label(&mapper, area_id, label), (None, 4.5, 1.0, 0));
+
+        let _ = stack.undo(&mapper);
+        assert_eq!(
+            placed_label(&mapper, area_id, label),
+            (Some(room), 4.5, 1.0, 0)
+        );
+        assert_eq!(label_offset(&mapper, area_id, label), (0.5, -1.0));
+    }
+
+    #[tokio::test]
+    async fn attaching_and_detaching_keep_the_label_where_it_is_drawn() {
+        let mapper = test_mapper();
+        let area_id = area_with_rooms(&mapper, &[(1, 4.0, 2.0)]).await;
+        let room = RoomAddress::map(RoomNumber(1));
+        let label = label_at(&mapper, area_id, (6.0, 2.0), None).await;
+        let mut stack = CommandStack::default();
+
+        assert!(
+            attach_label(&mapper.get_current_atlas(), area_id, label, None).is_none(),
+            "a free label has nothing to detach"
+        );
+        let command =
+            attach_label(&mapper.get_current_atlas(), area_id, label, Some(room)).expect("command");
+        let _ = stack.push_and_apply(&mapper, command);
+        assert_eq!(
+            placed_label(&mapper, area_id, label),
+            (Some(room), 6.0, 2.0, 0)
+        );
+        assert_eq!(label_offset(&mapper, area_id, label), (2.0, 0.0));
+
+        let command =
+            attach_label(&mapper.get_current_atlas(), area_id, label, None).expect("command");
+        let _ = stack.push_and_apply(&mapper, command);
+        assert_eq!(placed_label(&mapper, area_id, label), (None, 6.0, 2.0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_label_shifted_level_without_its_room_leaves_it() {
+        let mapper = test_mapper();
+        let area_id = area_with_rooms(&mapper, &[(1, 4.0, 2.0)]).await;
+        let room = RoomAddress::map(RoomNumber(1));
+        let label = label_at(&mapper, area_id, (4.5, 1.0), Some(room)).await;
+        let mut stack = CommandStack::default();
+
+        let with_room: Selection = [EntityId::Room(RoomNumber(1)), EntityId::Label(label)]
+            .into_iter()
+            .collect();
+        let command = shift_selection_level(&mapper.get_current_atlas(), area_id, &with_room, 1)
+            .expect("command");
+        assert!(
+            command
+                .redo_mutations()
+                .iter()
+                .all(|mutation| !matches!(mutation, Mutation::UpdateLabel { .. })),
+            "a label goes up with its room"
+        );
+        let _ = stack.push_and_apply(&mapper, command);
+        assert_eq!(
+            placed_label(&mapper, area_id, label),
+            (Some(room), 4.5, 1.0, 1)
+        );
+
+        let command = shift_selection_level(
+            &mapper.get_current_atlas(),
+            area_id,
+            &select_label(label),
+            1,
+        )
+        .expect("command");
+        let _ = stack.push_and_apply(&mapper, command);
+        assert_eq!(placed_label(&mapper, area_id, label), (None, 4.5, 1.0, 2));
+
+        let _ = stack.undo(&mapper);
+        assert_eq!(
+            placed_label(&mapper, area_id, label),
+            (Some(room), 4.5, 1.0, 1)
+        );
     }
 }

@@ -329,7 +329,7 @@ pub fn bundle(
     let mut out = json!({"source":own_wire,"rev":super::reviewed_moves::rev(area,source),"actions":actions,
         "properties":props.iter().map(|(n,p)| json!({"name":n,"value":p.value})).collect::<Vec<_>>(),
         "rooms":own_rooms,"room_data":data,"connections":connections,
-        "labels":labels.iter().map(super::secrets::label_json).collect::<Vec<_>>(),
+        "labels":labels.iter().filter_map(|l| super::room_labels::shown(st, viewer, area, l)).collect::<Vec<_>>(),
         "shapes":shapes.iter().map(super::secrets::shape_json).collect::<Vec<_>>()});
     if let Source::Secret(i) = source {
         let s = &area.secrets[i];

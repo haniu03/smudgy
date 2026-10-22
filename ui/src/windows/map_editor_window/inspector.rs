@@ -361,6 +361,12 @@ pub enum Message {
     LabelHorizontalAlignmentChanged(HorizontalAlignment),
     LabelVerticalAlignmentChanged(VerticalAlignment),
     LabelBoundsChanged(BoundsField, String),
+    /// Frees the selected label where it is drawn.
+    LabelDetached,
+    /// Attaches the selected label to the room nearest it.
+    LabelAttachedToNearest,
+    /// Selects a label attached to the selected room.
+    AttachedLabelSelected(LabelId),
     ShapeTypeChanged(ShapeType),
     ShapeBackgroundChanged(String),
     ShapeStrokeColorChanged(String),
@@ -400,6 +406,8 @@ struct PropertyRow {
 
 #[derive(Debug, Clone, Default)]
 struct LabelBuffers {
+    /// The room the label is attached to, and how the inspector names it.
+    attached: Option<(smudgy_cloud::RoomAddress, String)>,
     text: String,
     color: String,
     background: String,
@@ -659,7 +667,15 @@ impl State {
             }
             Some(EntityId::Label(label_id)) => {
                 if let Some((_, label)) = area.find_label(&label_id) {
+                    // An attached label shows where it is drawn; its own
+                    // x and y are its offset from its room.
+                    let (x, y) = area
+                        .label_place(label)
+                        .map_or((label.x, label.y), |place| (place.x, place.y));
                     self.label = LabelBuffers {
+                        attached: label
+                            .room()
+                            .map(|room| (room, attached_room_name(&area, room))),
                         text: label.text.clone(),
                         color: label.color.clone(),
                         background: label.background_color.clone(),
@@ -667,8 +683,8 @@ impl State {
                         font_weight: label.font_weight.to_string(),
                         horizontal_alignment: label.horizontal_alignment.clone(),
                         vertical_alignment: label.vertical_alignment.clone(),
-                        x: label.x.to_string(),
-                        y: label.y.to_string(),
+                        x: x.to_string(),
+                        y: y.to_string(),
                         width: label.width.to_string(),
                         height: label.height.to_string(),
                     };
@@ -1052,6 +1068,35 @@ impl MapEditorWindow {
             description,
         );
         self.push_command(command)
+    }
+
+    /// The center of the room the selected label is attached to, from which
+    /// its x and y are measured; the map's origin for a free label.
+    fn selected_label_origin(&self) -> (f32, f32) {
+        let atlas = self.mapper.get_current_atlas();
+        self.selected_label_id()
+            .and_then(|(area_id, label_id)| {
+                let area = atlas.get_area(&area_id)?;
+                let (_, label) = area.find_label(&label_id)?;
+                let room = area.map_room_at(label.room()?)?;
+                Some((room.get_x(), room.get_y()))
+            })
+            .unwrap_or((0.0, 0.0))
+    }
+
+    /// Attaches the selected label to `room`, or frees it with `None`.
+    fn attach_selected_label(
+        &mut self,
+        room: Option<smudgy_cloud::RoomAddress>,
+    ) -> Update<super::Message, super::Event> {
+        let Some((area_id, label_id)) = self.selected_label_id() else {
+            return Update::none();
+        };
+        let command =
+            commands::attach_label(&self.mapper.get_current_atlas(), area_id, label_id, room);
+        let update = self.push_command(command);
+        self.inspector.resync(&self.mapper, &self.editor);
+        update
     }
 
     fn commit_label_field(
@@ -2058,10 +2103,11 @@ impl MapEditorWindow {
                 }
                 match value.parse::<f32>() {
                     Ok(parsed) => {
+                        let (origin_x, origin_y) = self.selected_label_origin();
                         let mut updates = LabelUpdates::default();
                         match bounds_field {
-                            BoundsField::X => updates.x = Some(parsed),
-                            BoundsField::Y => updates.y = Some(parsed),
+                            BoundsField::X => updates.x = Some(parsed - origin_x),
+                            BoundsField::Y => updates.y = Some(parsed - origin_y),
                             BoundsField::Width => updates.width = Some(parsed.max(0.1)),
                             BoundsField::Height => updates.height = Some(parsed.max(0.1)),
                         }
@@ -2069,6 +2115,22 @@ impl MapEditorWindow {
                     }
                     Err(_) => Update::none(),
                 }
+            }
+            Message::LabelDetached => self.attach_selected_label(None),
+            Message::LabelAttachedToNearest => {
+                let room = self
+                    .selected_label_id()
+                    .and_then(|(_, label_id)| self.editor.nearest_room_for_label(label_id));
+                match room {
+                    Some(room) => self.attach_selected_label(Some(room)),
+                    None => Update::none(),
+                }
+            }
+            Message::AttachedLabelSelected(label_id) => {
+                self.editor.select(EntityId::Label(label_id));
+                self.selection_reset();
+                self.inspector.resync(&self.mapper, &self.editor);
+                Update::none()
             }
             Message::ShapeTypeChanged(shape_type) => {
                 self.inspector.shape.shape_type = shape_type.clone();
@@ -2855,9 +2917,157 @@ fn single_room_view<'a>(
     if let Some(places) = places_section(window) {
         content = content.push(places);
     }
+    if let Some(labels) = attached_labels_section(
+        window,
+        smudgy_cloud::RoomAddress::new(source.unwrap_or_default(), room_number),
+    ) {
+        content = content.push(labels);
+    }
     content = content.push(super::link_panel::room_exits(window));
 
     content
+}
+
+/// How the inspector names the room a label is attached to: its title, when
+/// it has one, with its heading ("Room #3", or a place's "Bookcase #1").
+fn attached_room_name(area: &AreaCache, room: smudgy_cloud::RoomAddress) -> String {
+    let heading = if room.source.is_map() {
+        crate::i18n::t!(
+            "inspector-room-heading",
+            "number" => room.number.to_string()
+        )
+    } else {
+        crate::i18n::t!(
+            "inspector-place-room-heading",
+            "place" => super::secrets::place_name(area, room.source),
+            "number" => room.number.to_string()
+        )
+    };
+    let title = area
+        .map_room_at(room)
+        .map(|found| found.get_title().trim().to_string())
+        .unwrap_or_default();
+    if title.is_empty() {
+        heading
+    } else {
+        crate::i18n::t!(
+            "inspector-label-attached-room",
+            "title" => title,
+            "room" => heading
+        )
+    }
+}
+
+/// The selected label's room: the one it is attached to, with Detach, or
+/// none, with Attach to nearest when a room is near enough.
+fn attached_field(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> {
+    let state = &window.inspector.label;
+    let atlas = window.mapper.get_current_atlas();
+    let area = window.editor.area_id().and_then(|id| atlas.get_area(&id));
+    let selected = match window.editor.selection().single() {
+        Some(EntityId::Label(label_id)) => Some(label_id),
+        _ => None,
+    };
+    let editable = selected
+        .zip(area.as_ref())
+        .and_then(|(label_id, area)| {
+            let (layer, _) = area.find_label(&label_id)?;
+            Some(super::secrets::can_write(
+                area,
+                smudgy_cloud::mapper::area_cache::SourceLayer::source_of(layer),
+            ))
+        })
+        .unwrap_or(false);
+    let (name, action) = match &state.attached {
+        Some((room, name)) => {
+            let color = area
+                .as_ref()
+                .and_then(|area| smudgy_map_widget::sources::source_color(area, room.source));
+            let name: ThemedElement<'_, super::Message> =
+                row![super::secrets::dot(color), text(name.clone()).size(12),]
+                    .spacing(6)
+                    .align_y(Vertical::Center)
+                    .into();
+            (
+                name,
+                button(text(crate::i18n::t!("inspector-label-detach")).size(12))
+                    .style(builtins::button::subtle)
+                    .padding([3, 8])
+                    .on_press_maybe(
+                        editable.then_some(super::Message::Inspector(Message::LabelDetached)),
+                    ),
+            )
+        }
+        None => {
+            let nearest =
+                selected.and_then(|label_id| window.editor.nearest_room_for_label(label_id));
+            (
+                text(crate::i18n::t!("inspector-label-free"))
+                    .size(12)
+                    .into(),
+                button(text(crate::i18n::t!("inspector-label-attach-nearest")).size(12))
+                    .style(builtins::button::subtle)
+                    .padding([3, 8])
+                    .on_press_maybe(
+                        (editable && nearest.is_some())
+                            .then_some(super::Message::Inspector(Message::LabelAttachedToNearest)),
+                    ),
+            )
+        }
+    };
+    column![
+        field_label(crate::i18n::t!("inspector-label-attached-to")),
+        row![container(name).width(Length::Fill), action]
+            .spacing(8)
+            .align_y(Vertical::Center),
+    ]
+    .spacing(2)
+    .into()
+}
+
+/// The labels attached to the selected room, from every source the viewer
+/// reads; a click selects one.
+fn attached_labels_section(
+    window: &MapEditorWindow,
+    room: smudgy_cloud::RoomAddress,
+) -> Option<ThemedElement<'_, super::Message>> {
+    let atlas = window.mapper.get_current_atlas();
+    let area = atlas.get_area(&window.editor.area_id()?)?;
+    let mut labels: Vec<(Option<iced::Color>, LabelId, String)> = area
+        .labels_on(room)
+        .map(|(layer, label)| {
+            let source = smudgy_cloud::mapper::area_cache::SourceLayer::source_of(layer);
+            (
+                smudgy_map_widget::sources::source_color(&area, source),
+                label.id,
+                label.text.clone(),
+            )
+        })
+        .collect();
+    if labels.is_empty() {
+        return None;
+    }
+    labels.sort_by(|a, b| a.2.cmp(&b.2).then(a.1.0.cmp(&b.1.0)));
+    let mut section = Column::new().spacing(2);
+    section = section.push(field_label(crate::i18n::t!(
+        "inspector-room-attached-labels"
+    )));
+    for (color, label_id, label_text) in labels {
+        section = section.push(
+            button(
+                row![super::secrets::dot(color), text(label_text).size(12)]
+                    .spacing(6)
+                    .align_y(Vertical::Center),
+            )
+            .width(Length::Fill)
+            .padding([4, 6])
+            .style(builtins::button::link)
+            .on_press(super::Message::Inspector(Message::AttachedLabelSelected(
+                label_id,
+            ))),
+        );
+    }
+    Some(section.into())
 }
 
 /// The selected map room's data in each Secret and Private: one group per
@@ -3531,6 +3741,7 @@ fn label_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
     if let Some(field) = super::moves::in_field(window) {
         content = content.push(field);
     }
+    content = content.push(attached_field(window));
 
     content = content.push(labeled_input(
         crate::i18n::t!("inspector-label-text"),

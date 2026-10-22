@@ -41,6 +41,7 @@ pub mod mutations;
 pub mod pending;
 pub mod projection;
 pub mod reviewed_moves;
+pub mod room_labels;
 pub mod secret_grants;
 pub mod secrets;
 pub mod shares;

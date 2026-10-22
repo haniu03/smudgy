@@ -353,9 +353,12 @@ type LabelVerticalAlign = "Top" | "Center" | "Bottom";
 /** A shape's kind. */
 type ShapeKind = "Rectangle" | "RoundedRectangle";
 
-/** A text label read back from an area (`area.labels`). */
+/** A text label read back from an area (`area.labels`). A label attached to a room follows
+ *  it: its position and level are where it is drawn now. */
 interface Label {
     readonly id: LabelId;
+    /** The number of the map room the label is attached to; absent when it is free. */
+    readonly room?: number;
     /** Map level / z-layer. */
     readonly level: number;
     readonly x: number;
@@ -376,6 +379,9 @@ interface Label {
 /** Fields accepted when creating a label (`mapper.createLabel`). Position, size, and `text` are
  *  required; any omitted field takes its default. */
 interface LabelArgs {
+    /** Attaches the label to this map room, so it moves with the room. `x` and `y` are still
+     *  where it is drawn, and it takes the room's level. */
+    room?: number;
     x: number;
     y: number;
     width: number;
@@ -399,6 +405,9 @@ interface LabelArgs {
 /** Fields accepted when updating a label (`mapper.setLabel`). Any omitted field is left
  *  unchanged. */
 interface LabelUpdates {
+    /** Attaches the label to this map room, or frees it with `null`. It stays where it is
+     *  drawn unless `x` and `y` say otherwise. */
+    room?: number | null;
     x?: number;
     y?: number;
     width?: number;

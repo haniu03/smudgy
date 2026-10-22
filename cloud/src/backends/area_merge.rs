@@ -51,9 +51,10 @@ pub struct AreaMergeSource {
     pub translate: Translate,
     /// The rooms to move, when only some should. `None` moves everything
     /// and deletes the source. `Some` moves exactly the listed rooms, with
-    /// their exits, properties and tags and the connections among them,
-    /// and keeps the source as a written document with its labels and
-    /// shapes, even when no room remains; an empty list is refused.
+    /// their exits, properties, tags and attached labels and the
+    /// connections among them, and keeps the source as a written document
+    /// with its other labels and its shapes, even when no room remains; an
+    /// empty list is refused.
     #[serde(default)]
     pub rooms: Option<Vec<RoomNumber>>,
 }
@@ -645,8 +646,13 @@ fn move_content(
             into.connections.push(connection);
         }
         for mut label in taken.labels {
-            label.x += translate.x;
-            label.y += translate.y;
+            // An attached label keeps its offset from its room, which moves.
+            if let (Some(number), None) = (label.room_number, label.room_source) {
+                label.room_number = Some(renumber(number));
+            } else {
+                label.x += translate.x;
+                label.y += translate.y;
+            }
             label.level = translated_level(label.level, translate.level)?;
             into.labels.push(label);
         }
@@ -673,9 +679,9 @@ struct Taken {
 }
 
 /// Takes what moves out of a source: everything from a whole source; from
-/// a partial one the moving rooms and the connections all of whose member
-/// exits sit on them, so a connection follows its exits, while the labels
-/// and shapes stay. After [`split_straddling_connections`] no connection
+/// a partial one the moving rooms, the labels attached to them and the
+/// connections all of whose member exits sit on them, so a connection
+/// follows its exits, while the other labels and the shapes stay. After [`split_straddling_connections`] no connection
 /// has members on both sides, so every connection has exactly one place to
 /// be.
 fn take_moving_content(
@@ -714,10 +720,19 @@ fn take_moving_content(
             .into_iter()
             .partition(|connection| matches!(sides.get(&connection.id), Some((true, false))));
     source.connections = staying_connections;
+    let (labels, staying_labels): (Vec<_>, Vec<_>) = std::mem::take(&mut source.labels)
+        .into_iter()
+        .partition(|label| {
+            label.room_source.is_none()
+                && label
+                    .room_number
+                    .is_some_and(|number| moving.contains(&number))
+        });
+    source.labels = staying_labels;
     Taken {
         rooms,
         connections,
-        labels: Vec::new(),
+        labels,
         shapes: Vec::new(),
     }
 }
@@ -1587,6 +1602,8 @@ mod tests {
             .route_points = vec![MapPoint::new(1.0, 1.0)];
         source.labels.push(Label {
             id: LabelId(Uuid::from_u128(20)),
+            room_number: None,
+            room_source: None,
             level: 1,
             x: 2.0,
             y: 3.0,
@@ -2156,6 +2173,8 @@ mod tests {
     fn sign_label(seed: u128) -> Label {
         Label {
             id: LabelId(Uuid::from_u128(seed)),
+            room_number: None,
+            room_source: None,
             level: 0,
             x: 1.0,
             y: 1.0,

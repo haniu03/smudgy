@@ -3,7 +3,7 @@
 use super::*;
 use crate::support::source_refs::{self as refs, Source};
 
-fn written(st: &MockState, ctx: &ApplyCtx) -> Source {
+pub(super) fn written(st: &MockState, ctx: &ApplyCtx) -> Source {
     let area = &st.areas[&ctx.area_id];
     ctx.secret.map_or(Source::Map, |id| {
         if let Some(index) = area.secrets.iter().position(|s| s.id == id) {

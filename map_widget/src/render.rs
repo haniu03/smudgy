@@ -18,6 +18,7 @@ use smudgy_cloud::{
     connection_geometry::{ConnectionGeometry, PathPrimitive},
     mapper::{
         AtlasCache,
+        area_cache::LabelPlace,
         room_cache::RoomCache,
         room_connection::{RoomConnection, RoomConnectionEnd},
     },
@@ -965,8 +966,22 @@ fn font_weight(weight: i32) -> iced::font::Weight {
 /// reads as that many pixels.
 const LABEL_FONT_SIZE_REFERENCE_SCALING: f32 = 40.0;
 
-/// Draws a text label: optional background fill, then text aligned within
-/// the label's bounds.
+/// `label` where it is drawn ([`AreaCache::label_place`]), its position
+/// scaled by `spacing` as room positions are, for [`draw_label`].
+///
+/// [`AreaCache::label_place`]: smudgy_cloud::mapper::area_cache::AreaCache::label_place
+#[must_use]
+pub fn placed(label: &Label, place: LabelPlace, spacing: f32) -> Label {
+    Label {
+        x: place.x * spacing,
+        y: place.y * spacing,
+        level: place.level,
+        ..label.clone()
+    }
+}
+
+/// Draws a text label at its own `x` and `y`: optional background fill,
+/// then text aligned within the label's bounds.
 pub fn draw_label(frame: &mut canvas::Frame, label: &Label, opacity: f32) {
     let top_left = Point::new(label.x, label.y);
     let size = Size::new(label.width, label.height);

@@ -310,6 +310,13 @@ impl SourceDocument {
         self.content.room_data.sort_by_key(room_data_address);
         self.content.rooms.sort_by_key(|room| room.room_number);
         let source = self.context.source;
+        let before = source_sites(details, source);
+        self.write_back(details);
+        restate_attached_labels(details, source, &before);
+    }
+
+    fn write_back(self, details: &mut AreaWithDetails) {
+        let source = self.context.source;
         if source.is_map() {
             let kept: std::collections::HashSet<_> =
                 self.content.rooms.iter().map(|r| r.room_number).collect();
@@ -344,6 +351,50 @@ impl SourceDocument {
             bundle.labels = self.content.labels;
             bundle.shapes = self.content.shapes;
             bundle.connections = self.content.connections;
+        }
+    }
+}
+
+/// Where each of `source`'s own rooms stands, by number.
+fn source_sites(details: &AreaWithDetails, source: SourceId) -> HashMap<RoomNumber, RoomSite> {
+    let rooms = if source.is_map() {
+        details.rooms.as_slice()
+    } else {
+        details
+            .sources
+            .iter()
+            .find(|bundle| bundle.source == source)
+            .map_or(&[][..], |bundle| bundle.rooms.as_slice())
+    };
+    rooms
+        .iter()
+        .map(|room| (room.room_number, site(room)))
+        .collect()
+}
+
+/// Labels anywhere on the map attached to `source`'s rooms follow them, as
+/// the server's do: onto a room's new level, or, when a room went, freed
+/// where they were drawn. `before` is where the rooms stood.
+fn restate_attached_labels(
+    details: &mut AreaWithDetails,
+    source: SourceId,
+    before: &HashMap<RoomNumber, RoomSite>,
+) {
+    let after = source_sites(details, source);
+    let lists = std::iter::once(&mut details.labels)
+        .chain(details.sources.iter_mut().map(|bundle| &mut bundle.labels));
+    for labels in lists {
+        for (number, site) in before {
+            if !after.contains_key(number) {
+                super::area_edits::free_labels_on(labels, RoomAddress::new(source, *number), *site);
+            }
+        }
+        for label in labels.iter_mut() {
+            if let Some(room) = label.room().filter(|room| room.source == source)
+                && let Some(site) = after.get(&room.number)
+            {
+                label.level = site.level;
+            }
         }
     }
 }

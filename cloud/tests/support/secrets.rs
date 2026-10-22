@@ -24,8 +24,8 @@ use uuid::Uuid;
 use super::http::{authenticate, bad_request, created, not_found, ok, parse_area_id, parse_body};
 use super::secret_grants::OWNER_ACTIONS;
 use super::state::{
-    AreaRecord, ConnectionRecord, EndpointRecord, ExitRecord, LabelRecord, MockState, RoomRecord,
-    SecretRecord, ShapeRecord, map_room_of, stand_in,
+    AreaRecord, ConnectionRecord, EndpointRecord, ExitRecord, MockState, RoomRecord, SecretRecord,
+    ShapeRecord, map_room_of, stand_in,
 };
 
 pub type Shared = Arc<Mutex<MockState>>;
@@ -339,24 +339,6 @@ pub fn forget_inbound(
     changed
 }
 
-pub(super) fn label_json(l: &LabelRecord) -> Value {
-    json!({
-        "id": l.id,
-        "level": l.level,
-        "x": l.x,
-        "y": l.y,
-        "width": l.width,
-        "height": l.height,
-        "horizontal_alignment": l.horizontal_alignment,
-        "vertical_alignment": l.vertical_alignment,
-        "text": l.text,
-        "color": l.color,
-        "background_color": l.background_color,
-        "font_size": l.font_size,
-        "font_weight": l.font_weight,
-    })
-}
-
 pub(super) fn shape_json(s: &ShapeRecord) -> Value {
     json!({
         "id": s.id,
@@ -577,11 +559,9 @@ pub async fn delete_secret(
     if let Some(refusal) = super::clan_maps::refused_while_disposing(&st, area_id) {
         return refusal;
     }
-    st.areas
-        .get_mut(&area_id)
-        .expect("just found")
-        .secrets
-        .remove(index);
+    let area = st.areas.get_mut(&area_id).expect("just found");
+    super::room_labels::release_rooms_of(area, super::source_refs::Source::Secret(index));
+    area.secrets.remove(index);
     drop_exits_into_secret(&mut st.areas, area_id, id, None);
     ok(Value::Null)
 }

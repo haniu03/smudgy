@@ -1018,19 +1018,27 @@ fn sweep_frozen(st: &mut MockState, clan: Uuid, excluded: Option<Uuid>) {
         .get(&clan)
         .map(|record| record.directory().into_iter().collect())
         .unwrap_or_default();
+    let kept = |secret: &SecretRecord| {
+        let Some(record) = &secret.clan else {
+            return true;
+        };
+        if record.clan_id != clan || !record.frozen {
+            return true;
+        }
+        record.grants.iter().any(|grant| match grant.recipient {
+            ClanRecipient::Group(_) => true,
+            ClanRecipient::User(id) => active.contains(&id) && Some(id) != excluded,
+        })
+    };
     for area in st.areas.values_mut() {
-        area.secrets.retain(|secret| {
-            let Some(record) = &secret.clan else {
-                return true;
-            };
-            if record.clan_id != clan || !record.frozen {
-                return true;
-            }
-            record.grants.iter().any(|grant| match grant.recipient {
-                ClanRecipient::Group(_) => true,
-                ClanRecipient::User(id) => active.contains(&id) && Some(id) != excluded,
-            })
-        });
+        let doomed: Vec<usize> = (0..area.secrets.len())
+            .filter(|index| !kept(&area.secrets[*index]))
+            .collect();
+        // Other sources' labels on a deleted Secret's rooms stay, freed.
+        for index in doomed.into_iter().rev() {
+            super::room_labels::release_rooms_of(area, super::source_refs::Source::Secret(index));
+            area.secrets.remove(index);
+        }
     }
 }
 

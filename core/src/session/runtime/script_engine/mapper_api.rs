@@ -37,10 +37,10 @@ use smudgy_cloud::{
     ConnectionUpdates, CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS, Door,
     DoorState, ExitArgs, ExitDirection, ExitId, ExitUpdates, HorizontalAlignment, Label, LabelArgs,
     LabelId, LabelUpdates, MapDestination, MapPoint, MapStorage, Mapper, PortMode, RelocationMode,
-    RoomNumber, RoomSide, RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId, ShapeType,
-    ShapeUpdates, Translate, Uuid, VerticalAlignment,
+    RoomAddress, RoomNumber, RoomSide, RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId,
+    ShapeType, ShapeUpdates, Translate, Uuid, VerticalAlignment,
     mapper::{
-        AreaMutationBatch, MutationSubmission, RoomKey, area_cache::AreaCache,
+        AreaMutationBatch, AtlasCache, MutationSubmission, RoomKey, area_cache::AreaCache,
         room_cache::RoomCache,
     },
     mutation::{AreaMutation, MAX_MUTATION_OPERATIONS},
@@ -3157,10 +3157,14 @@ async fn op_smudgy_mapper_delete_link(
 // already obtained through a gated entry op, so they need no separate gate.
 // ============================================================================
 
+/// A label as scripts read it: where it is drawn, and the map room it is
+/// attached to.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JSLabel {
     id: ScriptUuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    room: Option<i32>,
     level: i32,
     x: f32,
     y: f32,
@@ -3175,13 +3179,24 @@ struct JSLabel {
     font_weight: i32,
 }
 
-impl From<&Label> for JSLabel {
-    fn from(label: &Label) -> Self {
+impl JSLabel {
+    /// `label` as `map` draws it: an attached label's position and level
+    /// follow its room. `room` names only a map room.
+    fn placed(label: &Label, map: &AreaCache) -> Self {
+        let (x, y, level) = map
+            .label_place(label)
+            .map_or((label.x, label.y, label.level), |place| {
+                (place.x, place.y, place.level)
+            });
         Self {
             id: ScriptUuid(label.id.0),
-            level: label.level,
-            x: label.x,
-            y: label.y,
+            room: label
+                .room_number
+                .filter(|_| label.room_source.is_none())
+                .map(|number| number.0),
+            level,
+            x,
+            y,
             width: label.width,
             height: label.height,
             horizontal_alignment: label.horizontal_alignment.clone(),
@@ -3230,10 +3245,12 @@ impl From<&Shape> for JSShape {
 }
 
 /// `createLabel` fields: position, size, and `text` are required; the rest default host-side
-/// (mirroring `CreateRoomParams`, where only the essentials are required).
+/// (mirroring `CreateRoomParams`, where only the essentials are required). `room` attaches
+/// the label to that map room; `x` and `y` are where it is drawn either way.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JSLabelParams {
+    room: Option<i32>,
     x: f32,
     y: f32,
     width: f32,
@@ -3256,6 +3273,8 @@ impl From<JSLabelParams> for LabelArgs {
             // Script-created labels carry no pre-minted identity; the mapper
             // mints one before enqueue.
             id: None,
+            room_number: None,
+            room_source: None,
             level: params.level.unwrap_or(0),
             x: params.x,
             y: params.y,
@@ -3273,9 +3292,14 @@ impl From<JSLabelParams> for LabelArgs {
 }
 
 /// `setLabel` fields: all optional; only present fields change (mirrors `JSExitUpdateParams`).
+/// `room` attaches the label to that map room, and `null` frees it; `x` and `y` are where it
+/// is drawn.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JSLabelUpdateParams {
+    #[serde(default, deserialize_with = "present")]
+    #[allow(clippy::option_option)] // absent, null and a room are three different updates
+    room: Option<Option<i32>>,
     x: Option<f32>,
     y: Option<f32>,
     width: Option<f32>,
@@ -3293,6 +3317,8 @@ struct JSLabelUpdateParams {
 impl From<JSLabelUpdateParams> for LabelUpdates {
     fn from(params: JSLabelUpdateParams) -> Self {
         Self {
+            room_number: None,
+            room_source: None,
             level: params.level,
             x: params.x,
             y: params.y,
@@ -3307,6 +3333,80 @@ impl From<JSLabelUpdateParams> for LabelUpdates {
             font_weight: params.font_weight,
         }
     }
+}
+
+/// The map whose rooms `area_id`'s labels are attached to: the map itself,
+/// or a Secret's or Private additions' map.
+fn label_map(atlas: &AtlasCache, area_id: AreaId) -> Option<Arc<AreaCache>> {
+    let area = atlas.get_area(&area_id)?;
+    match area.map_id() {
+        Some(map) => atlas.get_area(&map),
+        None => Some(area),
+    }
+}
+
+/// The map room `number` a script attaches a label to.
+fn label_room(
+    map: &AreaCache,
+    number: i32,
+    operation: &'static str,
+) -> Result<(RoomAddress, Arc<RoomCache>), MapperError> {
+    let address = RoomAddress::map(RoomNumber(number));
+    map.map_room_at(address)
+        .map(|room| (address, room.clone()))
+        .ok_or_else(|| MapperError::OperationFailed {
+            operation,
+            message: format!("room {number} is not on the map"),
+        })
+}
+
+/// A script's label updates in the label's own terms: positions a script
+/// names are where the label is drawn, and an attached label's are its
+/// offset from its room.
+fn scripted_label_updates(
+    atlas: &AtlasCache,
+    area_id: AreaId,
+    label_id: LabelId,
+    params: JSLabelUpdateParams,
+) -> Result<LabelUpdates, MapperError> {
+    let room = params.room;
+    let mut updates = LabelUpdates::from(params);
+    let (Some(area), Some(map)) = (atlas.get_area(&area_id), label_map(atlas, area_id)) else {
+        return Ok(updates);
+    };
+    let Some(label) = area.get_label(&label_id) else {
+        return Ok(updates);
+    };
+    let place = map.label_place(label);
+    let target = match room {
+        None => label
+            .room()
+            .map(|room| (room, map.map_room_at(room).cloned())),
+        Some(None) => None,
+        Some(Some(number)) => {
+            let (address, found) = label_room(&map, number, "update label")?;
+            Some((address, Some(found)))
+        }
+    };
+    let address = target.as_ref().map(|(address, _)| *address);
+    let moves_room = room.is_some() && address != label.room();
+    if moves_room {
+        updates.x = updates.x.or(place.map(|place| place.x));
+        updates.y = updates.y.or(place.map(|place| place.y));
+    }
+    let origin = target.and_then(|(_, found)| found);
+    if let Some(origin) = &origin {
+        updates.x = updates.x.map(|x| x - origin.get_x());
+        updates.y = updates.y.map(|y| y - origin.get_y());
+    }
+    if moves_room {
+        updates.level = match &origin {
+            Some(origin) => Some(origin.get_level()),
+            None => updates.level.or(place.map(|place| place.level)),
+        };
+        updates = updates.with_room(address);
+    }
+    Ok(updates)
 }
 
 /// `createShape` fields: position and size are required; the rest default host-side.
@@ -3383,8 +3483,22 @@ impl From<JSShapeUpdateParams> for ShapeUpdates {
 /// `area.labels`: the area's text labels. Wrapper accessor on a `JSArea` handle -- not gated.
 #[op2]
 #[serde]
-fn op_smudgy_mapper_get_area_labels(#[cppgc] area_wrapper: &JSArea) -> Vec<JSLabel> {
-    area_wrapper.0.labels().iter().map(JSLabel::from).collect()
+fn op_smudgy_mapper_get_area_labels(
+    state: &OpState,
+    #[cppgc] area_wrapper: &JSArea,
+) -> Vec<JSLabel> {
+    let area = &area_wrapper.0;
+    // A Secret's labels can follow map rooms, which its map places.
+    let map = area.map_id().and_then(|map| {
+        state
+            .try_borrow::<Mapper>()
+            .and_then(|mapper| mapper.get_current_atlas().get_area(&map))
+    });
+    let map = map.as_deref().unwrap_or(area);
+    area.labels()
+        .iter()
+        .map(|label| JSLabel::placed(label, map))
+        .collect()
 }
 
 /// `area.shapes`: the area's graphical shapes. Wrapper accessor on a `JSArea` handle -- not gated.
@@ -3414,8 +3528,18 @@ async fn op_smudgy_mapper_create_label(
         reach_shared(&state, area_id)
             .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
         let id = LabelId(Uuid::new_v4());
+        let room = params.room;
         let mut body: LabelArgs = params.into();
         body.id = Some(id);
+        if let Some(number) = room {
+            let map =
+                label_map(&mapper.get_current_atlas(), area_id).ok_or(MapperError::AreaNotFound)?;
+            let (address, found) = label_room(&map, number, "create label")?;
+            body.set_room(Some(address));
+            body.x -= found.get_x();
+            body.y -= found.get_y();
+            body.level = found.get_level();
+        }
         let submission = mapper
             .mutate_area(
                 area_id,
@@ -3530,12 +3654,12 @@ async fn op_smudgy_mapper_set_label(
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         ensure_area_write(&state, AreaId(parse_id(&area_id)?))?;
         reach(&state, AreaId(parse_id(&area_id)?)).map_err(operation_failed("update label"))?;
+        let area_id = AreaId(parse_id(&area_id)?);
+        let label_id = LabelId(parse_id(&label_id)?);
+        let updates =
+            scripted_label_updates(&mapper.get_current_atlas(), area_id, label_id, params)?;
         let submission = mapper
-            .update_label(
-                AreaId(parse_id(&area_id)?),
-                LabelId(parse_id(&label_id)?),
-                params.into(),
-            )
+            .update_label(area_id, label_id, updates)
             .map_err(operation_failed("update label"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await

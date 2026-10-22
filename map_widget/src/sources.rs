@@ -142,9 +142,10 @@ pub fn ring(
 
 /// Each layer's shapes and labels on `level`, ringed, except those `skip`
 /// names (a dragged selection draws itself). Positions scale by `spacing` as
-/// the map's own do.
+/// the map's own do; `map` places labels attached to rooms.
 pub fn draw_drawings(
     frame: &mut canvas::Frame,
+    map: &AreaCache,
     layers: &[ColoredLayer<'_>],
     level: i32,
     spacing: f32,
@@ -169,10 +170,11 @@ pub fn draw_drawings(
             }
         }
         for label in layer.content().get_labels() {
-            if label.level == level && !skip(Drawing::Label(label.id)) {
-                let mut label = label.clone();
-                label.x *= spacing;
-                label.y *= spacing;
+            let Some(place) = map.label_place(label) else {
+                continue;
+            };
+            if place.level == level && !skip(Drawing::Label(label.id)) {
+                let label = render::placed(label, place, spacing);
                 render::draw_label(frame, &label, opacity);
                 ring(
                     frame,

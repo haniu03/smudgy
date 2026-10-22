@@ -797,14 +797,21 @@ impl MapView {
                 }
 
                 for label in area.get_labels() {
-                    if label.level == self.level {
-                        let mut label = label.clone();
-                        label.x *= spacing;
-                        label.y *= spacing;
-                        render::draw_label(frame, &label, opacity);
+                    if let Some(place) = area.label_place(label)
+                        && place.level == self.level
+                    {
+                        render::draw_label(frame, &render::placed(label, place, spacing), opacity);
                     }
                 }
-                sources::draw_drawings(frame, &layers, self.level, spacing, opacity, &|_| false);
+                sources::draw_drawings(
+                    frame,
+                    &area,
+                    &layers,
+                    self.level,
+                    spacing,
+                    opacity,
+                    &|_| false,
+                );
 
                 // Connections draw in spatial-query order; a style accent
                 // changes a connection's paint, not its z-order, so a

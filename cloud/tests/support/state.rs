@@ -206,9 +206,15 @@ impl ConnectionRecord {
     }
 }
 
+/// A label a source draws (format-3 §2.2): free, at map coordinates, or
+/// attached to a room ([`super::room_labels`]).
 #[derive(Debug, Clone)]
 pub struct LabelRecord {
     pub id: Uuid,
+    /// The identity of the room the label is attached to, in any source of
+    /// its map; `None` for a free label. While attached, `x` and `y` are the
+    /// offset of its top-left corner from the room's center.
+    pub room: Option<Uuid>,
     pub level: i32,
     pub x: f32,
     pub y: f32,
@@ -221,6 +227,7 @@ pub struct LabelRecord {
     pub background_color: String,
     pub font_size: i32,
     pub font_weight: i32,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]

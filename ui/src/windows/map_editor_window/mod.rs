@@ -2093,13 +2093,14 @@ impl MapEditorWindow {
         let add_to = self.add_to();
 
         match request {
-            MutationRequest::MoveSelection { offset } => {
+            MutationRequest::MoveSelection { offset, attach } => {
                 self.mark_moved_automatic_routes_stale();
                 let update = self.push_command(commands::move_selection(
                     &self.mapper.get_current_atlas(),
                     area_id,
                     self.editor.selection(),
                     offset,
+                    &attach,
                 ));
                 // Canvas-originated edits refresh the inspector's view of
                 // the moved entities.
@@ -2205,11 +2206,16 @@ impl MapEditorWindow {
                     from.source,
                 )
             }
-            MutationRequest::CreateLabel { rect } if !add_to.is_map() => {
+            MutationRequest::CreateLabel { rect, room } if !add_to.is_map() => {
+                let atlas = self.mapper.get_current_atlas();
+                let area = atlas.get_area(&area_id);
+                let room = room.and_then(|address| {
+                    Some((address, area.as_ref()?.map_room_at(address)?.as_ref()))
+                });
                 let (command, label_id) = source_rooms::create_label(
                     area_id,
                     add_to,
-                    commands::new_label_args(rect, self.editor.level()),
+                    commands::new_label_args(rect, self.editor.level(), room),
                 );
                 let update = self.push_command(Some(command));
                 self.editor.select(EntityId::Label(label_id));
@@ -2229,12 +2235,14 @@ impl MapEditorWindow {
                 self.inspector.resync(&self.mapper, &self.editor);
                 update
             }
-            MutationRequest::CreateLabel { rect } => {
-                let update = self.push_command(Some(commands::create_label(
-                    area_id,
-                    rect,
-                    self.editor.level(),
-                )));
+            MutationRequest::CreateLabel { rect, room } => {
+                let atlas = self.mapper.get_current_atlas();
+                let area = atlas.get_area(&area_id);
+                let room = room.and_then(|address| {
+                    Some((address, area.as_ref()?.map_room_at(address)?.as_ref()))
+                });
+                let args = commands::new_label_args(rect, self.editor.level(), room);
+                let update = self.push_command(Some(commands::create_label(area_id, args)));
                 self.pending_select = self.stack.last_command_id();
                 self.editor.clear_selection();
                 update
@@ -2701,7 +2709,10 @@ impl MapEditorWindow {
                 }
                 #[allow(clippy::cast_precision_loss)]
                 let offset = Vector::new(dx as f32, dy as f32);
-                self.handle_mutation_request(MutationRequest::MoveSelection { offset })
+                self.handle_mutation_request(MutationRequest::MoveSelection {
+                    offset,
+                    attach: Vec::new(),
+                })
             }
             Hotkey::Undo => {
                 // Undo replays mutations through the Mapper, so it honors

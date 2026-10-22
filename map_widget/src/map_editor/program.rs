@@ -6,6 +6,7 @@
 //! gesture lives in [`EditorProgramState`]; committed state changes are
 //! published as [`Message`]s and applied in [`MapEditor::update`].
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use iced::keyboard::{self, key::Named};
@@ -15,20 +16,25 @@ use iced::{Color, Point, Rectangle, Size, Vector, mouse};
 use iced::event::Event as IcedEvent;
 
 use smudgy_cloud::{
-    CORNER_INSET, ConnectionEndpoint, ConnectionId, ConnectionRouting, ConnectionUpdates, MapPoint,
-    PortMode, RoomAddress, RoomSide, SegmentShape,
+    CORNER_INSET, ConnectionEndpoint, ConnectionId, ConnectionRouting, ConnectionUpdates, LabelId,
+    MapPoint, PortMode, RoomAddress, RoomSide, SegmentShape, SourceId,
     connection_geometry::{
         EndpointGeometry, GeometryInput, Handle as ConnectionHandle, distance_to_segment,
         port_position, reroute_for_port_move, reroute_for_waypoint_move, resolve, stub_tip,
     },
-    mapper::{RoomKey, area_cache::SourceLayer, room_connection::RoomConnection},
+    mapper::{
+        RoomKey,
+        area_cache::{AreaCache, SourceLayer},
+        room_connection::RoomConnection,
+    },
 };
 
 use crate::{render, sources, viewport};
 
+use super::label_rooms::{self, DraggedLabel};
 use super::{
-    EntityId, ExitTarget, LinkDrop, MapEditor, Message, PlacedRoom, RectKind, Renderer,
-    SelectedConnectionHandle, Theme, Tool, direction_between,
+    EditorActivity, EntityId, ExitTarget, LinkDrop, MapEditor, Message, PlacedRoom, RectKind,
+    Renderer, SelectedConnectionHandle, Theme, Tool, direction_between,
 };
 
 /// Screen-space distance (pixels) a press must travel before it becomes a
@@ -145,10 +151,12 @@ pub enum Interaction {
         additive: bool,
     },
     /// Dragging the current selection; rendered as a preview offset until
-    /// release commits a single move mutation.
+    /// release commits a single move mutation. `labels` holds, for a drag
+    /// of labels alone, the room each one attaches to on release.
     DraggingSelection {
         start_map: Point,
         current_map: Point,
+        labels: Vec<DraggedLabel>,
     },
     RubberBand {
         start_map: Point,
@@ -662,12 +670,30 @@ impl MapEditor {
             Interaction::DraggingSelection {
                 start_map,
                 current_map,
+                labels,
             } => {
                 let offset = Self::drag_offset(start_map, current_map, state.modifiers);
-                if offset == Vector::new(0.0, 0.0) {
-                    Some(canvas::Action::request_redraw().and_capture())
+                let rooms = self.label_rooms_now(&labels);
+                let attach: Vec<_> = labels
+                    .iter()
+                    .map(|label| (label.id, label.target))
+                    .collect();
+                if offset == Vector::new(0.0, 0.0)
+                    && attach
+                        .iter()
+                        .all(|(id, target)| rooms.get(id) == Some(target))
+                {
+                    Some(if labels.is_empty() {
+                        canvas::Action::request_redraw().and_capture()
+                    } else {
+                        canvas::Action::publish(Message::ActivityChanged(EditorActivity::Idle))
+                            .and_capture()
+                    })
                 } else {
-                    Some(canvas::Action::publish(Message::MoveCommitted { offset }).and_capture())
+                    Some(
+                        canvas::Action::publish(Message::MoveCommitted { offset, attach })
+                            .and_capture(),
+                    )
                 }
             }
             Interaction::RubberBand {
@@ -719,17 +745,17 @@ impl MapEditor {
                 start_map,
                 current_map,
             } => {
-                let a = Self::maybe_snap(start_map, state.modifiers);
-                let b = Self::maybe_snap(current_map, state.modifiers);
-                let mut rect = rect_from_corners(a, b);
-                rect.width = rect.width.max(MIN_RECT_DIMENSION);
-                rect.height = rect.height.max(MIN_RECT_DIMENSION);
+                let rect = Self::drawn_rect(start_map, current_map, state.modifiers);
+                let room = (kind == RectKind::Label)
+                    .then(|| self.drawn_label_room(rect, state.modifiers))
+                    .flatten();
 
                 Some(
                     canvas::Action::publish(Message::RectDrawn {
                         kind,
                         rect,
                         keep_tool: state.modifiers.shift(),
+                        room,
                     })
                     .and_capture(),
                 )
@@ -807,11 +833,21 @@ impl canvas::Program<Message, Theme> for MapEditor {
         // even while the cursor is outside the canvas.
         if let IcedEvent::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
             state.modifiers = *modifiers;
-            if matches!(
-                state.interaction,
-                Interaction::DraggingConnectionHandle { .. }
-            ) {
-                return Some(canvas::Action::request_redraw().and_capture());
+            let free = modifiers.command();
+            match &mut state.interaction {
+                Interaction::DraggingConnectionHandle { .. } | Interaction::DrawingRect { .. } => {
+                    return Some(canvas::Action::request_redraw().and_capture());
+                }
+                Interaction::DraggingSelection {
+                    current_map,
+                    labels,
+                    ..
+                } => {
+                    let pointer = *current_map;
+                    self.retarget_dragged(labels, pointer, free);
+                    return Some(canvas::Action::request_redraw().and_capture());
+                }
+                _ => {}
             }
         }
 
@@ -823,12 +859,15 @@ impl canvas::Program<Message, Theme> for MapEditor {
         }) = event
         {
             if !matches!(state.interaction, Interaction::Idle) {
-                let connection_drag = matches!(
-                    state.interaction,
-                    Interaction::DraggingConnectionHandle { .. }
-                );
+                // These gestures show their own legend, which ends with them.
+                let legend_shown = match &state.interaction {
+                    Interaction::DraggingConnectionHandle { .. } => true,
+                    Interaction::DraggingSelection { labels, .. } => !labels.is_empty(),
+                    Interaction::DrawingRect { kind, .. } => *kind == RectKind::Label,
+                    _ => false,
+                };
                 state.interaction = Interaction::Idle;
-                return Some(if connection_drag {
+                return Some(if legend_shown {
                     canvas::Action::publish(Message::ActivityChanged(super::EditorActivity::Idle))
                         .and_capture()
                 } else {
@@ -842,11 +881,14 @@ impl canvas::Program<Message, Theme> for MapEditor {
         // the cursor leaving the canvas must clear it explicitly or the
         // hover glow outlives the pointer.
         if matches!(event, IcedEvent::Mouse(mouse::Event::CursorLeft))
-            && (self.hovered_room.is_some() || self.hovered_connection.is_some())
+            && (self.hovered_room.is_some()
+                || self.hovered_connection.is_some()
+                || self.hovered_entity.is_some())
         {
             return Some(canvas::Action::publish(Message::SetHovered {
                 room: None,
                 connection: None,
+                entity: None,
             }));
         }
 
@@ -1058,8 +1100,9 @@ impl canvas::Program<Message, Theme> for MapEditor {
                             )
                         }
                         Tool::AddLabel | Tool::AddShape => {
+                            let label = self.tool == Tool::AddLabel;
                             state.interaction = Interaction::DrawingRect {
-                                kind: if self.tool == Tool::AddLabel {
+                                kind: if label {
                                     RectKind::Label
                                 } else {
                                     RectKind::Shape
@@ -1067,7 +1110,14 @@ impl canvas::Program<Message, Theme> for MapEditor {
                                 start_map: map_position,
                                 current_map: map_position,
                             };
-                            Some(canvas::Action::request_redraw().and_capture())
+                            Some(if label {
+                                canvas::Action::publish(Message::ActivityChanged(
+                                    EditorActivity::PlacingLabels,
+                                ))
+                                .and_capture()
+                            } else {
+                                canvas::Action::request_redraw().and_capture()
+                            })
                         }
                     },
                     _ => None,
@@ -1101,10 +1151,26 @@ impl canvas::Program<Message, Theme> for MapEditor {
                             // a line press as selection instead of emitting an
                             // empty movement command.
                             if self.editable && !matches!(entity, EntityId::Connection(_)) {
+                                let mut labels = self.labels_dragged_from(*entity, *start_map);
+                                self.retarget_dragged(
+                                    &mut labels,
+                                    map_position,
+                                    state.modifiers.command(),
+                                );
+                                let attaching = !labels.is_empty();
                                 state.interaction = Interaction::DraggingSelection {
                                     start_map: *start_map,
                                     current_map: map_position,
+                                    labels,
                                 };
+                                if attaching {
+                                    return Some(
+                                        canvas::Action::publish(Message::ActivityChanged(
+                                            EditorActivity::PlacingLabels,
+                                        ))
+                                        .and_capture(),
+                                    );
+                                }
                             }
                         }
                         Some(canvas::Action::request_redraw().and_capture())
@@ -1139,8 +1205,13 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         }
                         Some(canvas::Action::request_redraw().and_capture())
                     }
-                    Interaction::DraggingSelection { current_map, .. } => {
+                    Interaction::DraggingSelection {
+                        current_map,
+                        labels,
+                        ..
+                    } => {
                         *current_map = map_position;
+                        self.retarget_dragged(labels, map_position, state.modifiers.command());
                         Some(canvas::Action::request_redraw().and_capture())
                     }
                     Interaction::RubberBand { current_map, .. }
@@ -1164,12 +1235,16 @@ impl canvas::Program<Message, Theme> for MapEditor {
                             Some(EntityId::Connection(id)) if self.tool == Tool::Select => Some(id),
                             _ => None,
                         };
-                        if room == self.hovered_room && connection == self.hovered_connection {
+                        if room == self.hovered_room
+                            && connection == self.hovered_connection
+                            && top == self.hovered_entity
+                        {
                             Some(canvas::Action::request_redraw())
                         } else {
                             Some(canvas::Action::publish(Message::SetHovered {
                                 room,
                                 connection,
+                                entity: top,
                             }))
                         }
                     }
@@ -1230,12 +1305,47 @@ impl canvas::Program<Message, Theme> for MapEditor {
 
                 render::draw_grid(frame, &region, self.scaling);
 
-                let drag_offset = match &state.interaction {
+                let (drag_offset, dragged_labels) = match &state.interaction {
                     Interaction::DraggingSelection {
                         start_map,
                         current_map,
-                    } => Some(Self::drag_offset(*start_map, *current_map, state.modifiers)),
-                    _ => None,
+                        labels,
+                    } => (
+                        Some(Self::drag_offset(*start_map, *current_map, state.modifiers)),
+                        labels.as_slice(),
+                    ),
+                    _ => (None, &[][..]),
+                };
+                // Labels attached to rooms the drag moves move with them.
+                let carried: HashSet<LabelId> = if drag_offset.is_some() {
+                    label_rooms::all_labels(&area)
+                        .filter(|(_, label)| {
+                            label
+                                .room()
+                                .is_some_and(|room| self.selection.contains(EntityId::from(room)))
+                        })
+                        .map(|(_, label)| label.id)
+                        .collect()
+                } else {
+                    HashSet::new()
+                };
+                let moving = |id: LabelId| {
+                    drag_offset.is_some()
+                        && (self.selection.contains(EntityId::Label(id)) || carried.contains(&id))
+                };
+                // While labels are placed, the rooms of sources they can't
+                // attach to are dimmed.
+                let drawn_label = matches!(
+                    state.interaction,
+                    Interaction::DrawingRect {
+                        kind: RectKind::Label,
+                        ..
+                    }
+                );
+                let attaching: Vec<SourceId> = if drawn_label {
+                    vec![self.add_to]
+                } else {
+                    dragged_labels.iter().map(|label| label.source).collect()
                 };
 
                 // Ghosted adjacent levels, below then above.
@@ -1248,11 +1358,21 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         }
                     }
                     for label in area.get_labels() {
-                        if label.level == ghost_level {
-                            render::draw_label(frame, label, opacity);
+                        if let Some(place) = area.label_place(label)
+                            && place.level == ghost_level
+                        {
+                            render::draw_label(frame, &render::placed(label, place, 1.0), opacity);
                         }
                     }
-                    sources::draw_drawings(frame, &layers, ghost_level, 1.0, opacity, &|_| false);
+                    sources::draw_drawings(
+                        frame,
+                        &area,
+                        &layers,
+                        ghost_level,
+                        1.0,
+                        opacity,
+                        &|_| false,
+                    );
                     area.with_room_connections_in(min_x, min_y, max_x, max_y, |connection| {
                         if connection.from_level == ghost_level {
                             render::draw_connection(frame, &atlas, connection, opacity, true);
@@ -1294,19 +1414,20 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     }
                 }
                 for label in area.get_labels() {
-                    if label.level == self.level
-                        && !(drag_offset.is_some()
-                            && self.selection.contains(EntityId::Label(label.id)))
+                    if let Some(place) = area.label_place(label)
+                        && place.level == self.level
+                        && !moving(label.id)
                     {
-                        render::draw_label(frame, label, 1.0);
+                        render::draw_label(frame, &render::placed(label, place, 1.0), 1.0);
                     }
                 }
-                sources::draw_drawings(frame, &layers, self.level, 1.0, 1.0, &|drawing| {
-                    drag_offset.is_some()
-                        && self.selection.contains(match drawing {
-                            sources::Drawing::Label(id) => EntityId::Label(id),
-                            sources::Drawing::Shape(id) => EntityId::Shape(id),
-                        })
+                sources::draw_drawings(frame, &area, &layers, self.level, 1.0, 1.0, &|drawing| {
+                    match drawing {
+                        sources::Drawing::Label(id) => moving(id),
+                        sources::Drawing::Shape(id) => {
+                            drag_offset.is_some() && self.selection.contains(EntityId::Shape(id))
+                        }
+                    }
                 });
                 area.with_room_connections_in(min_x, min_y, max_x, max_y, |connection| {
                     if connection.from_level == self.level
@@ -1359,20 +1480,30 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     }
                 });
 
-                sources::draw_rooms(
-                    frame,
-                    &layers,
-                    self.level,
-                    (min_x, min_y, max_x, max_y),
-                    1.0,
-                    1.0,
-                    &|source, number| {
-                        drag_offset.is_some()
-                            && self
-                                .selection
-                                .contains(EntityId::SourceRoom(source, number))
-                    },
-                );
+                let (usable, unusable): (Vec<_>, Vec<_>) =
+                    layers.iter().copied().partition(|(layer, _)| {
+                        attaching.is_empty() || attaching.contains(&layer.source())
+                    });
+                for (layers, opacity) in [(usable, 1.0), (unusable, Self::UNUSABLE_OPACITY)] {
+                    sources::draw_rooms(
+                        frame,
+                        &layers,
+                        self.level,
+                        (min_x, min_y, max_x, max_y),
+                        1.0,
+                        opacity,
+                        &|source, number| {
+                            drag_offset.is_some()
+                                && self
+                                    .selection
+                                    .contains(EntityId::SourceRoom(source, number))
+                        },
+                    );
+                }
+
+                if drag_offset.is_none() && !drawn_label {
+                    self.draw_resting_tethers(frame, &area);
+                }
 
                 // Player marker.
                 if let Some(room_key) = self
@@ -1410,7 +1541,9 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     frame.with_save(|frame| {
                         frame.translate(offset);
                         self.draw_selected_entities(frame, area.as_ref(), accent);
+                        self.draw_carried_labels(frame, &area, &carried);
                     });
+                    self.draw_label_targets(frame, &area, dragged_labels, offset);
                 } else {
                     self.draw_selection_outlines(
                         frame,
@@ -1509,6 +1642,12 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     );
                     frame.fill(&path, render::apply_opacity(accent, 0.15));
                     frame.stroke(&path, render::solid_stroke(accent, 1.0));
+                    if drawn_label {
+                        let drawn = Self::drawn_rect(*start_map, *current_map, state.modifiers);
+                        if let Some(target) = self.drawn_label_room(drawn, state.modifiers) {
+                            self.draw_target(frame, &area, target, self.add_to, drawn, true);
+                        }
+                    }
                 }
 
                 // Resize preview and handles for the selected label/shape.
@@ -1701,6 +1840,217 @@ fn endpoint_at_pointer(
 }
 
 impl MapEditor {
+    /// The opacity of a room a placed label can't attach to.
+    const UNUSABLE_OPACITY: f32 = 0.3;
+
+    /// The labels a drag that started on `pressed` at `start` attaches.
+    fn labels_dragged_from(&self, pressed: EntityId, start: Point) -> Vec<DraggedLabel> {
+        let atlas = self.mapper.get_current_atlas();
+        self.area_id
+            .as_ref()
+            .and_then(|id| atlas.get_area(id))
+            .map(|area| self.dragged_labels(&area, pressed, start))
+            .unwrap_or_default()
+    }
+
+    /// [`MapEditor::retarget`] on the current map.
+    fn retarget_dragged(&self, labels: &mut [DraggedLabel], pointer: Point, free: bool) {
+        if labels.is_empty() {
+            return;
+        }
+        let atlas = self.mapper.get_current_atlas();
+        if let Some(area) = self.area_id.as_ref().and_then(|id| atlas.get_area(id)) {
+            self.retarget(&area, labels, pointer, free);
+        }
+    }
+
+    /// The rooms the dragged labels are attached to now.
+    fn label_rooms_now(
+        &self,
+        labels: &[DraggedLabel],
+    ) -> std::collections::HashMap<LabelId, Option<RoomAddress>> {
+        let atlas = self.mapper.get_current_atlas();
+        let Some(area) = self.area_id.as_ref().and_then(|id| atlas.get_area(id)) else {
+            return std::collections::HashMap::new();
+        };
+        labels
+            .iter()
+            .filter_map(|dragged| {
+                let (_, label) = area.find_label(&dragged.id)?;
+                Some((dragged.id, label.room()))
+            })
+            .collect()
+    }
+
+    /// The bounds a label or shape drag-out between `start` and `current`
+    /// gives, snapped unless Alt is held, at least the smallest size.
+    fn drawn_rect(start: Point, current: Point, modifiers: keyboard::Modifiers) -> Rectangle {
+        let a = Self::maybe_snap(start, modifiers);
+        let b = Self::maybe_snap(current, modifiers);
+        let mut rect = rect_from_corners(a, b);
+        rect.width = rect.width.max(MIN_RECT_DIMENSION);
+        rect.height = rect.height.max(MIN_RECT_DIMENSION);
+        rect
+    }
+
+    /// The room a label drawn at `rect` attaches to: the one nearest its
+    /// center, unless Ctrl (⌘) is held.
+    fn drawn_label_room(
+        &self,
+        rect: Rectangle,
+        modifiers: keyboard::Modifiers,
+    ) -> Option<RoomAddress> {
+        if modifiers.command() {
+            return None;
+        }
+        let atlas = self.mapper.get_current_atlas();
+        let area = atlas.get_area(self.area_id.as_ref()?)?;
+        self.label_room_near(&area, rect.center(), self.add_to, None)
+    }
+
+    /// The color a label in `source` draws its tether and target in.
+    fn tether_color(area: &AreaCache, source: SourceId) -> Color {
+        sources::source_color(area, source).unwrap_or(label_rooms::MAP_TETHER)
+    }
+
+    /// The tethers of attached labels on the current level that are
+    /// selected or hovered, or whose rooms are.
+    fn draw_resting_tethers(&self, frame: &mut canvas::Frame, area: &AreaCache) {
+        for (source, label) in label_rooms::all_labels(area) {
+            let Some(room) = label.room() else {
+                continue;
+            };
+            let entities = [EntityId::Label(label.id), EntityId::from(room)];
+            let strong = entities
+                .iter()
+                .any(|entity| self.selection.contains(*entity));
+            let hovered = self
+                .hovered_entity
+                .is_some_and(|hovered| entities.contains(&hovered));
+            if !strong && !hovered {
+                continue;
+            }
+            let (Some(anchor), Some((rect, level))) = (
+                area.map_room_at(room),
+                label_rooms::placed_rect(area, label),
+            ) else {
+                continue;
+            };
+            if level == self.level {
+                label_rooms::draw_tether(
+                    frame,
+                    Point::new(anchor.get_x(), anchor.get_y()),
+                    rect,
+                    Self::tether_color(area, source),
+                    self.scaling,
+                    strong,
+                );
+            }
+        }
+    }
+
+    /// Labels that move with the rooms they are attached to, with their
+    /// tethers, for a translated drag preview.
+    fn draw_carried_labels(
+        &self,
+        frame: &mut canvas::Frame,
+        area: &AreaCache,
+        carried: &HashSet<LabelId>,
+    ) {
+        for (source, label) in label_rooms::all_labels(area) {
+            if !carried.contains(&label.id) || self.selection.contains(EntityId::Label(label.id)) {
+                continue;
+            }
+            let (Some(room), Some(place)) = (
+                label.room().and_then(|room| area.map_room_at(room)),
+                area.label_place(label),
+            ) else {
+                continue;
+            };
+            if place.level != self.level {
+                continue;
+            }
+            let placed = render::placed(label, place, 1.0);
+            render::draw_label(frame, &placed, 1.0);
+            let rect = Rectangle::new(
+                Point::new(placed.x, placed.y),
+                Size::new(placed.width, placed.height),
+            );
+            let color = Self::tether_color(area, source);
+            if !source.is_map() {
+                sources::ring(frame, rect.position(), rect.size(), 0.0, color, 1.0);
+            }
+            label_rooms::draw_tether(
+                frame,
+                Point::new(room.get_x(), room.get_y()),
+                rect,
+                color,
+                self.scaling,
+                true,
+            );
+        }
+    }
+
+    /// The rooms dragged labels attach to on release, each with a ring and
+    /// a tether to the label where it would land; the label pressed also
+    /// names its room.
+    fn draw_label_targets(
+        &self,
+        frame: &mut canvas::Frame,
+        area: &AreaCache,
+        labels: &[DraggedLabel],
+        offset: Vector,
+    ) {
+        for dragged in labels {
+            let Some(target) = dragged.target else {
+                continue;
+            };
+            let Some((rect, _)) = area
+                .find_label(&dragged.id)
+                .and_then(|(_, label)| label_rooms::placed_rect(area, label))
+            else {
+                continue;
+            };
+            let landing = Rectangle::new(rect.position() + offset, rect.size());
+            self.draw_target(
+                frame,
+                area,
+                target,
+                dragged.source,
+                landing,
+                dragged.leads(),
+            );
+        }
+    }
+
+    /// The target ring and tether of a label of `source` landing at
+    /// `label`, attaching to the room at `target`; `named` adds the room's
+    /// title.
+    fn draw_target(
+        &self,
+        frame: &mut canvas::Frame,
+        area: &AreaCache,
+        target: RoomAddress,
+        source: SourceId,
+        label: Rectangle,
+        named: bool,
+    ) {
+        let Some(room) = area.map_room_at(target) else {
+            return;
+        };
+        let center = Point::new(room.get_x(), room.get_y());
+        let color = Self::tether_color(area, source);
+        label_rooms::draw_tether(frame, center, label, color, self.scaling, true);
+        label_rooms::draw_target(
+            frame,
+            center,
+            if named { room.get_title() } else { "" },
+            label,
+            color,
+            self.scaling,
+        );
+    }
+
     /// Draws every selected entity (used translated for drag previews).
     fn draw_selected_entities(
         &self,
@@ -1741,8 +2091,11 @@ impl MapEditor {
                     }
                 }
                 EntityId::Label(id) => {
-                    if let Some((layer, label)) = area.find_label(&id) {
-                        render::draw_label(frame, label, 1.0);
+                    if let Some((layer, label)) = area.find_label(&id)
+                        && let Some(place) = area.label_place(label)
+                    {
+                        let label = render::placed(label, place, 1.0);
+                        render::draw_label(frame, &label, 1.0);
                         let rect = Rectangle::new(
                             Point::new(label.x, label.y),
                             Size::new(label.width, label.height),
@@ -1818,11 +2171,9 @@ impl MapEditor {
                     }
                 }
                 EntityId::Label(id) => {
-                    if let Some((layer, label)) = area.find_label(&id) {
-                        let rect = Rectangle::new(
-                            Point::new(label.x, label.y),
-                            Size::new(label.width, label.height),
-                        );
+                    if let Some((layer, label)) = area.find_label(&id)
+                        && let Some((rect, _)) = label_rooms::placed_rect(area, label)
+                    {
                         let source = SourceLayer::source_of(layer);
                         self.outline_drawing(frame, area, source, rect, 0.0, false, accent);
                     }
