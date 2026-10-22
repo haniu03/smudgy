@@ -65,9 +65,12 @@ async function loadSession(name: string, room: TargetLocation | null) {
     const state = { room };
     const roomListeners: Function[] = [];
     const procedures = new Map<string, Function>();
+    const eventListeners = new Map<string, Function>();
+    const publishedEvents: [string, unknown][] = [];
     const fixture = {
-        empty: {}, events: { mapEvent: {} },
+        empty: {}, events: { mapEvent: { on: (name: string, callback: Function) => eventListeners.set(name, callback) } },
         core: {
+            createEvent: (name: string) => ({ emit: (event: unknown) => publishedEvents.push([name, event]) }),
             session: handle, getSessions: () => [...sessions.values()],
             createProcedure: (name: string, callback: Function) => { procedures.set(name, callback); return {}; },
             createState: (name: string) => {
@@ -103,7 +106,8 @@ async function loadSession(name: string, room: TargetLocation | null) {
     await import(`../index.ts?targetSession=${handle.id}`);
     const { targets } = await import(`./targets.ts?targetSession=${handle.id}`);
     return {
-        handle, targets,
+        handle, targets, publishedEvents,
+        observeRoomChange: (event: unknown) => eventListeners.get("roomChanged")!(event),
         post: (request: SetTargetRequest) => procedures.get("setTarget")!(structuredClone(request)),
         move: (room: TargetLocation | null) => {
             state.room = room;
@@ -173,4 +177,13 @@ test("the exported setTarget procedure creates, updates and removes only the rec
     assert.throws(() => kap.targets.find("c"), /No speedwalk target/);
     assert.deepEqual(zur.targets.find("c").location, kapRoom);
     assert.equal(writes, 2, "procedure targets are not automatic location broadcasts");
+});
+
+test("the public roomChanged handle forwards mapped and unmapped movement payloads", async () => {
+    const session = await loadSession("Observer", null);
+    const mapped = { mapped: true, areaId: "area", roomNumber: 2, title: "Hall" };
+    const unseen = { mapped: false, areaId: null, roomNumber: null, title: null };
+    session.observeRoomChange(mapped);
+    session.observeRoomChange(unseen);
+    assert.deepEqual(session.publishedEvents, [["roomChanged", mapped], ["roomChanged", unseen]]);
 });

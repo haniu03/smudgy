@@ -7,7 +7,10 @@
 
 import './mapper/room-capturer.ts';
 import './mapper/alias.ts';
-import { createProcedure, createState } from 'smudgy:core';
+import { createEvent, createProcedure, createState } from 'smudgy:core';
+import { mapEvent } from './mapper/events.ts';
+import type { RoomChangedEvent } from './mapper/room-change.ts';
+export type { RoomChangedEvent } from './mapper/room-change.ts';
 import { targets } from './mapper/targets.ts';
 import { startTargetSharing } from './mapper/target-sharing.ts';
 
@@ -30,7 +33,11 @@ export const setTarget = createProcedure<SetTargetRequest>('setTarget', request 
 export const sessionTarget = createState<SetTargetRequest>('sessionTarget');
 startTargetSharing(sessionTarget);
 
-export { mapEvent } from './mapper/events.ts';
+/** Likely physical movement, including unmapped, dark, and blind destinations. */
+export const roomChanged = createEvent<RoomChangedEvent>('roomChanged');
+mapEvent.on('roomChanged', event => roomChanged.emit(event));
+
+export { mapEvent };
 export type { RoomEvent } from './mapper/events.ts';
 export { onAreaChanged, onRoomChanged, onModeChanged, options, speedwalk, state, State } from './mapper/mapper.ts';
 export type { MoveCommand } from './mapper/mapper.ts';

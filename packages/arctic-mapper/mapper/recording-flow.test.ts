@@ -5,6 +5,7 @@ import { beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import * as layoutModel from "../../map-layout/model.ts";
 import * as layoutGeometry from "../../map-layout/layout.ts";
+import * as linkRoutes from "../../map-layout/link-routes.ts";
 import { layoutSnapshotKey } from "../../map-layout/stable-snapshot.ts";
 import { mapEvent } from "./events.ts";
 import { RecordingPlaces } from "./recording-place.ts";
@@ -24,7 +25,7 @@ let map: Area, secret: Secret, privateArea: Area, start: Room;
 
 function makeArea(id: string, place: MapPlace, mapId?: string): Area {
     const rooms = new Map<number, any>();
-    const area = { id, place, mapId, name: id, storage: "cloud", rooms,
+    const area = { id, place, mapId, name: id, storage: "cloud", rooms, connections: [],
         get roomNumbers() { return [...rooms.keys()]; },
         get nextRoomNumber() { return rooms.size + 1; },
         room: (number: number) => rooms.get(number),
@@ -46,11 +47,18 @@ function addExit(room: Room, place: MapPlace, args: ExitArgs): ExitId {
     const id = `exit-${++sequence}` as ExitId;
     writes.push({ area: room.areaId, kind: "exit", place });
     room.exits.push({ id, place, toAreaId: null, toRoomNumber: null, toDirection: null,
-        door: null, ...args } as Exit);
+        door: null, connectionId: `link-${sequence}`, ...args } as Exit);
     return id;
 }
+const pairings: [string, string][] = [];
 const mapper = {
     getCurrentLocation: () => undefined,
+    pairConnections: async (_area: string, keep: string, merge: string) => {
+        pairings.push([keep, merge]);
+        for (const area of areas.values()) for (const room of area.rooms.values()) {
+            for (const exit of room.exits) if (exit.connectionId === merge) exit.connectionId = keep;
+        }
+    },
     getAreaById: (id: string) => { const area = areas.get(id); if (!area) throw new Error("Area not found"); return area; },
     setCurrentLocation: (area: string, room: number) => { location = [area, room]; },
     addRoomTag: async (area: string, room: number, tag: string) => { tagCalls.push(["add", area, room, tag]); },
@@ -104,10 +112,11 @@ globalThis.__recordingFlow = {
         createTrigger() {}, createHotkey() {}, send() {}, sendRaw() {}, capture() {}, buffer: {}, line: {},
         getSessions: () => [], session: { id: 1 },
     },
+    sys: { disconnect: { on() {} } },
     params: { get: () => undefined }, events: { room: { on() {} }, areasLoaded: { on() {} } },
     prompt: { on() {} }, widgets: { extractMarkdownLinks: () => [] },
     widget: { requestExistingRoomConnection: async () => connectDecision },
-    layout: { ...layoutModel, ...layoutGeometry, layoutSnapshotKey, loadLayoutModel, planLayoutModel: plan,
+    layout: { ...layoutModel, ...layoutGeometry, ...linkRoutes, layoutSnapshotKey, loadLayoutModel, planLayoutModel: plan,
         measureIntegralLayoutQuality: (...args: Parameters<typeof layoutGeometry.measureIntegralLayoutQuality>) => {
             qualityMeasurements++;
             return layoutGeometry.measureIntegralLayoutQuality(...args);
@@ -117,9 +126,25 @@ globalThis.__recordingFlow = {
             const result = { ...plan(model, change, options), sourceSnapshotKey: layoutSnapshotKey(model) };
             afterPlanning?.();
             return result;
-        } },
+        },
+        // A polish whose searches find nothing better than the map they were given.
+        createLayoutPlanner: () => ({
+            planIntegral: async (request: any, options: any) => {
+                layoutCalls.push({ area: options.plannerContext.areaId, change: { type: "reflow" }, options });
+                return { positions: new Map(request.residents.map((room: any) => [room.id, room.position])),
+                    movedExisting: false, quality: options.currentQuality };
+            },
+            planModel: async (model: layoutModel.LayoutModel, change: any, options: any) => {
+                layoutCalls.push({ area: model.areaId!, change, options });
+                return { positions: new Map(model.rooms.map(room => [room.id, room.position])),
+                    quality: layoutGeometry.measureIntegralLayoutQuality(
+                        new Map(model.rooms.map(room => [room.id, room.position])), model.edges) };
+            },
+            close() {},
+        }) },
 };
 const mocks = new Map([
+    ["smudgy:events/sys", "sys"],
     ["smudgy:core", "core"], ["smudgy:params", "params"], ["smudgy:events/map", "events"],
     ["smudgy:widgets", "widgets"], ["./widget.tsx", "widget"], ["smudgy:@map-layout", "layout"],
     ["smudgy:events/kapusniak/arctic-prompt/prompt", "prompt"],
@@ -146,7 +171,7 @@ const { state, State, Direction, options, ZMode } = await import("./mapper.ts");
 await import("./alias.ts");
 
 beforeEach(() => {
-    areas.clear(); writes.length = 0; messages.length = 0; tagCalls.length = 0;
+    areas.clear(); writes.length = 0; messages.length = 0; tagCalls.length = 0; pairings.length = 0;
     layoutCalls.length = 0; qualityMeasurements = 0;
     afterPlanning = undefined;
     options.autoAdjustMapLayout = false; options.zMode = ZMode.Auto;
@@ -434,15 +459,24 @@ test("known links and matching rooms at the destination skip scoring and plannin
 });
 
 test("manual reflow and explicitly connecting an existing room remain available with adjustment off", async () => {
+    const west = addRoom(map, { title: "West room", x: -1, y: 0 });
+    addExit(start, "map", { fromDirection: "West", toAreaId: map.id, toRoomNumber: west.roomNumber });
     aliases.get("mapper")!({ args: "reflow" });
-    await new Promise<void>(resolve => setImmediate(resolve));
+    for (let turn = 0; turn < 100 && !messages.some(message => message.startsWith("Routes in")); turn++) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+    }
     assert.equal(layoutCalls[0].change.type, "reflow");
-    assert.equal(layoutCalls[0].options.effort, "thorough");
+    assert.equal(layoutCalls[0].options.constraintRepair.when, "always");
+    assert.equal(layoutCalls[0].options.constraintRepair.maxDurationMs, Number.POSITIVE_INFINITY);
+    assert.deepEqual(layoutCalls[1].change, { type: "reflow", anchor: String(start.roomNumber) });
+    assert.equal(layoutCalls[1].options.effort, "thorough");
+    assert.match(messages.at(-2)!, /needed nothing/);
+    assert.match(messages.at(-1)!, /^Routes in .*: 0 links routed\.$/, "the reflow ends by routing the map");
     const existing = addRoom(map, { title: "Known room", x: 5, y: 0 });
     addExit(existing, "map", { fromDirection: "South" });
     connectDecision = { type: "connect", roomNumber: existing.roomNumber };
     await arrive(Direction.North, "Known room");
-    assert.equal(layoutCalls[1].change.type, "connect-rooms");
+    assert.equal(layoutCalls[2].change.type, "connect-rooms");
     assert.equal(state.room, existing);
 });
 
@@ -466,4 +500,37 @@ test("unadjusted normal vertical placement skips occupied levels without moving 
     assert.deepEqual(position(state.room!), { x: 0, y: 0, level: 2 });
     assert.deepEqual(position(upstairs), { x: 0, y: 0, level: 1 });
     assert.equal(layoutCalls.length, 0);
+});
+
+test("closing a loop back to a mapped room links the stubs waiting at both ends", async () => {
+    addExit(start, "map", { fromDirection: "North" });
+    addExit(start, "map", { fromDirection: "East" });
+    await arrive(Direction.North, "North room", "SE");
+    await arrive(Direction.East, "Corner room", "WS");
+    await arrive(Direction.South, "East room", "NW");
+    const east = state.room!;
+    await arrive(Direction.West, "Entrance", "NE");
+    assert.equal(state.room!.roomNumber, start.roomNumber, messages.join("\n"));
+    const startEast = start.exits.filter(exit => exit.fromDirection === "East");
+    assert.deepEqual(startEast.map(exit => [exit.toAreaId, exit.toRoomNumber]), [[map.id, east.roomNumber]],
+        "the start room's East stub is the link");
+    const eastWest = east.exits.filter(exit => exit.fromDirection === "West");
+    assert.deepEqual(eastWest.map(exit => [exit.toAreaId, exit.toRoomNumber]), [[map.id, start.roomNumber]],
+        "the east room's West stub is the link");
+    assert.equal(startEast[0].connectionId, eastWest[0].connectionId, "the two stubs make one two-way link");
+    assert.equal(pairings.length, 1);
+});
+
+test("linking two rooms whose facing stubs wait makes one two-way link", async () => {
+    const east = addRoom(map, { title: "East room", x: 1, y: 0 });
+    const out = addExit(start, "map", { fromDirection: "East" });
+    const back = addExit(east, "map", { fromDirection: "West" });
+    state.state = State.Following;
+    aliases.get("mapper")!({ args: `room link e ${east.roomNumber}` });
+    for (let turn = 0; turn < 50 && pairings.length === 0; turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    const forward = start.exits.find(exit => exit.id === out)!;
+    const reverse = east.exits.find(exit => exit.id === back)!;
+    assert.deepEqual([forward.toRoomNumber, reverse.toRoomNumber], [east.roomNumber, start.roomNumber], messages.join("\n"));
+    assert.equal(forward.connectionId, reverse.connectionId);
+    assert.equal(start.exits.length + east.exits.length, 2, "no exit is added beside the stubs");
 });

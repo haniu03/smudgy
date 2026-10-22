@@ -19,8 +19,10 @@ import {
     type LayoutQuality,
     type LayoutPatch,
 } from "smudgy:@map-layout";
-import { debugLog, distanceBetweenRooms, findRoomsAt, idsMatch, linkRooms, options, parseRoomExits, parseRoomExitsDetailed, roomsImpactedByPush, speedwalk, State, state, ZMode } from "./mapper.ts";
+import { debugLog, distanceBetweenRooms, findRoomsAt, idsMatch, linkRooms, options, pairReciprocalExits, parseRoomExits, parseRoomExitsDetailed, roomsImpactedByPush, speedwalk, State, state, ZMode } from "./mapper.ts";
 import { mapEvent, type RoomEvent } from "./events.ts";
+import { RoomChangeTracker } from "./room-change.ts";
+import { disconnect } from "smudgy:events/sys";
 import { requestExistingRoomConnection } from "./widget.tsx";
 
 import promptEvent from 'smudgy:events/kapusniak/arctic-prompt/prompt';
@@ -40,6 +42,8 @@ import { recordObservedDoors } from "./recording.ts";
 import { findAreaByName, findNearestRoomWithTagsInArea, roomRouteCost } from "./tag-search.ts";
 import { targets } from "./targets.ts";
 import { extendRecordedExit } from "./recording-place.ts";
+import { startPolish, stopPolish } from "./polish.ts";
+import { routeArea, routeSummaryText, type RouteOptions } from "./routes.ts";
 
 createAlias(/^map\b(\s+(?<args>.*))?$/, mapperCommand, { name: "mapper" });
 
@@ -769,6 +773,16 @@ async function exitCommand([dirArg, action, ...rest]: string[]) {
     }
 }
 
+/** Route an area's links and say what changed. */
+async function routeAndSay(areaId: AreaId, options?: RouteOptions): Promise<void> {
+    try {
+        const summary = await routeArea(areaId, options);
+        echo(routeSummaryText(mapper.getAreaById(areaId).name, summary));
+    } catch (error) {
+        echo(`Routing failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+
 const commands = {
     help: () => {
         echo("");
@@ -786,7 +800,9 @@ const commands = {
         echo("  move <direction> - Move the selection along an existing exit");
         echo("  path <from> <to> - Show the path between two rooms (tags: <number> or <area>#<number>)");
         echo("  push <direction> - Shift the selected room and connected rooms in a direction");
-        echo("  reflow - Thoroughly search and reflow the complete current area");
+        echo("  reflow - Polish the current area's layout, putting each better layout on the map");
+        echo("  stop - Stop a running reflow, keeping the best layout found so far");
+        echo("  routes [all] - Route the current area's links around rooms and each other (all: hand-drawn too)");
         echo("  z [auto|levels|projected] - Show or set new U/D room placement style");
         echo("  refresh - Refresh the current room (will send a `look` command)");
         echo("  send_link [n] - Run the nth link in the current room's notes (default 1)");
@@ -864,28 +880,42 @@ const commands = {
 
         state.refreshRoomAndArea();
     },
-    reflow: async () => {
+    reflow: () => {
         if (!state.area) {
             echo("No area selected");
             return;
         }
-        echo("Searching violation-prioritized anchors for a better layout…");
-        const result = await planAreaChange(state.area.id, {
-            type: "reflow",
-            anchor: state.room?.roomNumber,
-        }, {
-            effort: "thorough",
-        });
-        await applyLayoutMoves(state.area.id, result);
-        state.refreshRoomAndArea();
-        const search = result.search;
-        const searchText = search
-            ? ` Tried ${search.anchorsTried.length} anchors across ${search.planningPasses} passes; ` +
-                `selected ${search.selectedAnchor === null ? "the unanchored result" : `room ${search.selectedAnchor} as anchor`}.`
-            : "";
-        echo(`Thoroughly reflowed ${result.patch.moves.length} room${result.patch.moves.length === 1 ? "" : "s"}; ` +
-            `${result.quality.cardinalRayViolations} directional violation${result.quality.cardinalRayViolations === 1 ? "" : "s"} remain.` +
-            searchText);
+        const areaId = state.area.id;
+        // The links at every room the reflow moves are routed afresh when it ends.
+        const movedRooms = new Set<RoomNumber>();
+        void startPolish(areaId, {
+            say: (line) => echo(line),
+            anchor: state.room && idsMatch(state.room.areaId, areaId) ? state.room.roomNumber : undefined,
+            moved: (rooms) => {
+                for (const number of rooms) movedRooms.add(number);
+                state.refreshRoomAndArea();
+                const room = state.room;
+                // Recenter the map on the player's room when it moved.
+                if (room && idsMatch(room.areaId, areaId) && rooms.includes(room.roomNumber)) {
+                    state.setCurrentRoom(room);
+                }
+            },
+        })?.then(() => routeAndSay(areaId, { moved: movedRooms }));
+    },
+    stop: () => {
+        if (!stopPolish()) echo("No map reflow is running.");
+    },
+    routes: async (mode?: string) => {
+        if (!state.area) {
+            echo("No area selected");
+            return;
+        }
+        const all = mode?.toLowerCase() === "all";
+        if (mode !== undefined && !all) {
+            echo("Usage: map routes [all]");
+            return;
+        }
+        await routeAndSay(state.area.id, { redrawManual: all });
     },
     z: (mode?: string) => {
         const normalized = mode?.toLowerCase();
@@ -1086,31 +1116,34 @@ promptEvent.on(({exits}) => {
         ? null
         : new Map(parseRoomExitsDetailed(exits).map((e) => [e.direction, e.closed]));
 
-    if (darkRoomPending) {
-        darkRoomPending = false;
-        advanceInDark(exits);
+    const moves = unseenMoves;
+    unseenMoves = [];
+    for (const [index, direction] of moves.entries()) {
+        enqueueRoomUpdate(() => {
+            // Only the final unseen room can use this prompt's exits.
+            const room = advanceInDark(index === moves.length - 1 ? exits : undefined, direction);
+            publishRoomChange(null, direction, room);
+        });
     }
 });
 
-// A dark room ("It is pitch black.") produces no room block, but the prompt
-// that follows still arrives (with an exit list) — finalize the move there.
-let darkRoomPending = false;
-
+// Darkness and blindness share this response. Reserve each command as its
+// response arrives, so later failures cannot consume an earlier successful move.
+let unseenMoves: (MoveCommand | undefined)[] = [];
 mapEvent.on("visionFailed", () => {
-    darkRoomPending = true;
+    unseenMoves.push(state.popMoveCommand());
+    lastRoomEvent = null;
 });
 
-function advanceInDark(visibleExits: string | undefined) {
-    const direction = state.popMoveCommand();
-
+function advanceInDark(visibleExits: string | undefined, direction: MoveCommand | undefined): Room | null {
     if (state.state === State.Off) {
-        return;
+        return null;
     }
 
     debugLog(`dark room: direction=${direction ?? "(none)"}, mode=${State[state.state]}`);
 
     if (!direction || direction === "look") {
-        return;
+        return state.room;
     }
 
     // Rooms reachable in `direction` from any currently-possible room
@@ -1146,13 +1179,16 @@ function advanceInDark(visibleExits: string | undefined) {
         }
         debugLog(`dark move ${direction}: no mapped exit to follow; tracking lost`);
         state.possibleRooms = [];
-        return;
+        state.room = null;
+        if (state.area) mapper.setCurrentLocation(state.area.id);
+        return null;
     }
 
     candidates.sort((a, b) => distanceBetweenRooms(a, state.room) - distanceBetweenRooms(b, state.room));
     state.possibleRooms = candidates;
     state.setCurrentRoom(candidates[0]);
     debugLog(`now at "${candidates[0].title}" (#${candidates[0].roomNumber}) via dark-room exit; ${candidates.length} possible`);
+    return candidates.length === 1 ? candidates[0] : null;
 }
 
 /**
@@ -1320,12 +1356,16 @@ async function reflowAndConnectExistingRoom(
 
 async function linkRecordingRooms(from: Room, to: Room, direction: Direction, place: MapPlace) {
     const reverse = OppositeDirection[direction];
-    await extendRecordedExit(mapper, from, place, {
+    const forward = await extendRecordedExit(mapper, from, place, {
         fromDirection: direction, toDirection: reverse, toAreaId: to.areaId, toRoomNumber: to.roomNumber,
     });
-    await extendRecordedExit(mapper, to, place, {
+    const back = await extendRecordedExit(mapper, to, place, {
         fromDirection: reverse, toDirection: direction, toAreaId: from.areaId, toRoomNumber: from.roomNumber,
     });
+    // Linking two stubs already waiting at both rooms leaves two one-way links.
+    if (idsMatch(from.areaId, to.areaId)) {
+        await pairReciprocalExits(from.areaId, from.roomNumber, forward, to.roomNumber, back);
+    }
 }
 
 function measureRecordingLayout(model: LayoutModel): LayoutQuality {
@@ -1473,7 +1513,7 @@ async function createNewRoomInDirection(
 
 async function handleRoomEvent(
     roomEvent: RoomEvent,
-    direction: MoveCommand | undefined = state.popMoveCommand(),
+    direction: MoveCommand | undefined,
 ) {
 
     if (state.state === State.Off) {
@@ -1660,37 +1700,76 @@ async function handleRoomEvent(
     }
 }
 
+const roomChanges = new RoomChangeTracker();
 let mapUpdateQueue = Promise.resolve();
+let sessionGeneration = 0;
 /** The room last seen, to look for again when maps arrive. */
 let lastRoomEvent: RoomEvent | null = null;
+
+function enqueueRoomUpdate(update: () => void | Promise<void>) {
+    const generation = sessionGeneration;
+    mapUpdateQueue = mapUpdateQueue.then(() => {
+        if (generation === sessionGeneration) return update();
+    }).catch((error) => {
+        echo(`Automatic map update failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+}
+
+function observedRoom(event: RoomEvent): Room | null {
+    const room = state.state === State.Off ? null : state.room;
+    // Recording can refuse a move, leaving the old map selection in place.
+    // Never advertise that selection as the room we actually observed.
+    return room?.title === event.title && room.description === event.description.join("\n") ? room : null;
+}
+
+function publishRoomChange(event: RoomEvent | null, direction: MoveCommand | undefined, room: Room | null) {
+    const change = roomChanges.observe(event, direction, room);
+    if (change) mapEvent.emit("roomChanged", change);
+}
+
 mapEvent.on("room", (roomEvent: RoomEvent) => {
     lastRoomEvent = roomEvent;
-    mapUpdateQueue = mapUpdateQueue
-        .then(() => handleRoomEvent(roomEvent))
-        .then(async () => {
-            const room = state.room;
-            if (state.state === State.Mapping && room?.title === roomEvent.title
-                && room.description === roomEvent.description.join("\n")) {
-                await recordObservedDoors(mapper, room, parseRoomExitsDetailed(roomEvent.exits));
-                state.refreshRoomAndArea();
-            }
-        })
-        .then(() => hintShortcut(roomEvent))
-        .catch((error) => {
-            echo(`Automatic map update failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
+    const direction = state.popMoveCommand();
+    const generation = sessionGeneration;
+    enqueueRoomUpdate(async () => {
+        try {
+            await handleRoomEvent(roomEvent, direction);
+        } finally {
+            // Movement still counts if recording fails or mapping is disabled.
+            if (generation === sessionGeneration) publishRoomChange(roomEvent, direction, observedRoom(roomEvent));
+        }
+        if (generation !== sessionGeneration) return;
+        const room = state.room;
+        if (state.state === State.Mapping && room?.title === roomEvent.title
+            && room.description === roomEvent.description.join("\n")) {
+            await recordObservedDoors(mapper, room, parseRoomExitsDetailed(roomEvent.exits));
+            state.refreshRoomAndArea();
+        }
+        hintShortcut(roomEvent);
+    });
 });
 
-// A map that arrives after the session started can hold the room we're in: when the
-// last room seen matched nothing, look for it again, as a look rather than a move.
+// Map loading can resolve an earlier observation, but isn't physical movement.
 areasLoaded.on(() => {
     const roomEvent = lastRoomEvent;
-    if (state.room !== null || roomEvent === null) {
-        return;
-    }
-    mapUpdateQueue = mapUpdateQueue
-        .then(() => handleRoomEvent(roomEvent, "look"))
-        .catch((error) => {
-            echo(`Automatic map update failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
+    if (state.room !== null || roomEvent === null) return;
+    enqueueRoomUpdate(async () => {
+        if (roomEvent !== lastRoomEvent) return;
+        await handleRoomEvent(roomEvent, "look");
+        if (roomEvent === lastRoomEvent) {
+            // Refine the baseline silently so a newly mapped self-loop is still
+            // recognized as staying put. Never replay an old room after a move.
+            roomChanges.observe(roomEvent, "look", observedRoom(roomEvent));
+        }
+    });
+});
+
+disconnect.on(() => {
+    sessionGeneration++;
+    roomChanges.reset();
+    unseenMoves = [];
+    lastRoomEvent = null;
+    state.clearMoveQueue();
+    state.possibleRooms = [];
+    state.room = null;
 });

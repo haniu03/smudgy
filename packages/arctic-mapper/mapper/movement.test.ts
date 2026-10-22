@@ -5,6 +5,7 @@ import { beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import * as layoutModel from "../../map-layout/model.ts";
 import * as layoutGeometry from "../../map-layout/layout.ts";
+import * as linkRoutes from "../../map-layout/link-routes.ts";
 import { layoutSnapshotKey } from "../../map-layout/stable-snapshot.ts";
 
 const aliases = new Map<string, { pattern: RegExp; run: Function }>();
@@ -39,14 +40,16 @@ globalThis.__movementTest = {
         createTrigger() {}, createHotkey: (key: { key: string; modifiers: string[] }, run: Function) =>
             hotkeys.set([...key.modifiers, key.key].join("+"), run),
     },
+    sys: { disconnect: { on() {} } },
     params: { get: () => undefined },
     events: { room: { on() {} }, areasLoaded: { on: (handler: Function) => areasLoadedHandlers.push(handler) } },
     prompt: { on() {} },
     widgets: { extractMarkdownLinks: (text: string) => noteLinks.get(text) ?? [] },
     widget: { requestExistingRoomConnection() {} },
-    layout: { ...layoutModel, ...layoutGeometry, layoutSnapshotKey, planAreaChange() {}, loadLayoutModel() {} },
+    layout: { ...layoutModel, ...layoutGeometry, ...linkRoutes, layoutSnapshotKey, planAreaChange() {}, loadLayoutModel() {} },
 };
 const mocks = new Map([
+    ["smudgy:events/sys", "sys"],
     ["smudgy:core", "core"], ["smudgy:params", "params"], ["smudgy:events/map", "events"],
     ["smudgy:events/kapusniak/arctic-prompt/prompt", "prompt"],
     ["smudgy:widgets", "widgets"], ["./widget.tsx", "widget"], ["smudgy:@map-layout", "layout"],

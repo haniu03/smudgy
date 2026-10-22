@@ -108,13 +108,20 @@ Terminal map-free worker accounting is separately published as
 `layoutDiagnostics` from the same state module, including progress volume,
 worker disposition, stage timings, and optional Deno heap/RSS samples.
 
-Generated connections use orthogonal paths around intervening rooms only when
-the path can leave and enter through the walls declared by both exits. They
-store those paths as diagonal-tolerant routes so later layout changes cannot
-invalidate the map. Their turns are drawn with rounded corners. Generated
-routes are stored as solver-produced `Automatic` routing; a route drawn by
-hand — `Manual` routing in the map editor — is user-owned and is never
-overwritten by route recomputation.
+Generated connections are drawn by map-layout's route planner. A connection
+that leaves a wall facing away from the room it joins, runs across a room, or
+crosses another connection takes a route instead: out of the wall its exit
+declares, around the rooms in its way, and into the other room's wall, with
+rounded corners. Routes keep to lanes of their own; where routes run side by
+side or meet the same wall they are spaced apart, and a stretch with more
+routes than room for them is drawn at double width, each route in a color of
+its own from the sequence the map editor colors Secrets with. A connection
+with a color or width of its own keeps it. Generated routes are stored as
+solver-produced `Automatic` routing; a route drawn by hand — `Manual` routing
+in the map editor — is user-owned and is never overwritten by route
+recomputation. A connection between `up` and `down` exits is always drawn
+straight, even when its rooms share a level; a route drawn by hand on one is
+kept, unused, as it is between levels.
 
 Reflow and tidy refresh the player's location after moving its room. A chart
 that adds rooms or changes exits also refreshes the map display, including

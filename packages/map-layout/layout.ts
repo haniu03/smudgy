@@ -5,6 +5,7 @@ import {
 } from "./worker-client.ts";
 import { MAX_ROUTE_AMENDMENT_WAYPOINTS } from "./worker-protocol.ts";
 import type { LayoutPlannerContext, LayoutPlannerProgress } from "./planner-state.ts";
+import type { LayoutChange, LayoutModel, PlanLayoutOptions, PlannedLayout } from "./model.ts";
 
 /** An integral cell in Smudgy's map grid. */
 export interface GridPosition {
@@ -9765,15 +9766,23 @@ export function planIntegralLayoutAsync(
 }
 
 /**
- * Plans as `planIntegralLayoutAsync` does, on Workers of its own instead of
- * the shared ones: a long search neither waits behind other planning nor
- * holds it up. `close` ends its Workers and any planning still running.
+ * Plans as `planIntegralLayoutAsync` and `planLayoutModelAsync` do, on Workers
+ * of its own instead of the shared ones: a long search neither waits behind
+ * other planning nor holds it up. `close` ends its Workers and any planning
+ * still running.
  */
 export interface LayoutPlanner {
   planIntegral(
     request: IntegralLayoutRequest,
     options?: IntegralLayoutAsyncOptions,
   ): Promise<IntegralLayoutPlan>;
+  /** Plans one change to a layout model, as `planLayoutModelAsync` does without a constraint repair. */
+  planModel(
+    model: LayoutModel,
+    change: LayoutChange,
+    options?: PlanLayoutOptions,
+    control?: LayoutWorkerControlOptions,
+  ): Promise<PlannedLayout>;
   close(): void;
 }
 
@@ -9782,6 +9791,7 @@ export function createLayoutPlanner(): LayoutPlanner {
   const client = createLayoutWorkerClient();
   return {
     planIntegral: (request, options = {}) => planIntegralLayoutOn(client, request, options),
+    planModel: (model, change, options = {}, control = {}) => client.planModel(model, change, options, control),
     close: () => client.terminate(new Error("map-layout planner was closed")),
   };
 }

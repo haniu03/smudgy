@@ -139,9 +139,10 @@ and links and uses the same full quality order when choosing a layout.
 
 The shared Workers run one request at a time, so a long search delays every
 request queued behind it. `createLayoutPlanner()` returns a planner whose
-`planIntegral` takes the same arguments as `planIntegralLayoutAsync` but runs
-on Workers of its own: a long background search neither waits behind the
-shared queue nor holds it up. Its Workers start with its first request, and
+`planIntegral` takes the same arguments as `planIntegralLayoutAsync`, and whose
+`planModel` takes those of `planLayoutModelAsync` without `constraintRepair`,
+but runs on Workers of its own: a long background search neither waits behind
+the shared queue nor holds it up. Its Workers start with its first request, and
 `close()` ends them, rejecting any request still running.
 
 ```ts
@@ -475,6 +476,49 @@ without a position are ignored, and a link between two levels has no segment,
 so no room lies next to it. Plan a pinned request without `constraintRepair`:
 the constraint search does not yet take pinned rooms as anchors, so a pinned
 repair spends its budget without finding a layout.
+
+## Link routes
+
+Some maps leave no layout in which every link runs straight out of its walls:
+two exits of one room that lead to the same room cannot both point at it.
+`planLinkRoutes` routes the links of a finished layout instead of moving
+rooms. A routable link is routed when it leaves a wall facing away from its
+partner or runs across a room, and, when it only crosses other links, when a
+route at most six cells longer crosses fewer. Routes run out of each end's
+wall and into the other's on a lattice of half cells, so a route can pass
+between neighbouring rooms. Steps, turns, crossings and stretches shared with
+another link each cost a route, so routes stay short, turn little and keep to
+lanes of their own; a crossing costs two cells of route. Every other link is
+avoided as it is drawn.
+
+Routes that still share a stretch of one lane are splayed into lanes 0.1
+cells apart, or as little as 0.07 where crowded, each on the side its route
+turns toward, within 0.15 cells of the lane in a corridor between rooms and
+0.3 through empty cells. A route's first and last runs move with their ports:
+a free port slides along its wall, and a fixed port stays where it is with its
+run in line. A stretch with more routes than lanes gives each of those routes
+a `callout`: its place among them, from 0, so a caller can draw each in a
+color of its own.
+
+```ts
+const plans = planLinkRoutes(positions, links.map((link) => ({
+  id: link.connectionId,
+  from: link.fromRoom, to: link.toRoom,           // keys of positions
+  fromSide: link.fromSide, toSide: link.toSide,   // "North" | "East" | "South" | "West"
+  fromPort: link.fromPort, fromPortFixed: link.fromPortIsManual,
+  toPort: link.toPort, toPortFixed: link.toPortIsManual,
+  points: link.handDrawn ? link.routePoints : undefined,
+  routable: !link.handDrawn && link.cardinal,
+})));
+// One { id, points, fromPort, toPort, callout? } per routable link;
+// empty points draw the link straight.
+```
+
+Points run between the two stub tips, as Smudgy stores a Connection's route
+points. Links whose rooms are missing, on different levels or the same room
+are left alone. The caller decides which links are routable: links between Up
+and Down exits stay straight, and so do routes drawn by hand unless the caller
+redraws them.
 
 ## Elevation
 

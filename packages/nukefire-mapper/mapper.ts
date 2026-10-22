@@ -63,7 +63,6 @@ import {
 import {
   amendedConnectionRoute,
   amendmentWaypointsBetween,
-  directRoomObstructions,
   indexRouteAmendments,
   planConnectionRoute,
   routeCrossesCells,
@@ -79,6 +78,15 @@ import {
   stackVerticalTraversals,
 } from "./vertical-levels.ts";
 import { reflowPolicy } from "./reflow-policy.ts";
+import {
+  DEFAULT_LINK_COLOR,
+  DEFAULT_LINK_THICKNESS,
+  isVerticalDirection,
+  type LinkGeometry,
+  planLinkGeometry,
+  type RoutingLink,
+  withoutCallout,
+} from "./link-routing.ts";
 import { planningFingerprint } from "./planning-fingerprint.ts";
 import {
   assertCurrentMapperRun,
@@ -238,6 +246,8 @@ interface ConnectionMirror {
   segmentShape: ConnectionSegmentShape;
   corner: ConnectionCorner;
   routePoints: MapPoint[];
+  color: string;
+  thickness: number;
 }
 
 interface AreaMirror {
@@ -260,6 +270,9 @@ interface DesiredConnectionGeometry {
   segment_shape: ConnectionSegmentShape;
   corner: ConnectionCorner;
   route_points: MapPoint[];
+  /** Absent where the host's default style applies. */
+  color?: string;
+  thickness?: number;
 }
 
 /**
@@ -298,6 +311,16 @@ function newRoomId(vnum: number): string {
   return `vnum:${vnum}`;
 }
 
+/** The geometry the mirror holds, in link-routing's snake_case shape: the same object at run time. */
+function routingGeometry(geometry: DesiredConnectionGeometry): LinkGeometry {
+  return geometry as unknown as LinkGeometry;
+}
+
+/** A geometry link-routing decided, in the mirror's shape: the same object at run time. */
+function mirrorGeometry(geometry: LinkGeometry): DesiredConnectionGeometry {
+  return geometry as unknown as DesiredConnectionGeometry;
+}
+
 function geometrySignature(geometry: DesiredConnectionGeometry): string {
   return JSON.stringify({
     a: geometry.endpoint_a,
@@ -306,6 +329,8 @@ function geometrySignature(geometry: DesiredConnectionGeometry): string {
     shape: geometry.segment_shape,
     corner: geometry.corner,
     points: geometry.route_points,
+    color: geometry.color?.toUpperCase() ?? null,
+    thickness: geometry.thickness ?? null,
   });
 }
 
@@ -318,6 +343,8 @@ function connectionSignature(connection: ConnectionMirror): string {
     segment_shape: connection.segmentShape,
     corner: connection.corner,
     route_points: connection.routePoints,
+    color: connection.color,
+    thickness: connection.thickness,
   });
 }
 
@@ -544,6 +571,8 @@ function copyConnection(connection: Connection): ConnectionMirror {
     segmentShape: connection.segment_shape,
     corner: connection.corner,
     routePoints: connection.route_points.map((point) => ({ x: point.x, y: point.y })),
+    color: connection.color,
+    thickness: connection.thickness,
   };
 }
 
@@ -3358,6 +3387,8 @@ export class NukeFireMapper {
       segment_shape: connection.segmentShape,
       corner: connection.corner,
       route_points: connection.routePoints.map((point) => ({ ...point })),
+      color: connection.color,
+      thickness: connection.thickness,
     });
     const writeGeometry = async (
       connection: ConnectionMirror,
@@ -3380,6 +3411,8 @@ export class NukeFireMapper {
       connection.segmentShape = desired.segment_shape;
       connection.corner = desired.corner;
       connection.routePoints = desired.route_points.map((point) => ({ ...point }));
+      if (desired.color !== undefined) connection.color = desired.color;
+      if (desired.thickness !== undefined) connection.thickness = desired.thickness;
     };
 
     // The host checks every Connection's routing against the kind it derives
@@ -3416,6 +3449,7 @@ export class NukeFireMapper {
         routing: "Simple",
         segment_shape: authored ? before.segment_shape : "Direct",
         route_points: authored ? before.route_points : [],
+        ...withoutCallout({ color: connection.color, thickness: connection.thickness }, area.id),
       };
       await writeGeometry(connection, desired);
       changes.push({
@@ -3427,8 +3461,10 @@ export class NukeFireMapper {
       });
     }
 
-    const proposals: {
-      key: string;
+    // Every Connection drawn on one level takes part in planning: the
+    // mapper's own links, which the route planner draws, and every other one
+    // as it is drawn, for those routes to avoid.
+    interface Proposal {
       connection: ConnectionMirror;
       roomA: RoomMirror;
       roomB: RoomMirror;
@@ -3436,37 +3472,31 @@ export class NukeFireMapper {
       positionB: GridPosition;
       exitA?: ExitMirror;
       exitB?: ExitMirror;
-      preferredStart: RouteSide;
-      preferredEnd: RouteSide;
-      obstructions: GridPosition[];
       desired: DesiredConnectionGeometry;
-      amended: boolean;
+      reason: string;
+      callout?: boolean;
       oneWayOriginRoom?: RoomNumber;
-    }[] = [];
-
+    }
+    const proposals = new Map<string, Proposal>();
+    const links: RoutingLink[] = [];
+    const planningRooms = new Map(positions);
+    for (const room of area.roomsByNumber.values()) {
+      const id = residentId(room.roomNumber);
+      if (!planningRooms.has(id)) planningRooms.set(id, byRoomNumber.get(room.roomNumber) ?? room.position);
+    }
     for (const connection of area.connections.values()) {
       const endpointB = connection.endpointB;
       if (!endpointB) continue;
-      // An author-drawn route is user-owned, exactly as Manual ports are:
-      // recomputation proposes nothing for it, nor for one left dormant, so
-      // its geometry survives every commit while its endpoints still reserve
-      // their wall slots below.
-      if (
-        routeIsManuallyAuthored(connection.routing) ||
-        routeIsDormant(connection.routing, connection.routePoints)
-      ) continue;
-      if (routeAfterCommit.has(connectionMirrorKey(connection.id))) continue;
-      const roomA = residentRooms.get(connection.endpointA.room_number);
-      const roomB = residentRooms.get(endpointB.room_number);
-      if (!roomA || !roomB || roomA.vnum === undefined || roomB.vnum === undefined) continue;
-      const positionA = byRoomNumber.get(roomA.roomNumber);
-      const positionB = byRoomNumber.get(roomB.roomNumber);
-      if (!positionA || !positionB || roomA.roomNumber === roomB.roomNumber || positionA.level !== positionB.level) {
-        continue;
-      }
-      const deltaX = positionB.x - positionA.x;
-      const deltaY = positionB.y - positionA.y;
+      const roomA = area.roomsByNumber.get(connection.endpointA.room_number);
+      const roomB = area.roomsByNumber.get(endpointB.room_number);
+      if (!roomA || !roomB || roomA === roomB) continue;
+      const positionA = byRoomNumber.get(roomA.roomNumber) ?? roomA.position;
+      const positionB = byRoomNumber.get(roomB.roomNumber) ?? roomB.position;
+      // A Connection between levels runs straight, as settled above.
+      if (positionA.level !== positionB.level) continue;
       const key = connectionMirrorKey(connection.id);
+      const current = geometryOf(connection, endpointB);
+      const ends = { id: key, from: residentId(roomA.roomNumber), to: residentId(roomB.roomNumber) };
       const members = membersByConnection.get(key) ?? [];
       const exactExitA = members.find((member) =>
         member.room.roomNumber === roomA.roomNumber
@@ -3490,39 +3520,6 @@ export class NukeFireMapper {
           exit.toRoomNumber === roomA.roomNumber
         )
         : undefined);
-      const directionA = exitA?.fromDirection ?? exitB?.toDirection ?? "Other";
-      const directionB = exitB?.fromDirection ?? exitA?.toDirection ?? "Other";
-      const preferredStart = directionSide(directionA, deltaX, deltaY) as RouteSide;
-      const preferredEnd = directionSide(directionB, -deltaX, -deltaY) as RouteSide;
-      // A matching engine amendment supplies the generated route directly,
-      // oriented from this connection's endpoint A toward endpoint B. Manual
-      // connections never reach this point, so an amendment can never touch
-      // an author-drawn route.
-      const amendmentWaypoints = amendmentWaypointsBetween(
-        amendmentIndex,
-        connection.endpointA.room_number,
-        endpointB.room_number,
-      );
-      const unchanged = scope !== undefined &&
-        !scope.rooms.has(roomA.roomNumber) && !scope.rooms.has(roomB.roomNumber) &&
-        !(amendmentWaypoints && amendmentWaypoints.length > 0) &&
-        !routeCrossesCells(positionA, positionB, connection.routePoints, scope.cells);
-      const obstructions = unchanged ? [] : directRoomObstructions(positionA, positionB, occupied);
-      const desired = unchanged
-        ? geometryOf(connection, endpointB)
-        : this.#desiredConnectionGeometry(
-          roomA.roomNumber,
-          roomB.roomNumber,
-          positionA,
-          positionB,
-          occupied,
-          preferredStart,
-          preferredEnd,
-          connection.endpointA,
-          endpointB,
-          obstructions.length > 0,
-          amendmentWaypoints,
-        );
       const soleMember = members.length === 1 ? members[0] : undefined;
       const oneWayOriginRoom = soleMember &&
           ((soleMember.room.roomNumber === roomA.roomNumber &&
@@ -3535,31 +3532,109 @@ export class NukeFireMapper {
               soleMember.exit.toRoomNumber === roomA.roomNumber))
         ? soleMember.room.roomNumber
         : undefined;
-      proposals.push({
-        key,
-        connection,
-        roomA,
-        roomB,
-        positionA,
-        positionB,
-        exitA,
-        exitB,
-        preferredStart,
-        preferredEnd,
-        obstructions,
-        desired,
-        amended: amendmentWaypoints !== undefined && amendmentWaypoints.length > 0,
-        oneWayOriginRoom,
+      const propose = (desired: DesiredConnectionGeometry, reason: string): void => {
+        proposals.set(key, {
+          connection, roomA, roomB, positionA, positionB, exitA, exitB, desired, reason, oneWayOriginRoom,
+        });
+      };
+
+      // A link between Up and Down exits runs straight, whoever drew it.
+      if (
+        members.some((member) => isVerticalDirection(member.exit.fromDirection)) ||
+        isVerticalDirection(exitA?.fromDirection) || isVerticalDirection(exitB?.fromDirection)
+      ) {
+        links.push({ ...ends, geometry: routingGeometry(current), role: "vertical" });
+        propose(current, "up-down-runs-straight");
+        continue;
+      }
+      // An author-drawn route is user-owned, exactly as Manual ports are, and
+      // so is one left dormant; a link between rooms the mapper did not make
+      // is the author's too. Each stays as it is drawn.
+      if (
+        routeIsManuallyAuthored(connection.routing) ||
+        routeIsDormant(connection.routing, connection.routePoints) ||
+        routeAfterCommit.has(key) ||
+        !residentRooms.has(roomA.roomNumber) || !residentRooms.has(roomB.roomNumber) ||
+        roomA.vnum === undefined || roomB.vnum === undefined
+      ) {
+        links.push({ ...ends, geometry: routingGeometry(current), role: "keep" });
+        continue;
+      }
+      const deltaX = positionB.x - positionA.x;
+      const deltaY = positionB.y - positionA.y;
+      const directionA = exitA?.fromDirection ?? exitB?.toDirection ?? "Other";
+      const directionB = exitB?.fromDirection ?? exitA?.toDirection ?? "Other";
+      const preferredStart = directionSide(directionA, deltaX, deltaY) as RouteSide;
+      const preferredEnd = directionSide(directionB, -deltaX, -deltaY) as RouteSide;
+      // A matching engine amendment is the plan's own answer for a defect
+      // movement can never resolve, so it supplies the route. Manual
+      // connections never reach this point, so an amendment can never touch
+      // an author-drawn route.
+      const amendmentWaypoints = amendmentWaypointsBetween(
+        amendmentIndex,
+        connection.endpointA.room_number,
+        endpointB.room_number,
+      );
+      if (amendmentWaypoints && amendmentWaypoints.length > 0) {
+        const desired: DesiredConnectionGeometry = {
+          ...this.#desiredConnectionGeometry(
+            roomA.roomNumber,
+            roomB.roomNumber,
+            positionA,
+            positionB,
+            occupied,
+            preferredStart,
+            preferredEnd,
+            connection.endpointA,
+            endpointB,
+            undefined,
+            amendmentWaypoints,
+          ),
+          ...withoutCallout({ color: connection.color, thickness: connection.thickness }, area.id),
+        };
+        links.push({ ...ends, geometry: routingGeometry(desired), role: "keep" });
+        propose(desired, "engine-route-amendment");
+        continue;
+      }
+      // A pass that moved no room keeps every route away from what it changed.
+      if (
+        scope !== undefined &&
+        !scope.rooms.has(roomA.roomNumber) && !scope.rooms.has(roomB.roomNumber) &&
+        !routeCrossesCells(positionA, positionB, connection.routePoints, scope.cells)
+      ) {
+        links.push({ ...ends, geometry: routingGeometry(current), role: "keep" });
+        propose(current, "unchanged");
+        continue;
+      }
+      links.push({
+        ...ends,
+        geometry: routingGeometry(current),
+        role: "route",
+        sides: [
+          routedEndpointSide(connection.endpointA, preferredStart) as RouteSide,
+          routedEndpointSide(endpointB, preferredEnd) as RouteSide,
+        ],
       });
+      propose(current, "planned");
+    }
+    for (const decision of planLinkGeometry(planningRooms, links, area.id)) {
+      const proposal = proposals.get(decision.id);
+      if (!proposal) continue;
+      proposal.desired = mirrorGeometry(decision.geometry);
+      proposal.callout = decision.callout;
+      if (proposal.reason === "planned") {
+        proposal.reason = decision.routed ? "planned-route" : "direct-segment-clear";
+      }
     }
 
-    const proposedByKey = new Map(proposals.map((proposal) => [proposal.key, proposal]));
+    // One-way arrivals that run straight to a crowded wall spread their
+    // ports; a planned route has its ports from the planner.
     const portConnections: OneWayPortConnection[] = [];
     for (const connection of area.connections.values()) {
       const endpointB = connection.endpointB;
       if (!endpointB) continue;
       const key = connectionMirrorKey(connection.id);
-      const proposal = proposedByKey.get(key);
+      const proposal = proposals.get(key);
       const endpointA = proposal?.desired.endpoint_a ?? connection.endpointA;
       const desiredEndpointB = proposal?.desired.endpoint_b ?? endpointB;
       const roomA = area.roomsByNumber.get(endpointA.room_number);
@@ -3578,33 +3653,16 @@ export class NukeFireMapper {
     }
     const portLayouts = disambiguateOneWayArrivalPorts(portConnections);
 
-    for (const proposal of proposals) {
-      const {
-        key,
-        connection,
-        roomA,
-        roomB,
-        positionA,
-        positionB,
-        exitA,
-        exitB,
-        preferredStart,
-        preferredEnd,
-        obstructions,
-        desired,
-        amended,
-      } = proposal;
+    for (const [key, proposal] of proposals) {
+      const { connection, roomA, roomB, positionA, positionB, exitA, exitB, desired } = proposal;
       const currentEndpointB = connection.endpointB;
       if (!currentEndpointB) continue;
-      const ports = portLayouts.get(key);
+      const ports = desired.route_points.length === 0 ? portLayouts.get(key) : undefined;
       if (ports) {
         desired.endpoint_a = copyEndpoint(ports.endpointA);
         desired.endpoint_b = copyEndpoint(ports.endpointB);
       }
-      const desiredSignature = geometrySignature(desired);
-      if (connectionSignature(connection) === desiredSignature) {
-        continue;
-      }
+      if (connectionSignature(connection) === geometrySignature(desired)) continue;
       const portsChanged = connection.endpointA.port_offset !== desired.endpoint_a.port_offset ||
         currentEndpointB.port_offset !== desired.endpoint_b.port_offset;
       const before = geometryOf(connection, currentEndpointB);
@@ -3623,18 +3681,8 @@ export class NukeFireMapper {
           position: positionB,
           direction: exitB?.fromDirection,
         },
-        preferredStart,
-        preferredEnd,
-        obstructions,
-        reason: portsChanged
-          ? "one-way-arrival-disambiguation"
-          : amended
-          ? "engine-route-amendment"
-          : desired.route_points.length > 0
-          ? "direct-segment-crosses-room"
-          : obstructions.length > 0
-          ? "no-orthogonal-route-found"
-          : "direct-segment-clear",
+        reason: ports && portsChanged ? "one-way-arrival-disambiguation" : proposal.reason,
+        ...(proposal.callout ? { callout: true } : {}),
         before,
         after: desired,
       });
@@ -4076,6 +4124,13 @@ export class NukeFireMapper {
       preferredStart,
       preferredEnd,
     );
+    // A link between Up and Down exits runs straight, whatever levels its
+    // rooms are on.
+    if (isVerticalDirection(mapped.direction) || isVerticalDirection(mapped.opposite)) {
+      geometry.routing = "Simple";
+      geometry.segment_shape = "Direct";
+      geometry.route_points = [];
+    }
     const traversals: LinkTraversalArgs[] = [
       {
         room_number: from.roomNumber,
@@ -4132,6 +4187,8 @@ export class NukeFireMapper {
       segmentShape: canonicalGeometry.segment_shape,
       corner: canonicalGeometry.corner,
       routePoints: canonicalGeometry.route_points,
+      color: canonicalGeometry.color ?? DEFAULT_LINK_COLOR,
+      thickness: canonicalGeometry.thickness ?? DEFAULT_LINK_THICKNESS,
     });
     from.exits.push(exitFromFields(traversals[0], undefined, connectionId));
     if (traversals[1]) {
