@@ -1,8 +1,8 @@
 {
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Adds a simple, configurable map pane to a Smudgy session.",
   "entry": "index.tsx",
-  "min_smudgy_version": "0.5.4",
+  "min_smudgy_version": "0.5.8",
   "params": [
     {
       "key": "position",

@@ -6,7 +6,7 @@ export interface AuthoredPoint {
 
 export interface AuthoredEndpoint {
   readonly side: "North" | "East" | "South" | "West";
-  readonly port_offset: number;
+  readonly portOffset: number;
 }
 
 export interface AuthoredRouteMove {
@@ -39,7 +39,7 @@ export function authoredEndpointTip(position: AuthoredPoint, endpoint: AuthoredE
   const half = f32(ROOM_SIZE / 2);
   const radius = f32(CORNER_INSET * ROOM_SIZE);
   const flat = f32(half - radius);
-  const offset = Math.min(1, Math.max(0, f32(endpoint.port_offset)));
+  const offset = Math.min(1, Math.max(0, f32(endpoint.portOffset)));
   const along = f32(f32(offset - 0.5) * ROOM_SIZE);
   let across = along;
   let outward = half;

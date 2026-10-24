@@ -4,7 +4,7 @@
 // Ported from the Mudlet package calendar-todo-list (Belgarath); see README.md
 // for what is kept from the source and what is deliberately different.
 
-import { eq, openDatabase, type Database, type DatabaseLocation, type Row } from "smudgy://official/mudlet-db";
+import { eq, openDatabase, type Database, type DatabaseLocation, type Row } from "smudgy:@mudlet-db";
 
 /** `db:create("calendar", ...)` as the source declared it, options included. */
 export const CALENDAR_SCHEMA = {

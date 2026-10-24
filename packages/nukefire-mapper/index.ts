@@ -15,7 +15,7 @@ import {
 } from "smudgy:core";
 import { created, destroyed } from "smudgy:events/sessions";
 import { get, set } from "smudgy:params";
-import { nukefire, watchMessage } from "smudgy://kapusniak/nukefire-gmcp";
+import { nukefire, watchMessage } from "smudgy:@nukefire-gmcp";
 import { AreaNames, rulesToSeed } from "./area-names.ts";
 import { NUKEFIRE_AREA_NAME_RULES } from "./nukefire-maps.ts";
 import { DEFAULT_DECISION_LOG_FILE } from "./decision-log.ts";
@@ -29,7 +29,7 @@ import {
   layoutWorkerDiagnostics,
   type LayoutPlannerSnapshot,
   type LayoutWorkerClientDiagnostics,
-} from "smudgy://kapusniak/map-layout";
+} from "smudgy:@map-layout";
 import {
   LAYOUT_STATE_PUBLISH_INTERVAL_MS,
   ThrottledMirror,

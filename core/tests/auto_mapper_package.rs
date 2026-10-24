@@ -56,18 +56,6 @@ fn copy_package(server: &str, name: &str) {
 fn copy_package_source(server: &str) {
     copy_package(server, "map-layout");
     copy_package(server, "auto-mapper");
-    let directory = packages_dir(server)
-        .expect("packages dir")
-        .join("auto-mapper");
-    for name in ["engine.ts", "smudgy.package.json"] {
-        let path = directory.join(name);
-        let source = std::fs::read_to_string(&path).expect("read auto-mapper dependency");
-        std::fs::write(
-            path,
-            source.replace("smudgy://kapusniak/map-layout", "smudgy://local/map-layout"),
-        )
-        .expect("localize auto-mapper dependency");
-    }
 }
 
 fn gmcp(name: &str, data: &str) -> RuntimeAction {

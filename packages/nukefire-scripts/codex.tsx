@@ -27,7 +27,7 @@ import {
   type NukeFireKnowledgeEntry,
   type NukeFireKnowledgeResult,
   type NukeFireKnowledgeResults,
-} from "smudgy://kapusniak/nukefire-gmcp";
+} from "smudgy:@nukefire-gmcp";
 import { widgetTextSize } from "./config.ts";
 import { isPrimarySession } from "./multi.ts";
 import { UI, domainColor } from "./theme.ts";

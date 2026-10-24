@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { authoredEndpointTip, maintainAuthoredRoutePoints, type AuthoredRouteMove } from "./authored-route-maintenance.ts";
 
-const east = { side: "East", port_offset: 0.5 } as const;
-const west = { side: "West", port_offset: 0.5 } as const;
+const east = { side: "East", portOffset: 0.5 } as const;
+const west = { side: "West", portOffset: 0.5 } as const;
 const beforeA = { x: 0, y: 0 };
 const beforeB = { x: 6, y: 0 };
 const baseline: AuthoredRouteMove = {
@@ -67,17 +67,17 @@ test("empty and single-point authored paths receive only the necessary endpoint 
 });
 
 test("rounded corner port tips follow public f32 geometry on all four walls", () => {
-  const north = authoredEndpointTip({ x: 0, y: 0 }, { side: "North", port_offset: 0 });
-  const south = authoredEndpointTip({ x: 0, y: 0 }, { side: "South", port_offset: 1 });
-  const eastTip = authoredEndpointTip({ x: 0, y: 0 }, { side: "East", port_offset: 0 });
-  const westTip = authoredEndpointTip({ x: 0, y: 0 }, { side: "West", port_offset: 1 });
+  const north = authoredEndpointTip({ x: 0, y: 0 }, { side: "North", portOffset: 0 });
+  const south = authoredEndpointTip({ x: 0, y: 0 }, { side: "South", portOffset: 1 });
+  const eastTip = authoredEndpointTip({ x: 0, y: 0 }, { side: "East", portOffset: 0 });
+  const westTip = authoredEndpointTip({ x: 0, y: 0 }, { side: "West", portOffset: 1 });
   assert.deepEqual(south, { x: -north.x, y: -north.y });
   assert.deepEqual(eastTip, { x: -north.y, y: north.x });
   assert.deepEqual(westTip, { x: north.y, y: -north.x });
   assert.ok(Math.abs(north.x + 0.22071068) < 1e-7);
   assert.ok(Math.abs(north.y + 0.37071068) < 1e-7);
   for (const side of ["North", "East", "South", "West"] as const) {
-    const move = { ...baseline, endpointA: { side, port_offset: 0 }, endpointB: { side, port_offset: 1 },
+    const move = { ...baseline, endpointA: { side, portOffset: 0 }, endpointB: { side, portOffset: 1 },
       points: [], afterA: { x: 1, y: -1 }, afterB: { x: 8, y: 2 } };
     assertOrthogonal(move, maintainAuthoredRoutePoints(move));
   }

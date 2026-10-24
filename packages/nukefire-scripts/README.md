@@ -1,7 +1,7 @@
 # nukefire-scripts
 
 NukeFire command deck for Smudgy, built on
-`smudgy://kapusniak/nukefire-gmcp`.
+`smudgy:@nukefire-gmcp`.
 
 ## Panels
 
@@ -11,6 +11,7 @@ NukeFire command deck for Smudgy, built on
 | **Affects** | Timed character and scanned-target effects. |
 | **Comms** | Filterable channel feed with plain or full-ANSI rendering. |
 | **Map** | Smudgy map with persistent visit history, a since-session-start trail, other-session locations, and the live GPS route accented in gold. |
+| **Notes** | Markdown notes for the current area and room, beneath the Map. |
 | **Radar** | Interactive local BIGMAP view with exits, doors, and route overlays; disabled by default. |
 | **Atlas** | Searchable GPS catalog; selecting a destination starts walking. |
 | **Deck** | Context-sensitive service status and actions. |
@@ -38,6 +39,14 @@ already reused before conversion, the original game identity is unavailable.
 The **view** menu can hide or clear the current session's trail and reset visit
 history for the current area. Connected characters on the same map appear as distinct colored
 room outlines; GPS styling takes precedence where it overlaps the trail.
+
+The Notes pane shows the current area's notes and the current room's notes.
+Select **AREA** or **ROOM** to write them in an editor over the Map. Notes are
+Markdown, and a `<command>` link sends that command when clicked, so
+`<open gate>` or `<say password>` can live with the room that needs it. Saving
+empty notes removes them. Each map and each room keeps its notes in its own
+`notes` property. A room's notes move with it when map sections are combined;
+a section's area notes are not carried into the map it joins.
 
 Enable **Show live layout planner state below the map** to add a compact status
 block beneath `MapView`. It shows the active phase and elapsed time, candidate
@@ -74,7 +83,7 @@ rechecks the source and final room geometry, commits room moves with compatible
 connection routing, and retains the engine's detours for fixed-room defects.
 The command announces completion after the owner acknowledges the commit. A
 missing acknowledgement reports an unknown result; inspect the map before
-retrying. NukeFire Scripts 0.5.8 requires mapper 0.18.5 and Smudgy 0.5.8.
+retrying. NukeFire Scripts 0.6.0 requires mapper 0.18.7 and Smudgy 0.5.8.
 
 When **Show live layout planner state** is enabled, the panel also attributes
 automatic work to its area, shows the terminal reason, and exposes map-free

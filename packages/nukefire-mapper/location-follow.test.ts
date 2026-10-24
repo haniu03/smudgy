@@ -13,14 +13,14 @@ function makeArea(
   rooms: { number: RoomNumber; externalId?: string }[],
 ): FollowArea {
   const byNumber = new Map<RoomNumber, FollowRoom>(rooms.map((room) => [room.number, {
-    area_id: id,
-    room_number: room.number,
+    areaId: id,
+    roomNumber: room.number,
     externalId: room.externalId,
   }]));
   return {
     id,
     storage,
-    room_numbers: rooms.map((room) => room.number),
+    roomNumbers: rooms.map((room) => room.number),
     room: (number) => byNumber.get(number),
   };
 }

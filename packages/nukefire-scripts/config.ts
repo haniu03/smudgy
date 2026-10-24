@@ -5,6 +5,7 @@ export type PanelKey =
   | "affects"
   | "comms"
   | "map"
+  | "notes"
   | "radar"
   | "atlas"
   | "deck"
@@ -41,6 +42,7 @@ export const panelVisibility: Readonly<Record<PanelKey, boolean>> = {
   affects: boolParam("showAffects", true),
   comms: boolParam("showComms", true),
   map: boolParam("showMap", true),
+  notes: boolParam("showNotes", true),
   radar: boolParam("showRadar", false),
   atlas: boolParam("showAtlas", true),
   deck: boolParam("showDeck", true),

@@ -68,17 +68,17 @@ export function loadLayoutModel(
   const movable = options.isRoomMovable ?? defaultRoomMovable;
   // Materialize every host wrapper exactly once. All work below this point is
   // performed against these primitives rather than repeated atomic reads.
-  const rooms = area.room_numbers.flatMap((number) => {
+  const rooms = area.roomNumbers.flatMap((number) => {
     const room = area.room(number);
     if (!room) return [];
     return [{
-      roomNumber: room.room_number,
+      roomNumber: room.roomNumber,
       position: { x: room.x, y: room.y, level: room.level },
       movable: movable(room),
       exits: room.exits.map((exit) => ({
-        fromDirection: exit.from_direction,
-        toAreaId: exit.to_area_id ?? null,
-        toRoomNumber: exit.to_room_number,
+        fromDirection: exit.fromDirection,
+        toAreaId: exit.toAreaId ?? null,
+        toRoomNumber: exit.toRoomNumber,
       })),
     }];
   });

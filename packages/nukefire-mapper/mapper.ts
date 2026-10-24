@@ -4,7 +4,7 @@ import {
   layoutSnapshotKey,
   loadLayoutModel,
   resolveElevationGeometry,
-} from "smudgy://kapusniak/map-layout";
+} from "smudgy:@map-layout";
 import type { ManualLayoutRequest } from "./manual-layout.ts";
 import { maintainAuthoredRoutePoints } from "./authored-route-maintenance.ts";
 import {
@@ -15,7 +15,7 @@ import {
   type NukeFireMapLocal,
   type NukeFireMapRoom,
   type RoomInfo,
-} from "smudgy://kapusniak/nukefire-gmcp";
+} from "smudgy:@nukefire-gmcp";
 import {
   directionSide,
   externalRoomId,
@@ -44,7 +44,7 @@ import {
   type LayoutTraceEvent,
   type RouteAmendment,
 } from "./layout.ts";
-import { seamRegion } from "smudgy://kapusniak/map-layout/seam-region.ts";
+import { seamRegion } from "smudgy:@map-layout/seam-region.ts";
 import {
   DEFAULT_DECISION_LOG_FILE,
   MappingDecisionLogger,
@@ -264,12 +264,12 @@ interface AreaMirror {
 }
 
 interface DesiredConnectionGeometry {
-  endpoint_a: ConnectionEndpoint;
-  endpoint_b: ConnectionEndpoint;
+  endpointA: ConnectionEndpoint;
+  endpointB: ConnectionEndpoint;
   routing: ConnectionRouting;
-  segment_shape: ConnectionSegmentShape;
+  segmentShape: ConnectionSegmentShape;
   corner: ConnectionCorner;
-  route_points: MapPoint[];
+  routePoints: MapPoint[];
   /** Absent where the host's default style applies. */
   color?: string;
   thickness?: number;
@@ -311,7 +311,7 @@ function newRoomId(vnum: number): string {
   return `vnum:${vnum}`;
 }
 
-/** The geometry the mirror holds, in link-routing's snake_case shape: the same object at run time. */
+/** The geometry the mirror holds, in link-routing's shape: the same object at run time. */
 function routingGeometry(geometry: DesiredConnectionGeometry): LinkGeometry {
   return geometry as unknown as LinkGeometry;
 }
@@ -323,12 +323,12 @@ function mirrorGeometry(geometry: LinkGeometry): DesiredConnectionGeometry {
 
 function geometrySignature(geometry: DesiredConnectionGeometry): string {
   return JSON.stringify({
-    a: geometry.endpoint_a,
-    b: geometry.endpoint_b,
+    a: geometry.endpointA,
+    b: geometry.endpointB,
     routing: geometry.routing,
-    shape: geometry.segment_shape,
+    shape: geometry.segmentShape,
     corner: geometry.corner,
-    points: geometry.route_points,
+    points: geometry.routePoints,
     color: geometry.color?.toUpperCase() ?? null,
     thickness: geometry.thickness ?? null,
   });
@@ -337,12 +337,12 @@ function geometrySignature(geometry: DesiredConnectionGeometry): string {
 function connectionSignature(connection: ConnectionMirror): string {
   if (!connection.endpointB) return "";
   return geometrySignature({
-    endpoint_a: connection.endpointA,
-    endpoint_b: connection.endpointB,
+    endpointA: connection.endpointA,
+    endpointB: connection.endpointB,
     routing: connection.routing,
-    segment_shape: connection.segmentShape,
+    segmentShape: connection.segmentShape,
     corner: connection.corner,
-    route_points: connection.routePoints,
+    routePoints: connection.routePoints,
     color: connection.color,
     thickness: connection.thickness,
   });
@@ -384,25 +384,25 @@ function mirrorPlanningFingerprint(area: AreaMirror): string {
 }
 
 function livePlanningFingerprint(area: Area): string {
-  return planningFingerprint(area.room_numbers.flatMap((roomNumber) => {
+  return planningFingerprint(area.roomNumbers.flatMap((roomNumber) => {
     const room = area.room(roomNumber);
     if (!room) return [];
     const vnum = roomVnum(room);
     return [{
-      roomNumber: room.room_number,
+      roomNumber: room.roomNumber,
       vnum,
       position: roundedPosition(room.x, room.y, room.level),
       movable: vnum !== undefined &&
         room.data(ROOM_LAYOUT_LOCK_PROPERTY)?.trim().toLowerCase() !== "true",
       internalExits: room.exits
         .filter((exit) =>
-          exit.to_area_id !== null &&
-          exit.to_room_number !== null &&
-          sameAreaId(exit.to_area_id, area.id)
+          exit.toAreaId !== null &&
+          exit.toRoomNumber !== null &&
+          sameAreaId(exit.toAreaId, area.id)
         )
         .map((exit) => ({
-          direction: exit.from_direction,
-          toRoomNumber: exit.to_room_number as RoomNumber,
+          direction: exit.fromDirection,
+          toRoomNumber: exit.toRoomNumber as RoomNumber,
         })),
     }];
   }));
@@ -494,26 +494,31 @@ function observedLinkKey(link: Readonly<NukeFireMapLink>): string {
 
 function copyEndpoint(endpoint: ConnectionEndpoint): ConnectionEndpoint {
   return {
-    room_number: endpoint.room_number,
+    roomNumber: endpoint.roomNumber,
     side: endpoint.side,
-    port_offset: endpoint.port_offset,
-    port_mode: endpoint.port_mode,
+    portOffset: endpoint.portOffset,
+    portMode: endpoint.portMode,
   };
 }
 
 function copyExit(exit: Exit): ExitMirror {
   return {
     id: exit.id,
-    connectionId: exit.connection_id,
-    fromDirection: exit.from_direction,
-    toDirection: exit.to_direction,
-    toAreaId: exit.to_area_id,
-    toRoomNumber: exit.to_room_number,
-    hidden: exit.is_hidden,
+    connectionId: exit.connectionId,
+    fromDirection: exit.fromDirection,
+    toDirection: exit.toDirection,
+    toAreaId: exit.toAreaId,
+    toRoomNumber: exit.toRoomNumber,
+    hidden: exit.isHidden,
     door: copyDoor(exit.door),
     weight: exit.weight,
     command: exit.command,
   };
+}
+
+/** The area the fields lead to. Every ExitArgs here is built from mirrored ids. */
+function fieldsAreaId(fields: ExitArgs): AreaId | null {
+  return (fields.toAreaId ?? null) as AreaId | null;
 }
 
 function exitFromFields(
@@ -524,11 +529,11 @@ function exitFromFields(
   return {
     id,
     connectionId,
-    fromDirection: fields.from_direction,
-    toDirection: fields.to_direction ?? null,
-    toAreaId: fields.to_area_id ?? null,
-    toRoomNumber: fields.to_room_number ?? null,
-    hidden: fields.is_hidden ?? false,
+    fromDirection: fields.fromDirection,
+    toDirection: fields.toDirection ?? null,
+    toAreaId: fieldsAreaId(fields),
+    toRoomNumber: fields.toRoomNumber ?? null,
+    hidden: fields.isHidden ?? false,
     door: copyDoor(fields.door),
     weight: fields.weight ?? 1,
     command: fields.command ?? null,
@@ -540,22 +545,22 @@ function sameOptionalArea(a: AreaId | null, b: AreaId | undefined): boolean {
 }
 
 function exitMatchesFields(exit: ExitMirror, fields: ExitArgs): boolean {
-  return exit.fromDirection === fields.from_direction &&
-    exit.toDirection === (fields.to_direction ?? null) &&
-    sameOptionalArea(exit.toAreaId, fields.to_area_id) &&
-    exit.toRoomNumber === (fields.to_room_number ?? null) &&
-    exit.hidden === (fields.is_hidden ?? false) &&
+  return exit.fromDirection === fields.fromDirection &&
+    exit.toDirection === (fields.toDirection ?? null) &&
+    sameOptionalArea(exit.toAreaId, fieldsAreaId(fields) ?? undefined) &&
+    exit.toRoomNumber === (fields.toRoomNumber ?? null) &&
+    exit.hidden === (fields.isHidden ?? false) &&
     sameDoor(exit.door, copyDoor(fields.door)) &&
     exit.weight === (fields.weight ?? 1) &&
     commandKey(exit.command) === commandKey(fields.command ?? null);
 }
 
 function applyExitFields(exit: ExitMirror, fields: ExitArgs): void {
-  exit.fromDirection = fields.from_direction;
-  exit.toDirection = fields.to_direction ?? null;
-  exit.toAreaId = fields.to_area_id ?? null;
-  exit.toRoomNumber = fields.to_room_number ?? null;
-  exit.hidden = fields.is_hidden ?? false;
+  exit.fromDirection = fields.fromDirection;
+  exit.toDirection = fields.toDirection ?? null;
+  exit.toAreaId = fieldsAreaId(fields);
+  exit.toRoomNumber = fields.toRoomNumber ?? null;
+  exit.hidden = fields.isHidden ?? false;
   exit.door = copyDoor(fields.door);
   exit.weight = fields.weight ?? 1;
   exit.command = fields.command ?? null;
@@ -564,13 +569,13 @@ function applyExitFields(exit: ExitMirror, fields: ExitArgs): void {
 function copyConnection(connection: Connection): ConnectionMirror {
   return {
     id: connection.id,
-    endpointA: copyEndpoint(connection.endpoint_a),
-    endpointB: connection.endpoint_b ? copyEndpoint(connection.endpoint_b) : null,
+    endpointA: copyEndpoint(connection.endpointA),
+    endpointB: connection.endpointB ? copyEndpoint(connection.endpointB) : null,
     kind: connection.kind,
     routing: connection.routing,
-    segmentShape: connection.segment_shape,
+    segmentShape: connection.segmentShape,
     corner: connection.corner,
-    routePoints: connection.route_points.map((point) => ({ x: point.x, y: point.y })),
+    routePoints: connection.routePoints.map((point) => ({ x: point.x, y: point.y })),
     color: connection.color,
     thickness: connection.thickness,
   };
@@ -587,25 +592,25 @@ const CONNECTION_SIDE_ORDER: Record<ConnectionEndpoint["side"], number> = {
 function canonicalConnectionGeometry(
   geometry: Readonly<DesiredConnectionGeometry>,
 ): DesiredConnectionGeometry {
-  const endpointA = geometry.endpoint_a;
-  const endpointB = geometry.endpoint_b;
-  const flip = endpointA.room_number === endpointB.room_number
+  const endpointA = geometry.endpointA;
+  const endpointB = geometry.endpointB;
+  const flip = endpointA.roomNumber === endpointB.roomNumber
     ? CONNECTION_SIDE_ORDER[endpointA.side] > CONNECTION_SIDE_ORDER[endpointB.side] ||
-      (endpointA.side === endpointB.side && endpointA.port_offset > endpointB.port_offset)
-    : endpointA.room_number > endpointB.room_number;
+      (endpointA.side === endpointB.side && endpointA.portOffset > endpointB.portOffset)
+    : endpointA.roomNumber > endpointB.roomNumber;
   if (!flip) {
     return {
       ...geometry,
-      endpoint_a: copyEndpoint(endpointA),
-      endpoint_b: copyEndpoint(endpointB),
-      route_points: geometry.route_points.map((point) => ({ ...point })),
+      endpointA: copyEndpoint(endpointA),
+      endpointB: copyEndpoint(endpointB),
+      routePoints: geometry.routePoints.map((point) => ({ ...point })),
     };
   }
   return {
     ...geometry,
-    endpoint_a: copyEndpoint(endpointB),
-    endpoint_b: copyEndpoint(endpointA),
-    route_points: [...geometry.route_points].reverse().map((point) => ({ ...point })),
+    endpointA: copyEndpoint(endpointB),
+    endpointB: copyEndpoint(endpointA),
+    routePoints: [...geometry.routePoints].reverse().map((point) => ({ ...point })),
   };
 }
 
@@ -865,13 +870,13 @@ export class NukeFireMapper {
       roomsByNumber: new Map(),
       connections: new Map(),
     };
-    for (const roomNumber of source.room_numbers) {
+    for (const roomNumber of source.roomNumbers) {
       const room = source.room(roomNumber);
       if (!room) continue;
       const externalId = room.externalId;
       const mirrored: RoomMirror = {
         areaId: id,
-        roomNumber: room.room_number,
+        roomNumber: room.roomNumber,
         vnum: roomVnum(room),
         externalId,
         title: room.title,
@@ -1053,11 +1058,11 @@ export class NukeFireMapper {
         const authored = routeIsManuallyAuthored(connection.routing);
         const dormant = routeIsDormant(connection.routing, connection.routePoints);
         const preservePoints = (authored || dormant) &&
-          (fieldsByNumber.has(connection.endpointA.room_number) || fieldsByNumber.has(endpointB.room_number));
-        const beforeA = preservePoints ? storedPosition(connection.endpointA.room_number) : undefined;
-        const beforeB = preservePoints ? storedPosition(endpointB.room_number) : undefined;
-        const fieldsA = fieldsByNumber.get(connection.endpointA.room_number);
-        const fieldsB = fieldsByNumber.get(endpointB.room_number);
+          (fieldsByNumber.has(connection.endpointA.roomNumber) || fieldsByNumber.has(endpointB.roomNumber));
+        const beforeA = preservePoints ? storedPosition(connection.endpointA.roomNumber) : undefined;
+        const beforeB = preservePoints ? storedPosition(endpointB.roomNumber) : undefined;
+        const fieldsA = fieldsByNumber.get(connection.endpointA.roomNumber);
+        const fieldsB = fieldsByNumber.get(endpointB.roomNumber);
         const afterA = beforeA ? {
           x: fieldsA?.x ?? beforeA.x, y: fieldsA?.y ?? beforeA.y, level: fieldsA?.level ?? beforeA.level,
         } : undefined;
@@ -1074,13 +1079,13 @@ export class NukeFireMapper {
             authored: authored && afterA.level === afterB.level,
           })
           : undefined;
-        const demote = (levelChanges.has(connection.endpointA.room_number) ||
-          levelChanges.has(endpointB.room_number)) && (connection.routing === "Automatic" || authored);
+        const demote = (levelChanges.has(connection.endpointA.roomNumber) ||
+          levelChanges.has(endpointB.roomNumber)) && (connection.routing === "Automatic" || authored);
         if (points || demote && authored) restores.push({ id: connection.id, routing: connection.routing, points });
         if (!demote) continue;
         await mutation.setConnection(connection.id, {
           routing: "Simple",
-          ...(authored ? {} : { segment_shape: "Direct", route_points: [] }),
+          ...(authored ? {} : { segmentShape: "Direct", routePoints: [] }),
         });
         connection.routing = "Simple";
         if (!authored) { connection.segmentShape = "Direct"; connection.routePoints = []; }
@@ -1120,7 +1125,7 @@ export class NukeFireMapper {
           if (!connection) continue;
           await mutation.setConnection(restore.id, {
             routing: connection.kind === "CrossLevel" ? "Simple" : restore.routing,
-            ...(restore.points ? { route_points: restore.points } : {}),
+            ...(restore.points ? { routePoints: restore.points } : {}),
           });
         }
       }, `Preserve authored NukeFire routes in ${area.name}`));
@@ -1484,7 +1489,7 @@ export class NukeFireMapper {
     const externalId = externalRoomId(vnum);
     const hostRoom = mapper.findRoomByExternalId(externalId);
     if (hostRoom) {
-      const hostArea = mapper.getAreaById(hostRoom.area_id);
+      const hostArea = mapper.getAreaById(hostRoom.areaId);
       if (this.#inTier(hostArea)) {
         const area = this.#hydrateArea(hostArea);
         const room = [...area.roomsByNumber.values()].find(
@@ -2211,7 +2216,7 @@ export class NukeFireMapper {
         }
         const hostRoom = mapper.findRoomByExternalId(externalRoomId(source.vnum));
         if (!hostRoom) continue;
-        const hostArea = mapper.getAreaById(hostRoom.area_id);
+        const hostArea = mapper.getAreaById(hostRoom.areaId);
         if (!this.#inTier(hostArea)) continue;
         this.#hydrateArea(hostArea);
         const room = this.#roomsByVnum.get(source.vnum);
@@ -3269,27 +3274,27 @@ export class NukeFireMapper {
     amendmentWaypoints?: readonly MapPoint[],
   ): DesiredConnectionGeometry {
     const baseA: ConnectionEndpoint = endpointA ?? {
-      room_number: roomA,
+      roomNumber: roomA,
       side: preferredStart,
-      port_offset: 0.5,
-      port_mode: "AutoPinned",
+      portOffset: 0.5,
+      portMode: "AutoPinned",
     };
     const baseB: ConnectionEndpoint = endpointB ?? {
-      room_number: roomB,
+      roomNumber: roomB,
       side: preferredEnd,
-      port_offset: 0.5,
-      port_mode: "AutoPinned",
+      portOffset: 0.5,
+      portMode: "AutoPinned",
     };
     // Only two rooms on one level may be joined by a drawn route, so a
     // Connection between levels, or from a room to itself, runs straight.
     if (roomA === roomB || positionA.level !== positionB.level) {
       return {
-        endpoint_a: baseA,
-        endpoint_b: baseB,
+        endpointA: baseA,
+        endpointB: baseB,
         routing: "Simple",
-        segment_shape: "Direct",
+        segmentShape: "Direct",
         corner: "Rounded",
-        route_points: [],
+        routePoints: [],
       };
     }
     const routedStart = routedEndpointSide(baseA, preferredStart) as RouteSide;
@@ -3314,16 +3319,16 @@ export class NukeFireMapper {
         knownObstructed,
       );
     return {
-      endpoint_a: { ...baseA, side: routedEndpointSide(baseA, route.startSide) },
-      endpoint_b: { ...baseB, side: routedEndpointSide(baseB, route.endSide) },
+      endpointA: { ...baseA, side: routedEndpointSide(baseA, route.startSide) },
+      endpointB: { ...baseB, side: routedEndpointSide(baseB, route.endSide) },
       // The data model reserves `Manual` routing for author-drawn centerlines.
       // Every route produced here is solver-generated, so it persists as
-      // `Automatic` with `route_points` carrying any detour, leaving `Manual`
+      // `Automatic` with `routePoints` carrying any detour, leaving `Manual`
       // as the unambiguous user-ownership marker.
       routing: "Automatic",
-      segment_shape: route.segmentShape,
+      segmentShape: route.segmentShape,
       corner: route.corner,
-      route_points: route.routePoints,
+      routePoints: route.routePoints,
     };
   }
 
@@ -3381,12 +3386,12 @@ export class NukeFireMapper {
       connection: ConnectionMirror,
       endpointB: ConnectionEndpoint,
     ): DesiredConnectionGeometry => ({
-      endpoint_a: copyEndpoint(connection.endpointA),
-      endpoint_b: copyEndpoint(endpointB),
+      endpointA: copyEndpoint(connection.endpointA),
+      endpointB: copyEndpoint(endpointB),
       routing: connection.routing,
-      segment_shape: connection.segmentShape,
+      segmentShape: connection.segmentShape,
       corner: connection.corner,
-      route_points: connection.routePoints.map((point) => ({ ...point })),
+      routePoints: connection.routePoints.map((point) => ({ ...point })),
       color: connection.color,
       thickness: connection.thickness,
     });
@@ -3405,12 +3410,12 @@ export class NukeFireMapper {
             () => mapper.setConnection(area.id, connection.id, desired),
           ),
       );
-      connection.endpointA = copyEndpoint(desired.endpoint_a);
-      connection.endpointB = copyEndpoint(desired.endpoint_b);
+      connection.endpointA = copyEndpoint(desired.endpointA);
+      connection.endpointB = copyEndpoint(desired.endpointB);
       connection.routing = desired.routing;
-      connection.segmentShape = desired.segment_shape;
+      connection.segmentShape = desired.segmentShape;
       connection.corner = desired.corner;
-      connection.routePoints = desired.route_points.map((point) => ({ ...point }));
+      connection.routePoints = desired.routePoints.map((point) => ({ ...point }));
       if (desired.color !== undefined) connection.color = desired.color;
       if (desired.thickness !== undefined) connection.thickness = desired.thickness;
     };
@@ -3429,9 +3434,9 @@ export class NukeFireMapper {
     const routeAfterCommit = new Set<string>();
     for (const connection of area.connections.values()) {
       const endpointB = connection.endpointB;
-      if (!endpointB || endpointB.room_number === connection.endpointA.room_number) continue;
-      const levelA = levelOf(connection.endpointA.room_number);
-      const levelB = levelOf(endpointB.room_number);
+      if (!endpointB || endpointB.roomNumber === connection.endpointA.roomNumber) continue;
+      const levelA = levelOf(connection.endpointA.roomNumber);
+      const levelB = levelOf(endpointB.roomNumber);
       if (levelA === undefined || levelB === undefined) continue;
       if (levelA === levelB) {
         if (connection.kind === "CrossLevel") {
@@ -3447,8 +3452,8 @@ export class NukeFireMapper {
       const desired: DesiredConnectionGeometry = {
         ...before,
         routing: "Simple",
-        segment_shape: authored ? before.segment_shape : "Direct",
-        route_points: authored ? before.route_points : [],
+        segmentShape: authored ? before.segmentShape : "Direct",
+        routePoints: authored ? before.routePoints : [],
         ...withoutCallout({ color: connection.color, thickness: connection.thickness }, area.id),
       };
       await writeGeometry(connection, desired);
@@ -3487,8 +3492,8 @@ export class NukeFireMapper {
     for (const connection of area.connections.values()) {
       const endpointB = connection.endpointB;
       if (!endpointB) continue;
-      const roomA = area.roomsByNumber.get(connection.endpointA.room_number);
-      const roomB = area.roomsByNumber.get(endpointB.room_number);
+      const roomA = area.roomsByNumber.get(connection.endpointA.roomNumber);
+      const roomB = area.roomsByNumber.get(endpointB.roomNumber);
       if (!roomA || !roomB || roomA === roomB) continue;
       const positionA = byRoomNumber.get(roomA.roomNumber) ?? roomA.position;
       const positionB = byRoomNumber.get(roomB.roomNumber) ?? roomB.position;
@@ -3572,8 +3577,8 @@ export class NukeFireMapper {
       // an author-drawn route.
       const amendmentWaypoints = amendmentWaypointsBetween(
         amendmentIndex,
-        connection.endpointA.room_number,
-        endpointB.room_number,
+        connection.endpointA.roomNumber,
+        endpointB.roomNumber,
       );
       if (amendmentWaypoints && amendmentWaypoints.length > 0) {
         const desired: DesiredConnectionGeometry = {
@@ -3635,10 +3640,10 @@ export class NukeFireMapper {
       if (!endpointB) continue;
       const key = connectionMirrorKey(connection.id);
       const proposal = proposals.get(key);
-      const endpointA = proposal?.desired.endpoint_a ?? connection.endpointA;
-      const desiredEndpointB = proposal?.desired.endpoint_b ?? endpointB;
-      const roomA = area.roomsByNumber.get(endpointA.room_number);
-      const roomB = area.roomsByNumber.get(desiredEndpointB.room_number);
+      const endpointA = proposal?.desired.endpointA ?? connection.endpointA;
+      const desiredEndpointB = proposal?.desired.endpointB ?? endpointB;
+      const roomA = area.roomsByNumber.get(endpointA.roomNumber);
+      const roomB = area.roomsByNumber.get(desiredEndpointB.roomNumber);
       if (!roomA || !roomB) continue;
       const positionA = byRoomNumber.get(roomA.roomNumber) ?? roomA.position;
       const positionB = byRoomNumber.get(roomB.roomNumber) ?? roomB.position;
@@ -3657,14 +3662,14 @@ export class NukeFireMapper {
       const { connection, roomA, roomB, positionA, positionB, exitA, exitB, desired } = proposal;
       const currentEndpointB = connection.endpointB;
       if (!currentEndpointB) continue;
-      const ports = desired.route_points.length === 0 ? portLayouts.get(key) : undefined;
+      const ports = desired.routePoints.length === 0 ? portLayouts.get(key) : undefined;
       if (ports) {
-        desired.endpoint_a = copyEndpoint(ports.endpointA);
-        desired.endpoint_b = copyEndpoint(ports.endpointB);
+        desired.endpointA = copyEndpoint(ports.endpointA);
+        desired.endpointB = copyEndpoint(ports.endpointB);
       }
       if (connectionSignature(connection) === geometrySignature(desired)) continue;
-      const portsChanged = connection.endpointA.port_offset !== desired.endpoint_a.port_offset ||
-        currentEndpointB.port_offset !== desired.endpoint_b.port_offset;
+      const portsChanged = connection.endpointA.portOffset !== desired.endpointA.portOffset ||
+        currentEndpointB.portOffset !== desired.endpointB.portOffset;
       const before = geometryOf(connection, currentEndpointB);
       await writeGeometry(connection, desired);
       changes.push({
@@ -3986,11 +3991,11 @@ export class NukeFireMapper {
       if (existing && !existing.id) {
         const source = mapper.getAreaById(room.areaId).room(room.roomNumber);
         const hostExit = source?.exits.find((exit) =>
-          exit.from_direction === observation.mapped.direction
+          exit.fromDirection === observation.mapped.direction
         );
         if (!hostExit) continue;
         existing.id = hostExit.id;
-        existing.connectionId = hostExit.connection_id;
+        existing.connectionId = hostExit.connectionId;
       }
       pending.push({ observation, existing });
     }
@@ -4002,7 +4007,7 @@ export class NukeFireMapper {
         for (const { observation, existing } of pending) {
           if (!existing) {
             const fields: ExitArgs = {
-              from_direction: observation.mapped.direction,
+              fromDirection: observation.mapped.direction,
               door: reportedDoor(true, false, null),
               weight: 1,
               command: observation.mapped.command,
@@ -4128,16 +4133,16 @@ export class NukeFireMapper {
     // rooms are on.
     if (isVerticalDirection(mapped.direction) || isVerticalDirection(mapped.opposite)) {
       geometry.routing = "Simple";
-      geometry.segment_shape = "Direct";
-      geometry.route_points = [];
+      geometry.segmentShape = "Direct";
+      geometry.routePoints = [];
     }
     const traversals: LinkTraversalArgs[] = [
       {
-        room_number: from.roomNumber,
-        from_direction: mapped.direction,
-        ...(mapped.opposite ? { to_direction: mapped.opposite } : {}),
-        to_area_id: to.areaId,
-        to_room_number: to.roomNumber,
+        roomNumber: from.roomNumber,
+        fromDirection: mapped.direction,
+        ...(mapped.opposite ? { toDirection: mapped.opposite } : {}),
+        toAreaId: to.areaId,
+        toRoomNumber: to.roomNumber,
         door: reportedDoor(link.closed, link.locked, null),
         weight: 1,
         command: mapped.command,
@@ -4145,11 +4150,11 @@ export class NukeFireMapper {
     ];
     if (link.bidirectional && reverse) {
       traversals.push({
-        room_number: to.roomNumber,
-        from_direction: reverse.direction,
-        to_direction: mapped.direction,
-        to_area_id: from.areaId,
-        to_room_number: from.roomNumber,
+        roomNumber: to.roomNumber,
+        fromDirection: reverse.direction,
+        toDirection: mapped.direction,
+        toAreaId: from.areaId,
+        toRoomNumber: from.roomNumber,
         door: reportedDoor(link.closed, link.locked, null),
         weight: 1,
         command: reverse.command,
@@ -4176,17 +4181,17 @@ export class NukeFireMapper {
     const canonicalGeometry = canonicalConnectionGeometry(geometry);
     area.connections.set(connectionMirrorKey(connectionId), {
       id: connectionId,
-      endpointA: canonicalGeometry.endpoint_a,
-      endpointB: canonicalGeometry.endpoint_b,
+      endpointA: canonicalGeometry.endpointA,
+      endpointB: canonicalGeometry.endpointB,
       kind: from.roomNumber === to.roomNumber
         ? "SelfLoop"
         : positionA.level === positionB.level
         ? "Internal"
         : "CrossLevel",
       routing: canonicalGeometry.routing,
-      segmentShape: canonicalGeometry.segment_shape,
+      segmentShape: canonicalGeometry.segmentShape,
       corner: canonicalGeometry.corner,
-      routePoints: canonicalGeometry.route_points,
+      routePoints: canonicalGeometry.routePoints,
       color: canonicalGeometry.color ?? DEFAULT_LINK_COLOR,
       thickness: canonicalGeometry.thickness ?? DEFAULT_LINK_THICKNESS,
     });
@@ -4209,13 +4214,13 @@ export class NukeFireMapper {
     this.#assertCurrentRun(runGeneration);
     const destination = to
       ? {
-          ...(mapped.opposite ? { to_direction: mapped.opposite } : {}),
-          to_area_id: to.areaId,
-          to_room_number: to.roomNumber,
+          ...(mapped.opposite ? { toDirection: mapped.opposite } : {}),
+          toAreaId: to.areaId,
+          toRoomNumber: to.roomNumber,
         }
       : {};
     const fields: ExitArgs = {
-      from_direction: mapped.direction,
+      fromDirection: mapped.direction,
       ...destination,
       door: reportedDoor(closed, locked, existing?.door ?? null),
       weight: 1,
@@ -4231,12 +4236,12 @@ export class NukeFireMapper {
         const source = mapper.getAreaById(from.areaId).room(from.roomNumber);
         const hostExit = source && (mapped.direction === "Special"
           ? source.exits.find((exit) =>
-            exit.from_direction === "Special" && commandKey(exit.command) === mapped.command
+            exit.fromDirection === "Special" && commandKey(exit.command) === mapped.command
           )
-          : source.exits.find((exit) => exit.from_direction === mapped.direction));
+          : source.exits.find((exit) => exit.fromDirection === mapped.direction));
         if (!hostExit) return false;
         existing.id = hostExit.id;
-        existing.connectionId = hostExit.connection_id;
+        existing.connectionId = hostExit.connectionId;
       }
       await this.#whileCurrentRun(
         runGeneration,

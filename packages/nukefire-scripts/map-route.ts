@@ -18,15 +18,15 @@ export type RouteDirection =
 export type MapRouteAreaId = string;
 
 export interface RouteExit {
-  from_direction: RouteDirection;
-  to_area_id: MapRouteAreaId | null;
-  to_room_number: number | null;
+  fromDirection: RouteDirection;
+  toAreaId: MapRouteAreaId | null;
+  toRoomNumber: number | null;
   command: string | null;
 }
 
 export interface RouteRoom {
-  area_id: MapRouteAreaId;
-  room_number: number;
+  areaId: MapRouteAreaId;
+  roomNumber: number;
   exits: readonly RouteExit[];
 }
 
@@ -78,7 +78,7 @@ function exitForStep(room: RouteRoom, step: string): RouteExit | undefined {
   // Explicit traversal commands win. This matters when a room has a Special
   // exit alongside an ordinary direction which happens to share its command.
   return room.exits.find((exit) => normalizedCommand(exit.command) === step) ??
-    room.exits.find((exit) => exit.from_direction.toLowerCase() === direction);
+    room.exits.find((exit) => exit.fromDirection.toLowerCase() === direction);
 }
 
 /** Select every exit anchored at the current room. The associated style only
@@ -91,8 +91,8 @@ export function currentRoomMapViewApply(
   return [{
     style: CURRENT_ROOM_STYLE,
     exits: room.exits.map((exit) => ({
-      room: room.room_number,
-      direction: exit.from_direction,
+      room: room.roomNumber,
+      direction: exit.fromDirection,
     })),
   }];
 }
@@ -114,20 +114,20 @@ export function mapViewRoute(
   lookup: RouteRoomLookup,
 ): RouteStyleApplication[] {
   if (!start) return [];
-  const areaId = start.area_id;
-  const rooms = [start.room_number];
+  const areaId = start.areaId;
+  const rooms = [start.roomNumber];
   const exits: { room: number; direction: RouteDirection }[] = [];
   let room = start;
 
   for (const step of routeRaw.trim().toLowerCase()) {
     const exit = exitForStep(room, step);
     if (!exit) break;
-    exits.push({ room: room.room_number, direction: exit.from_direction });
-    if (!exit.to_area_id || exit.to_room_number === null) break;
-    if (!sameArea(areaId, exit.to_area_id)) break;
-    const next = lookup(exit.to_area_id, exit.to_room_number);
+    exits.push({ room: room.roomNumber, direction: exit.fromDirection });
+    if (!exit.toAreaId || exit.toRoomNumber === null) break;
+    if (!sameArea(areaId, exit.toAreaId)) break;
+    const next = lookup(exit.toAreaId, exit.toRoomNumber);
     if (!next) break;
-    rooms.push(next.room_number);
+    rooms.push(next.roomNumber);
     room = next;
   }
   return [{ style: ROUTE_STYLE, rooms, exits }];

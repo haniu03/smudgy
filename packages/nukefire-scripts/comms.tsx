@@ -18,7 +18,7 @@ import {
   createWidget,
   removeWidget,
 } from "smudgy:widgets";
-import { nukefire, onMessage, watchMessage } from "smudgy://kapusniak/nukefire-gmcp";
+import { nukefire, onMessage, watchMessage } from "smudgy:@nukefire-gmcp";
 import { parseAnsiFragments } from "./ansi.ts";
 import {
   auctionItemSpans,

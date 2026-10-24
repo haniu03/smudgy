@@ -138,37 +138,6 @@ fn copy_package(server: &str, name: &str) {
     }
 }
 
-fn localize_rop_dependency(server: &str) {
-    let dir = packages_dir(server)
-        .expect("packages dir")
-        .join("rop-mapper");
-    for name in ["index.ts", "smudgy.package.json"] {
-        let path = dir.join(name);
-        let source = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(
-            path,
-            source.replace(
-                "smudgy://official/auto-mapper",
-                "smudgy://local/auto-mapper",
-            ),
-        )
-        .unwrap();
-    }
-
-    let auto_mapper = packages_dir(server)
-        .expect("packages dir")
-        .join("auto-mapper");
-    for name in ["engine.ts", "smudgy.package.json"] {
-        let path = auto_mapper.join(name);
-        let source = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(
-            path,
-            source.replace("smudgy://kapusniak/map-layout", "smudgy://local/map-layout"),
-        )
-        .unwrap();
-    }
-}
-
 fn gmcp(name: &str, data: &str) -> RuntimeAction {
     RuntimeAction::GmcpMessage {
         name: Arc::from(name),
@@ -262,7 +231,6 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
     copy_package(SERVER, "map-layout");
     copy_package(SERVER, "auto-mapper");
     copy_package(SERVER, "rop-mapper");
-    localize_rop_dependency(SERVER);
     shared_packages::install_package(SERVER, "smudgy://local/rop-mapper", UpdateMode::Auto, true)
         .unwrap();
 

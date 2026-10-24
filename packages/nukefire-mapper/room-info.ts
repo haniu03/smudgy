@@ -1,4 +1,4 @@
-import type { NukeFireMapLink } from "smudgy://kapusniak/nukefire-gmcp";
+import type { NukeFireMapLink } from "smudgy:@nukefire-gmcp";
 import { isUsableVnum, mapDirection, type MappedDirection } from "./model.ts";
 
 export interface VerticalExitObservation {

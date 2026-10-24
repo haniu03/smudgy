@@ -11,6 +11,7 @@ import * as deck from "./deck.tsx";
 import * as hud from "./hud.tsx";
 import * as map from "./map.tsx";
 import { getMagnifiedSession, startMultiSessionSupport } from "./multi.ts";
+import * as notes from "./notes.tsx";
 import * as radar from "./radar.tsx";
 import * as vitals from "./vitals.tsx";
 import * as welcome from "./welcome.tsx";
@@ -21,7 +22,8 @@ interface Panel {
 }
 
 // Parents precede children. Deck is split beneath Affects; Atlas joins Map's
-// tab group before Comms and Radar are split beneath it. Closing runs in
+// tab group before Comms and Radar are split beneath it. Notes is split
+// beneath Map last, so it sits directly under the map. Closing runs in
 // reverse order.
 const PANELS: readonly Panel[] = [
   { key: "hud", module: hud },
@@ -32,6 +34,7 @@ const PANELS: readonly Panel[] = [
   { key: "comms", module: comms },
   { key: "radar", module: radar },
   { key: "codex", module: codex },
+  { key: "notes", module: notes },
 ];
 
 export const panesOpen = createState<Record<PanelKey, boolean>>("panesOpen");

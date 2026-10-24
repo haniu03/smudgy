@@ -5,15 +5,15 @@
 // MapView keeps tracking the player. Nothing here writes to the map.
 
 export interface FollowRoom {
-  readonly area_id: AreaId;
-  readonly room_number: RoomNumber;
+  readonly areaId: AreaId;
+  readonly roomNumber: RoomNumber;
   readonly externalId: string | undefined;
 }
 
 export interface FollowArea {
   readonly id: AreaId;
   readonly storage: MapStorage;
-  readonly room_numbers: RoomNumber[];
+  readonly roomNumbers: RoomNumber[];
   room(roomNumber: number): FollowRoom | undefined;
 }
 
@@ -35,7 +35,7 @@ function sameAreaId(a: AreaId, b: AreaId): boolean {
 }
 
 function roomInArea(area: FollowArea, externalId: string): FollowRoom | undefined {
-  for (const number of area.room_numbers) {
+  for (const number of area.roomNumbers) {
     const room = area.room(number);
     if (room?.externalId === externalId) return room;
   }
@@ -57,10 +57,10 @@ export function resolveFollowedLocation(
   if (!found) return undefined;
 
   const current = mapper.getCurrentLocation();
-  if (current && !sameAreaId(found.area_id, current.area)) {
+  if (current && !sameAreaId(found.areaId, current.area)) {
     try {
       const stayed = roomInArea(mapper.getAreaById(current.area), externalId);
-      if (stayed) return { area: stayed.area_id, room: stayed.room_number };
+      if (stayed) return { area: stayed.areaId, room: stayed.roomNumber };
     } catch {
       // The viewed area disappeared; fall through to the global binding.
     }
@@ -68,17 +68,17 @@ export function resolveFollowedLocation(
 
   let foundStorage: MapStorage | undefined;
   try {
-    foundStorage = mapper.getAreaById(found.area_id).storage;
+    foundStorage = mapper.getAreaById(found.areaId).storage;
   } catch {
     return undefined;
   }
   if (foundStorage !== "session") {
-    return { area: found.area_id, room: found.room_number };
+    return { area: found.areaId, room: found.roomNumber };
   }
   for (const area of mapper.areas) {
     if (area.storage === "session") continue;
     const durable = roomInArea(area, externalId);
-    if (durable) return { area: durable.area_id, room: durable.room_number };
+    if (durable) return { area: durable.areaId, room: durable.roomNumber };
   }
-  return { area: found.area_id, room: found.room_number };
+  return { area: found.areaId, room: found.roomNumber };
 }

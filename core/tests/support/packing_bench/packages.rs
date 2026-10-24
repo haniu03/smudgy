@@ -316,7 +316,7 @@ fn instrument_scripts(files: &mut [(String, String)]) {
     for (subpath, source) in files {
         if subpath == "index.ts" {
             *source = format!(
-                "import './commands.ts';\nimport {{ layoutPlannerState, layoutWorkerDiagnostics }} from 'smudgy://kapusniak/map-layout';\n{}",
+                "import './commands.ts';\nimport {{ layoutPlannerState, layoutWorkerDiagnostics }} from 'smudgy:@map-layout';\n{}",
                 PLANNER_PROBE.replace("__PACKING_REALM__", "\"scripts\"")
             );
         } else if subpath == "welcome.tsx" {

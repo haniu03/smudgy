@@ -1,5 +1,5 @@
 // Loader hooks for running the package under plain Node: `smudgy:core` is a
-// stub backed by globalThis.__smudgyStub, and the `smudgy://official/mudlet-db`
+// stub backed by globalThis.__smudgyStub, and the `smudgy:@mudlet-db`
 // dependency resolves to the sibling package folder.
 
 const CORE = `
@@ -17,7 +17,7 @@ const MUDLET_DB = new URL("../../mudlet-db/index.ts", import.meta.url).href;
 
 export function resolve(specifier, context, next) {
   if (specifier === "smudgy:core") return { url: "virtual:smudgy:core", shortCircuit: true };
-  if (specifier === "smudgy://official/mudlet-db") return { url: MUDLET_DB, shortCircuit: true };
+  if (specifier === "smudgy:@mudlet-db") return { url: MUDLET_DB, shortCircuit: true };
   return next(specifier, context);
 }
 

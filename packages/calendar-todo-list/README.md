@@ -3,7 +3,7 @@
 A small to-do list and event calendar kept in a database, ported from the
 Mudlet package of the same name by Belgarath (Mudlet forums, listed on
 packages.mudlet.org; pinned in the smudgy-meta import research). It is the
-first consumer of `smudgy://official/mudlet-db`, and it is small enough to read
+first consumer of `smudgy:@mudlet-db`, and it is small enough to read
 in one sitting.
 
 | Command | Does |

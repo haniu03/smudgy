@@ -81,31 +81,6 @@ fn copy_package(server: &str, name: &str) {
     }
 }
 
-fn localize_mapper_dependencies(server: &str) {
-    let directory = packages_dir(server)
-        .expect("packages dir")
-        .join("nukefire-mapper");
-    for entry in std::fs::read_dir(&directory).expect("read mapper package") {
-        let entry = entry.expect("mapper package entry");
-        let path = entry.path();
-        let is_source = path.extension().is_some_and(|extension| extension == "ts");
-        let is_manifest = path
-            .file_name()
-            .is_some_and(|name| name == "smudgy.package.json");
-        if !is_source && !is_manifest {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).expect("read mapper source");
-        let localized = source
-            .replace(
-                "smudgy://kapusniak/nukefire-gmcp",
-                "smudgy://local/nukefire-gmcp",
-            )
-            .replace("smudgy://kapusniak/map-layout", "smudgy://local/map-layout");
-        std::fs::write(path, localized).expect("localize mapper dependency");
-    }
-}
-
 fn write_gmcp_fixture(server: &str) {
     let directory = packages_dir(server)
         .expect("packages dir")
@@ -145,7 +120,6 @@ pub fn install_mapper_packages(server: &str) {
     copy_package(server, "map-layout");
     copy_package(server, "nukefire-mapper");
     write_gmcp_fixture(server);
-    localize_mapper_dependencies(server);
     shared_packages::install_package(server, MAPPER_SPEC, UpdateMode::Auto, true)
         .expect("install NukeFire mapper");
 }

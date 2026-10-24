@@ -50,8 +50,8 @@ function refreshMapStyles() {
         currentRoomMapApply.set([{
             style: CURRENT_ROOM_STYLE,
             exits: room.exits.map((exit) => ({
-                room: room.room_number,
-                direction: exit.from_direction,
+                room: room.roomNumber,
+                direction: exit.fromDirection,
             })),
         }]);
     } catch {
