@@ -58,7 +58,7 @@ fn test_initial_state_is_correct() {
     assert!(state.is_loading_profiles.is_none());
     assert!(state.server_action.is_none());
     assert_eq!(state.server_form_data.name, "");
-    assert_eq!(state.server_form_data.host, "");
+    assert_eq!(state.server_form_data.destination, "");
     assert_eq!(state.server_form_data.port, "");
     assert!(state.server_crud_error.is_none());
     assert!(state.profile_action.is_none());
@@ -118,7 +118,7 @@ fn test_submit_server_form_create_valid() {
     state.server_action = Some(ServerCrudAction::Create);
     state.server_form_data = ServerConfigFormData {
         name: "MyMUD".to_string(),
-        host: "mud.example.com".to_string(),
+        destination: "mud.example.com".to_string(),
         port: "4000".to_string(),
         ..ServerConfigFormData::default()
     };
@@ -136,7 +136,7 @@ fn wss_server_form_preserves_path_and_query() {
     state.server_action = Some(ServerCrudAction::Create);
     state.server_form_data = ServerConfigFormData {
         name: "Outpost".to_owned(),
-        wss_url: "wss://last-outpost.com/ws/telnet/?profile=one".to_owned(),
+        destination: "wss://last-outpost.com/ws/telnet/?profile=one".to_owned(),
         ..ServerConfigFormData::default()
     };
 
@@ -160,12 +160,107 @@ fn wss_server_form_preserves_path_and_query() {
 }
 
 #[test]
+fn destination_scheme_picks_the_transport() {
+    for wss in [
+        "wss://mud.example.com",
+        "WSS://mud.example.com/ws",
+        "  wss://mud.example.com/ws?x=1 ",
+    ] {
+        assert!(server::is_wss_destination(wss), "{wss}");
+    }
+    for telnet in ["mud.example.com", "", "ws://mud.example.com", "wss:"] {
+        assert!(!server::is_wss_destination(telnet), "{telnet}");
+    }
+}
+
+#[test]
+fn wss_destination_saves_tls_without_touching_the_forms_choice() {
+    let mut state = initial_state();
+    state.server_action = Some(ServerCrudAction::Create);
+    state.server_form_data = ServerConfigFormData {
+        name: "Outpost".to_owned(),
+        destination: "wss://mud.example.com/ws".to_owned(),
+        port: "not a port".to_owned(),
+        tls: false,
+        tls_verify: false,
+        ..ServerConfigFormData::default()
+    };
+
+    let _ = update(&mut state, Message::SubmitServerForm);
+    assert!(state.server_crud_error.is_none());
+    assert!(matches!(
+        &state.pending_server_operation.as_ref().expect("pending save").action,
+        ServerOperationAction::Create { config, .. }
+            if config.tls && config.tls_verify && config.port == 443
+    ));
+    assert!(!state.server_form_data.tls);
+    assert!(!state.server_form_data.tls_verify);
+}
+
+#[test]
+fn editing_a_wss_server_leaves_tls_unchecked_for_telnet() {
+    let mut state = initial_state();
+    let mut outpost = server("Outpost");
+    outpost.config = ServerConfig::new("mud.example.com".to_owned(), 443);
+    outpost.config.wss_url = Some("wss://mud.example.com/ws".to_owned());
+    outpost.config.tls = true;
+    state.servers.push(outpost.clone());
+
+    let _ = update(&mut state, Message::RequestEditServer(outpost.name.clone()));
+    assert_eq!(
+        state.server_form_data.destination,
+        "wss://mud.example.com/ws"
+    );
+    assert!(!state.server_form_data.tls);
+
+    for (field, value) in [
+        (ServerFormField::Destination, "mud.example.com"),
+        (ServerFormField::Port, "4000"),
+    ] {
+        let _ = update(
+            &mut state,
+            Message::UpdateServerFormField(field, value.to_owned()),
+        );
+    }
+    let _ = update(&mut state, Message::SubmitServerForm);
+    assert!(matches!(
+        &state.pending_server_operation.as_ref().expect("pending save").action,
+        ServerOperationAction::Update { config, .. }
+            if config.wss_url.is_none() && !config.tls && config.port == 4000
+    ));
+}
+
+#[test]
+fn destination_must_be_a_host_or_a_wss_url() {
+    for (destination, error) in [
+        ("   ", "Destination cannot be empty."),
+        (
+            "telnet://mud.example.com",
+            "Destination must be a host name or a wss:// URL.",
+        ),
+    ] {
+        let mut state = initial_state();
+        state.server_action = Some(ServerCrudAction::Create);
+        state.server_form_data = ServerConfigFormData {
+            name: "MyMUD".to_owned(),
+            destination: destination.to_owned(),
+            port: "4000".to_owned(),
+            ..ServerConfigFormData::default()
+        };
+
+        let _ = update(&mut state, Message::SubmitServerForm);
+        assert!(state.pending_server_operation.is_none(), "{destination}");
+        assert_eq!(state.server_crud_error.as_deref(), Some(error));
+    }
+}
+
+#[test]
 fn test_submit_server_form_create_invalid_port() {
     let mut state = initial_state();
     state.server_action = Some(ServerCrudAction::Create);
     state.server_form_data = ServerConfigFormData {
         name: "MyMUD".to_string(),
-        host: "mud.example.com".to_string(),
+        destination: "mud.example.com".to_string(),
         port: "invalid_port".to_string(),
         ..ServerConfigFormData::default()
     };
@@ -187,7 +282,7 @@ fn test_submit_server_form_create_empty_name() {
     state.server_action = Some(ServerCrudAction::Create);
     state.server_form_data = ServerConfigFormData {
         name: "".to_string(),
-        host: "mud.example.com".to_string(),
+        destination: "mud.example.com".to_string(),
         port: "4000".to_string(),
         ..ServerConfigFormData::default()
     };
@@ -208,7 +303,7 @@ fn test_submit_server_form_rejects_untranslated_core_name_error_early() {
     state.server_action = Some(ServerCrudAction::Create);
     state.server_form_data = ServerConfigFormData {
         name: "My MUD".to_string(),
-        host: "mud.example.com".to_string(),
+        destination: "mud.example.com".to_string(),
         port: "4000".to_string(),
         ..Default::default()
     };
@@ -450,7 +545,7 @@ fn server_submit_captures_the_exact_snapshot_and_hidden_config() {
     );
     let _ = update(
         &mut state,
-        Message::UpdateServerFormField(ServerFormField::Host, "new.example".to_string()),
+        Message::UpdateServerFormField(ServerFormField::Destination, "new.example".to_string()),
     );
     let _ = update(&mut state, Message::SubmitServerForm);
 
@@ -472,7 +567,7 @@ fn server_submit_captures_the_exact_snapshot_and_hidden_config() {
     let immutable = pending.clone();
     let _ = update(
         &mut state,
-        Message::UpdateServerFormField(ServerFormField::Host, "later.example".to_string()),
+        Message::UpdateServerFormField(ServerFormField::Destination, "later.example".to_string()),
     );
     assert_eq!(state.pending_server_operation.as_ref(), Some(&immutable));
 }
@@ -491,7 +586,7 @@ fn server_completion_updates_only_its_original_snapshot_and_not_a_new_form() {
     );
     let _ = update(
         &mut state,
-        Message::UpdateServerFormField(ServerFormField::Host, "saved.example".to_string()),
+        Message::UpdateServerFormField(ServerFormField::Destination, "saved.example".to_string()),
     );
     let _ = update(&mut state, Message::SubmitServerForm);
     let pending = state.pending_server_operation.clone().unwrap();
@@ -508,7 +603,7 @@ fn server_completion_updates_only_its_original_snapshot_and_not_a_new_form() {
     let _ = update(&mut state, Message::RequestEditServer(other.name.clone()));
     let _ = update(
         &mut state,
-        Message::UpdateServerFormField(ServerFormField::Host, "draft.example".to_string()),
+        Message::UpdateServerFormField(ServerFormField::Destination, "draft.example".to_string()),
     );
     let newer_revision = state.server_form_revision;
 
@@ -522,7 +617,7 @@ fn server_completion_updates_only_its_original_snapshot_and_not_a_new_form() {
 
     assert_eq!(state.selected_server.as_deref(), Some("Discworld"));
     assert_eq!(state.server_form_revision, newer_revision);
-    assert_eq!(state.server_form_data.host, "draft.example");
+    assert_eq!(state.server_form_data.destination, "draft.example");
     assert!(matches!(
         &state.server_action,
         Some(ServerCrudAction::Edit(server)) if server == &other
@@ -537,7 +632,7 @@ fn server_double_submit_and_out_of_order_completion_are_ignored() {
     state.server_action = Some(ServerCrudAction::Create);
     state.server_form_data = ServerConfigFormData {
         name: "Arctic".to_string(),
-        host: "mud.example".to_string(),
+        destination: "mud.example".to_string(),
         port: "4000".to_string(),
         ..ServerConfigFormData::default()
     };
@@ -891,7 +986,7 @@ fn compare_and_swap_conflicts_are_reported_in_translated_text() {
     state.server_action = Some(ServerCrudAction::Edit(server.clone()));
     state.server_form_data = ServerConfigFormData {
         name: server.name.clone(),
-        host: "mud.example.com".to_string(),
+        destination: "mud.example.com".to_string(),
         port: "4000".to_string(),
         ..Default::default()
     };

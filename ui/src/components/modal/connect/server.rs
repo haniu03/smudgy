@@ -19,8 +19,8 @@ use smudgy_core::models::server::{ServerCas, ServerConfig, parse_wss_address};
 use super::{
     AppliedServerOperation, Message, ServerCrudAction, ServerFormField, ServerOperationAction,
     ServerOperationCompletion, ServerOperationEnvelope, ServerOperationError, State,
-    next_server_operation_id, server_host_input_id, server_name_input_id, server_port_input_id,
-    server_wss_input_id,
+    next_server_operation_id, server_destination_input_id, server_name_input_id,
+    server_port_input_id,
 };
 
 /// The encoding dropdown's "no override" entry — UTF-8, i.e.
@@ -85,27 +85,32 @@ fn compression_field(state: &State) -> Element<'_, Message> {
 }
 
 /// The TLS checkbox, with a nested "Verify certificate" shown only when TLS is on.
+/// A `wss://` destination is always verified TLS, so both show checked and
+/// locked; the form's own TLS choices stay as the user left them.
 fn tls_field(state: &State) -> Element<'_, Message> {
-    let secure = checkbox(state.server_form_data.tls)
+    let wss = is_wss_destination(&state.server_form_data.destination);
+    let tls = wss || state.server_form_data.tls;
+    let secure = checkbox(tls)
         .label(t!("server-tls"))
-        .on_toggle(Message::ToggleServerTls)
+        .on_toggle_maybe((!wss).then_some(Message::ToggleServerTls))
         .size(16);
     let mut col = column![secure].spacing(4);
-    if state.server_form_data.tls {
-        let verify = checkbox(state.server_form_data.tls_verify)
+    if tls {
+        let verify = checkbox(wss || state.server_form_data.tls_verify)
             .label(t!("server-tls-verify"))
-            .on_toggle(Message::ToggleServerTlsVerify)
+            .on_toggle_maybe((!wss).then_some(Message::ToggleServerTlsVerify))
             .size(16);
-        col = col.push(
-            column![
-                verify,
+        let mut nested = column![verify]
+            .spacing(2)
+            .padding(iced::Padding::default().left(24.0));
+        if !wss {
+            nested = nested.push(
                 text(t!("server-tls-insecure-help"))
                     .size(12)
                     .style(builtins::text::muted),
-            ]
-            .spacing(2)
-            .padding(iced::Padding::default().left(24.0)),
-        );
+            );
+        }
+        col = col.push(nested);
     }
     col.into()
 }
@@ -126,9 +131,6 @@ fn encoding_field(state: &State) -> Element<'_, Message> {
             Message::UpdateServerFormField(ServerFormField::Encoding, val.0.to_string())
         })
         .width(Length::Fixed(220.0)),
-        text(t!("encoding-help"))
-            .size(12)
-            .style(builtins::text::muted),
     ]
     .spacing(4)
     .into()
@@ -193,12 +195,27 @@ pub(super) fn format_bytes(bytes: u64) -> String {
 
 // --- Update Logic ---
 
+/// Whether a Destination connects over a secure WebSocket: it names the `wss`
+/// scheme (in any case, as URL schemes are). Anything else is a Telnet host.
+pub(super) fn is_wss_destination(destination: &str) -> bool {
+    destination
+        .trim()
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("wss"))
+}
+
 fn form_address(state: &State) -> Result<(String, u16, Option<String>), String> {
-    let wss_url = state.server_form_data.wss_url.trim();
-    if !wss_url.is_empty() {
-        return parse_wss_address(wss_url)
-            .map(|(host, port)| (host, port, Some(wss_url.to_owned())))
+    let destination = state.server_form_data.destination.trim();
+    if destination.is_empty() {
+        return Err(t!("server-error-destination-empty"));
+    }
+    if is_wss_destination(destination) {
+        return parse_wss_address(destination)
+            .map(|(host, port)| (host, port, Some(destination.to_owned())))
             .map_err(|error| error.to_string());
+    }
+    if destination.contains("://") {
+        return Err(t!("server-error-destination-scheme"));
     }
     let port = state
         .server_form_data
@@ -206,22 +223,19 @@ fn form_address(state: &State) -> Result<(String, u16, Option<String>), String> 
         .trim()
         .parse::<u16>()
         .map_err(|_| t!("server-error-port"))?;
-    Ok((state.server_form_data.host.trim().to_owned(), port, None))
+    Ok((destination.to_owned(), port, None))
 }
 
-fn wss_field(state: &State) -> Element<'_, Message> {
+fn destination_field(state: &State) -> Element<'_, Message> {
     column![
-        text(t!("server-wss-url"))
+        text(t!("server-destination"))
             .size(13)
             .style(builtins::text::muted),
-        TextInput::new(
-            "wss://example.org/ws/telnet/",
-            &state.server_form_data.wss_url
-        )
-        .id(server_wss_input_id())
-        .on_input(|value| Message::UpdateServerFormField(ServerFormField::WssUrl, value))
-        .on_submit(Message::SubmitServerForm),
-        text(t!("server-wss-help"))
+        TextInput::new("mud.example.com", &state.server_form_data.destination)
+            .id(server_destination_input_id())
+            .on_input(|value| Message::UpdateServerFormField(ServerFormField::Destination, value))
+            .on_submit(Message::SubmitServerForm),
+        text(t!("server-destination-help"))
             .size(12)
             .style(builtins::text::muted),
     ]
@@ -407,18 +421,6 @@ pub(super) fn view_server_form<'a>(
             ]
             .spacing(4);
 
-            let host_field: Element<Message> = column![
-                text(t!("server-host"))
-                    .size(13)
-                    .style(builtins::text::muted),
-                TextInput::new("mud.example.com", &state.server_form_data.host)
-                    .id(server_host_input_id())
-                    .on_input(|val| Message::UpdateServerFormField(ServerFormField::Host, val))
-                    .on_submit(Message::SubmitServerForm),
-            ]
-            .spacing(4)
-            .into();
-
             let port_field: Element<Message> = column![
                 text(t!("server-port"))
                     .size(13)
@@ -450,24 +452,15 @@ pub(super) fn view_server_form<'a>(
                 text(t!("server-add")).size(Pixels(22.0)).into(),
                 vec![
                     name_field.into(),
-                    wss_field(state),
-                    if state.server_form_data.wss_url.trim().is_empty() {
-                        host_field
-                    } else {
+                    destination_field(state),
+                    if is_wss_destination(&state.server_form_data.destination) {
                         horizontal_space().into()
-                    },
-                    if state.server_form_data.wss_url.trim().is_empty() {
+                    } else {
                         port_field
-                    } else {
-                        horizontal_space().into()
                     },
                     encoding_field(state),
                     compression_field(state),
-                    if state.server_form_data.wss_url.trim().is_empty() {
-                        tls_field(state)
-                    } else {
-                        horizontal_space().into()
-                    },
+                    tls_field(state),
                     server_error(state),
                 ],
                 Row::new()
@@ -488,18 +481,6 @@ pub(super) fn view_server_form<'a>(
                 text(name).size(Pixels(16.0)),
             ]
             .spacing(4);
-
-            let host_field: Element<Message> = column![
-                text(t!("server-host"))
-                    .size(13)
-                    .style(builtins::text::muted),
-                TextInput::new("mud.example.com", &state.server_form_data.host)
-                    .id(server_host_input_id())
-                    .on_input(|val| Message::UpdateServerFormField(ServerFormField::Host, val))
-                    .on_submit(Message::SubmitServerForm),
-            ]
-            .spacing(4)
-            .into();
 
             let port_field: Element<Message> = column![
                 text(t!("server-port"))
@@ -548,24 +529,15 @@ pub(super) fn view_server_form<'a>(
                 text(t!("server-edit")).size(Pixels(22.0)).into(),
                 vec![
                     name_field.into(),
-                    wss_field(state),
-                    if state.server_form_data.wss_url.trim().is_empty() {
-                        host_field
-                    } else {
+                    destination_field(state),
+                    if is_wss_destination(&state.server_form_data.destination) {
                         horizontal_space().into()
-                    },
-                    if state.server_form_data.wss_url.trim().is_empty() {
+                    } else {
                         port_field
-                    } else {
-                        horizontal_space().into()
                     },
                     encoding_field(state),
                     compression_field(state),
-                    if state.server_form_data.wss_url.trim().is_empty() {
-                        tls_field(state)
-                    } else {
-                        horizontal_space().into()
-                    },
+                    tls_field(state),
                     server_error(state),
                 ],
                 Row::new()
