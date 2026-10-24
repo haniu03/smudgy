@@ -12,6 +12,7 @@ web-audio-cpal = []
 [dependencies]
 arc-swap = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
+chrono = { workspace = true }
 encoding_rs = "0.8"
 iced = { workspace = true }
 iced_runtime = { workspace = true }

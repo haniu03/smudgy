@@ -11641,6 +11641,7 @@ version = "0.5.8-dev"
 dependencies = [
  "arc-swap",
  "bytemuck",
+ "chrono",
  "encoding_rs",
  "iced",
  "iced_runtime",
