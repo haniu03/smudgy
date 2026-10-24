@@ -31,7 +31,7 @@ const COMMAND_ENTRY: &str = r#"
 import "./commands.ts";
 import { createAlias, echo, mapper, getSessions } from "smudgy:core";
 import { planAreaChange, loadLayoutModel, layoutSnapshotKey,
-  createLayoutModel, resolveElevationGeometry } from "smudgy://kapusniak/map-layout";
+  createLayoutModel, resolveElevationGeometry } from "smudgy:@map-layout";
 import { applyManualLayout } from "smudgy:procedures/kapusniak/nukefire-mapper";
 import { manualLayoutApplied } from "smudgy:events/kapusniak/nukefire-mapper";
 manualLayoutApplied.from(getSessions()[0]).on((ack) => {
@@ -171,7 +171,10 @@ fn manifest_dependency(
     let declaration = declarations
         .iter()
         .filter_map(|raw| PackageDependency::parse(raw).map(Result::unwrap))
-        .find(|declaration| declaration.key.owner == OWNER && declaration.key.name == name)
+        .find(|declaration| {
+            declaration.key.name == name
+                && (declaration.key.owner.is_empty() || declaration.key.owner == OWNER)
+        })
         .expect("authored manifest declares fixture dependency");
     dependency(
         name,
@@ -654,7 +657,7 @@ async fn installed_manual_reflows_commit_routes_acknowledge_and_reject_stale_res
         .clone();
     let location_aliases = format!(
         r#"import {{ createAlias, echo, mapper }} from "smudgy:core";
-import {{ layoutSnapshotKey, loadLayoutModel }} from "smudgy://kapusniak/map-layout";
+import {{ layoutSnapshotKey, loadLayoutModel }} from "smudgy:@map-layout";
 import {{ applyManualLayout }} from "smudgy:procedures/kapusniak/nukefire-mapper";
 createAlias(/^locate-bounded$/, () => {{ mapper.setCurrentLocation("{bounded}", 1); echo("BOUNDED-LOCATED"); }});
 createAlias(/^locate-perfect$/, () => {{ mapper.setCurrentLocation("{perfect}", 1); echo("PERFECT-LOCATED"); }});
