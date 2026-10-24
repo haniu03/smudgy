@@ -293,7 +293,7 @@ interface Palette {
     output: string;
     selection: string;
     inputBackground: string;
-    /** The app accent color; absent when the scheme falls back to the foreground. */
+    /** The app accent color: the one chosen in Preferences, else the scheme's; absent when neither sets one. */
     accent?: string;
 }
 

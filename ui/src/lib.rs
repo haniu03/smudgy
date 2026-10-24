@@ -1122,7 +1122,7 @@ pub fn run() -> anyhow::Result<()> {
                 // one coherent light/dark palette.
                 prefs::app_theme()
             } else {
-                smudgy_theme::secondary()
+                prefs::secondary_theme()
             }
         })
         .style(|_smudgy, theme| {

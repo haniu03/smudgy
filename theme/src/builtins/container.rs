@@ -143,9 +143,9 @@ pub fn modal_body(theme: &Theme) -> container::Style {
     }
 }
 
-/// Inline purple notice strip — the single vehicle for inline warnings/disclosures
+/// Inline accent notice strip — the single vehicle for inline warnings/disclosures
 /// (e.g. the plain-text auto-login disclosure in the profile form). Reuses the
-/// modal title bar's purple gradient, but rounded on all corners so it reads as a
+/// modal title bar's accent gradient, but rounded on all corners so it reads as a
 /// standalone banner embedded in a form rather than a panel header.
 #[must_use]
 pub fn notice(theme: &Theme) -> container::Style {

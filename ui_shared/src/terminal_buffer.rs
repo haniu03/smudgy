@@ -2499,28 +2499,18 @@ impl TerminalBuffer {
 /// font, so the client visibly speaks in a different voice from the game.
 pub(crate) const SYSTEM_FONT: iced::Font = crate::assets::GEIST;
 
-/// Smudgy's own purple, in the two values that keep it legible: the lighter
-/// one for text on a dark ground, the deeper one on a light ground. The
-/// client speaks in its brand colour rather than borrowing the scheme's echo
-/// role, so its rows read as the app talking whatever palette the terminal
-/// wears.
-const SYSTEM_PURPLE_ON_DARK: iced::Color = iced::Color::from_rgb(0.686, 0.596, 0.980);
-const SYSTEM_PURPLE_ON_LIGHT: iced::Color = iced::Color::from_rgb(0.357, 0.169, 0.788);
-
-/// The colour a system row of `severity` is drawn in. Warnings keep the
+/// The colour a system row of `severity` is drawn in. The client speaks in
+/// the app accent rather than borrowing the scheme's echo role, so its rows
+/// read as the app talking whatever palette the terminal wears; the accent's
+/// text tint for the terminal's ground keeps them legible. Warnings keep the
 /// scheme's warn role: a warning must look like a warning, not like chrome.
 pub(crate) fn system_color(prefs: &TerminalPrefs, severity: Severity) -> iced::Color {
     match severity {
-        Severity::Info => {
-            let background = prefs.palette.background;
-            // Rec. 601 luma is enough to tell a dark ground from a light one.
-            let luma = 0.299 * background.r + 0.587 * background.g + 0.114 * background.b;
-            if luma > 0.5 {
-                SYSTEM_PURPLE_ON_LIGHT
-            } else {
-                SYSTEM_PURPLE_ON_DARK
-            }
-        }
+        Severity::Info => prefs
+            .accent
+            .as_ref()
+            .unwrap_or(&smudgy_theme::accent::Accent::STOCK)
+            .ink(prefs.palette.background),
         Severity::Warn => prefs.palette.warn,
     }
 }
@@ -2755,6 +2745,24 @@ mod tests {
                 .collect();
             lines.reverse();
             lines
+        }
+
+        #[test]
+        fn info_rows_speak_in_the_chosen_accent_and_warnings_in_the_warn_role() {
+            use smudgy_theme::accent::Accent;
+
+            let stock = TerminalPrefs::default();
+            assert_eq!(
+                system_color(&stock, Severity::Info),
+                Accent::STOCK.ink_on_dark
+            );
+            let accent = Accent::from_color(iced::Color::from_rgb8(8, 108, 72));
+            let chosen = TerminalPrefs {
+                accent: Some(accent),
+                ..TerminalPrefs::default()
+            };
+            assert_eq!(system_color(&chosen, Severity::Info), accent.ink_on_dark);
+            assert_eq!(system_color(&chosen, Severity::Warn), chosen.palette.warn);
         }
 
         #[test]

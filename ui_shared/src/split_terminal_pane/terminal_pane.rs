@@ -56,7 +56,6 @@ const MAX_EFFECT_FRAGMENTS: usize = 512;
 /// 100 '0's shaped once per prefs generation to measure the monospace cell
 /// advance for the column-based line-length clamp.
 const ADVANCE_PROBE: &str = "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-const TERMINAL_SELECTION_BACKGROUND: iced::Color = iced::Color::from_rgb8(55, 23, 130);
 
 /// Left inset of a system row's text: room for the gutter bar and, on a
 /// group, the fold chevron.
@@ -2487,6 +2486,13 @@ where
     ) {
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
         let prefs = crate::prefs::current();
+        // Search matches wear the app accent; a plain selection, the scheme's
+        // own selection color.
+        let search_highlight = prefs
+            .accent
+            .as_ref()
+            .unwrap_or(&smudgy_theme::accent::Accent::STOCK)
+            .fill;
 
         let effect_viewport = if self.shrink {
             *viewport
@@ -2673,7 +2679,7 @@ where
                                     ..Default::default()
                                 },
                                 Background::Color(if cache.search_selection {
-                                    TERMINAL_SELECTION_BACKGROUND
+                                    search_highlight
                                 } else {
                                     prefs.palette.selection
                                 }),

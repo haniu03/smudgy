@@ -1,6 +1,7 @@
 use iced::widget::{container, scrollable, text_editor};
 use iced::{Background, Border, Color, Shadow, border};
 
+pub mod accent;
 pub mod markdown;
 mod secondary;
 mod smudgy;
