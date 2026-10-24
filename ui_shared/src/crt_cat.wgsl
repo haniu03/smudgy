@@ -17,7 +17,8 @@ struct Uniforms {
     // 1.0 when the render target is an sRGB format (so the final colour is
     // converted to linear, cancelling the hardware's linear->sRGB store), else 0.0.
     linearize: f32,
-    _pad: f32,
+    // The costume the cat wears; one of the `COSTUME_*` selectors below.
+    costume: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -76,7 +77,7 @@ fn tongue_level(lt: f32, start: f32, end: f32) -> f32 {
     return exp(-(lt - end) / TONGUE_TAU);
 }
 
-fn sprite(p: vec2<i32>, t: f32) -> vec4<f32> {
+fn cat(p: vec2<i32>, t: f32) -> vec4<f32> {
     if (p.x < 0 || p.x >= 15 || p.y < 0 || p.y >= 12) {
         return vec4<f32>(0.0);
     }
@@ -129,6 +130,37 @@ fn sprite(p: vec2<i32>, t: f32) -> vec4<f32> {
     return vec4<f32>(c, a);
 }
 
+// Holiday costumes, each in its own module concatenated after this one
+// (`crt_cat/*.wgsl`). Selectors and heights must match `Costume` in crt_cat.rs.
+const COSTUME_NONE: u32 = 0u;
+const COSTUME_WITCH_HAT: u32 = 1u;
+
+// Source rows the costume rises above the cat's head.
+fn costume_rows_above() -> f32 {
+    if (U.costume == COSTUME_WITCH_HAT) { return f32(-WITCH_HAT_TOP); }
+    return 0.0;
+}
+
+// The costume's pixel at `p`, in cat coordinates; alpha 0 where it has none.
+fn costume(p: vec2<i32>, t: f32) -> vec4<f32> {
+    if (U.costume == COSTUME_WITCH_HAT) { return witch_hat(p, t); }
+    return vec4<f32>(0.0);
+}
+
+// Haze a costume casts around itself, at continuous source position `gp`:
+// premultiplied colour and coverage, so it can glow or darken.
+fn costume_haze(gp: vec2<f32>, t: f32) -> vec4<f32> {
+    if (U.costume == COSTUME_WITCH_HAT) { return witch_hat_smoke(gp, t); }
+    return vec4<f32>(0.0);
+}
+
+// The cat with its costume drawn over it.
+fn sprite(p: vec2<i32>, t: f32) -> vec4<f32> {
+    let base = cat(p, t);
+    let worn = costume(p, t);
+    return vec4<f32>(mix(base.rgb, worn.rgb, worn.a), max(base.a, worn.a));
+}
+
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
     let cutoff = step(vec3<f32>(0.04045), c);
     let low = c / 12.92;
@@ -154,10 +186,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
     // Literal nearest-neighbour enlargement of the 15x12 source: 8 logical
     // points (8 * scale physical pixels) per source pixel, centred in the
-    // widget. Phosphors below remain in physical screen space, so each source
-    // pixel contains multiple CRT elements instead of becoming one glowing tile.
+    // widget together with any costume rising above it. Phosphors below remain
+    // in physical screen space, so each source pixel contains multiple CRT
+    // elements instead of becoming one glowing tile.
     let src_px = 8.0 * U.scale;
-    let gp = (frag_coord - 0.5 * res) / src_px + vec2<f32>(7.5, 6.0);
+    let gp = (frag_coord - 0.5 * res) / src_px + vec2<f32>(7.5, 6.0 - 0.5 * costume_rows_above());
     let cell = vec2<i32>(floor(gp));
     let within = fract(gp) - vec2<f32>(0.5);
 
@@ -185,6 +218,13 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     col += left.rgb * hot_left * bleed_left * 0.16;
     col += right.rgb * hot_right * bleed_right * 0.16;
     alpha = max(alpha, max(hot_left * bleed_left, hot_right * bleed_right) * 0.16);
+
+    // A costume's haze sits behind the sprite, and fades out over the last
+    // source pixel and a half before the widget's edge so it is never clipped.
+    let edge = min(min(frag_coord.x, res.x - frag_coord.x), min(frag_coord.y, res.y - frag_coord.y)) / src_px;
+    let haze = costume_haze(gp, t) * (1.0 - core.a) * smoothstep(0.0, 1.5, edge);
+    col += haze.rgb;
+    alpha = max(alpha, haze.a);
 
     // Filmic-ish phosphor response and display gamma.
     col = 1.0 - exp(-col * 1.45);

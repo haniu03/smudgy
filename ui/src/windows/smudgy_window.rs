@@ -4058,7 +4058,7 @@ impl SmudgyWindow {
             // Every pane here is hidden (the grid drops hidden panes): the
             // sessions still run, so this is not the no-sessions view but
             // its sibling — the same cat, and the ways back to the panes.
-            let cat = widgets::crt_cat::view(self.cat_clock.seconds());
+            let cat = widgets::crt_cat::view(&self.cat_clock);
             let hidden = layout_menu::everything_hidden(cat, crate::i18n::translate)
                 .map(|action| Message::ToolbarAction(toolbar::Message::LayoutMenu(action)));
             // A whole-window drop surface like the empty state, with its
@@ -4075,7 +4075,7 @@ impl SmudgyWindow {
             // menu bar). The cat is a custom wgpu shader primitive; under the
             // software (tiny-skia) renderer it is a no-op and its slot is
             // simply blank.
-            let cat = widgets::crt_cat::view(self.cat_clock.seconds());
+            let cat = widgets::crt_cat::view(&self.cat_clock);
 
             let empty_state: ThemedElement<'_, Message> = container(
                 column![

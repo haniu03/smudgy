@@ -1518,10 +1518,10 @@ pub fn view<'a>(
         stack![panes, drag_overlay::TargetOverlay::new(rects)].into()
     } else if !ui.sessions.is_empty() {
         // Sessions run but every pane is hidden.
-        layout_menu::everything_hidden(crt_cat::view(ui.cat_clock.seconds()), label)
+        layout_menu::everything_hidden(crt_cat::view(&ui.cat_clock), label)
             .map(|action| Message::Toolbar(main_toolbar::Message::LayoutMenu(action)))
     } else {
-        empty_state(ui.cat_clock.seconds())
+        empty_state(&ui.cat_clock)
     };
 
     let body: Element<'_, Message, Theme> = column![
@@ -1586,10 +1586,10 @@ fn show_pane_header(hide_pane_headers: bool, toolbar_expanded: bool) -> bool {
     !hide_pane_headers || toolbar_expanded
 }
 
-fn empty_state(seconds: f32) -> Element<'static, Message, Theme> {
+fn empty_state(clock: &crt_cat::Clock) -> Element<'static, Message, Theme> {
     container(
         column![
-            crt_cat::view(seconds),
+            crt_cat::view(clock),
             text("No active sessions").font(GEIST).size(22),
             text("Connect to a server to get started.")
                 .font(GEIST)
