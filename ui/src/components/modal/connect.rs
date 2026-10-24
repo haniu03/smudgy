@@ -48,11 +48,8 @@ pub type ProfileName = String;
 pub(super) fn server_name_input_id() -> Id {
     Id::new("connect-server-name")
 }
-pub(super) fn server_host_input_id() -> Id {
-    Id::new("connect-server-host")
-}
-pub(super) fn server_wss_input_id() -> Id {
-    Id::new("connect-server-wss")
+pub(super) fn server_destination_input_id() -> Id {
+    Id::new("connect-server-destination")
 }
 pub(super) fn server_port_input_id() -> Id {
     Id::new("connect-server-port")
@@ -168,9 +165,8 @@ impl From<ConnectIntent> for Message {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ServerFormField {
     Name, // Only for Create
-    Host,
+    Destination,
     Port,
-    WssUrl,
     Encoding,
 }
 
@@ -201,9 +197,10 @@ impl From<String> for ProfilePasswordInput {
 #[derive(Debug)]
 pub struct ServerConfigFormData {
     pub name: String,
-    pub host: String,
+    /// A host name (Telnet) or a `wss://` URL (Telnet over a secure WebSocket).
+    pub destination: String,
+    /// Telnet only; a `wss://` destination carries its own port.
     pub port: String,
-    pub wss_url: String,
     /// The encoding dropdown's display value; [`server::DEFAULT_ENCODING_CHOICE`]
     /// stands for "no override" (UTF-8, `ServerConfig::encoding = None`).
     pub encoding: String,
@@ -211,7 +208,8 @@ pub struct ServerConfigFormData {
     pub compression: bool,
     /// Whether inbound MCCP4 compression offers are accepted.
     pub mccp4_compression: bool,
-    /// Connect over TLS.
+    /// Connect over TLS. The user's choice for a Telnet destination; a `wss://`
+    /// destination is always TLS and leaves this untouched.
     pub tls: bool,
     /// When `tls`, verify the server certificate (off = accept any, insecure).
     pub tls_verify: bool,
@@ -221,9 +219,8 @@ impl Default for ServerConfigFormData {
     fn default() -> Self {
         Self {
             name: String::new(),
-            host: String::new(),
+            destination: String::new(),
             port: String::new(),
-            wss_url: String::new(),
             encoding: server::DEFAULT_ENCODING_CHOICE.to_string(),
             compression: true,
             mccp4_compression: true,
@@ -1415,9 +1412,12 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 state.server_action = Some(ServerCrudAction::Edit(server_to_edit.clone()));
                 state.server_form_data = ServerConfigFormData {
                     name: server_to_edit.name.clone(), // Pre-fill name (though not directly editable usually)
-                    host: server_to_edit.config.host.clone(),
+                    destination: server_to_edit
+                        .config
+                        .wss_url
+                        .clone()
+                        .unwrap_or_else(|| server_to_edit.config.host.clone()),
                     port: server_to_edit.config.port.to_string(),
-                    wss_url: server_to_edit.config.wss_url.clone().unwrap_or_default(),
                     encoding: server_to_edit
                         .config
                         .encoding
@@ -1425,7 +1425,9 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                         .unwrap_or_else(|| server::DEFAULT_ENCODING_CHOICE.to_string()),
                     compression: server_to_edit.config.compression,
                     mccp4_compression: server_to_edit.config.accepts_mccp4_compression(),
-                    tls: server_to_edit.config.tls,
+                    // A WSS server's stored TLS flag comes from its scheme, not
+                    // from a choice the user made.
+                    tls: server_to_edit.config.wss_url.is_none() && server_to_edit.config.tls,
                     tls_verify: server_to_edit.config.tls_verify,
                 };
                 state.server_crud_error = None;
@@ -1443,12 +1445,7 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 );
                 state.selected_server = Some(server_name); // Ensure server remains selected
                 // Name isn't editable in edit mode; focus the first editable field.
-                let field = if server_to_edit.config.wss_url.is_some() {
-                    server_wss_input_id()
-                } else {
-                    server_host_input_id()
-                };
-                task = Task::batch([operation::focus(field), usage_task]);
+                task = Task::batch([operation::focus(server_destination_input_id()), usage_task]);
             } else {
                 warn!("Error: Requested to edit non-existent server '{server_name}'");
             }
@@ -1552,9 +1549,8 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
             ) {
                 match field {
                     ServerFormField::Name => state.server_form_data.name = value,
-                    ServerFormField::Host => state.server_form_data.host = value,
+                    ServerFormField::Destination => state.server_form_data.destination = value,
                     ServerFormField::Port => state.server_form_data.port = value,
-                    ServerFormField::WssUrl => state.server_form_data.wss_url = value,
                     ServerFormField::Encoding => state.server_form_data.encoding = value,
                 }
                 state.server_crud_error = None; // Clear error when user types

@@ -127,6 +127,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loading before a script looks up or edits maps.
 - **Batch edit errors identify saved work.** `MutateAreaError` reports the
   operation IDs confirmed saved before a `mapper.mutateArea()` failure.
+- **Servers can connect over a secure WebSocket.** A server's Host is now its
+  Destination: a host name connects over Telnet, and a `wss://` URL connects
+  over a secure WebSocket. A `wss://` destination is always secure, so "Secure
+  connection" shows checked and can't be changed.
 
 ### Changed
 

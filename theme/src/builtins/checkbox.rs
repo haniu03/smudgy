@@ -18,17 +18,17 @@ impl checkbox::Catalog for Theme {
 
 #[must_use]
 pub fn default(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
-    let (is_checked, is_hovered) = match status {
-        checkbox::Status::Active { is_checked } | checkbox::Status::Disabled { is_checked } => {
-            (is_checked, false)
-        }
-        checkbox::Status::Hovered { is_checked } => (is_checked, true),
+    let (is_checked, is_hovered, disabled) = match status {
+        checkbox::Status::Active { is_checked } => (is_checked, false, false),
+        checkbox::Status::Hovered { is_checked } => (is_checked, true, false),
+        checkbox::Status::Disabled { is_checked } => (is_checked, false, true),
     };
+    let alpha = if disabled { 0.45 } else { 1.0 };
 
     let background = if is_checked {
-        Background::Color(theme.styles.general.accent)
+        theme.styles.general.accent
     } else {
-        Background::Color(theme.styles.general.container_background)
+        theme.styles.general.container_background
     };
 
     let border_color = if is_hovered {
@@ -38,13 +38,13 @@ pub fn default(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
     };
 
     checkbox::Style {
-        background,
-        icon_color: theme.styles.text.normal,
+        background: Background::Color(background.scale_alpha(alpha)),
+        icon_color: theme.styles.text.normal.scale_alpha(alpha),
         border: Border {
-            color: border_color,
+            color: border_color.scale_alpha(alpha),
             width: 1.0,
             radius: 2.0.into(),
         },
-        text_color: Some(theme.styles.text.normal),
+        text_color: Some(theme.styles.text.normal.scale_alpha(alpha)),
     }
 }
