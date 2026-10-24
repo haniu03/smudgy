@@ -5,7 +5,7 @@ import test from "node:test";
 const mapLayout = new URL("../map-layout/", import.meta.url).href;
 registerHooks({
   resolve(specifier, context, next) {
-    const prefix = "smudgy://kapusniak/map-layout/";
+    const prefix = "smudgy:@map-layout/";
     return specifier.startsWith(prefix)
       ? { url: mapLayout + specifier.slice(prefix.length), shortCircuit: true }
       : next(specifier, context);
@@ -25,9 +25,9 @@ function rooms(entries: Record<number, [number, number]>): Map<string, { x: numb
 
 function geometry(a: number, sideA: RouteSide, b: number, sideB: RouteSide, extra: Partial<LinkGeometry> = {}): LinkGeometry {
   return {
-    endpoint_a: { room_number: a, side: sideA, port_offset: 0.5, port_mode: "AutoPinned" },
-    endpoint_b: { room_number: b, side: sideB, port_offset: 0.5, port_mode: "AutoPinned" },
-    routing: "Automatic", segment_shape: "Direct", corner: "Rounded", route_points: [],
+    endpointA: { roomNumber: a, side: sideA, portOffset: 0.5, portMode: "AutoPinned" },
+    endpointB: { roomNumber: b, side: sideB, portOffset: 0.5, portMode: "AutoPinned" },
+    routing: "Automatic", segmentShape: "Direct", corner: "Rounded", routePoints: [],
     color: DEFAULT_LINK_COLOR, thickness: 1,
     ...extra,
   };
@@ -42,28 +42,28 @@ test("a link out of walls facing away from its room takes a route of rounded tur
   assert.equal(decision.routed, true);
   assert.equal(decision.geometry.routing, "Automatic");
   assert.equal(decision.geometry.corner, "Rounded");
-  assert.ok(decision.geometry.route_points.length > 0);
+  assert.ok(decision.geometry.routePoints.length > 0);
 });
 
 test("a link straight out of both walls runs straight, still the mapper's own", () => {
   const [decision] = planLinkGeometry(rooms({ 1: [0, 0], 2: [0, 2] }), [own("clean", 1, "South", 2, "North")], MAP);
   assert.equal(decision.routed, false);
   assert.equal(decision.geometry.routing, "Automatic");
-  assert.deepEqual(decision.geometry.route_points, []);
+  assert.deepEqual(decision.geometry.routePoints, []);
 });
 
 test("links between Up and Down exits run straight: the mapper's route is dropped, an author's kept dormant", () => {
   const points = [{ x: 1, y: -1 }, { x: 2, y: -1 }];
   const decisions = planLinkGeometry(rooms({ 1: [0, 0], 2: [2, 0] }), [
-    { id: "generated", from: "room:1", to: "room:2", role: "vertical", geometry: geometry(1, "North", 2, "South", { route_points: points }) },
-    { id: "authored", from: "room:1", to: "room:2", role: "vertical", geometry: geometry(1, "East", 2, "West", { routing: "Manual", route_points: points }) },
+    { id: "generated", from: "room:1", to: "room:2", role: "vertical", geometry: geometry(1, "North", 2, "South", { routePoints: points }) },
+    { id: "authored", from: "room:1", to: "room:2", role: "vertical", geometry: geometry(1, "East", 2, "West", { routing: "Manual", routePoints: points }) },
   ], MAP);
   const generated = decisions.find((decision) => decision.id === "generated")!;
   const authored = decisions.find((decision) => decision.id === "authored")!;
   assert.equal(generated.geometry.routing, "Simple");
-  assert.deepEqual(generated.geometry.route_points, []);
+  assert.deepEqual(generated.geometry.routePoints, []);
   assert.equal(authored.geometry.routing, "Simple");
-  assert.deepEqual(authored.geometry.route_points, points);
+  assert.deepEqual(authored.geometry.routePoints, points);
   assert.equal(isVerticalDirection("Up"), true);
   assert.equal(isVerticalDirection("North"), false);
 });
@@ -71,7 +71,7 @@ test("links between Up and Down exits run straight: the mapper's route is droppe
 test("kept links get no decision and their drawings are avoided", () => {
   const kept: RoutingLink = {
     id: "kept", from: "room:3", to: "room:4", role: "keep",
-    geometry: geometry(3, "South", 4, "North", { routing: "Manual", route_points: [] }),
+    geometry: geometry(3, "South", 4, "North", { routing: "Manual", routePoints: [] }),
   };
   const decisions = planLinkGeometry(rooms({ 1: [0, 0], 2: [2, 2], 3: [1, -1], 4: [1, 3] }), [
     own("bent", 1, "East", 2, "North"),

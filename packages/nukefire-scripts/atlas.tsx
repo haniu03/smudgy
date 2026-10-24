@@ -23,7 +23,7 @@ import {
   fetchGpsCatalog,
   watchMessage,
   type NukeFireGpsDestination,
-} from "smudgy://kapusniak/nukefire-gmcp";
+} from "smudgy:@nukefire-gmcp";
 import { filteredGpsDestinations } from "./atlas-model.ts";
 import { widgetTextSize } from "./config.ts";
 import { GPS_CLEAR, GPS_WALK, UI, gpsSet } from "./theme.ts";

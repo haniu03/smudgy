@@ -56,7 +56,7 @@ export function routedEndpointSide(
   endpoint: Readonly<ConnectionEndpoint>,
   automaticSide: ConnectionEndpoint["side"],
 ): ConnectionEndpoint["side"] {
-  return endpoint.port_mode === "Manual" ? endpoint.side : automaticSide;
+  return endpoint.portMode === "Manual" ? endpoint.side : automaticSide;
 }
 
 type EndpointRole = "a" | "b";
@@ -76,21 +76,21 @@ const OFFSET_EPSILON = 1e-6;
 
 function endpointCopy(endpoint: ConnectionEndpoint): ConnectionEndpoint {
   return {
-    room_number: endpoint.room_number,
+    roomNumber: endpoint.roomNumber,
     side: endpoint.side,
-    port_offset: endpoint.port_offset,
-    port_mode: endpoint.port_mode,
+    portOffset: endpoint.portOffset,
+    portMode: endpoint.portMode,
   };
 }
 
 function wallKey(endpoint: ConnectionEndpoint): string {
-  return `${endpoint.room_number}\u0000${endpoint.side}`;
+  return `${endpoint.roomNumber}\u0000${endpoint.side}`;
 }
 
 function arrivalRole(connection: OneWayPortConnection): EndpointRole | undefined {
   if (connection.protected || connection.oneWayOriginRoom === undefined) return undefined;
-  const aIsOrigin = connection.endpointA.room_number === connection.oneWayOriginRoom;
-  const bIsOrigin = connection.endpointB.room_number === connection.oneWayOriginRoom;
+  const aIsOrigin = connection.endpointA.roomNumber === connection.oneWayOriginRoom;
+  const bIsOrigin = connection.endpointB.roomNumber === connection.oneWayOriginRoom;
   // This also excludes self-loops and corrupt/ambiguous endpoint pairs.
   if (aIsOrigin === bIsOrigin) return undefined;
   return aIsOrigin ? "b" : "a";
@@ -100,7 +100,7 @@ function projectedSourceBearing(
   connection: OneWayPortConnection,
   targetRole: EndpointRole,
 ): number {
-  const origin = connection.endpointA.room_number === connection.oneWayOriginRoom
+  const origin = connection.endpointA.roomNumber === connection.oneWayOriginRoom
     ? connection.positionA
     : connection.positionB;
   const destination = targetRole === "a"
@@ -116,7 +116,7 @@ function projectedSourceBearing(
 function usesOffset(occupants: readonly EndpointOccupant[], offset: number): boolean {
   return occupants.some((occupant) =>
     !occupant.movableArrival &&
-    Math.abs(occupant.endpoint.port_offset - offset) <= OFFSET_EPSILON
+    Math.abs(occupant.endpoint.portOffset - offset) <= OFFSET_EPSILON
   );
 }
 
@@ -134,7 +134,7 @@ function assignCanonicalSlots(
   if (arrivals.length === 0 || occupants.length < 2) return;
   const fixedAtHome = occupants.filter((occupant) =>
     !occupant.movableArrival &&
-    Math.abs(occupant.endpoint.port_offset - HOME_OFFSET) <= OFFSET_EPSILON
+    Math.abs(occupant.endpoint.portOffset - HOME_OFFSET) <= OFFSET_EPSILON
   ).length;
   // An endpoint elsewhere on the same wall is already visually distinct. Fan
   // arrivals only when their semantic midpoint homes would actually collide.
@@ -203,8 +203,8 @@ export function disambiguateOneWayArrivalPorts(
     const movableRole = arrivalRole(connection);
     for (const role of ["a", "b"] as const) {
       const endpoint = role === "a" ? endpointA : endpointB;
-      const movableArrival = role === movableRole && endpoint.port_mode === "AutoPinned";
-      if (movableArrival) endpoint.port_offset = HOME_OFFSET;
+      const movableArrival = role === movableRole && endpoint.portMode === "AutoPinned";
+      if (movableArrival) endpoint.portOffset = HOME_OFFSET;
       const occupant: EndpointOccupant = {
         connection,
         endpoint,
@@ -222,7 +222,7 @@ export function disambiguateOneWayArrivalPorts(
 
   for (const occupants of cohorts.values()) {
     assignCanonicalSlots(occupants, (occupant, offset) => {
-      occupant.endpoint.port_offset = offset;
+      occupant.endpoint.portOffset = offset;
     });
   }
   return result;

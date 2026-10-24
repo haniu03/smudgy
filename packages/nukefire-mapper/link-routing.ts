@@ -17,26 +17,26 @@ import {
   type RouteLink,
   type RoutePoint,
   type RouteSide,
-} from "smudgy://kapusniak/map-layout/link-routes.ts";
+} from "smudgy:@map-layout/link-routes.ts";
 
 export const DEFAULT_LINK_COLOR = "#A4A4A4";
 export const DEFAULT_LINK_THICKNESS = 1;
 
 export interface RoutingEndpoint {
-  room_number: number;
+  roomNumber: number;
   side: RouteSide;
-  port_offset: number;
-  port_mode: "AutoPinned" | "Manual";
+  portOffset: number;
+  portMode: "AutoPinned" | "Manual";
 }
 
 /** A link's stored geometry and style, as the mapper writes it. */
 export interface LinkGeometry {
-  endpoint_a: RoutingEndpoint;
-  endpoint_b: RoutingEndpoint;
+  endpointA: RoutingEndpoint;
+  endpointB: RoutingEndpoint;
   routing: "Stub" | "Simple" | "Manual" | "Automatic";
-  segment_shape: "Direct" | "Orthogonal";
+  segmentShape: "Direct" | "Orthogonal";
   corner: "Sharp" | "Rounded";
-  route_points: RoutePoint[];
+  routePoints: RoutePoint[];
   color: string;
   thickness: number;
 }
@@ -79,7 +79,7 @@ export interface RoutingDecision {
 }
 
 function drawnPoints(geometry: LinkGeometry): RoutePoint[] | undefined {
-  return geometry.routing === "Manual" || geometry.routing === "Automatic" ? geometry.route_points : undefined;
+  return geometry.routing === "Manual" || geometry.routing === "Automatic" ? geometry.routePoints : undefined;
 }
 
 /**
@@ -108,15 +108,15 @@ export function planLinkGeometry(
         geometry: {
           ...geometry,
           routing: "Simple",
-          segment_shape: authored ? geometry.segment_shape : "Direct",
-          route_points: authored ? geometry.route_points : [],
+          segmentShape: authored ? geometry.segmentShape : "Direct",
+          routePoints: authored ? geometry.routePoints : [],
           ...withoutCallout(geometry, mapId),
         },
       });
       planned.push({
         id: link.id, from: link.from, to: link.to,
-        fromSide: geometry.endpoint_a.side, toSide: geometry.endpoint_b.side,
-        fromPort: geometry.endpoint_a.port_offset, toPort: geometry.endpoint_b.port_offset,
+        fromSide: geometry.endpointA.side, toSide: geometry.endpointB.side,
+        fromPort: geometry.endpointA.portOffset, toPort: geometry.endpointB.portOffset,
         routable: false,
       });
       continue;
@@ -124,8 +124,8 @@ export function planLinkGeometry(
     if (link.role === "keep") {
       planned.push({
         id: link.id, from: link.from, to: link.to,
-        fromSide: geometry.endpoint_a.side, toSide: geometry.endpoint_b.side,
-        fromPort: geometry.endpoint_a.port_offset, toPort: geometry.endpoint_b.port_offset,
+        fromSide: geometry.endpointA.side, toSide: geometry.endpointB.side,
+        fromPort: geometry.endpointA.portOffset, toPort: geometry.endpointB.portOffset,
         points: drawnPoints(geometry),
         routable: false,
       });
@@ -135,9 +135,9 @@ export function planLinkGeometry(
     planned.push({
       id: link.id, from: link.from, to: link.to,
       fromSide: link.sides[0], toSide: link.sides[1],
-      fromPort: geometry.endpoint_a.port_offset, toPort: geometry.endpoint_b.port_offset,
-      fromPortFixed: geometry.endpoint_a.port_mode === "Manual",
-      toPortFixed: geometry.endpoint_b.port_mode === "Manual",
+      fromPort: geometry.endpointA.portOffset, toPort: geometry.endpointB.portOffset,
+      fromPortFixed: geometry.endpointA.portMode === "Manual",
+      toPortFixed: geometry.endpointB.portMode === "Manual",
       routable: true,
     });
   }
@@ -155,12 +155,12 @@ export function planLinkGeometry(
       callout: plan.callout !== undefined,
       geometry: {
         ...geometry,
-        endpoint_a: { ...geometry.endpoint_a, side: link.sides[0], port_offset: plan.fromPort },
-        endpoint_b: { ...geometry.endpoint_b, side: link.sides[1], port_offset: plan.toPort },
+        endpointA: { ...geometry.endpointA, side: link.sides[0], portOffset: plan.fromPort },
+        endpointB: { ...geometry.endpointB, side: link.sides[1], portOffset: plan.toPort },
         routing: "Automatic",
-        segment_shape: "Direct",
+        segmentShape: "Direct",
         corner: "Rounded",
-        route_points: plan.points,
+        routePoints: plan.points,
         ...style,
       },
     });

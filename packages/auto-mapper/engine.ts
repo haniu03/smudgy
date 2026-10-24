@@ -23,7 +23,7 @@ import {
     planAreaChange,
     type AreaChangePlan,
     type LayoutDirection,
-} from "smudgy://kapusniak/map-layout";
+} from "smudgy:@map-layout";
 
 // ---------------------------------------------------------------------------------------
 // The normalized room fix every dialect reduces to.
@@ -352,7 +352,7 @@ const inferMovement = options.inferMovementFromCommands ?? true;
 const enableRoomModule = options.enableRoomModule ?? true;
 
 // IMPORTANT: an `Area` handle wraps an immutable snapshot taken when the handle was
-// minted — `area.room(n)` / `area.room_numbers` on a cached handle never see later
+// minted — `area.room(n)` / `area.roomNumbers` on a cached handle never see later
 // writes. All session state therefore holds `AreaId`s and re-fetches a fresh handle
 // (`mapper.getAreaById`) at every read.
 
@@ -642,7 +642,7 @@ async function planRoomConnection(
 }
 
 function occupied(area: Area, x: number, y: number, level: number): boolean {
-    for (const number of area.room_numbers) {
+    for (const number of area.roomNumbers) {
         const room = area.room(number);
         if (room && room.level === level && Math.abs(room.x - x) < 0.5 && Math.abs(room.y - y) < 0.5) {
             return true;
@@ -684,11 +684,11 @@ function placement(areaId: AreaId, fix: RoomFix, direction: string | null): { x:
 
 /** The room's exit in canonical direction (or special command) `dir`. */
 function exitFor(room: Room, dir: string): Exit | undefined {
-    const from_direction = EXIT_DIRECTION[dir] ?? "Special";
+    const fromDirection = EXIT_DIRECTION[dir] ?? "Special";
     return room.exits.find(
         (exit) =>
-            exit.from_direction === from_direction &&
-            (from_direction !== "Special" || (exit.command ?? "") === dir),
+            exit.fromDirection === fromDirection &&
+            (fromDirection !== "Special" || (exit.command ?? "") === dir),
     );
 }
 
@@ -732,10 +732,10 @@ async function relinkExit(
     }
     await mutation.deleteRoomExit(room, exit.id);
     const fields: ExitArgs = {
-        from_direction: exit.from_direction,
-        to_area_id: toAreaId,
-        to_room_number: toRoomNumber,
-        is_hidden: exit.is_hidden,
+        fromDirection: exit.fromDirection,
+        toAreaId,
+        toRoomNumber,
+        isHidden: exit.isHidden,
         door: exit.door ?? null,
         weight: exit.weight,
         command: exit.command ?? undefined,
@@ -854,7 +854,7 @@ async function linkOrStub(
     mutation?: AreaMutator,
     pendingEffects?: PendingLinkEffect[],
 ) {
-    const from_direction = EXIT_DIRECTION[dir] ?? "Special";
+    const fromDirection = EXIT_DIRECTION[dir] ?? "Special";
     const command = dir;
     if (destId !== null) {
         // A named destination is always a room on the map: the mapped one, or a fresh
@@ -868,13 +868,13 @@ async function linkOrStub(
         }
         dest ??= await createPlaceholder(areaId, room, dir, destId);
         if (dest) {
-            if (alreadyMapped && sameArea(areaId, dest.area_id)) {
-                await planRoomConnection(areaId, room, dest.room_number, dir, mutation);
+            if (alreadyMapped && sameArea(areaId, dest.areaId)) {
+                await planRoomConnection(areaId, room, dest.roomNumber, dir, mutation);
             }
             const fields: ExitArgs = {
-                from_direction,
-                to_area_id: dest.area_id,
-                to_room_number: dest.room_number,
+                fromDirection,
+                toAreaId: dest.areaId,
+                toRoomNumber: dest.roomNumber,
                 door: newExitDoor(door),
                 command,
                 weight: 1,
@@ -893,7 +893,7 @@ async function linkOrStub(
     // No identity (or the placeholder could not be minted): a dangling stub until the
     // far room is discovered.
     const fields: ExitArgs = {
-        from_direction,
+        fromDirection,
         door: newExitDoor(door),
         command,
         weight: 1,
@@ -926,11 +926,11 @@ async function resolvePending(
             const exit = owner?.exits.find((candidate) => sameExit(candidate.id, waiter.exitId));
             if (!exit) continue;
             const pointsAtReplaced = replacing !== undefined
-                && exit.to_area_id !== null
-                && exit.to_room_number !== null
-                && sameArea(exit.to_area_id, replacing.areaId)
-                && exit.to_room_number === replacing.room;
-            if (exit.to_room_number !== null && !pointsAtReplaced) continue;
+                && exit.toAreaId !== null
+                && exit.toRoomNumber !== null
+                && sameArea(exit.toAreaId, replacing.areaId)
+                && exit.toRoomNumber === replacing.room;
+            if (exit.toRoomNumber !== null && !pointsAtReplaced) continue;
             if (sameArea(waiter.areaId, areaId)) {
                 await planRoomConnection(waiter.areaId, waiter.room, room, waiter.dir);
             }
@@ -959,7 +959,7 @@ async function reconcileTraversal(
     if (!prevRoom) return;
     const existing = exitFor(prevRoom, dir);
     if (existing) {
-        if (existing.to_room_number === null && !exitIsPending(existing.id)) {
+        if (existing.toRoomNumber === null && !exitIsPending(existing.id)) {
             if (!topologyPlanned && sameArea(prev.areaId, toAreaId)) {
                 await planRoomConnection(prev.areaId, prev.room, toRoomNumber, dir);
             }
@@ -970,9 +970,9 @@ async function reconcileTraversal(
             await planRoomConnection(prev.areaId, prev.room, toRoomNumber, dir);
         }
         await mapper.createRoomExit(prev.areaId, prev.room, {
-            from_direction: EXIT_DIRECTION[dir] ?? "Special",
-            to_area_id: toAreaId,
-            to_room_number: toRoomNumber,
+            fromDirection: EXIT_DIRECTION[dir] ?? "Special",
+            toAreaId,
+            toRoomNumber,
             command: dir,
             weight: 1,
         });
@@ -981,7 +981,7 @@ async function reconcileTraversal(
     if (!reverse) return;
     const destRoom = mapper.getAreaById(toAreaId).room(toRoomNumber);
     const reverseExit = destRoom ? exitFor(destRoom, reverse) : undefined;
-    if (reverseExit && reverseExit.to_room_number === null && !exitIsPending(reverseExit.id)) {
+    if (reverseExit && reverseExit.toRoomNumber === null && !exitIsPending(reverseExit.id)) {
         await relinkExit(toAreaId, toRoomNumber, reverseExit, prev.areaId, prev.room);
     }
 }
@@ -1036,17 +1036,17 @@ async function reconcileReportedExit(
         return;
     }
 
-    const alreadyLinked = existing.to_area_id !== null
-        && existing.to_room_number !== null
-        && sameArea(existing.to_area_id, destination.area_id)
-        && existing.to_room_number === destination.room_number;
+    const alreadyLinked = existing.toAreaId !== null
+        && existing.toRoomNumber !== null
+        && sameArea(existing.toAreaId, destination.areaId)
+        && existing.toRoomNumber === destination.roomNumber;
     let exitId = existing.id;
     if (!alreadyLinked) {
-        if (planTopology && alreadyMapped && sameArea(areaId, destination.area_id)) {
+        if (planTopology && alreadyMapped && sameArea(areaId, destination.areaId)) {
             await planRoomConnection(
                 areaId,
                 roomNumber,
-                destination.room_number,
+                destination.roomNumber,
                 dir,
                 mutation,
             );
@@ -1056,8 +1056,8 @@ async function reconcileReportedExit(
             areaId,
             roomNumber,
             existing,
-            destination.area_id,
-            destination.room_number,
+            destination.areaId,
+            destination.roomNumber,
             mutation,
         );
     }
@@ -1085,8 +1085,8 @@ async function reconcileReportedExit(
  *  script-engine rebuild; the map does). Opt-in `mapprune`: compass exits the server
  *  stopped reporting are removed. */
 async function reconcileKnownRoom(room: Room, fix: RoomFix) {
-    const areaId = room.area_id;
-    const roomNumber = room.room_number;
+    const areaId = room.areaId;
+    const roomNumber = room.roomNumber;
     await mapper.mutateArea(areaId, async (mutation) => {
         if (fix.name && fix.name !== room.title) {
             await mutation.updateRoom(roomNumber, { title: fix.name });
@@ -1111,8 +1111,8 @@ async function reconcileKnownRoom(room: Room, fix: RoomFix) {
     }
     if (pruneStale) {
         for (const exit of room.exits) {
-            if (exit.from_direction === "Special" || exit.from_direction === "Other") continue;
-            const dir = exit.from_direction.toLowerCase();
+            if (exit.fromDirection === "Special" || exit.fromDirection === "Other") continue;
+            const dir = exit.fromDirection.toLowerCase();
             if (!(dir in fix.exits)) {
                 await mapper.deleteRoomExit(areaId, roomNumber, exit.id);
                 dropPendingExit(exit.id);
@@ -1130,18 +1130,18 @@ async function reconcileKnownRoom(room: Room, fix: RoomFix) {
 async function materialize(room: Room, fix: RoomFix, dir: string | null): Promise<Room> {
     const id = fix.id!;
     const target = await zoneArea(fix.zone);
-    if (inZone(room.area_id, target)) {
-        await mapper.mutateArea(room.area_id, async (mutation) => {
+    if (inZone(room.areaId, target)) {
+        await mapper.mutateArea(room.areaId, async (mutation) => {
             if (fix.coords) {
-                const at = placement(room.area_id, fix, null);
-                await mutation.updateRoom(room.room_number, { x: at.x, y: at.y, level: at.level });
+                const at = placement(room.areaId, fix, null);
+                await mutation.updateRoom(room.roomNumber, { x: at.x, y: at.y, level: at.level });
                 await mutation.setRoomProperty(
-                    room.room_number,
+                    room.roomNumber,
                     SERVER_COORDINATES_PROPERTY,
                     "true",
                 );
             }
-            await mutation.setRoomProperty(room.room_number, "unvisited", "");
+            await mutation.setRoomProperty(room.roomNumber, "unvisited", "");
         }, { description: "Materialize GMCP map placeholder" });
         // Tracked exits already point at this room; they need no re-targeting.
         pendingLinks.delete(id);
@@ -1160,8 +1160,8 @@ async function materialize(room: Room, fix: RoomFix, dir: string | null): Promis
             await mutation.setRoomProperty(rebuilt, SERVER_COORDINATES_PROPERTY, "true");
         }
     }, { description: "Relocate GMCP map placeholder" });
-    await resolvePending(id, target, rebuilt, { areaId: room.area_id, room: room.room_number });
-    await mapper.deleteRoom(room.area_id, room.room_number);
+    await resolvePending(id, target, rebuilt, { areaId: room.areaId, room: room.roomNumber });
+    await mapper.deleteRoom(room.areaId, room.roomNumber);
     await mapper.setRoomExternalId(target, rebuilt, id);
     return mapper.getAreaById(target).room(rebuilt) ?? room;
 }
@@ -1189,7 +1189,7 @@ async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir
                 ? mapper.getAreaById(areaId).room(lastRoom.room)
                 : null;
             const planned = source && placementDir
-                ? await planRoomAddition(areaId, source.room_number, placementDir)
+                ? await planRoomAddition(areaId, source.roomNumber, placementDir)
                 : null;
             const at = planned?.position ?? placement(areaId, fix, placementDir);
             const params: CreateRoomParams = {
@@ -1261,7 +1261,7 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
     }
     pendingNeighborhoods.delete(fix.centerId);
 
-    const areaId = center.area_id;
+    const areaId = center.areaId;
     const centerX = center.x;
     const centerY = center.y;
     const centerLevel = center.level;
@@ -1284,13 +1284,13 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
                 const y = centerY + reported.offset.y * GRID;
                 const level = centerLevel + Math.round(reported.offset.z);
                 const room = mapper.findRoomByExternalId(reported.id);
-                if (room && !sameArea(room.area_id, areaId)) {
+                if (room && !sameArea(room.areaId, areaId)) {
                     if (isUnvisited(room) && reported.terrain) {
-                        const key = room.area_id;
+                        const key = room.areaId;
                         const group = offAreaTerrain.get(key) ?? [];
                         group.push({
-                            areaId: room.area_id,
-                            roomNumber: room.room_number,
+                            areaId: room.areaId,
+                            roomNumber: room.roomNumber,
                             terrain: reported.terrain,
                             color: TERRAIN_COLORS[reported.terrain.toLowerCase()],
                         });
@@ -1326,19 +1326,19 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
                 }
 
                 if (room.level === level && (room.x !== x || room.y !== y)) {
-                    await mutation.updateRoom(room.room_number, { x, y });
+                    await mutation.updateRoom(room.roomNumber, { x, y });
                 }
                 if (!propertyIsTrue(room.data(SERVER_COORDINATES_PROPERTY))) {
                     await mutation.setRoomProperty(
-                        room.room_number,
+                        room.roomNumber,
                         SERVER_COORDINATES_PROPERTY,
                         "true",
                     );
                 }
                 if (isUnvisited(room) && reported.terrain) {
-                    await mutation.setRoomProperty(room.room_number, "terrain", reported.terrain);
+                    await mutation.setRoomProperty(room.roomNumber, "terrain", reported.terrain);
                     const color = TERRAIN_COLORS[reported.terrain.toLowerCase()];
-                    if (color) await mutation.setRoomColor(room.room_number, color);
+                    if (color) await mutation.setRoomColor(room.roomNumber, color);
                 }
             }
         }, { description: "Apply GMCP neighborhood rooms" });
@@ -1364,7 +1364,7 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
     for (const id of missingBefore) {
         const room = mapper.findRoomByExternalId(id);
         if (room) {
-            await resolvePending(id, room.area_id, room.room_number);
+            await resolvePending(id, room.areaId, room.roomNumber);
         }
     }
 
@@ -1382,9 +1382,9 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
         const room = mapper.findRoomByExternalId(reported.id);
         if (!room) continue;
         for (const [dir, dest] of Object.entries(reported.exits)) {
-            const key = room.area_id;
-            const group = exitGroups.get(key) ?? { areaId: room.area_id, work: [] };
-            group.work.push({ roomNumber: room.room_number, dir, dest });
+            const key = room.areaId;
+            const group = exitGroups.get(key) ?? { areaId: room.areaId, work: [] };
+            group.work.push({ roomNumber: room.roomNumber, dir, dest });
             exitGroups.set(key, group);
         }
     }
@@ -1442,20 +1442,20 @@ async function handleRoomFix(fix: RoomFix | null, fixAt: number): Promise<void> 
             try {
                 room = await materialize(known, fix, dir);
             } catch (err) {
-                warnUnwritable(known.area_id, err);
+                warnUnwritable(known.areaId, err);
             }
         }
-        mapper.setCurrentLocation(room.area_id, room.room_number);
+        mapper.setCurrentLocation(room.areaId, room.roomNumber);
         const from = lastRoom;
-        lastRoom = { areaId: room.area_id, room: room.room_number, fix };
+        lastRoom = { areaId: room.areaId, room: room.roomNumber, fix };
         if (!fix.unmappable) {
             try {
                 await reconcileKnownRoom(room, fix);
                 if (dir && !idDir && from && from.fix.id !== fix.id) {
-                    await reconcileTraversal(from, dir, room.area_id, room.room_number);
+                    await reconcileTraversal(from, dir, room.areaId, room.roomNumber);
                 }
             } catch (err) {
-                warnUnwritable(room.area_id, err);
+                warnUnwritable(room.areaId, err);
             }
         }
         return;

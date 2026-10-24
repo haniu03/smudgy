@@ -27,7 +27,7 @@ import {
   watchMessage,
   type CharStatus,
   type CharVitals,
-} from "smudgy://kapusniak/nukefire-gmcp";
+} from "smudgy:@nukefire-gmcp";
 // The self-consumer shim is generated from index.ts when the package is
 // installed. The checked-in workspace typings describe the previously
 // installed package version, so they cannot know this new export yet.

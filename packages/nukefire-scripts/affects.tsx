@@ -27,7 +27,7 @@ import {
   type CharTargetAffects,
   type NukeFireAffects,
   type NukeFireEffect,
-} from "smudgy://kapusniak/nukefire-gmcp";
+} from "smudgy:@nukefire-gmcp";
 import { widgetTextSize } from "./config.ts";
 import { UI, fmtDuration } from "./theme.ts";
 

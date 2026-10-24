@@ -9,7 +9,7 @@ import {
     type NeighborhoodFix,
     type NeighborhoodRoomFix,
     type RoomFix,
-} from "smudgy://official/auto-mapper/engine.ts";
+} from "smudgy:@auto-mapper/engine.ts";
 import { createAlias } from "smudgy:core";
 
 const MAX_EXITS = 64;

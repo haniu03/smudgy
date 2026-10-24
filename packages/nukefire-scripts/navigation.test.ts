@@ -14,25 +14,25 @@ const AREA = "11111111-1111-4111-8111-111111111111";
 const OTHER = "33333333-3333-4333-8333-333333333333";
 
 function room(
-  room_number: number,
+  roomNumber: number,
   exits: NavigationRoom["exits"] = [],
-  area_id: NavigationAreaId = AREA,
+  areaId: NavigationAreaId = AREA,
 ): NavigationRoom {
-  return { area_id, room_number, exits };
+  return { areaId, roomNumber, exits };
 }
 
 test("turns weighted mapper paths into explicit and directional commands", () => {
   const rooms = new Map<string, NavigationRoom>([
     [`${AREA}:10`, room(10, [{
-      from_direction: "North",
-      to_area_id: AREA,
-      to_room_number: 11,
+      fromDirection: "North",
+      toAreaId: AREA,
+      toRoomNumber: 11,
       command: "north",
     }])],
     [`${AREA}:11`, room(11, [{
-      from_direction: "Special",
-      to_area_id: OTHER,
-      to_room_number: 20,
+      fromDirection: "Special",
+      toAreaId: OTHER,
+      toRoomNumber: 20,
       command: "enter portal",
       door: { state: "closed", name: null, opensWith: null },
     }])],
@@ -53,9 +53,9 @@ test("turns weighted mapper paths into explicit and directional commands", () =>
 
 test("reads each hop's door: locked is closed too, and an open door is neither", () => {
   const exit = (to: number, door: NavigationDoor | null) => ({
-    from_direction: "East",
-    to_area_id: AREA,
-    to_room_number: to,
+    fromDirection: "East",
+    toAreaId: AREA,
+    toRoomNumber: to,
     command: null,
     door,
   });
@@ -83,9 +83,9 @@ test("falls back to the canonical short command when an exit has none", () => {
     [[AREA, 1], [AREA, 2]],
     (_area, number) => number === 1
       ? room(1, [{
-        from_direction: "Northeast",
-        to_area_id: AREA,
-        to_room_number: 2,
+        fromDirection: "Northeast",
+        toAreaId: AREA,
+        toRoomNumber: 2,
         command: null,
       }])
       : room(2),

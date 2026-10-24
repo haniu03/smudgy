@@ -49,7 +49,7 @@ import {
   nukefire,
   watchMessage,
   type CharGps,
-} from "smudgy://kapusniak/nukefire-gmcp";
+} from "smudgy:@nukefire-gmcp";
 import { showLayoutState, widgetTextSize } from "./config.ts";
 import {
   CURRENT_ROOM_STYLE,
@@ -130,7 +130,8 @@ interface DirectedMapState {
 const directedMapConsumer = generatedSessionMapConsumer as StateConsumer<SessionMapSnapshot>;
 const directedMaps = new Map<number, DirectedMapState>();
 
-function currentMappedRoom(): Room | undefined {
+/** The player's room on the map, confirmed against the room the game reports. */
+export function currentMappedRoom(): Room | undefined {
   const location = mapper.getCurrentLocation();
   const vnum = nukefire.value?.Room?.Info?.num;
   if (location?.room !== undefined) {
@@ -167,8 +168,8 @@ function currentMapLocation(): MapLocation | undefined {
   if (!current) return undefined;
   try {
     return {
-      areaId: mapper.getAreaById(current.area_id).id,
-      roomNumber: current.room_number,
+      areaId: mapper.getAreaById(current.areaId).id,
+      roomNumber: current.roomNumber,
     };
   } catch {
     return undefined;
@@ -243,17 +244,17 @@ function traversedExit(
   const previousRoom = previousArea?.room(previous.roomNumber);
   if (!previousArea || !nextArea || !previousRoom) return undefined;
   const exit = previousRoom.exits.find((candidate) =>
-    candidate.to_area_id !== null &&
-    candidate.to_room_number === next.roomNumber &&
-    candidate.to_area_id === nextArea.id
+    candidate.toAreaId !== null &&
+    candidate.toRoomNumber === next.roomNumber &&
+    candidate.toAreaId === nextArea.id
   );
   return exit
     ? {
       areaId: previous.areaId,
       exit: {
         room: previous.roomNumber,
-        direction: exit.from_direction,
-        connectionKey: connectionKey(exit.connection_id),
+        direction: exit.fromDirection,
+        connectionKey: connectionKey(exit.connectionId),
       },
     }
     : undefined;
@@ -273,25 +274,25 @@ function connectionKey(id: ConnectionId): string {
 /** Style every endpoint ref the renderer can use, including a one-way link's
  * synthetic endpoint where no stored traversal originates. */
 function expandExitRefs(area: Area, refs: readonly MapExitRef[]): MapExitRef[] {
-  const traversals = area.room_numbers.flatMap((roomNumber) =>
+  const traversals = area.roomNumbers.flatMap((roomNumber) =>
     (area.room(roomNumber)?.exits ?? []).map((exit) => ({
-      connectionKey: connectionKey(exit.connection_id),
+      connectionKey: connectionKey(exit.connectionId),
       room: roomNumber,
-      direction: exit.from_direction,
-      toRoom: exit.to_room_number,
-      toDirection: exit.to_direction,
+      direction: exit.fromDirection,
+      toRoom: exit.toRoomNumber,
+      toDirection: exit.toDirection,
     }))
   );
   const connections = area.connections.map((connection) => ({
     key: connectionKey(connection.id),
     endpointA: {
-      room: connection.endpoint_a.room_number,
-      side: connection.endpoint_a.side,
+      room: connection.endpointA.roomNumber,
+      side: connection.endpointA.side,
     },
-    endpointB: connection.endpoint_b
+    endpointB: connection.endpointB
       ? {
-        room: connection.endpoint_b.room_number,
-        side: connection.endpoint_b.side,
+        room: connection.endpointB.roomNumber,
+        side: connection.endpointB.side,
       }
       : null,
   }));
@@ -304,21 +305,21 @@ function unvisitedApplication(area: Area): MapStyleApplication | undefined {
   const isVisited = (owner: Area, roomNumber: number): boolean => isRoomVisited(
     visited, vnums, owner.id, roomNumber, roomVnum(owner.room(roomNumber)?.externalId),
   );
-  const rooms = area.room_numbers.filter((roomNumber) => !isVisited(area, roomNumber));
+  const rooms = area.roomNumbers.filter((roomNumber) => !isVisited(area, roomNumber));
   const exits: MapExitRef[] = [];
 
-  for (const roomNumber of area.room_numbers) {
+  for (const roomNumber of area.roomNumbers) {
     const sourceVisited = isVisited(area, roomNumber);
     for (const exit of area.room(roomNumber)?.exits ?? []) {
       let destinationVisited = true;
-      if (exit.to_area_id !== null && exit.to_room_number !== null) {
-        const destinationArea = mapper.areas.find((candidate) => candidate.id === exit.to_area_id);
+      if (exit.toAreaId !== null && exit.toRoomNumber !== null) {
+        const destinationArea = mapper.areas.find((candidate) => candidate.id === exit.toAreaId);
         if (destinationArea) {
-          destinationVisited = isVisited(destinationArea, exit.to_room_number);
+          destinationVisited = isVisited(destinationArea, exit.toRoomNumber);
         }
       }
       if (!sourceVisited || !destinationVisited) {
-        exits.push({ room: roomNumber, direction: exit.from_direction });
+        exits.push({ room: roomNumber, direction: exit.fromDirection });
       }
     }
   }
@@ -373,7 +374,7 @@ function refreshMapStyles(): void {
     return;
   }
   try {
-    const area = mapper.getAreaById(current.area_id);
+    const area = mapper.getAreaById(current.areaId);
     const applications: MapStyleApplication[] = [];
     const unvisited = unvisitedApplication(area);
     if (unvisited) applications.push(unvisited);
@@ -387,7 +388,7 @@ function refreshMapStyles(): void {
         });
       }
     }
-    applications.push(...peerApplications(area, current.room_number));
+    applications.push(...peerApplications(area, current.roomNumber));
     applications.push(...currentRoomMapViewApply(current as RouteRoom));
     applications.push(...gpsApplications(current, area));
     mapApply.set(applications);
@@ -680,7 +681,7 @@ function mount(): void {
                   saveVisitedRooms(markAreaUnvisited(loadVisitedRooms(), location.areaId));
                   const area = areaById(location.areaId);
                   const vnums = loadVisitedVnums();
-                  for (const roomNumber of area?.room_numbers ?? []) {
+                  for (const roomNumber of area?.roomNumbers ?? []) {
                     const vnum = roomVnum(area?.room(roomNumber)?.externalId);
                     if (vnum !== undefined) vnums.delete(vnum);
                   }

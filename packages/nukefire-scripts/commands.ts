@@ -17,8 +17,8 @@ import {
   submission,
 } from "smudgy:core";
 import { submit } from "smudgy:events/sys";
-import { compareLayoutQuality, layoutSnapshotKey, loadLayoutModel, planAreaChange } from "smudgy://kapusniak/map-layout";
-import { nukefire } from "smudgy://kapusniak/nukefire-gmcp";
+import { compareLayoutQuality, layoutSnapshotKey, loadLayoutModel, planAreaChange } from "smudgy:@map-layout";
+import { nukefire } from "smudgy:@nukefire-gmcp";
 import { applyManualLayout } from "smudgy:procedures/kapusniak/nukefire-mapper";
 import { manualLayoutApplied } from "smudgy:events/kapusniak/nukefire-mapper";
 import { serializeManualRouteAmendments, waitForManualLayoutCommit } from "./manual-layout.ts";
@@ -80,7 +80,7 @@ function nukeFireAreas(): Area[] {
 
 function allMappedRooms(): Room[] {
   return nukeFireAreas().flatMap((area) =>
-    area.room_numbers.flatMap((number) => {
+    area.roomNumbers.flatMap((number) => {
       const room = area.room(number);
       return room ? [room] : [];
     })
@@ -98,7 +98,7 @@ function summarizeRoom(room: Room): RoomSummary {
   return {
     vnum: roomVnum(room),
     name: room.title,
-    area: mapper.getAreaById(room.area_id).name,
+    area: mapper.getAreaById(room.areaId).name,
   };
 }
 
@@ -150,15 +150,15 @@ interface RouteResolution {
 }
 
 function routeBetween(from: Room, to: Room): RouteResolution {
-  if (sameAreaId(from.area_id, to.area_id) && from.room_number === to.room_number) {
+  if (sameAreaId(from.areaId, to.areaId) && from.roomNumber === to.roomNumber) {
     return { steps: [], error: null };
   }
 
   const path = mapper.getPathBetweenRooms(
-    from.area_id,
-    from.room_number,
-    to.area_id,
-    to.room_number,
+    from.areaId,
+    from.roomNumber,
+    to.areaId,
+    to.roomNumber,
   );
   if (path.length < 2) return { steps: [], error: "no mapped path is reachable" };
 
@@ -345,7 +345,7 @@ function rememberDeath(): void {
   lastDeath.set({
     vnum,
     name: info?.name || mapped?.title || "",
-    area: info?.area || (mapped ? mapper.getAreaById(mapped.area_id).name : ""),
+    area: info?.area || (mapped ? mapper.getAreaById(mapped.areaId).name : ""),
     recordedAt: Date.now(),
   });
   echo(`[nf] Remembered death room #${vnum}${info?.name ? ` — ${info.name}` : ""}.`);
@@ -399,10 +399,10 @@ async function reflowCurrentArea(mode: NukeFireReflowMode): Promise<void> {
       ? "[nf] Searching without an automatic time limit for a perfect layout…"
       : "[nf] Running a bounded search for a better layout…");
     const liveArea = mapper.getAreaById(location.area);
-    const residentCount = liveArea.room_numbers.length;
-    const edgeCount = liveArea.room_numbers.reduce(
+    const residentCount = liveArea.roomNumbers.length;
+    const edgeCount = liveArea.roomNumbers.reduce(
       (count, number) => count + (liveArea.room(number)?.exits.filter((exit) =>
-        exit.to_area_id ? sameAreaId(exit.to_area_id, location.area) : false
+        exit.toAreaId ? sameAreaId(exit.toAreaId, location.area) : false
       ).length ?? 0),
       0,
     );

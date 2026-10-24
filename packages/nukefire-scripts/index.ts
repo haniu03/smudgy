@@ -1,7 +1,7 @@
 // =============================================================================
 //  nukefire-scripts — the NukeFire command deck
 // =============================================================================
-//  Panels and widgets over smudgy://kapusniak/nukefire-gmcp:
+//  Panels and widgets over smudgy:@nukefire-gmcp:
 //
 //    HUD      per-session strip, or aggregate pane above shared session tabs
 //    Affects  live effects with local countdowns + a combat target scanner

@@ -1,6 +1,6 @@
 # NukeFire Mapper
 
-`smudgy://kapusniak/nukefire-mapper` reads NukeFire's GMCP data and
+`smudgy:@nukefire-mapper` reads NukeFire's GMCP data and
 automatically builds the map shown in Smudgy's map widget.
 
 As you explore, it adds rooms, exits, terrain, doors, and vertical connections.
@@ -218,9 +218,9 @@ next polish. Only the session that maps NukeFire can tidy.
 
 Enable the package and connect to NukeFire; mapping starts automatically. For
 the complete map and radar interface, also enable
-`smudgy://kapusniak/nukefire-scripts`.
+`smudgy:@nukefire-scripts`.
 
-Disable `smudgy://official/auto-mapper` while using this package. Running both
+Disable `smudgy:@auto-mapper` while using this package. Running both
 mappers can cause conflicting room and exit updates.
 
 For troubleshooting, enable **Log mapping decisions (debug)** in the package

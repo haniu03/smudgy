@@ -27,7 +27,7 @@ Use this script to check the copy. Replace the example path with the full path t
 
 ```ts
 import { echo } from "smudgy:core";
-import { openDatabase } from "smudgy://official/mudlet-db";
+import { openDatabase } from "smudgy:@mudlet-db";
 
 const mydb = openDatabase(
   { path: "C:/Users/YourName/Documents/MudData/Database_combatlog.db" },
@@ -70,7 +70,7 @@ end
 The Smudgy version uses the same sheet and column names. Replace the path with the path to your copied `Database_people.db`:
 
 ```ts
-import { openDatabase, eq } from "smudgy://official/mudlet-db";
+import { openDatabase, eq } from "smudgy:@mudlet-db";
 
 const mydb = openDatabase(
   { path: "C:/Users/YourName/Documents/MudData/Database_people.db" },
@@ -107,7 +107,7 @@ If you have no saved data to bring across, use a name and Smudgy's data director
 
 ```ts
 import { getDataDir } from "smudgy:core";
-import { openDatabase } from "smudgy://official/mudlet-db";
+import { openDatabase } from "smudgy:@mudlet-db";
 
 const mydb = openDatabase(
   { name: "people", directory: getDataDir() },
@@ -137,7 +137,7 @@ A column you omit receives its default value. Each saved row has an automatic `_
 ### Find rows
 
 ```ts
-import { eq, and, like } from "smudgy://official/mudlet-db";
+import { eq, and, like } from "smudgy:@mudlet-db";
 
 const everyone = friends.fetch();
 const bostonians = friends.fetch(eq(friends.fields.city, "Boston"));
@@ -193,7 +193,7 @@ For true/false values, choose numbers such as `1` and `0`, or strings such as `"
 For a date column, import `timestamp` and `CURRENT_TIMESTAMP`:
 
 ```ts
-import { timestamp, CURRENT_TIMESTAMP } from "smudgy://official/mudlet-db";
+import { timestamp, CURRENT_TIMESTAMP } from "smudgy:@mudlet-db";
 
 const schema = {
   sightings: {
@@ -252,7 +252,7 @@ Here, `mydb` is the result of `openDatabase`, `sheet` is a sheet, and `field` co
 
 ### Query functions
 
-Import the functions you use from `smudgy://official/mudlet-db`.
+Import the functions you use from `smudgy:@mudlet-db`. Smudgy versions before 0.5.8 spell it `smudgy://official/mudlet-db`.
 
 | In Mudlet | In Smudgy |
 | --- | --- |
@@ -281,7 +281,7 @@ Add these entries to that package's `smudgy.package.json`. Keep its other entrie
 
 ```json
 {
-  "dependencies": ["smudgy://official/mudlet-db@^0.1"],
+  "dependencies": ["smudgy:@mudlet-db@^0.1"],
   "permissions": {
     "read": ["$DATA"],
     "write": ["$DATA"]
@@ -312,7 +312,7 @@ To show a database error in Smudgy:
 
 ```ts
 import { echo } from "smudgy:core";
-import { MudletDbError } from "smudgy://official/mudlet-db";
+import { MudletDbError } from "smudgy:@mudlet-db";
 
 try {
   friends.add({ name: "Ada", city: "Boston" });

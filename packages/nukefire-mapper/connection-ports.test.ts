@@ -15,10 +15,10 @@ function endpoint(
   portMode: PortMode = "AutoPinned",
 ): ConnectionEndpoint {
   return {
-    room_number: room,
+    roomNumber: room,
     side,
-    port_offset: portOffset,
-    port_mode: portMode,
+    portOffset: portOffset,
+    portMode: portMode,
   };
 }
 
@@ -76,12 +76,12 @@ test("fans one-way arrivals around a reciprocal midpoint in source order", () =>
   ];
   const result = disambiguateOneWayArrivalPorts(input);
 
-  assert.equal(result.get("reciprocal")?.endpointA.port_offset, 0.5);
-  assert.equal(result.get("west-arrival")?.endpointB.port_offset, 0.2);
+  assert.equal(result.get("reciprocal")?.endpointA.portOffset, 0.5);
+  assert.equal(result.get("west-arrival")?.endpointB.portOffset, 0.2);
   // The target is canonical endpoint A here, proving A/B order is irrelevant.
-  assert.equal(result.get("east-arrival")?.endpointA.port_offset, 0.8);
-  assert.equal(result.get("west-arrival")?.endpointA.port_offset, 0.5);
-  assert.equal(result.get("east-arrival")?.endpointB.port_offset, 0.5);
+  assert.equal(result.get("east-arrival")?.endpointA.portOffset, 0.8);
+  assert.equal(result.get("west-arrival")?.endpointA.portOffset, 0.5);
+  assert.equal(result.get("east-arrival")?.endpointB.portOffset, 0.5);
 });
 
 test("is deterministic under input permutation and repeated application", () => {
@@ -103,8 +103,8 @@ test("is deterministic under input permutation and repeated application", () => 
   const reversed = disambiguateOneWayArrivalPorts([...input].reverse());
   assert.deepEqual(plain(forward), plain(reversed));
   // Equal source projections fall back to the stable key.
-  assert.equal(forward.get("alpha")?.endpointB.port_offset, 0.2);
-  assert.equal(forward.get("zeta")?.endpointB.port_offset, 0.8);
+  assert.equal(forward.get("alpha")?.endpointB.portOffset, 0.2);
+  assert.equal(forward.get("zeta")?.endpointB.portOffset, 0.8);
 
   const reapplied = disambiguateOneWayArrivalPorts(
     input.map((connection) => ({
@@ -138,9 +138,9 @@ test("orders three one-way arrivals across all canonical lanes", () => {
     }, [2, -2], [0, 0]),
   ]);
 
-  assert.equal(result.get("left")?.endpointB.port_offset, 0.2);
-  assert.equal(result.get("middle")?.endpointB.port_offset, 0.5);
-  assert.equal(result.get("right")?.endpointB.port_offset, 0.8);
+  assert.equal(result.get("left")?.endpointB.portOffset, 0.2);
+  assert.equal(result.get("middle")?.endpointB.portOffset, 0.5);
+  assert.equal(result.get("right")?.endpointB.portOffset, 0.8);
 });
 
 test("orders two arrivals after a Manual early-lane endpoint", () => {
@@ -164,9 +164,9 @@ test("orders two arrivals after a Manual early-lane endpoint", () => {
     }, [2, -2], [0, 0]),
   ]);
 
-  assert.equal(result.get("manual-left")?.endpointA.port_offset, 0.2);
-  assert.equal(result.get("left-arrival")?.endpointB.port_offset, 0.5);
-  assert.equal(result.get("right-arrival")?.endpointB.port_offset, 0.8);
+  assert.equal(result.get("manual-left")?.endpointA.portOffset, 0.2);
+  assert.equal(result.get("left-arrival")?.endpointB.portOffset, 0.5);
+  assert.equal(result.get("right-arrival")?.endpointB.portOffset, 0.8);
 });
 
 test("different target walls do not form a crowded cohort", () => {
@@ -185,8 +185,8 @@ test("different target walls do not form a crowded cohort", () => {
     }, [-2, 0], [0, 0]),
   ]);
 
-  assert.equal(result.get("north")?.endpointB.port_offset, 0.5);
-  assert.equal(result.get("west")?.endpointB.port_offset, 0.5);
+  assert.equal(result.get("north")?.endpointB.portOffset, 0.5);
+  assert.equal(result.get("west")?.endpointB.portOffset, 0.5);
 });
 
 test("an already distinct off-center wall-mate does not displace an arrival", () => {
@@ -204,8 +204,8 @@ test("an already distinct off-center wall-mate does not displace an arrival", ()
     }, [0, -2], [0, 0]),
   ]);
 
-  assert.equal(result.get("manual-lane")?.endpointA.port_offset, 0.8);
-  assert.equal(result.get("arrival")?.endpointB.port_offset, 0.5);
+  assert.equal(result.get("manual-lane")?.endpointA.portOffset, 0.8);
+  assert.equal(result.get("arrival")?.endpointB.portOffset, 0.5);
 });
 
 test("Manual and protected arrivals remain fixed while reserving their slots", () => {
@@ -231,9 +231,9 @@ test("Manual and protected arrivals remain fixed while reserving their slots", (
     }, [3, -2], [0, 0]),
   ]);
 
-  assert.equal(result.get("manual")?.endpointB.port_offset, 0.2);
-  assert.equal(result.get("protected")?.endpointB.port_offset, 0.5);
-  assert.equal(result.get("movable")?.endpointB.port_offset, 0.8);
+  assert.equal(result.get("manual")?.endpointB.portOffset, 0.2);
+  assert.equal(result.get("protected")?.endpointB.portOffset, 0.5);
+  assert.equal(result.get("movable")?.endpointB.portOffset, 0.8);
 });
 
 test("a no-longer-crowded AutoPinned arrival heals to its midpoint home", () => {
@@ -246,8 +246,8 @@ test("a no-longer-crowded AutoPinned arrival heals to its midpoint home", () => 
     }, [-2, 0], [0, 0]),
   ]);
 
-  assert.equal(result.get("arrival")?.endpointB.port_offset, 0.5);
-  assert.equal(result.get("arrival")?.endpointA.port_offset, 0.5);
+  assert.equal(result.get("arrival")?.endpointB.portOffset, 0.5);
+  assert.equal(result.get("arrival")?.endpointA.portOffset, 0.5);
 });
 
 test("bidirectional and ambiguous endpoint pairs are never moved", () => {

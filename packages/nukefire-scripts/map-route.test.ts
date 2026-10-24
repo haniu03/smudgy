@@ -14,21 +14,21 @@ const AREA = "11111111-1111-4111-8111-111111111111";
 const OTHER_AREA = "33333333-3333-4333-8333-333333333333";
 
 function exit(
-  from_direction: RouteDirection,
-  to_room_number: number,
+  fromDirection: RouteDirection,
+  toRoomNumber: number,
   command: string | null = null,
-  to_area_id: MapRouteAreaId = AREA,
+  toAreaId: MapRouteAreaId = AREA,
 ): RouteExit {
   return {
-    from_direction,
-    to_area_id,
-    to_room_number,
+    fromDirection,
+    toAreaId,
+    toRoomNumber,
     command,
   };
 }
 
-function room(room_number: number, exits: RouteExit[] = []): RouteRoom {
-  return { area_id: AREA, room_number, exits };
+function room(roomNumber: number, exits: RouteExit[] = []): RouteRoom {
+  return { areaId: AREA, roomNumber, exits };
 }
 
 test("selects every exit at the current room for persistent labels", () => {

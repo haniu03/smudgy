@@ -1,6 +1,6 @@
 # Map Widget
 
-`smudgy://official/map-widget` adds a simple map pane to a Smudgy session. Choose which side of the session it opens on, set its starting size, and decide whether to show the current area and room information.
+`smudgy:@map-widget` adds a simple map pane to a Smudgy session. Choose which side of the session it opens on, set its starting size, and decide whether to show the current area and room information.
 
 The widget displays the maps available to the connected MUD. Cross-area destinations appear when you hover over their exits, with labels that use the active app background color. Labels on exits from your current room remain visible so area transitions are readable before you move. A mapper package or script is still responsible for identifying your current room and following you as you move.
 

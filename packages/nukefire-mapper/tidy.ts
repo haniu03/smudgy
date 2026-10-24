@@ -4,7 +4,7 @@
  * in it to hear the game's, and how a polish reports its progress.
  */
 
-import type { LayoutPlannerSnapshot, LayoutQuality } from "smudgy://kapusniak/map-layout";
+import type { LayoutPlannerSnapshot, LayoutQuality } from "smudgy:@map-layout";
 import type { MapFacts } from "./zone-plan.ts";
 
 /** The map holding most of the zone, then the largest, then the lowest id. */

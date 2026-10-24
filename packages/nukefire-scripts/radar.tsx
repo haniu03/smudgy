@@ -31,7 +31,7 @@ import {
   type NukeFireMapLocal,
   type NukeFireMapRoom,
   type RoomInfo,
-} from "smudgy://kapusniak/nukefire-gmcp";
+} from "smudgy:@nukefire-gmcp";
 import { widgetTextSize } from "./config.ts";
 import { UI, terrainColor } from "./theme.ts";
 

@@ -13,13 +13,13 @@ const positions = new Map([
   [3, { x: 0, y: -2 }], [4, { x: 0, y: 2 }],
 ]);
 const area = {
-  id: "facade-area", room_numbers: [1, 2, 3, 4],
+  id: "facade-area", roomNumbers: [1, 2, 3, 4],
   room(number: number) {
     const position = positions.get(number);
     return position ? {
-      room_number: number, ...position, level: 0,
+      roomNumber: number, ...position, level: 0,
       hasTag: () => true, data: () => undefined,
-      exits: number === 1 || number === 3 ? [{ from_direction: "Other", to_area_id: "facade-area", to_room_number: number + 1 }] : [],
+      exits: number === 1 || number === 3 ? [{ fromDirection: "Other", toAreaId: "facade-area", toRoomNumber: number + 1 }] : [],
     } : undefined;
   },
 };

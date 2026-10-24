@@ -12,7 +12,7 @@ import {
   type GridPosition,
   type LayoutDirection,
   type LayoutEdge,
-} from "smudgy://kapusniak/map-layout/layout.ts";
+} from "smudgy:@map-layout/layout.ts";
 import type { AreaNames, MapName } from "./area-names.ts";
 import type { DecisionLogRecord } from "./decision-log.ts";
 import { seamSeeds } from "./seam-preview.ts";
@@ -74,8 +74,8 @@ export function readZoneFacts(zone: number, context: ZoneContext, charted: reado
   const { marks } = context;
   const zoneRooms = new Map<string, Set<RoomNumber>>();
   const add = (room: Room) => {
-    const rooms = zoneRooms.get(room.area_id) ?? new Set<RoomNumber>();
-    zoneRooms.set(room.area_id, rooms.add(room.room_number));
+    const rooms = zoneRooms.get(room.areaId) ?? new Set<RoomNumber>();
+    zoneRooms.set(room.areaId, rooms.add(room.roomNumber));
   };
   mapper.findRoomsByProperty(marks.zone, String(zone)).forEach(add);
   for (const externalId of charted) {
@@ -90,7 +90,7 @@ export function readZoneFacts(zone: number, context: ZoneContext, charted: reado
     managed: area.data(marks.managed.property) === marks.managed.value,
     placeholder: marks.placeholderZone(area.name) !== undefined,
     madeFor: madeFor(area, marks),
-    roomCount: area.room_numbers.length,
+    roomCount: area.roomNumbers.length,
     zoneRooms: [...zoneRooms.get(area.id) ?? []],
   }));
 }
@@ -124,10 +124,10 @@ export async function settleZone(
       );
     } catch (error) {
       const reason = String(error);
-      if (!/\bmerge_/.test(reason)) throw error;
+      if (!/\bmerge[A-Z]/.test(reason)) throw error;
       context.log({ kind: "zone-merge-refused", zone, into, sources, reason });
       // Busy maps free up; anything else is left as it is until the next run.
-      return /\bmerge_areas_(busy|source_changed)\b/.test(reason)
+      return /\bmergeAreas(Busy|SourceChanged)\b/.test(reason)
         ? { kind: "retry" }
         : { kind: "settled", into, changed: [into], deleted: [] };
     }
@@ -224,8 +224,8 @@ async function ensureMap(destination: Destination, name: MapName, context: ZoneC
   }
 }
 
-const roomsOf = (area: Area): Room[] => area.room_numbers.flatMap((number) => area.room(number) ?? []);
-const layoutId = (room: Room): string => `${room.area_id}:${room.room_number}`;
+const roomsOf = (area: Area): Room[] => area.roomNumbers.flatMap((number) => area.room(number) ?? []);
+const layoutId = (room: Room): string => `${room.areaId}:${room.roomNumber}`;
 const at = (room: Room): GridPosition => ({ x: Math.round(room.x), y: Math.round(room.y), level: room.level });
 
 /** Each source with the offset map-layout chose to join its moving rooms to the destination. */
@@ -238,10 +238,10 @@ function placeSources(into: AreaId, sources: readonly Source[]): MergeAreaSource
   });
   const edges: LayoutEdge[] = [...residents, ...blocks.flatMap((block) => block.rooms)].flatMap((room) =>
     room.exits.flatMap((exit) =>
-      exit.to_area_id === null || exit.to_room_number === null ? [] : [{
+      exit.toAreaId === null || exit.toRoomNumber === null ? [] : [{
         from: layoutId(room),
-        to: `${exit.to_area_id}:${exit.to_room_number}`,
-        direction: exit.from_direction as LayoutDirection,
+        to: `${exit.toAreaId}:${exit.toRoomNumber}`,
+        direction: exit.fromDirection as LayoutDirection,
       }]
     )
   );
@@ -260,9 +260,9 @@ function placeSources(into: AreaId, sources: readonly Source[]): MergeAreaSource
 function seamsOf(into: AreaId, moved: readonly MergedRoom[]): RoomNumber[] {
   const arrivedFrom = new Map(moved.map((room) => [room.to, String(room.from.area)]));
   const rooms = roomsOf(mapper.getAreaById(into)).map((room) => ({
-    roomNumber: room.room_number,
+    roomNumber: room.roomNumber,
     exitsTo: room.exits.flatMap((exit) =>
-      exit.to_room_number !== null && exit.to_area_id === into ? [exit.to_room_number] : []
+      exit.toRoomNumber !== null && exit.toAreaId === into ? [exit.toRoomNumber] : []
     ),
   }));
   return seamSeeds(rooms, arrivedFrom);
@@ -273,7 +273,7 @@ async function joinDuplicateRooms(into: AreaId, moved: readonly MergedRoom[], co
   const arrived = new Set(moved.map((room) => room.to));
   const byVnum = new Map<string, RoomNumber[]>();
   for (const room of roomsOf(mapper.getAreaById(into))) {
-    if (room.externalId) byVnum.set(room.externalId, [...byVnum.get(room.externalId) ?? [], room.room_number]);
+    if (room.externalId) byVnum.set(room.externalId, [...byVnum.get(room.externalId) ?? [], room.roomNumber]);
   }
   for (const [vnum, numbers] of byVnum) {
     const keep = numbers.find((number) => !arrived.has(number)) ?? numbers[0];

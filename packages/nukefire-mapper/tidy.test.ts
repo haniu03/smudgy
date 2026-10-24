@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { LayoutPlannerSnapshot } from "smudgy://kapusniak/map-layout";
+import type { LayoutPlannerSnapshot } from "smudgy:@map-layout";
 import { elapsedClock, polishProgressLine, qualitySummary, zoneNameFromMaps } from "./tidy.ts";
 import type { MapFacts } from "./zone-plan.ts";
 

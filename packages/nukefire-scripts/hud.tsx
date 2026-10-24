@@ -23,7 +23,7 @@ import {
   watchMessage,
   type CharStatus,
   type CharVitals,
-} from "smudgy://kapusniak/nukefire-gmcp";
+} from "smudgy:@nukefire-gmcp";
 import { widgetMetric } from "./config.ts";
 import { UI, fmtNum, themeBackground } from "./theme.ts";
 import {

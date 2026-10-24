@@ -12,17 +12,17 @@ export interface NavigationDoor {
 }
 
 export interface NavigationExit {
-  from_direction: string;
-  to_area_id: NavigationAreaId | null;
-  to_room_number: number | null;
+  fromDirection: string;
+  toAreaId: NavigationAreaId | null;
+  toRoomNumber: number | null;
   command: string | null;
   /** The exit's door, or null for none. */
   door?: NavigationDoor | null;
 }
 
 export interface NavigationRoom {
-  area_id: NavigationAreaId;
-  room_number: number;
+  areaId: NavigationAreaId;
+  roomNumber: number;
   exits: readonly NavigationExit[];
 }
 
@@ -62,7 +62,7 @@ export function sameAreaId(left: NavigationAreaId, right: NavigationAreaId): boo
 function exitCommand(exit: NavigationExit): string | undefined {
   const explicit = exit.command?.trim();
   if (explicit) return explicit;
-  return DIRECTION_COMMANDS[exit.from_direction.trim().toLowerCase()];
+  return DIRECTION_COMMANDS[exit.fromDirection.trim().toLowerCase()];
 }
 
 /** Convert mapper path keys into concrete commands, validating every hop. */
@@ -81,9 +81,9 @@ export function buildNavigationRoute(
     }
 
     const exit = room.exits.find((candidate) =>
-      candidate.to_area_id !== null &&
-      candidate.to_room_number === to[1] &&
-      sameAreaId(candidate.to_area_id, to[0])
+      candidate.toAreaId !== null &&
+      candidate.toRoomNumber === to[1] &&
+      sameAreaId(candidate.toAreaId, to[0])
     );
     if (!exit) {
       return { steps, error: `mapped path has no exit from room ${from[1]} to ${to[1]}` };
@@ -93,7 +93,7 @@ export function buildNavigationRoute(
     if (!command) {
       return {
         steps,
-        error: `the ${exit.from_direction} exit from room ${from[1]} has no traversal command`,
+        error: `the ${exit.fromDirection} exit from room ${from[1]} has no traversal command`,
       };
     }
 
@@ -101,7 +101,7 @@ export function buildNavigationRoute(
     steps.push({
       from,
       to,
-      direction: exit.from_direction,
+      direction: exit.fromDirection,
       command,
       closed: door === "closed" || door === "locked",
       locked: door === "locked",

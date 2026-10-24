@@ -1,6 +1,6 @@
 # RoP Mapper
 
-`smudgy://official/rop-mapper` maps Rites of Passage from its authoritative
+`smudgy:@rop-mapper` maps Rites of Passage from its authoritative
 `Room.Info` exits and `Room.Map` neighborhoods.
 
 New zones begin in durable local storage and survive restarts on this device.

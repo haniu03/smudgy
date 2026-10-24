@@ -26,7 +26,7 @@ import {
   watchMessage,
   type NukeFireContextAction,
   type NukeFireContextEntry,
-} from "smudgy://kapusniak/nukefire-gmcp";
+} from "smudgy:@nukefire-gmcp";
 import { widgetMetric, widgetTextSize } from "./config.ts";
 import { visibleContexts } from "./context-model.ts";
 import { UI, kindColor, themeBackground, toneColor } from "./theme.ts";

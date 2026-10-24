@@ -6,13 +6,12 @@ import type { LayoutPlannerSnapshot } from "../../map-layout/planner-state.ts";
 import { nukeFirePerfectConstraintRepairPolicy } from "../../nukefire-mapper/constraint-policy.ts";
 
 interface FakeRoom {
-    room_number: number;
     roomNumber: number;
     areaId: string;
     x: number;
     y: number;
     level: number;
-    exits: { from_direction: string; to_area_id: string; to_room_number: number }[];
+    exits: { fromDirection: string; toAreaId: string; toRoomNumber: number }[];
     hasTag(tag: string): boolean;
     data(key: string): string | undefined;
 }
@@ -32,7 +31,7 @@ const kind = (connection: FakeConnection) =>
         ? "Internal" : "CrossLevel";
 const area = {
     id: AREA, name: "Solace", place: "map",
-    get room_numbers() { return [...rooms.keys()]; },
+    get roomNumbers() { return [...rooms.keys()]; },
     room: (number: number) => rooms.get(number),
     get connections() { return connections.map((connection) => ({ ...connection, kind: kind(connection) })); },
 };
@@ -79,8 +78,8 @@ const { deepPolishPolicy, polishProgressLine, qualitySummary, startPolish, stopP
 
 function addRoom(number: number, x: number, y: number, level: number, exits: [string, number][]) {
     rooms.set(number, {
-        room_number: number, roomNumber: number, areaId: AREA, x, y, level,
-        exits: exits.map(([from_direction, to_room_number]) => ({ from_direction, to_area_id: AREA, to_room_number })),
+        roomNumber: number, areaId: AREA, x, y, level,
+        exits: exits.map(([fromDirection, toRoomNumber]) => ({ fromDirection, toAreaId: AREA, toRoomNumber })),
         hasTag: () => false, data: () => undefined,
     });
 }
@@ -89,7 +88,7 @@ function addRoom(number: number, x: number, y: number, level: number, exits: [st
 function planAt(second: GridPosition, first: GridPosition = { x: 0, y: 0, level: 0 }): IntegralLayoutPlan {
     const positions = new Map([["1", first], ["2", second]]);
     const edges = [...rooms.values()].flatMap((room) => room.exits.map((exit) =>
-        ({ from: String(room.room_number), to: String(exit.to_room_number), direction: exit.from_direction as any })));
+        ({ from: String(room.roomNumber), to: String(exit.toRoomNumber), direction: exit.fromDirection as any })));
     return { positions, movedExisting: true, quality: measureIntegralLayoutQuality(positions, edges) };
 }
 
