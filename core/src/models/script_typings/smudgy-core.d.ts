@@ -876,7 +876,7 @@ declare module "smudgy:core" {
     output: string;
     selection: string;
     inputBackground: string;
-    /** The app accent color, if the color scheme defines one. */
+    /** The app accent color: the one chosen in Preferences, else the color scheme's own, if it defines one. */
     accent?: string;
   }
 

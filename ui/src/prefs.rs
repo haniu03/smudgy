@@ -18,6 +18,7 @@ use smudgy_core::models::settings::{
     ThemeTweaks,
 };
 use smudgy_core::session::styled_line::Color as VtColor;
+use smudgy_theme::accent::Accent;
 use smudgy_ui_shared::prefs as shared;
 
 use crate::assets;
@@ -84,6 +85,17 @@ pub fn effective_palette(settings: &Settings) -> TerminalPalette {
         .map_or_else(|| base.clone(), |tweaks| apply_tweaks(base, tweaks))
 }
 
+/// The accent chosen in Preferences, resolved into its shades; `None` when
+/// unset (or unparseable), which keeps each theme's own accent.
+#[must_use]
+pub fn chosen_accent(settings: &Settings) -> Option<Accent> {
+    settings
+        .accent_color
+        .as_deref()
+        .and_then(parse_css_color)
+        .map(Accent::from_color)
+}
+
 /// The effective terminal palette as the script-visible [`ScriptPalette`] (each color a
 /// `#rrggbb` hex string), for `smudgy:core`'s `getSettings().palette`. Resolved here because
 /// color-scheme resolution lives in this (UI) crate, not in `smudgy_core`.
@@ -100,7 +112,10 @@ pub fn script_palette(settings: &Settings) -> ScriptPalette {
         output: hex(palette.output),
         selection: hex(palette.selection),
         input_background: hex(palette.input_background),
-        accent: palette.accent.map(hex),
+        accent: chosen_accent(settings)
+            .map(|accent| accent.fill)
+            .or(palette.accent)
+            .map(hex),
     }
 }
 
@@ -136,6 +151,7 @@ impl TerminalPrefs {
                 history_case_sensitive_match: settings.history_case_sensitive_match,
                 max_history: settings.max_history,
                 hide_pane_headers: settings.hide_pane_headers,
+                accent: chosen_accent(settings),
                 generation,
             },
             palette,
@@ -338,6 +354,7 @@ pub fn apply(settings: &Settings) {
         && next.font_size == current.font_size
         && next.line_height == current.line_height
         && next.line_length == current.line_length
+        && next.accent == current.accent
         && *next.palette == *current.palette
         && next.theme_extended_colors == current.theme_extended_colors;
     if !visually_equal {
@@ -422,7 +439,18 @@ fn mix(a: Color, b: Color, amount: f32) -> Color {
 #[must_use]
 pub fn app_theme() -> smudgy_theme::Theme {
     let prefs = current();
-    shared::app_theme_for_palette(&prefs.palette)
+    shared::app_theme_for_palette(&prefs.palette, prefs.accent.as_ref())
+}
+
+/// The theme for tool windows (Settings, Map and Script editors): the
+/// secondary chrome in the chosen accent.
+#[must_use]
+pub fn secondary_theme() -> smudgy_theme::Theme {
+    let theme = smudgy_theme::secondary();
+    match &current().accent {
+        Some(accent) => theme.with_accent(accent),
+        None => theme,
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +584,36 @@ mod tests {
             };
             assert_eq!(TerminalPrefs::from_settings(&settings, 0).bold_mode, mode);
         }
+    }
+
+    #[test]
+    fn a_chosen_accent_reaches_the_render_snapshot_and_scripts() {
+        assert!(
+            TerminalPrefs::from_settings(&Settings::default(), 0)
+                .accent
+                .is_none()
+        );
+        assert_eq!(super::script_palette(&Settings::default()).accent, None);
+
+        let settings = Settings {
+            accent_color: Some("#086C48".to_string()),
+            ..Settings::default()
+        };
+        let accent = TerminalPrefs::from_settings(&settings, 0)
+            .accent
+            .expect("the accent parses");
+        assert_eq!(accent.fill, Color::from_rgb8(8, 108, 72));
+        assert_eq!(
+            super::script_palette(&settings).accent.as_deref(),
+            Some("#086c48")
+        );
+
+        // A hand edit that does not parse keeps the theme's own accent.
+        let settings = Settings {
+            accent_color: Some("not a color".to_string()),
+            ..Settings::default()
+        };
+        assert!(TerminalPrefs::from_settings(&settings, 0).accent.is_none());
     }
 
     #[test]

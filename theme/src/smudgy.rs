@@ -3,16 +3,18 @@ use iced::{Background, Border, Color, Shadow, Vector, border::Radius};
 use iced::{Gradient, gradient::Linear};
 
 use super::{Button, Buttons, General, Modal, Styles, Tabs, Text, Theme};
+use crate::accent::Accent;
 
 #[must_use]
 pub fn smudgy() -> Theme {
+    let accent = Accent::STOCK;
     Theme {
         name: "Smudgy".to_string(),
         styles: Styles {
             general: General {
                 background: Color::from_rgb8(15, 15, 14),
                 container_background: Color::from_rgb8(7, 7, 6),
-                accent: Color::from_rgb8(55, 23, 130),
+                accent: accent.fill,
                 border: Color::from_rgba8(255, 250, 239, 0.1),
                 rule: Color::from_rgba8(255, 250, 239, 0.1),
                 overlay_background: Color::from_rgba8(20, 20, 20, 0.9),
@@ -40,15 +42,8 @@ pub fn smudgy() -> Theme {
                 drop_marker: Color::from_rgba8(255, 255, 255, 0.9),
             },
             modal: Modal {
-                title_bar_background: accent_background(
-                    Color::from_rgb8(55, 23, 130),
-                    Color::from_rgb8(63, 40, 116),
-                ),
-                title_bar_border: Border {
-                    color: Color::from_rgb8(78, 55, 131),
-                    width: 1.0,
-                    radius: Radius::new(5),
-                },
+                title_bar_background: accent_background(accent.fill, accent.fill_end),
+                title_bar_border: accent_border(&accent),
                 body_background: Background::Color(Color::from_rgb8(30, 30, 30)),
                 body_border: Border {
                     color: Color::from_rgb8(50, 50, 50),
@@ -62,26 +57,7 @@ pub fn smudgy() -> Theme {
                 },
             },
             buttons: Buttons {
-                primary: Button {
-                    background: accent_background(
-                        Color::from_rgb8(55, 23, 130),
-                        Color::from_rgb8(63, 40, 116),
-                    ),
-                    background_hover: accent_background(
-                        Color::from_rgb8(60, 28, 135),
-                        Color::from_rgb8(68, 45, 121),
-                    ),
-                    background_pressed: accent_background(
-                        Color::from_rgb8(50, 18, 125),
-                        Color::from_rgb8(63, 40, 116),
-                    ),
-                    border: Border {
-                        color: Color::from_rgb8(78, 55, 131),
-                        width: 1.0,
-                        radius: Radius::new(5),
-                    },
-                    text: Color::from_rgb8(255, 250, 239),
-                },
+                primary: primary_button(&accent),
                 secondary: Button {
                     background: Background::Color(Color::from_rgb8(68, 68, 68)),
                     background_hover: Background::Color(Color::from_rgb8(0, 0, 0)),
@@ -95,6 +71,37 @@ pub fn smudgy() -> Theme {
                 },
             },
         },
+    }
+}
+
+impl Theme {
+    /// This theme with `accent` in every accent-bearing style: the general
+    /// accent, primary buttons, and the modal title bar.
+    #[must_use]
+    pub fn with_accent(mut self, accent: &Accent) -> Self {
+        self.styles.general.accent = accent.fill;
+        self.styles.buttons.primary = primary_button(accent);
+        self.styles.modal.title_bar_background = accent_background(accent.fill, accent.fill_end);
+        self.styles.modal.title_bar_border = accent_border(accent);
+        self
+    }
+}
+
+fn primary_button(accent: &Accent) -> Button {
+    Button {
+        background: accent_background(accent.fill, accent.fill_end),
+        background_hover: accent_background(accent.hover, accent.hover_end),
+        background_pressed: accent_background(accent.pressed, accent.pressed_end),
+        border: accent_border(accent),
+        text: Color::from_rgb8(255, 250, 239),
+    }
+}
+
+fn accent_border(accent: &Accent) -> Border {
+    Border {
+        color: accent.border,
+        width: 1.0,
+        radius: Radius::new(5),
     }
 }
 

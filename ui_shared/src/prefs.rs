@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock};
 use arc_swap::ArcSwap;
 use iced::{Background, Color, Font};
 use smudgy_session_model::{AnsiColor, Color as VtColor};
+use smudgy_theme::accent::Accent;
 
 use crate::assets::GEIST_MONO;
 
@@ -64,10 +65,17 @@ pub fn palette_by_name(name: &str) -> &'static NamedTerminalPalette {
         .unwrap_or(&crate::palettes::SMUDGY)
 }
 
-/// Derive readable application chrome from a terminal palette.
+/// Derive readable application chrome from a terminal palette. A chosen
+/// `accent` replaces the stock violet and outranks the palette's own accent.
 #[must_use]
-pub fn app_theme_for_palette(palette: &NamedTerminalPalette) -> smudgy_theme::Theme {
+pub fn app_theme_for_palette(
+    palette: &NamedTerminalPalette,
+    accent: Option<&Accent>,
+) -> smudgy_theme::Theme {
     let mut theme = smudgy_theme::smudgy();
+    if let Some(accent) = accent {
+        theme = theme.with_accent(accent);
+    }
     if !palette.derive_app_theme {
         theme.styles.general.background = palette.background;
         theme.styles.general.input_background = palette.input_background;
@@ -88,7 +96,9 @@ pub fn app_theme_for_palette(palette: &NamedTerminalPalette) -> smudgy_theme::Th
     theme.styles.general.border = mix(bg, fg, 0.18);
     theme.styles.general.rule = mix(bg, fg, 0.14);
     theme.styles.general.overlay_background = Color { a: 0.9, ..bg };
-    theme.styles.general.accent = palette.accent.unwrap_or(fg);
+    if accent.is_none() {
+        theme.styles.general.accent = palette.accent.unwrap_or(fg);
+    }
     theme.styles.text.normal = fg;
     theme.styles.text.success = palette.ansi[2];
     theme.styles.text.error = palette.ansi[1];
@@ -330,6 +340,9 @@ pub struct TerminalPrefs {
     pub history_case_sensitive_match: bool,
     pub max_history: usize,
     pub hide_pane_headers: bool,
+    /// The accent chosen in Preferences; `None` keeps the stock violet (and
+    /// each derived theme's own accent).
+    pub accent: Option<Accent>,
     pub generation: u64,
 }
 
@@ -351,6 +364,7 @@ impl Default for TerminalPrefs {
             history_case_sensitive_match: false,
             max_history: 1_000,
             hide_pane_headers: false,
+            accent: None,
             generation: 0,
         }
     }
@@ -381,4 +395,42 @@ pub(crate) fn lock_prefs_test() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Accent, Color, app_theme_for_palette};
+    use crate::palettes;
+
+    #[test]
+    fn a_chosen_accent_replaces_the_stock_violet_and_outranks_a_palette_accent() {
+        let accent = Accent::from_color(Color::from_rgb8(8, 108, 72));
+
+        let stock = app_theme_for_palette(&palettes::SMUDGY, None);
+        assert_eq!(stock.styles.general.accent, Accent::STOCK.fill);
+        assert_eq!(
+            stock.styles.buttons.primary.border.color,
+            Accent::STOCK.border
+        );
+        let chosen = app_theme_for_palette(&palettes::SMUDGY, Some(&accent));
+        assert_eq!(chosen.styles.general.accent, accent.fill);
+        assert_eq!(chosen.styles.buttons.primary.border.color, accent.border);
+        assert_eq!(chosen.styles.modal.title_bar_border.color, accent.border);
+
+        let derived = palettes::ALL
+            .iter()
+            .find(|palette| palette.derive_app_theme && palette.accent.is_some())
+            .expect("a derived palette with its own accent");
+        assert_eq!(
+            app_theme_for_palette(derived, None).styles.general.accent,
+            derived.accent.unwrap()
+        );
+        assert_eq!(
+            app_theme_for_palette(derived, Some(&accent))
+                .styles
+                .general
+                .accent,
+            accent.fill
+        );
+    }
 }

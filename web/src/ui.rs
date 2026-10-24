@@ -681,9 +681,10 @@ impl ClientUiState {
 
     #[must_use]
     pub fn theme(&self) -> Theme {
-        smudgy_ui_shared::prefs::app_theme_for_palette(smudgy_ui_shared::prefs::palette_by_name(
-            self.theme.selected(),
-        ))
+        smudgy_ui_shared::prefs::app_theme_for_palette(
+            smudgy_ui_shared::prefs::palette_by_name(self.theme.selected()),
+            None,
+        )
     }
 
     pub fn set_input_preferences(&mut self, preferences: InputPreferences) -> Task<Message> {

@@ -228,6 +228,7 @@ pub mod bootstrap_icons {
     pub const DPAD: &str = "\u{F687}";
     pub const EXCLAMATION_TRIANGLE: &str = "\u{F33B}";
     pub const EYE_SLASH: &str = "\u{F340}";
+    pub const EYEDROPPER: &str = "\u{F342}";
     pub const FOLDER_PLUS: &str = "\u{F3D3}";
     pub const FONTS: &str = "\u{F3DA}";
     pub const LIGHTNING: &str = "\u{F46F}";

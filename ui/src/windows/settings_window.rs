@@ -10,7 +10,7 @@
 
 use iced::widget::{
     button, checkbox, column, container, markdown, pick_list, row, rule, slider, space, text,
-    text_input,
+    text_input, tooltip,
 };
 use iced::{Alignment, Background, Color, Length, Task};
 use smudgy_cloud::cloud_api::{ApiKeyInfo, AuthSession, CreatedApiKey, SessionInfo, UserProfile};
@@ -19,15 +19,17 @@ use smudgy_core::models::settings::{
     Settings, ThemeTweaks, clear_update_check_seed, load_settings,
 };
 use smudgy_session_model::input_policy::CommandSyntax;
+use smudgy_theme::accent::{self, Accent};
 use smudgy_ui_shared::settings_appearance::{self, Appearance, Change as AppearanceChange};
 use smudgy_ui_shared::settings_input::{self, Change as InputChange, InputPreferences};
 use smudgy_ui_shared::settings_theme;
 
 use crate::account_deletion::{self, AfterFailure, Answer};
+use crate::assets::{bootstrap_icons, fonts};
 use crate::cloud_account::{CloudHandles, DeletionKey};
 use crate::components::clan_panel::{self, ClanPanel};
 use crate::components::cloud_errors::display_error;
-use crate::components::color_picker::{self, ColorPicker};
+use crate::components::color_picker::{self, ColorPicker, Hsv};
 use crate::components::pending_invitations::Pending;
 use crate::components::social_panel::{self, SocialPanel};
 use crate::i18n::{self, LocaleChoice, t, ts};
@@ -156,6 +158,11 @@ pub enum Message {
     PrefFontLigaturesToggled(bool),
     Appearance(settings_appearance::Message),
     PrefLocaleSelected(LocaleChoice),
+    /// A preset accent was chosen, or `None`: the theme's own.
+    AccentPicked(Option<String>),
+    /// The custom accent swatch was pressed: opens or closes its picker.
+    AccentCustomPressed,
+    AccentPicker(color_picker::Message),
     Theme(settings_theme::Message),
     Syntax(settings_input::SyntaxMessage),
     Input(settings_input::Message),
@@ -262,6 +269,8 @@ pub struct SettingsWindow {
     input: settings_input::State,
     syntax: settings_input::SyntaxState,
     theme: settings_theme::State,
+    /// The open custom accent picker.
+    accent_picker: Option<ColorPicker>,
     /// Monospaced system font families, `None` until the first Preferences
     /// tab open kicks off enumeration.
     system_fonts: Option<Vec<String>>,
@@ -336,6 +345,7 @@ impl SettingsWindow {
             input,
             syntax,
             theme,
+            accent_picker: None,
             system_fonts: None,
             tweak_tab: TweakTab::Adjust,
             tweak_picker: None,
@@ -899,6 +909,35 @@ impl SettingsWindow {
                 i18n::activate(&self.settings.locale);
                 self.settings_changed()
             }
+            Message::AccentPicked(hex) => {
+                self.accent_picker = None;
+                self.settings.accent_color = hex;
+                self.settings_changed()
+            }
+            Message::AccentCustomPressed => {
+                if self.accent_picker.take().is_none() {
+                    // Seed from the accent the chrome shows now.
+                    let seed = self.chosen_accent().unwrap_or_else(|| self.theme_accent());
+                    self.accent_picker = Some(ColorPicker::from_color(seed));
+                }
+                Update::none()
+            }
+            Message::AccentPicker(message) => {
+                let Some(picker) = &mut self.accent_picker else {
+                    return Update::none();
+                };
+                // Mid-drag the swatch follows; the app re-themes on release.
+                match picker.update(message) {
+                    color_picker::Event::Preview => {
+                        self.settings.accent_color = Some(color_picker::to_hex(picker.color()));
+                        Update::none()
+                    }
+                    color_picker::Event::Committed(color) => {
+                        self.settings.accent_color = Some(color_picker::to_hex(color));
+                        self.settings_changed()
+                    }
+                }
+            }
             // Numeric buffers commit only on Enter; a partially typed value
             // must never mutate live settings.
             Message::Theme(message) => {
@@ -1108,6 +1147,22 @@ impl SettingsWindow {
             .theme_tweaks
             .get(base.name)
             .map_or_else(|| base.clone(), |tweaks| prefs::apply_tweaks(base, tweaks))
+    }
+
+    /// The persisted accent color, when one is chosen and parses.
+    fn chosen_accent(&self) -> Option<Color> {
+        self.settings
+            .accent_color
+            .as_deref()
+            .and_then(smudgy_cloud::parse_css_color)
+    }
+
+    /// The accent the chosen theme shows on its own.
+    fn theme_accent(&self) -> Color {
+        smudgy_ui_shared::prefs::app_theme_for_palette(&self.effective_palette(), None)
+            .styles
+            .general
+            .accent
     }
 
     /// Commits a tweak edit: drops the entry if it became neutral (keeps
@@ -1647,6 +1702,7 @@ impl SettingsWindow {
         col = col.push(
             settings_appearance::view(&self.appearance, &i18n::translate).map(Message::Appearance),
         );
+        col = col.push(self.accent_view());
         col = col.push(settings_theme::view(&self.theme, &i18n::translate).map(Message::Theme));
         col = col.push(self.tweak_panel());
         col = col.push(
@@ -1726,6 +1782,73 @@ impl SettingsWindow {
                 .on_toggle(Message::PrefAutoCheckForUpdatesToggled),
         );
 
+        col.into()
+    }
+
+    /// The accent picker above the Theme picker: the theme's own accent, the
+    /// presets and a custom color as round swatches, the choice's name, and
+    /// (while open) the custom color picker.
+    fn accent_view(&self) -> ThemedElement<'_, Message> {
+        let presets = accent_presets();
+        let chosen = self.chosen_accent();
+        let chosen_hex = chosen.map(color_picker::to_hex);
+        let preset = chosen_hex
+            .as_deref()
+            .and_then(|chosen| presets.iter().position(|(hex, _)| *hex == chosen));
+        let custom = chosen.filter(|_| preset.is_none());
+
+        let mut swatches = vec![accent_swatch(
+            SwatchFill::Color(self.theme_accent()),
+            Some(bootstrap_icons::ARROW_COUNTERCLOCKWISE),
+            chosen.is_none(),
+            t!("accent-theme-default"),
+            Message::AccentPicked(None),
+        )];
+        for (index, (hex, name)) in presets.iter().enumerate() {
+            swatches.push(accent_swatch(
+                SwatchFill::Color(smudgy_cloud::parse_css_color(hex).unwrap_or(Color::BLACK)),
+                None,
+                preset == Some(index),
+                name.clone(),
+                Message::AccentPicked(Some((*hex).to_string())),
+            ));
+        }
+        swatches.push(accent_swatch(
+            custom.map_or(SwatchFill::Spectrum, SwatchFill::Color),
+            Some(bootstrap_icons::EYEDROPPER),
+            custom.is_some(),
+            t!("accent-custom"),
+            Message::AccentCustomPressed,
+        ));
+        let second_row = swatches.split_off(swatches.len().div_ceil(2));
+
+        let name = match (preset, chosen_hex) {
+            (Some(index), _) => presets[index].1.clone(),
+            (None, Some(hex)) => t!("accent-custom-named", "hex" => hex),
+            (None, None) => t!("accent-theme-default"),
+        };
+        let mut col = column![
+            dim_text_owned(t!("preferences-accent")),
+            column![
+                row(swatches).spacing(ACCENT_SWATCH_SPACING),
+                row(second_row).spacing(ACCENT_SWATCH_SPACING),
+            ]
+            .spacing(ACCENT_SWATCH_SPACING),
+            text(name).size(12),
+        ]
+        .spacing(4);
+        if let Some(color) = custom
+            && Accent::from_color(color).fill != color
+        {
+            col = col.push(dim_text_owned(t!("accent-deepened")));
+        }
+        if let Some(picker) = &self.accent_picker {
+            col = col.push(
+                container(picker.view().map(Message::AccentPicker))
+                    .width(280)
+                    .padding([4, 0]),
+            );
+        }
         col.into()
     }
 
@@ -2071,6 +2194,126 @@ fn enumerate_system_fonts() -> Task<Message> {
     )
 }
 
+/// The outer size of an accent swatch, selection ring included.
+const ACCENT_SWATCH_SIZE: f32 = 28.0;
+const ACCENT_SWATCH_SPACING: f32 = 6.0;
+
+/// The curated accents, in hue order around the wheel, then the two
+/// neutrals. Each is deep enough to carry the chrome's light text as it is.
+fn accent_presets() -> [(&'static str, String); 12] {
+    [
+        ("#9e1b3a", t!("accent-garnet")),
+        ("#a83c0e", t!("accent-ember")),
+        ("#a0620a", t!("accent-amber")),
+        ("#506812", t!("accent-moss")),
+        ("#086c48", t!("accent-jade")),
+        ("#066770", t!("accent-lagoon")),
+        ("#0e54a4", t!("accent-cobalt")),
+        ("#2e37a0", t!("accent-indigo")),
+        ("#7c2892", t!("accent-orchid")),
+        ("#981e5e", t!("accent-raspberry")),
+        ("#415166", t!("accent-slate")),
+        ("#4a4a4f", t!("accent-graphite")),
+    ]
+}
+
+/// What fills an accent swatch.
+#[derive(Debug, Clone, Copy)]
+enum SwatchFill {
+    Color(Color),
+    /// The hue wheel, for a custom color not yet picked.
+    Spectrum,
+}
+
+/// A round accent swatch named by its tooltip. A text-colored ring around it
+/// marks the current choice; hovering shows a fainter one.
+fn accent_swatch(
+    fill: SwatchFill,
+    glyph: Option<&'static str>,
+    selected: bool,
+    name: String,
+    message: Message,
+) -> ThemedElement<'static, Message> {
+    let background = match fill {
+        SwatchFill::Color(color) => Background::Color(color),
+        SwatchFill::Spectrum => {
+            let mut spectrum =
+                iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_4));
+            for step in 0..=6_u8 {
+                let offset = f32::from(step) / 6.0;
+                let hue = Hsv {
+                    hue: offset * 360.0,
+                    saturation: 0.7,
+                    value: 0.9,
+                };
+                spectrum = spectrum.add_stop(offset, hue.to_color());
+            }
+            Background::Gradient(iced::Gradient::Linear(spectrum))
+        }
+    };
+    let glyph_color = match fill {
+        // Whichever of the light ink and near-black reads better on it.
+        SwatchFill::Color(color) => {
+            let light = Color::from_rgb8(255, 250, 239);
+            let dark = Color::from_rgb8(20, 20, 20);
+            if accent::contrast(color, light) >= accent::contrast(color, dark) {
+                light
+            } else {
+                dark
+            }
+        }
+        SwatchFill::Spectrum => Color::from_rgba(0.0, 0.0, 0.0, 0.75),
+    };
+    let content: ThemedElement<'static, Message> = match glyph {
+        Some(glyph) => text(glyph)
+            .font(fonts::BOOTSTRAP_ICONS)
+            .size(11)
+            .color(glyph_color)
+            .into(),
+        None => space::horizontal().width(0.0).into(),
+    };
+    let dot = container(content)
+        .center(Length::Fill)
+        .style(move |theme: &crate::Theme| iced::widget::container::Style {
+            background: Some(background),
+            border: iced::border::color(theme.styles.general.border)
+                .width(1.0)
+                .rounded(ACCENT_SWATCH_SIZE),
+            ..Default::default()
+        });
+    let swatch = button(dot)
+        .width(ACCENT_SWATCH_SIZE)
+        .height(ACCENT_SWATCH_SIZE)
+        .padding(4)
+        .style(
+            move |theme: &crate::Theme, status| iced::widget::button::Style {
+                background: None,
+                border: iced::border::color(if selected {
+                    theme.styles.text.normal
+                } else if matches!(
+                    status,
+                    iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed
+                ) {
+                    theme.styles.text.normal.scale_alpha(0.35)
+                } else {
+                    Color::TRANSPARENT
+                })
+                .width(2.0)
+                .rounded(ACCENT_SWATCH_SIZE / 2.0),
+                ..Default::default()
+            },
+        )
+        .on_press(message);
+    tooltip(
+        swatch,
+        container(text(name).size(11))
+            .padding(6)
+            .style(theme::builtins::container::tooltip),
+        tooltip::Position::Top,
+    )
+    .into()
+}
+
 /// De-emphasized owned text for translated labels and runtime strings.
 fn dim_text_owned<'a>(label: String) -> iced::widget::Text<'a, crate::Theme> {
     text(label)
@@ -2301,6 +2544,83 @@ mod tests {
 
     fn dialog(window: &SettingsWindow) -> &DeletionDialog {
         window.deletion.as_ref().expect("the confirmation is open")
+    }
+
+    /// A window on the theme's own accent, whatever `settings.json` holds.
+    fn accent_window() -> SettingsWindow {
+        let mut window = SettingsWindow::new(crate::cloud_account::test_handles_signed_in("mira"));
+        window.settings.accent_color = None;
+        window
+    }
+
+    /// The accent a committed change emitted, or `None` when nothing was.
+    fn emitted_accent(update: &Update<Message, Event>) -> Option<Option<String>> {
+        match &update.event {
+            Some(Event::SettingsChanged(settings)) => Some(settings.accent_color.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn accent_presets_are_canonical_and_carry_light_text_as_they_are() {
+        for (hex, name) in accent_presets() {
+            let color = smudgy_cloud::parse_css_color(hex).expect("a preset parses");
+            assert_eq!(color_picker::to_hex(color), hex, "{name} is not canonical");
+            assert_eq!(Accent::from_color(color).fill, color, "{name} would deepen");
+        }
+    }
+
+    #[test]
+    fn picking_an_accent_commits_it_and_the_theme_default_clears_it() {
+        let mut window = accent_window();
+        let update = window.update(Message::AccentPicked(Some("#086c48".to_string())));
+        assert_eq!(emitted_accent(&update), Some(Some("#086c48".to_string())));
+
+        let update = window.update(Message::AccentPicked(None));
+        assert_eq!(emitted_accent(&update), Some(None));
+    }
+
+    #[test]
+    fn the_custom_picker_previews_locally_and_commits_on_release() {
+        let mut window = accent_window();
+        let _ = window.update(Message::AccentCustomPressed);
+        let picker = window.accent_picker.expect("the picker opens");
+        assert_eq!(
+            color_picker::to_hex(picker.color()),
+            color_picker::to_hex(window.theme_accent()),
+            "seeded from the accent on screen"
+        );
+
+        let drag = window.update(Message::AccentPicker(color_picker::Message::HueChanged {
+            hue: 30.0,
+            commit: false,
+        }));
+        assert!(drag.event.is_none(), "nothing is written mid-drag");
+        let previewed = window.settings.accent_color.clone();
+        assert!(previewed.is_some());
+
+        let release = window.update(Message::AccentPicker(color_picker::Message::HueChanged {
+            hue: 30.0,
+            commit: true,
+        }));
+        assert_eq!(emitted_accent(&release), Some(previewed));
+
+        let _ = window.update(Message::AccentPicked(Some("#0e54a4".to_string())));
+        assert!(window.accent_picker.is_none(), "a preset closes the picker");
+    }
+
+    #[test]
+    fn the_custom_swatch_toggles_its_picker() {
+        let mut window = accent_window();
+        let open = window.update(Message::AccentCustomPressed);
+        assert!(open.event.is_none());
+        assert!(window.accent_picker.is_some());
+        let _ = window.update(Message::AccentCustomPressed);
+        assert!(window.accent_picker.is_none());
+        assert_eq!(
+            window.settings.accent_color, None,
+            "opening alone picks nothing"
+        );
     }
 
     #[test]

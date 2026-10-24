@@ -15,7 +15,11 @@ pub(super) fn view(content: &markdown::Content) -> Elem<'_> {
     style.font = fonts::GEIST_VF;
     style.inline_code_font = fonts::GEIST_MONO_VF;
     style.code_block_font = fonts::GEIST_MONO_VF;
-    style.link_color = Color::from_rgb8(190, 172, 255);
+    // The reading surface is always dark, so links take the accent's tint
+    // for a dark ground.
+    style.link_color = crate::prefs::current()
+        .accent
+        .map_or(Color::from_rgb8(190, 172, 255), |accent| accent.ink_on_dark);
 
     let mut settings = markdown::Settings::with_text_size(16.0, style);
     settings.h1_size = 28.0.into();

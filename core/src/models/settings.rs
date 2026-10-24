@@ -254,6 +254,11 @@ pub struct Settings {
     /// shown, in milliseconds. Zero shows tooltips immediately.
     #[serde(default)]
     pub link_tooltip_delay_ms: u64,
+    /// The app accent as a `#rrggbb` color: primary buttons, title bars,
+    /// selections, checked controls and the client's own transcript rows.
+    /// `None` keeps Smudgy's violet, or a derived theme's own accent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent_color: Option<String>,
     /// Named theme: terminal color scheme plus app background/accent.
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -717,7 +722,8 @@ pub struct ScriptPalette {
     pub output: String,
     pub selection: String,
     pub input_background: String,
-    /// The app accent color; absent when the scheme falls back to the foreground.
+    /// The app accent color: the one chosen in Preferences, else the scheme's;
+    /// absent when neither sets one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accent: Option<String>,
 }
@@ -789,6 +795,7 @@ impl Default for Settings {
             terminal_disable_blink: false,
             terminal_line_length: None,
             link_tooltip_delay_ms: 0,
+            accent_color: None,
             theme: default_theme(),
             theme_extended_colors: true,
             theme_tweaks: std::collections::HashMap::new(),
@@ -1013,6 +1020,20 @@ fn save_settings_to(settings_path: &std::path::Path, settings: &Settings) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_accent_color_is_written_only_when_chosen() {
+        let json = serde_json::to_value(super::Settings::default()).unwrap();
+        assert!(json.get("accent_color").is_none());
+
+        let chosen = super::Settings {
+            accent_color: Some("#086c48".to_string()),
+            ..super::Settings::default()
+        };
+        let json = serde_json::to_string(&chosen).unwrap();
+        let parsed: super::Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.accent_color.as_deref(), Some("#086c48"));
+    }
+
     use super::*;
 
     #[test]
